@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/tar-codec", "crates/tar-framing"]
+members = ["crates/tar-codec", "crates/tar-framing", "crates/tarpit"]
 
 [workspace.package]
 edition = "2024"
@@ -12,6 +12,11 @@ version = "0.1.0"
 readme = "README.md"
 
 [workspace.dependencies]
+tar-codec = { path = "crates/tar-codec" }
+tar-framing = { path = "crates/tar-framing" }
+
+async-compression = { version = "0.4", features = ["gzip", "tokio"] }
+clap = "4.6"
 thiserror = "2"
 tokio = "1"
 tokio-stream = "0.1"
