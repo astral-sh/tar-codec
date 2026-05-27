@@ -1,14 +1,6 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! High-level decoding and encoding for tar archives.
+//!
+//! Reading and secure extraction are currently available through [`extract`].
+//! Encoding support will be added in a future module.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub mod extract;

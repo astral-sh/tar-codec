@@ -16,7 +16,9 @@ tar-codec = { path = "crates/tar-codec" }
 tar-framing = { path = "crates/tar-framing" }
 
 async-compression = { version = "0.4", features = ["gzip", "tokio"] }
+cap-std = "4.0"
 clap = "4.6"
+tempfile = "3"
 thiserror = "2"
 tokio = "1"
 tokio-stream = "0.1"
