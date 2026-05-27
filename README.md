@@ -4,7 +4,7 @@ tar-codec is a small, contrained tar encoder and decoder for Rust.
 
 Goals:
 
-- Fast, asynchronous, minimally ambiguous pax-style tar encoding
+- Fast, asynchronous, minimally ambiguous, strict pax-style tar encoding
 - Fast, asynchronous tar decoding for distinct POSIX pax/ustar or GNU archive streams
 
 Anti-goals:
