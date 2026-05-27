@@ -843,15 +843,14 @@ fn is_zero_block(block: &[u8; BLOCK_SIZE]) -> bool {
 }
 
 fn detect_format(position: u64, block: &[u8; BLOCK_SIZE]) -> Result<ArchiveFormat, FrameError> {
-    let identity: [u8; 8] = block[IDENTITY_RANGE]
-        .try_into()
-        .expect("fixed header range");
-    match &identity {
-        POSIX_IDENTITY => Ok(ArchiveFormat::PosixPax),
-        GNU_IDENTITY => Ok(ArchiveFormat::Gnu),
-        _ => Err(FrameError::at(
+    match &block[IDENTITY_RANGE] {
+        identity if identity == POSIX_IDENTITY => Ok(ArchiveFormat::PosixPax),
+        identity if identity == GNU_IDENTITY => Ok(ArchiveFormat::Gnu),
+        identity => Err(FrameError::at(
             position,
-            FrameErrorInner::InvalidIdentity { found: identity },
+            FrameErrorInner::InvalidIdentity {
+                found: identity.try_into().expect("fixed header range"),
+            },
         )),
     }
 }
