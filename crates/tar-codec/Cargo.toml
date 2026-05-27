@@ -1,0 +1,13 @@
+[package]
+name = "tar-codec"
+description = "tar-codec is a small, contrained tar encoder and decoder for Rust"
+
+version = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+readme = { workspace = true }
+
+[dependencies]

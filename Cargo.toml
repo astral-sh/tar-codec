@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = ["crates/tar-codec", "crates/tar-framing"]
+
+[workspace.package]
+edition = "2024"
+homepage = "https://github.com/astral-sh/tar-codec"
+repository = "https://github.com/astral-sh/tar-codec"
+authors = ["William Woodruff <william@astral.sh>"]
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+readme = "README.md"
+
+[workspace.dependencies]
+thiserror = "2"
+tokio = "1"
+tokio-stream = "0.1"

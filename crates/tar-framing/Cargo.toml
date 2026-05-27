@@ -1,0 +1,15 @@
+[package]
+name = "tar-framing"
+description = "A framing layer for tar archives."
+
+version = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+
+[dependencies]
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
