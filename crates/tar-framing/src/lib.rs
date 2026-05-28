@@ -8,12 +8,12 @@ mod pax;
 
 use pax::{
     PaxSize, apply_global as apply_global_pax_records, parse_records as parse_pax_records,
-    size as pax_size, validate_charset as validate_pax_charset,
+    size as pax_size,
 };
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio_stream::Stream;
 
-pub use pax::{PaxRecord, PaxValue};
+pub use pax::{HdrCharset, PaxRecord, PaxValue};
 
 /// The size of a logical tar record.
 pub const BLOCK_SIZE: usize = 512;
@@ -133,7 +133,7 @@ pub enum FrameErrorInner {
         /// The rejected textual value.
         value: String,
     },
-    /// Effective pax metadata requests a text encoding unsupported by this UTF-8-only API.
+    /// A pax `hdrcharset` record requests text encoding unsupported by this UTF-8-only API.
     #[error("unsupported pax hdrcharset value {value:?}")]
     UnsupportedPaxCharset {
         /// The unsupported character-set identifier.
@@ -506,7 +506,6 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 remaining -= len as u64;
                 if remaining == 0 {
                     let records = parse_pax_records(header_position, &payload)?;
-                    validate_pax_charset(header_position, &records)?;
                     match kind {
                         PaxKind::Local => {
                             let size = pax_size(&records);
@@ -1572,7 +1571,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_effective_pax_charsets() {
+    fn rejects_unsupported_pax_charsets() {
         const UTF8_HDRCHARSET: &str = "ISO-IR 10646 2000 UTF-8";
 
         for typeflag in [b'x', b'g'] {
@@ -1591,9 +1590,10 @@ mod tests {
         let mut bytes = Vec::new();
         append_block(&mut bytes, &header(b'x', records.len() as u64));
         append_payload(&mut bytes, &records);
-        append_block(&mut bytes, &header(b'0', 0));
-        append_terminator(&mut bytes);
-        assert!(collect(bytes, BLOCK_SIZE).iter().all(Result::is_ok));
+        assert!(matches!(
+            last_error_inner(&collect(bytes, BLOCK_SIZE)),
+            FrameErrorInner::UnsupportedPaxCharset { value } if value == "BINARY"
+        ));
     }
 
     #[test]

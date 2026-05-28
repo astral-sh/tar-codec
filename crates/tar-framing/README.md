@@ -11,5 +11,6 @@ Each stream is locked to one archive family: POSIX pax/ustar or GNU, never a mix
 The POSIX pax subset parses standard extended-header records into typed values,
 accepts reserved `realtime.*` and `security.*` records plus uppercase
 `VENDOR.keyword` extensions, and rejects unknown unnamespaced keywords.
-Effective `hdrcharset=BINARY` metadata is intentionally out of scope for this
-UTF-8-only layer.
+`hdrcharset` records are accepted only for POSIX UTF-8 (or as deletion
+tombstones); other declared header-text encodings are intentionally out of
+scope for this UTF-8-only layer.

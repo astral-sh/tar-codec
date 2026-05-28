@@ -4,6 +4,24 @@ use super::{FrameError, FrameErrorInner};
 
 const UTF8_HDRCHARSET: &str = "ISO-IR 10646 2000 UTF-8";
 
+/// A supported character encoding for extraction-critical pax header text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HdrCharset {
+    /// UTF-8 extended-header text.
+    Utf8,
+}
+
+impl FromStr for HdrCharset {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            UTF8_HDRCHARSET => Ok(Self::Utf8),
+            _ => Err(value.to_owned()),
+        }
+    }
+}
+
 /// A parsed pax value, including an explicit POSIX deletion tombstone.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PaxValue<T> {
@@ -39,7 +57,9 @@ pub enum PaxRecord {
     /// Textual group name.
     Gname(PaxValue<String>),
     /// Encoding of extraction-critical extended-header values.
-    HdrCharset(PaxValue<String>),
+    ///
+    /// Only [`Charset::Utf8`] is currently accepted for non-deleted values.
+    HdrCharset(PaxValue<HdrCharset>),
     /// Pathname stored as link contents or a hard-link target.
     LinkPath(PaxValue<String>),
     /// File modification time in integral seconds; fractional seconds are discarded.
@@ -221,14 +241,6 @@ pub(super) fn parse_records(position: u64, payload: &[u8]) -> Result<Vec<PaxReco
         cursor = record_end;
     }
 
-    if records.is_empty() {
-        return Err(FrameError::at(
-            position,
-            FrameErrorInner::InvalidPaxRecords {
-                reason: "local extended header payload contains no records",
-            },
-        ));
-    }
     Ok(records)
 }
 
@@ -239,7 +251,7 @@ fn parse_record(position: u64, keyword: &str, value: &str) -> Result<PaxRecord, 
         "comment" => Ok(PaxRecord::Comment(parse_text(value))),
         "gid" => parse_integer(position, "gid", value).map(PaxRecord::Gid),
         "gname" => Ok(PaxRecord::Gname(parse_text(value))),
-        "hdrcharset" => Ok(PaxRecord::HdrCharset(parse_text(value))),
+        "hdrcharset" => parse_hdrcharset(position, value).map(PaxRecord::HdrCharset),
         "linkpath" => Ok(PaxRecord::LinkPath(parse_text(value))),
         "mtime" => parse_time(position, "mtime", value).map(PaxRecord::Mtime),
         "path" => Ok(PaxRecord::Path(parse_text(value))),
@@ -295,6 +307,12 @@ fn parse_text(value: &str) -> PaxValue<String> {
         Ok(value) => value,
         Err(error) => match error {},
     }
+}
+
+fn parse_hdrcharset(position: u64, value: &str) -> Result<PaxValue<HdrCharset>, FrameError> {
+    value
+        .parse()
+        .map_err(|value| FrameError::at(position, FrameErrorInner::UnsupportedPaxCharset { value }))
 }
 
 fn parse_integer(
@@ -357,23 +375,6 @@ pub(super) fn size(records: &[PaxRecord]) -> PaxSize {
         }
     }
     size
-}
-
-pub(super) fn validate_charset(position: u64, records: &[PaxRecord]) -> Result<(), FrameError> {
-    if let Some(charset) = records.iter().rev().find_map(|record| match record {
-        PaxRecord::HdrCharset(value) => Some(value),
-        _ => None,
-    }) && let PaxValue::Value(charset) = charset
-        && charset != UTF8_HDRCHARSET
-    {
-        return Err(FrameError::at(
-            position,
-            FrameErrorInner::UnsupportedPaxCharset {
-                value: charset.clone(),
-            },
-        ));
-    }
-    Ok(())
 }
 
 pub(super) fn apply_global(active: &mut Vec<PaxRecord>, records: Vec<PaxRecord>) {
@@ -544,7 +545,7 @@ mod tests {
                 PaxRecord::Comment(PaxValue::Value("a=b".to_owned())),
                 PaxRecord::Gid(PaxValue::Value(7)),
                 PaxRecord::Gname(PaxValue::Value("group".to_owned())),
-                PaxRecord::HdrCharset(PaxValue::Value(UTF8_HDRCHARSET.to_owned())),
+                PaxRecord::HdrCharset(PaxValue::Value(HdrCharset::Utf8)),
                 PaxRecord::LinkPath(PaxValue::Value("target".to_owned())),
                 PaxRecord::Mtime(PaxValue::Value(42)),
                 PaxRecord::Path(PaxValue::Value("file".to_owned())),
@@ -613,7 +614,7 @@ mod tests {
     }
 
     #[test]
-    fn applies_namespaced_globals_and_charset_precedence() {
+    fn applies_namespaced_globals_and_rejects_unsupported_hdrcharset_records() {
         let mut active = vec![
             PaxRecord::Vendor {
                 vendor: "ACME".to_owned(),
@@ -664,25 +665,28 @@ mod tests {
             ]
         );
 
-        assert!(matches!(
-            validate_charset(
-                0,
-                &[
-                    PaxRecord::HdrCharset(PaxValue::Value("BINARY".to_owned())),
-                    PaxRecord::HdrCharset(PaxValue::Value(UTF8_HDRCHARSET.to_owned())),
-                ]
-            ),
-            Ok(())
-        ));
-        assert!(matches!(
-            validate_charset(
-                31,
-                &[PaxRecord::HdrCharset(PaxValue::Value("BINARY".to_owned()))]
-            ),
-            Err(FrameError {
-                position: 31,
-                inner: FrameErrorInner::UnsupportedPaxCharset { .. },
-            })
-        ));
+        let supported = encoded_record("hdrcharset", UTF8_HDRCHARSET);
+        assert!(parse_records(0, &supported).is_ok());
+
+        let deleted = encoded_record("hdrcharset", "");
+        assert!(parse_records(0, &deleted).is_ok());
+
+        let member_data_charset = encoded_record("charset", "BINARY");
+        assert!(parse_records(0, &member_data_charset).is_ok());
+
+        let mut overridden_unsupported = encoded_record("hdrcharset", "BINARY");
+        overridden_unsupported.extend_from_slice(&encoded_record("hdrcharset", UTF8_HDRCHARSET));
+        for unsupported in [
+            encoded_record("hdrcharset", "BINARY"),
+            overridden_unsupported,
+        ] {
+            assert!(matches!(
+                parse_records(31, &unsupported),
+                Err(FrameError {
+                    position: 31,
+                    inner: FrameErrorInner::UnsupportedPaxCharset { .. },
+                })
+            ));
+        }
     }
 }

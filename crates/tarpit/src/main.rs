@@ -7,8 +7,8 @@ use std::{
 use async_compression::tokio::bufread::GzipDecoder;
 use clap::{Parser, Subcommand};
 use tar_framing::{
-    ArchiveFormat, DataOwner, Frame, FrameError, GnuKind, MemberKind, PaxKind, PaxRecord, PaxValue,
-    TarStream,
+    ArchiveFormat, DataOwner, Frame, FrameError, GnuKind, HdrCharset, MemberKind, PaxKind,
+    PaxRecord, PaxValue, TarStream,
 };
 use thiserror::Error;
 use tokio::{
@@ -192,7 +192,7 @@ fn render_pax_records(
             PaxRecord::Comment(value) => render_pax_text(output, scope, "comment", value)?,
             PaxRecord::Gid(value) => render_pax_integer(output, scope, "gid", value)?,
             PaxRecord::Gname(value) => render_pax_text(output, scope, "gname", value)?,
-            PaxRecord::HdrCharset(value) => render_pax_text(output, scope, "hdrcharset", value)?,
+            PaxRecord::HdrCharset(value) => render_pax_charset(output, scope, value)?,
             PaxRecord::LinkPath(value) => render_pax_text(output, scope, "linkpath", value)?,
             PaxRecord::Mtime(value) => render_pax_integer(output, scope, "mtime", value)?,
             PaxRecord::Path(value) => render_pax_text(output, scope, "path", value)?,
@@ -239,6 +239,18 @@ fn render_pax_integer(
     write!(output, "        {scope} pax: {}=", keyword.escape_default())?;
     match value {
         PaxValue::Value(value) => writeln!(output, "{value}"),
+        PaxValue::Deleted => writeln!(output, "<deleted>"),
+    }
+}
+
+fn render_pax_charset(
+    output: &mut impl Write,
+    scope: &str,
+    value: &PaxValue<HdrCharset>,
+) -> io::Result<()> {
+    write!(output, "        {scope} pax: hdrcharset=")?;
+    match value {
+        PaxValue::Value(HdrCharset::Utf8) => writeln!(output, "{:?}", "ISO-IR 10646 2000 UTF-8"),
         PaxValue::Deleted => writeln!(output, "<deleted>"),
     }
 }
