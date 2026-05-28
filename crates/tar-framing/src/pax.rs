@@ -58,7 +58,7 @@ pub enum PaxRecord {
     Gname(PaxValue<String>),
     /// Encoding of extraction-critical extended-header values.
     ///
-    /// Only [`Charset::Utf8`] is currently accepted for non-deleted values.
+    /// Only [`HdrCharset::Utf8`] is currently accepted for non-deleted values.
     HdrCharset(PaxValue<HdrCharset>),
     /// Pathname stored as link contents or a hard-link target.
     LinkPath(PaxValue<String>),
@@ -112,32 +112,6 @@ pub(super) enum PaxSize {
     Deleted,
 }
 
-#[derive(Debug)]
-struct WholeSeconds(u64);
-
-#[derive(Debug)]
-struct InvalidTimeValue;
-
-impl FromStr for WholeSeconds {
-    type Err = InvalidTimeValue;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let seconds = match value.split_once('.') {
-            Some((seconds, fractional_digits))
-                if !fractional_digits.is_empty()
-                    && fractional_digits.bytes().all(|byte| byte.is_ascii_digit()) =>
-            {
-                seconds
-            }
-            Some(_) => return Err(InvalidTimeValue),
-            None => value,
-        };
-        parse_decimal(seconds.as_bytes())
-            .map(Self)
-            .ok_or(InvalidTimeValue)
-    }
-}
-
 pub(super) fn parse_records(position: u64, payload: &[u8]) -> Result<Vec<PaxRecord>, FrameError> {
     if payload.is_empty() {
         return Err(FrameError::at(
@@ -171,14 +145,17 @@ pub(super) fn parse_records(position: u64, payload: &[u8]) -> Result<Vec<PaxReco
                 },
             ));
         }
-        let record_len = parse_decimal(&payload[cursor..length_end]).ok_or_else(|| {
-            FrameError::at(
-                position,
-                FrameErrorInner::InvalidPaxRecords {
-                    reason: "record length is not a valid decimal integer",
-                },
-            )
-        })?;
+        let record_len = std::str::from_utf8(&payload[cursor..length_end])
+            .ok()
+            .and_then(parse_integer)
+            .ok_or_else(|| {
+                FrameError::at(
+                    position,
+                    FrameErrorInner::InvalidPaxRecords {
+                        reason: "record length is not a valid decimal integer",
+                    },
+                )
+            })?;
         let record_len = usize::try_from(record_len).map_err(|_| {
             FrameError::at(
                 position,
@@ -249,14 +226,14 @@ fn parse_record(position: u64, keyword: &str, value: &str) -> Result<PaxRecord, 
         "atime" => parse_time(position, "atime", value).map(PaxRecord::Atime),
         "charset" => Ok(PaxRecord::Charset(parse_text(value))),
         "comment" => Ok(PaxRecord::Comment(parse_text(value))),
-        "gid" => parse_integer(position, "gid", value).map(PaxRecord::Gid),
+        "gid" => parse_record_integer(position, "gid", value).map(PaxRecord::Gid),
         "gname" => Ok(PaxRecord::Gname(parse_text(value))),
         "hdrcharset" => parse_hdrcharset(position, value).map(PaxRecord::HdrCharset),
         "linkpath" => Ok(PaxRecord::LinkPath(parse_text(value))),
         "mtime" => parse_time(position, "mtime", value).map(PaxRecord::Mtime),
         "path" => Ok(PaxRecord::Path(parse_text(value))),
-        "size" => parse_integer(position, "size", value).map(PaxRecord::Size),
-        "uid" => parse_integer(position, "uid", value).map(PaxRecord::Uid),
+        "size" => parse_record_integer(position, "size", value).map(PaxRecord::Size),
+        "uid" => parse_record_integer(position, "uid", value).map(PaxRecord::Uid),
         "uname" => Ok(PaxRecord::Uname(parse_text(value))),
         _ => parse_namespaced_record(position, keyword, value),
     }
@@ -315,12 +292,16 @@ fn parse_hdrcharset(position: u64, value: &str) -> Result<PaxValue<HdrCharset>, 
         .map_err(|value| FrameError::at(position, FrameErrorInner::UnsupportedPaxCharset { value }))
 }
 
-fn parse_integer(
+fn parse_record_integer(
     position: u64,
     keyword: &'static str,
     value: &str,
 ) -> Result<PaxValue<u64>, FrameError> {
-    let invalid = || {
+    if value.is_empty() {
+        return Ok(PaxValue::Deleted);
+    }
+
+    parse_integer(value).map(PaxValue::Value).ok_or_else(|| {
         FrameError::at(
             position,
             FrameErrorInner::InvalidPaxInteger {
@@ -328,14 +309,7 @@ fn parse_integer(
                 value: value.to_owned(),
             },
         )
-    };
-    let parsed = value.parse::<PaxValue<u64>>().map_err(|_| invalid())?;
-
-    // `u64::from_str` allows a leading `+`, which we must reject.
-    if value.starts_with('+') {
-        return Err(invalid());
-    }
-    Ok(parsed)
+    })
 }
 
 fn parse_time(
@@ -343,25 +317,32 @@ fn parse_time(
     keyword: &'static str,
     value: &str,
 ) -> Result<PaxValue<u64>, FrameError> {
-    value
-        .parse::<PaxValue<WholeSeconds>>()
-        .map(map_seconds)
-        .map_err(|_| {
-            FrameError::at(
-                position,
-                FrameErrorInner::InvalidPaxTime {
-                    keyword,
-                    value: value.to_owned(),
-                },
-            )
-        })
-}
-
-fn map_seconds(value: PaxValue<WholeSeconds>) -> PaxValue<u64> {
-    match value {
-        PaxValue::Value(WholeSeconds(value)) => PaxValue::Value(value),
-        PaxValue::Deleted => PaxValue::Deleted,
+    if value.is_empty() {
+        return Ok(PaxValue::Deleted);
     }
+
+    let invalid = || {
+        FrameError::at(
+            position,
+            FrameErrorInner::InvalidPaxTime {
+                keyword,
+                value: value.to_owned(),
+            },
+        )
+    };
+    let seconds = match value.split_once('.') {
+        Some((seconds, fractional_digits))
+            if !fractional_digits.is_empty()
+                && fractional_digits.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            seconds
+        }
+        Some(_) => return Err(invalid()),
+        None => value,
+    };
+    parse_integer(seconds)
+        .map(PaxValue::Value)
+        .ok_or_else(invalid)
 }
 
 pub(super) fn size(records: &[PaxRecord]) -> PaxSize {
@@ -418,13 +399,11 @@ fn same_keyword(left: &PaxRecord, right: &PaxRecord) -> bool {
     }
 }
 
-fn parse_decimal(bytes: &[u8]) -> Option<u64> {
-    if bytes.is_empty() || bytes.iter().any(|byte| !byte.is_ascii_digit()) {
+fn parse_integer(value: &str) -> Option<u64> {
+    if value.starts_with('+') {
         return None;
     }
-    bytes.iter().try_fold(0_u64, |value, byte| {
-        value.checked_mul(10)?.checked_add(u64::from(*byte - b'0'))
-    })
+    value.parse().ok()
 }
 
 #[cfg(test)]
@@ -482,10 +461,13 @@ mod tests {
     #[test]
     fn parses_strict_numeric_and_timestamp_values() {
         assert!(matches!(
-            parse_integer(0, "uid", "12"),
+            parse_record_integer(0, "uid", "12"),
             Ok(PaxValue::Value(12))
         ));
-        assert!(matches!(parse_integer(0, "uid", ""), Ok(PaxValue::Deleted)));
+        assert!(matches!(
+            parse_record_integer(0, "uid", ""),
+            Ok(PaxValue::Deleted)
+        ));
         assert!(matches!(
             parse_time(0, "mtime", "12.034"),
             Ok(PaxValue::Value(12))
@@ -494,7 +476,7 @@ mod tests {
 
         for value in ["+1", "-1", "12x", "18446744073709551616"] {
             assert!(matches!(
-                parse_integer(7, "gid", value),
+                parse_record_integer(7, "gid", value),
                 Err(FrameError {
                     position: 7,
                     inner: FrameErrorInner::InvalidPaxInteger { .. },
@@ -575,6 +557,7 @@ mod tests {
             b"11 path=name".as_slice(),
             b"12 pathname\n".as_slice(),
             b"99 path=name\n".as_slice(),
+            b"+12 path=name\n".as_slice(),
         ] {
             assert!(matches!(
                 parse_records(23, payload),
