@@ -7,7 +7,8 @@ use std::{
 use async_compression::tokio::bufread::GzipDecoder;
 use clap::{Parser, Subcommand};
 use tar_framing::{
-    ArchiveFormat, DataOwner, Frame, FrameError, GnuKind, MemberKind, PaxKind, PaxRecord, TarStream,
+    ArchiveFormat, DataOwner, Frame, FrameError, GnuKind, MemberKind, PaxKind, PaxRecord, PaxValue,
+    TarStream,
 };
 use thiserror::Error;
 use tokio::{
@@ -185,14 +186,61 @@ fn render_pax_records(
     records: &[PaxRecord],
 ) -> io::Result<()> {
     for record in records {
-        let keyword = record.keyword.escape_default();
-        write!(output, "        {scope} pax: {keyword}={:?}", record.value)?;
-        if record.value.is_empty() {
-            write!(output, " (deleted)")?;
+        match record {
+            PaxRecord::Atime(value) => render_pax_integer(output, scope, "atime", value)?,
+            PaxRecord::Charset(value) => render_pax_text(output, scope, "charset", value)?,
+            PaxRecord::Comment(value) => render_pax_text(output, scope, "comment", value)?,
+            PaxRecord::Gid(value) => render_pax_integer(output, scope, "gid", value)?,
+            PaxRecord::Gname(value) => render_pax_text(output, scope, "gname", value)?,
+            PaxRecord::HdrCharset(value) => render_pax_text(output, scope, "hdrcharset", value)?,
+            PaxRecord::LinkPath(value) => render_pax_text(output, scope, "linkpath", value)?,
+            PaxRecord::Mtime(value) => render_pax_integer(output, scope, "mtime", value)?,
+            PaxRecord::Path(value) => render_pax_text(output, scope, "path", value)?,
+            PaxRecord::Realtime { name, value } => {
+                render_pax_text(output, scope, &format!("realtime.{name}"), value)?;
+            }
+            PaxRecord::Security { name, value } => {
+                render_pax_text(output, scope, &format!("security.{name}"), value)?;
+            }
+            PaxRecord::Size(value) => render_pax_integer(output, scope, "size", value)?,
+            PaxRecord::Uid(value) => render_pax_integer(output, scope, "uid", value)?,
+            PaxRecord::Uname(value) => render_pax_text(output, scope, "uname", value)?,
+            PaxRecord::Vendor {
+                vendor,
+                name,
+                value,
+            } => {
+                render_pax_text(output, scope, &format!("{vendor}.{name}"), value)?;
+            }
         }
-        writeln!(output)?;
     }
     Ok(())
+}
+
+fn render_pax_text(
+    output: &mut impl Write,
+    scope: &str,
+    keyword: &str,
+    value: &PaxValue<String>,
+) -> io::Result<()> {
+    write!(output, "        {scope} pax: {}=", keyword.escape_default())?;
+    match value {
+        PaxValue::Value(value) => writeln!(output, "{value:?}"),
+        PaxValue::Deleted => writeln!(output, "<deleted>"),
+    }
+}
+
+fn render_pax_integer(
+    output: &mut impl Write,
+    scope: &str,
+    keyword: &str,
+    value: &PaxValue<u64>,
+) -> io::Result<()> {
+    write!(output, "        {scope} pax: {}=", keyword.escape_default())?;
+    match value {
+        PaxValue::Value(value) => writeln!(output, "{value}"),
+        PaxValue::Deleted => writeln!(output, "<deleted>"),
+    }
 }
 
 fn format_name(format: ArchiveFormat) -> &'static str {

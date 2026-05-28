@@ -8,4 +8,8 @@ This crate has one primary task: to abstract an asynchronous I/O source into an 
 
 Each stream is locked to one archive family: POSIX pax/ustar or GNU, never a mixture.
 
-The POSIX pax subset currently accepts UTF-8 extended-header text only; archives using `hdrcharset=BINARY` are intentionally out of scope for now.
+The POSIX pax subset parses standard extended-header records into typed values,
+accepts reserved `realtime.*` and `security.*` records plus uppercase
+`VENDOR.keyword` extensions, and rejects unknown unnamespaced keywords.
+Effective `hdrcharset=BINARY` metadata is intentionally out of scope for this
+UTF-8-only layer.

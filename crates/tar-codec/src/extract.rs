@@ -17,7 +17,7 @@ use cap_std::{
 };
 use tar_framing::{
     ArchiveFormat, DataFrame, DataOwner, Frame, FrameError, GnuKind, HeaderFrame, MemberKind,
-    TarStream,
+    PaxRecord, PaxValue, TarStream,
 };
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWriteExt};
@@ -272,7 +272,7 @@ fn decode_member(
     let (path, link_target) = match format {
         ArchiveFormat::PosixPax => {
             let raw_path = posix_header_path(header.position, &header.block)?;
-            let path = pax_text(&header, "path")?
+            let path = pax_text(&header, PaxTextField::Path)?
                 .map(str::to_owned)
                 .unwrap_or(raw_path);
             let link_target =
@@ -280,7 +280,7 @@ fn decode_member(
                     let raw_link =
                         header_text(header.position, "link name", &header.block[LINK_NAME_RANGE])?;
                     Some(
-                        pax_text(&header, "linkpath")?
+                        pax_text(&header, PaxTextField::LinkPath)?
                             .map(str::to_owned)
                             .unwrap_or(raw_link),
                     )
@@ -320,33 +320,51 @@ fn decode_member(
     })
 }
 
-fn pax_text<'a>(
-    header: &'a HeaderFrame,
-    keyword: &'static str,
-) -> Result<Option<&'a str>, ExtractError> {
-    match pax_text_allow_deleted(header, keyword) {
-        Some("") => Err(ExtractError::DeletedPaxMetadata {
-            position: header.position,
-            keyword,
-        }),
-        value => Ok(value),
+#[derive(Clone, Copy)]
+enum PaxTextField {
+    Path,
+    LinkPath,
+}
+
+impl PaxTextField {
+    fn keyword(self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::LinkPath => "linkpath",
+        }
+    }
+
+    fn value(self, record: &PaxRecord) -> Option<&PaxValue<String>> {
+        match (self, record) {
+            (Self::Path, PaxRecord::Path(value)) | (Self::LinkPath, PaxRecord::LinkPath(value)) => {
+                Some(value)
+            }
+            _ => None,
+        }
     }
 }
 
-fn pax_text_allow_deleted<'a>(header: &'a HeaderFrame, keyword: &str) -> Option<&'a str> {
-    header
+fn pax_text(header: &HeaderFrame, field: PaxTextField) -> Result<Option<&str>, ExtractError> {
+    let value = header
         .local_pax_records
         .iter()
         .rev()
-        .find(|record| record.keyword == keyword)
+        .find_map(|record| field.value(record))
         .or_else(|| {
             header
                 .global_pax_records
                 .iter()
                 .rev()
-                .find(|record| record.keyword == keyword)
-        })
-        .map(|record| record.value.as_str())
+                .find_map(|record| field.value(record))
+        });
+    match value {
+        Some(PaxValue::Value(value)) => Ok(Some(value.as_str())),
+        Some(PaxValue::Deleted) => Err(ExtractError::DeletedPaxMetadata {
+            position: header.position,
+            keyword: field.keyword(),
+        }),
+        None => Ok(None),
+    }
 }
 
 fn posix_header_path(

@@ -4,8 +4,16 @@ use std::{
     task::{Context, Poll},
 };
 
+mod pax;
+
+use pax::{
+    PaxSize, apply_global as apply_global_pax_records, parse_records as parse_pax_records,
+    size as pax_size, validate_charset as validate_pax_charset,
+};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio_stream::Stream;
+
+pub use pax::{PaxRecord, PaxValue};
 
 /// The size of a logical tar record.
 pub const BLOCK_SIZE: usize = 512;
@@ -16,7 +24,6 @@ const TYPEFLAG_OFFSET: usize = 156;
 const IDENTITY_RANGE: std::ops::Range<usize> = 257..265;
 const POSIX_IDENTITY: &[u8; 8] = b"ustar\x0000";
 const GNU_IDENTITY: &[u8; 8] = b"ustar  \0";
-const UTF8_HDRCHARSET: &str = "ISO-IR 10646 2000 UTF-8";
 
 type PositionedBlock = (u64, [u8; BLOCK_SIZE]);
 
@@ -95,25 +102,41 @@ pub enum FrameErrorInner {
         /// A description of the block received.
         found: &'static str,
     },
-    /// A local pax payload did not consist of valid extended header records.
+    /// A pax payload did not consist of valid extended header records.
     #[error("invalid pax records: {reason}")]
     InvalidPaxRecords {
         /// A concise description of the grammar violation.
         reason: &'static str,
     },
-    /// A local pax record could not be represented by this UTF-8-only API.
+    /// A pax record could not be represented by this UTF-8-only API.
     #[error("pax records contain non-UTF-8 text")]
     InvalidPaxUtf8,
+    /// A pax record keyword is neither standard nor an accepted namespaced extension.
+    #[error("invalid or unknown pax keyword {keyword:?}")]
+    InvalidPaxKeyword {
+        /// The rejected keyword.
+        keyword: String,
+    },
+    /// A pax decimal integer field is malformed or exceeds this API's integer range.
+    #[error("invalid pax {keyword} value: {value:?}")]
+    InvalidPaxInteger {
+        /// The affected standard keyword.
+        keyword: &'static str,
+        /// The rejected textual value.
+        value: String,
+    },
+    /// A pax file-time value is malformed or exceeds this API's integer range.
+    #[error("invalid pax {keyword} time value: {value:?}")]
+    InvalidPaxTime {
+        /// The affected standard keyword.
+        keyword: &'static str,
+        /// The rejected textual value.
+        value: String,
+    },
     /// Effective pax metadata requests a text encoding unsupported by this UTF-8-only API.
     #[error("unsupported pax hdrcharset value {value:?}")]
     UnsupportedPaxCharset {
         /// The unsupported character-set identifier.
-        value: String,
-    },
-    /// A pax `size` record could not be used for member framing.
-    #[error("invalid pax size override: {value:?}")]
-    InvalidPaxSize {
-        /// The invalid value.
         value: String,
     },
     /// Pax records removed the size needed to frame a data-bearing member.
@@ -245,15 +268,6 @@ pub enum MemberKind {
     Contiguous,
 }
 
-/// A validated local pax extended-header record.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PaxRecord {
-    /// The record keyword.
-    pub keyword: String,
-    /// The UTF-8 record value.
-    pub value: String,
-}
-
 /// An ordinary member header block in the selected archive family.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeaderFrame {
@@ -271,7 +285,7 @@ pub struct HeaderFrame {
     pub payload_size: u64,
     /// Effective global pax records active for this member, including deletions.
     pub global_pax_records: Vec<PaxRecord>,
-    /// Validated local pax records that apply to this member, in input order.
+    /// Parsed local pax records that apply to this member, in input order.
     pub local_pax_records: Vec<PaxRecord>,
 }
 
@@ -326,21 +340,6 @@ enum State {
     AwaitingSecondZero,
     Complete,
     Failed,
-}
-
-/// The effect of pax `size` records within one precedence scope.
-///
-/// Local `x` records are consulted before active global `g` records, and
-/// the raw member-header size is used only when both scopes are unspecified.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum PaxSize {
-    /// No `size` record appears in this scope, so resolution continues outward.
-    #[default]
-    Unspecified,
-    /// The last `size` record in this scope supplies a decimal member size.
-    Value(u64),
-    /// The last `size` record in this scope deletes any lower-precedence size.
-    Deleted,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -510,15 +509,11 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                     validate_pax_charset(header_position, &records)?;
                     match kind {
                         PaxKind::Local => {
-                            let size = pax_size(header_position, &records)?;
+                            let size = pax_size(&records);
                             self.state = State::AwaitingPosixMember { records, size };
                         }
                         PaxKind::Global => {
-                            apply_global_pax_records(
-                                header_position,
-                                &mut self.global_pax_records,
-                                records,
-                            )?;
+                            apply_global_pax_records(&mut self.global_pax_records, records);
                             self.state = State::AwaitingHeader;
                         }
                     }
@@ -702,7 +697,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 let effective_size = match local_size {
                     PaxSize::Value(size) => Some(size),
                     PaxSize::Deleted => None,
-                    PaxSize::Unspecified => match pax_size(position, &self.global_pax_records)? {
+                    PaxSize::Unspecified => match pax_size(&self.global_pax_records) {
                         PaxSize::Value(size) => Some(size),
                         PaxSize::Deleted => None,
                         PaxSize::Unspecified => Some(parsed.size),
@@ -993,188 +988,6 @@ fn gnu_payload_size(position: u64, kind: MemberKind, size: u64) -> Result<u64, F
     }
 }
 
-fn parse_pax_records(position: u64, payload: &[u8]) -> Result<Vec<PaxRecord>, FrameError> {
-    if payload.is_empty() {
-        return Err(FrameError::at(
-            position,
-            FrameErrorInner::InvalidPaxRecords {
-                reason: "local extended header payload contains no records",
-            },
-        ));
-    }
-
-    let mut records = Vec::new();
-    let mut cursor = 0;
-    while cursor < payload.len() {
-        let length_end = payload[cursor..]
-            .iter()
-            .position(|byte| *byte == b' ')
-            .ok_or_else(|| {
-                FrameError::at(
-                    position,
-                    FrameErrorInner::InvalidPaxRecords {
-                        reason: "record is missing its length separator",
-                    },
-                )
-            })?
-            + cursor;
-        if length_end == cursor {
-            return Err(FrameError::at(
-                position,
-                FrameErrorInner::InvalidPaxRecords {
-                    reason: "record length is empty",
-                },
-            ));
-        }
-        let record_len = parse_decimal(&payload[cursor..length_end]).ok_or_else(|| {
-            FrameError::at(
-                position,
-                FrameErrorInner::InvalidPaxRecords {
-                    reason: "record length is not a valid decimal integer",
-                },
-            )
-        })?;
-        let record_len = usize::try_from(record_len).map_err(|_| {
-            FrameError::at(
-                position,
-                FrameErrorInner::ArithmeticOverflow {
-                    context: "pax record length",
-                },
-            )
-        })?;
-        let record_end = cursor.checked_add(record_len).ok_or_else(|| {
-            FrameError::at(
-                position,
-                FrameErrorInner::ArithmeticOverflow {
-                    context: "pax record end",
-                },
-            )
-        })?;
-        if record_end > payload.len() {
-            return Err(FrameError::at(
-                position,
-                FrameErrorInner::InvalidPaxRecords {
-                    reason: "record length exceeds extended header payload",
-                },
-            ));
-        }
-        let record = &payload[cursor..record_end];
-        if record.last() != Some(&b'\n') {
-            return Err(FrameError::at(
-                position,
-                FrameErrorInner::InvalidPaxRecords {
-                    reason: "record is not newline terminated",
-                },
-            ));
-        }
-        let content_start = length_end - cursor + 1;
-        let equals = record[content_start..record.len() - 1]
-            .iter()
-            .position(|byte| *byte == b'=')
-            .ok_or_else(|| {
-                FrameError::at(
-                    position,
-                    FrameErrorInner::InvalidPaxRecords {
-                        reason: "record is missing its keyword/value separator",
-                    },
-                )
-            })?
-            + content_start;
-        if equals == content_start {
-            return Err(FrameError::at(
-                position,
-                FrameErrorInner::InvalidPaxRecords {
-                    reason: "record keyword is empty",
-                },
-            ));
-        }
-        let keyword = std::str::from_utf8(&record[content_start..equals])
-            .map_err(|_| FrameError::at(position, FrameErrorInner::InvalidPaxUtf8))?
-            .to_owned();
-        let value = std::str::from_utf8(&record[equals + 1..record.len() - 1])
-            .map_err(|_| FrameError::at(position, FrameErrorInner::InvalidPaxUtf8))?
-            .to_owned();
-        records.push(PaxRecord { keyword, value });
-        cursor = record_end;
-    }
-
-    if records.is_empty() {
-        return Err(FrameError::at(
-            position,
-            FrameErrorInner::InvalidPaxRecords {
-                reason: "local extended header payload contains no records",
-            },
-        ));
-    }
-    Ok(records)
-}
-
-fn parse_pax_size(position: u64, value: &str) -> Result<u64, FrameError> {
-    parse_decimal(value.as_bytes()).ok_or_else(|| {
-        FrameError::at(
-            position,
-            FrameErrorInner::InvalidPaxSize {
-                value: value.to_owned(),
-            },
-        )
-    })
-}
-
-fn pax_size(position: u64, records: &[PaxRecord]) -> Result<PaxSize, FrameError> {
-    let mut size = PaxSize::Unspecified;
-    for record in records.iter().filter(|record| record.keyword == "size") {
-        size = if record.value.is_empty() {
-            PaxSize::Deleted
-        } else {
-            PaxSize::Value(parse_pax_size(position, &record.value)?)
-        };
-    }
-    Ok(size)
-}
-
-fn validate_pax_charset(position: u64, records: &[PaxRecord]) -> Result<(), FrameError> {
-    if let Some(charset) = records
-        .iter()
-        .rev()
-        .find(|record| record.keyword == "hdrcharset")
-        .map(|record| record.value.as_str())
-        && !charset.is_empty()
-        && charset != UTF8_HDRCHARSET
-    {
-        return Err(FrameError::at(
-            position,
-            FrameErrorInner::UnsupportedPaxCharset {
-                value: charset.to_owned(),
-            },
-        ));
-    }
-    Ok(())
-}
-
-fn apply_global_pax_records(
-    position: u64,
-    active: &mut Vec<PaxRecord>,
-    records: Vec<PaxRecord>,
-) -> Result<(), FrameError> {
-    for record in records {
-        if record.keyword == "size" && !record.value.is_empty() {
-            parse_pax_size(position, &record.value)?;
-        }
-        active.retain(|existing| existing.keyword != record.keyword);
-        active.push(record);
-    }
-    Ok(())
-}
-
-fn parse_decimal(bytes: &[u8]) -> Option<u64> {
-    if bytes.is_empty() || bytes.iter().any(|byte| !byte.is_ascii_digit()) {
-        return None;
-    }
-    bytes.iter().try_fold(0_u64, |value, byte| {
-        value.checked_mul(10)?.checked_add(u64::from(*byte - b'0'))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1266,26 +1079,6 @@ mod tests {
                 return encoded.into_bytes();
             }
             len = encoded.len();
-        }
-    }
-
-    fn raw_record(keyword: &[u8], value: &[u8]) -> Vec<u8> {
-        let mut suffix = Vec::new();
-        suffix.push(b' ');
-        suffix.extend_from_slice(keyword);
-        suffix.push(b'=');
-        suffix.extend_from_slice(value);
-        suffix.push(b'\n');
-        let mut len = suffix.len() + 1;
-        loop {
-            let prefix = len.to_string();
-            let actual = prefix.len() + suffix.len();
-            if actual == len {
-                let mut record = prefix.into_bytes();
-                record.extend_from_slice(&suffix);
-                return record;
-            }
-            len = actual;
         }
     }
 
@@ -1395,8 +1188,10 @@ mod tests {
         assert_eq!(header.effective_size, Some(513));
         assert_eq!(header.payload_size, 513);
         assert_eq!(header.local_pax_records.len(), 2);
-        assert_eq!(header.local_pax_records[1].keyword, "size");
-        assert_eq!(header.local_pax_records[1].value, "513");
+        assert_eq!(
+            header.local_pax_records[1],
+            PaxRecord::Size(PaxValue::Value(513))
+        );
         let Frame::Data(last) = frames[5].as_ref().unwrap() else {
             panic!("expected final member data");
         };
@@ -1456,44 +1251,26 @@ mod tests {
         assert_eq!(
             headers[0].global_pax_records,
             [
-                PaxRecord {
-                    keyword: "size".to_owned(),
-                    value: "2".to_owned(),
-                },
-                PaxRecord {
-                    keyword: "comment".to_owned(),
-                    value: "new".to_owned(),
-                },
+                PaxRecord::Size(PaxValue::Value(2)),
+                PaxRecord::Comment(PaxValue::Value("new".to_owned())),
             ]
         );
         assert_eq!(headers[1].effective_size, Some(3));
-        assert_eq!(headers[1].local_pax_records, local_records("local", "3"));
+        assert_eq!(headers[1].local_pax_records, local_records("local", 3));
         assert_eq!(headers[2].effective_size, None);
         assert_eq!(
             headers[2].global_pax_records,
             [
-                PaxRecord {
-                    keyword: "comment".to_owned(),
-                    value: String::new(),
-                },
-                PaxRecord {
-                    keyword: "size".to_owned(),
-                    value: String::new(),
-                },
+                PaxRecord::Comment(PaxValue::Deleted),
+                PaxRecord::Size(PaxValue::Deleted),
             ]
         );
     }
 
-    fn local_records(comment: &str, size: &str) -> Vec<PaxRecord> {
+    fn local_records(comment: &str, size: u64) -> Vec<PaxRecord> {
         vec![
-            PaxRecord {
-                keyword: "comment".to_owned(),
-                value: comment.to_owned(),
-            },
-            PaxRecord {
-                keyword: "size".to_owned(),
-                value: size.to_owned(),
-            },
+            PaxRecord::Comment(PaxValue::Value(comment.to_owned())),
+            PaxRecord::Size(PaxValue::Value(size)),
         ]
     }
 
@@ -1513,7 +1290,10 @@ mod tests {
             panic!("expected member header");
         };
         assert_eq!(header.effective_size, Some(2));
-        assert_eq!(header.local_pax_records[0].value, "");
+        assert_eq!(
+            header.local_pax_records[0],
+            PaxRecord::Size(PaxValue::Deleted)
+        );
     }
 
     #[test]
@@ -1536,8 +1316,14 @@ mod tests {
         assert_eq!(header.declared_size, 3);
         assert_eq!(header.effective_size, None);
         assert_eq!(header.payload_size, 0);
-        assert_eq!(header.global_pax_records[0].value, "7");
-        assert_eq!(header.local_pax_records[0].value, "");
+        assert_eq!(
+            header.global_pax_records[0],
+            PaxRecord::Size(PaxValue::Value(7))
+        );
+        assert_eq!(
+            header.local_pax_records[0],
+            PaxRecord::Size(PaxValue::Deleted)
+        );
     }
 
     #[test]
@@ -1590,8 +1376,14 @@ mod tests {
             panic!("expected member header");
         };
         assert_eq!(header.effective_size, Some(2));
-        assert_eq!(header.global_pax_records[0].value, "");
-        assert_eq!(header.local_pax_records[0].value, "2");
+        assert_eq!(
+            header.global_pax_records[0],
+            PaxRecord::Size(PaxValue::Deleted)
+        );
+        assert_eq!(
+            header.local_pax_records[0],
+            PaxRecord::Size(PaxValue::Value(2))
+        );
     }
 
     #[test]
@@ -1736,7 +1528,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_pax_sequences_and_records() {
+    fn rejects_invalid_pax_sequences() {
         assert!(matches!(
             last_error_inner(&collect(header(b'x', 0).to_vec(), BLOCK_SIZE)),
             FrameErrorInner::InvalidPaxRecords { .. }
@@ -1759,49 +1551,30 @@ mod tests {
             last_error_inner(&collect(missing_member, BLOCK_SIZE)),
             FrameErrorInner::UnexpectedEof { .. }
         ));
+    }
 
-        let malformed = b"11 path=name".to_vec();
-        let mut missing_newline = Vec::new();
-        append_block(&mut missing_newline, &header(b'x', malformed.len() as u64));
-        append_payload(&mut missing_newline, &malformed);
+    #[test]
+    fn preserves_pax_parse_error_positions_in_stream() {
+        let invalid = record("size", "bad");
+        let mut bytes = Vec::new();
+        append_block(&mut bytes, &header(b'0', 0));
+        append_block(&mut bytes, &header(b'x', invalid.len() as u64));
+        append_payload(&mut bytes, &invalid);
+
+        let frames = collect(bytes, BLOCK_SIZE);
         assert!(matches!(
-            last_error_inner(&collect(missing_newline, BLOCK_SIZE)),
-            FrameErrorInner::InvalidPaxRecords { .. }
+            frames.last(),
+            Some(Err(FrameError {
+                position,
+                inner: FrameErrorInner::InvalidPaxInteger { .. },
+            })) if *position == BLOCK_SIZE as u64
         ));
-
-        for malformed in [b"12 pathname\n".as_slice(), b"99 path=name\n".as_slice()] {
-            let mut bytes = Vec::new();
-            append_block(&mut bytes, &header(b'x', malformed.len() as u64));
-            append_payload(&mut bytes, malformed);
-            assert!(matches!(
-                last_error_inner(&collect(bytes, BLOCK_SIZE)),
-                FrameErrorInner::InvalidPaxRecords { .. }
-            ));
-        }
-
-        let invalid_utf8 = raw_record(b"path", &[0xff]);
-        let mut non_utf8 = Vec::new();
-        append_block(&mut non_utf8, &header(b'x', invalid_utf8.len() as u64));
-        append_payload(&mut non_utf8, &invalid_utf8);
-        assert!(matches!(
-            last_error_inner(&collect(non_utf8, BLOCK_SIZE)),
-            FrameErrorInner::InvalidPaxUtf8
-        ));
-
-        for value in ["12x", "18446744073709551616"] {
-            let invalid_size = record("size", value);
-            let mut bytes = Vec::new();
-            append_block(&mut bytes, &header(b'x', invalid_size.len() as u64));
-            append_payload(&mut bytes, &invalid_size);
-            assert!(matches!(
-                last_error_inner(&collect(bytes, BLOCK_SIZE)),
-                FrameErrorInner::InvalidPaxSize { .. }
-            ));
-        }
     }
 
     #[test]
     fn rejects_unsupported_effective_pax_charsets() {
+        const UTF8_HDRCHARSET: &str = "ISO-IR 10646 2000 UTF-8";
+
         for typeflag in [b'x', b'g'] {
             let records = record("hdrcharset", "BINARY");
             let mut bytes = Vec::new();
