@@ -322,6 +322,11 @@ pub struct DataFrame {
     pub len: usize,
     /// Whether this block carries metadata-extension or member data.
     pub owner: DataOwner,
+    /// Parsed records completed by this final pax payload block.
+    ///
+    /// This is `Some` only for the last data block belonging to a local or
+    /// global pax header; other payload data carries `None`.
+    pub completed_pax_records: Option<Vec<PaxRecord>>,
 }
 
 /// The parser phase required before the next logical tar block can be emitted.
@@ -521,18 +526,22 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 let len = remaining.min(BLOCK_SIZE as u64) as usize;
                 payload.extend_from_slice(&block[..len]);
                 remaining -= len as u64;
-                if remaining == 0 {
+                let completed_pax_records = if remaining == 0 {
                     let records = parse_pax_records(header_position, &payload)?;
                     match kind {
                         PaxKind::Local => {
                             let size = pax_size(&records);
-                            self.state = State::AwaitingUstarHeader { records, size };
+                            self.state = State::AwaitingUstarHeader {
+                                records: records.clone(),
+                                size,
+                            };
                         }
                         PaxKind::Global => {
-                            apply_global_pax_records(&mut self.global_pax_records, records);
+                            apply_global_pax_records(&mut self.global_pax_records, records.clone());
                             self.state = State::AwaitingHeader;
                         }
                     }
+                    Some(records)
                 } else {
                     self.state = State::ReadingPax {
                         kind,
@@ -540,12 +549,14 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                         remaining,
                         payload,
                     };
-                }
+                    None
+                };
                 Ok(Some(Frame::Data(DataFrame {
                     position,
                     block,
                     len,
                     owner: DataOwner::Pax(kind),
+                    completed_pax_records,
                 })))
             }
             State::AwaitingUstarHeader { records, size } => {
@@ -592,6 +603,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                     block,
                     len,
                     owner: DataOwner::Gnu(kind),
+                    completed_pax_records: None,
                 })))
             }
             State::AwaitingGnuMember { pending } => {
@@ -621,6 +633,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                     block,
                     len,
                     owner: DataOwner::Member,
+                    completed_pax_records: None,
                 })))
             }
             State::AwaitingSecondZero => {
@@ -1200,6 +1213,8 @@ mod tests {
         assert_eq!(first.len, BLOCK_SIZE);
         assert_eq!(last.len, 1);
         assert_eq!(last.owner, DataOwner::Member);
+        assert!(first.completed_pax_records.is_none());
+        assert!(last.completed_pax_records.is_none());
     }
 
     #[test]
@@ -1223,13 +1238,22 @@ mod tests {
         };
         assert_eq!(pax.kind, PaxKind::Local);
         assert_eq!(pax.payload_size, payload.len() as u64);
-        assert!(matches!(
-            frames[1].as_ref().unwrap(),
-            Frame::Data(DataFrame {
-                owner: DataOwner::Pax(PaxKind::Local),
-                ..
-            })
-        ));
+        let Frame::Data(first_pax_data) = frames[1].as_ref().unwrap() else {
+            panic!("expected first pax data frame");
+        };
+        assert_eq!(first_pax_data.owner, DataOwner::Pax(PaxKind::Local));
+        assert!(first_pax_data.completed_pax_records.is_none());
+        let Frame::Data(final_pax_data) = frames[2].as_ref().unwrap() else {
+            panic!("expected final pax data frame");
+        };
+        assert_eq!(final_pax_data.owner, DataOwner::Pax(PaxKind::Local));
+        assert_eq!(
+            final_pax_data
+                .completed_pax_records
+                .as_ref()
+                .and_then(|records| records.last()),
+            Some(&PaxRecord::Size(PaxValue::Value(513)))
+        );
         let Frame::Header(header) = frames[3].as_ref().unwrap() else {
             panic!("expected overridden member header");
         };
@@ -1288,6 +1312,25 @@ mod tests {
                 ..
             }))
         )));
+        let completed_global_payloads: Vec<&Vec<PaxRecord>> = frames
+            .iter()
+            .filter_map(|frame| match frame.as_ref().unwrap() {
+                Frame::Data(DataFrame {
+                    owner: DataOwner::Pax(PaxKind::Global),
+                    completed_pax_records: Some(records),
+                    ..
+                }) => Some(records),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completed_global_payloads.len(), 3);
+        assert_eq!(
+            completed_global_payloads[2],
+            &[
+                PaxRecord::Comment(PaxValue::Deleted),
+                PaxRecord::Size(PaxValue::Deleted),
+            ]
+        );
         let headers: Vec<&HeaderFrame> = frames
             .iter()
             .filter_map(|frame| match frame.as_ref().unwrap() {
@@ -1512,6 +1555,7 @@ mod tests {
         };
         assert_eq!(final_name.owner, DataOwner::Gnu(GnuKind::LongName));
         assert_eq!(final_name.len, 1);
+        assert!(final_name.completed_pax_records.is_none());
         assert!(matches!(
             frames[3].as_ref().unwrap(),
             Frame::Gnu(GnuFrame {

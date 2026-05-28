@@ -2,7 +2,8 @@
 //!
 //! `tar-codec` interprets member metadata above [`tar_framing`] and extracts
 //! archive contents into a capability-scoped destination. Compression is the
-//! caller's responsibility.
+//! caller's responsibility. Extraction requires an [`ExtractPolicy`] so that
+//! security-sensitive archive features are explicit at each call site.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -42,37 +43,157 @@ impl<R> Archive<R> {
     }
 }
 
+/// Controls which otherwise valid archive features extraction may accept.
+///
+/// The default permits symbolic links and either supported framing family,
+/// while rejecting hard links and vendor-namespaced POSIX pax records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExtractPolicy {
+    allow_symlinks: bool,
+    allow_hard_links: bool,
+    allow_gnu: bool,
+    allow_pax_vendor_extensions: bool,
+}
+
+impl Default for ExtractPolicy {
+    fn default() -> Self {
+        Self {
+            allow_symlinks: true,
+            allow_hard_links: false,
+            allow_gnu: true,
+            allow_pax_vendor_extensions: false,
+        }
+    }
+}
+
+impl ExtractPolicy {
+    /// Configures whether symbolic-link members may be extracted.
+    pub fn allow_symlinks(mut self, allow: bool) -> Self {
+        self.allow_symlinks = allow;
+        self
+    }
+
+    /// Configures whether hard-link members may be extracted.
+    ///
+    /// When enabled, POSIX `linkdata` payloads may update the contents of an
+    /// earlier extracted file through its shared inode.
+    pub fn allow_hard_links(mut self, allow: bool) -> Self {
+        self.allow_hard_links = allow;
+        self
+    }
+
+    /// Configures whether archives in the GNU framing family may be extracted.
+    pub fn allow_gnu(mut self, allow: bool) -> Self {
+        self.allow_gnu = allow;
+        self
+    }
+
+    /// Configures whether vendor-namespaced POSIX pax records may be accepted.
+    pub fn allow_pax_vendor_extensions(mut self, allow: bool) -> Self {
+        self.allow_pax_vendor_extensions = allow;
+        self
+    }
+
+    fn check_format(&self, position: u64, format: ArchiveFormat) -> Result<(), ExtractError> {
+        if format == ArchiveFormat::Gnu && !self.allow_gnu {
+            return Err(policy_violation(
+                position,
+                ExtractPolicyViolation::GnuArchive,
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_member_kind(&self, position: u64, kind: MemberKind) -> Result<(), ExtractError> {
+        let violation = match kind {
+            MemberKind::SymbolicLink if !self.allow_symlinks => {
+                Some(ExtractPolicyViolation::SymbolicLink)
+            }
+            MemberKind::HardLink if !self.allow_hard_links => {
+                Some(ExtractPolicyViolation::HardLink)
+            }
+            _ => None,
+        };
+        if let Some(violation) = violation {
+            return Err(policy_violation(position, violation));
+        }
+        Ok(())
+    }
+
+    fn check_pax_records(&self, position: u64, records: &[PaxRecord]) -> Result<(), ExtractError> {
+        if self.allow_pax_vendor_extensions {
+            return Ok(());
+        }
+        for record in records {
+            if let PaxRecord::Vendor { vendor, name, .. } = record {
+                return Err(policy_violation(
+                    position,
+                    ExtractPolicyViolation::PaxVendorExtension {
+                        vendor: vendor.clone(),
+                        name: name.clone(),
+                    },
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl<R: AsyncRead + Unpin> Archive<R> {
-    /// Securely extracts this archive beneath `dest`.
+    /// Securely extracts this archive beneath `dest` under `policy`.
     ///
     /// The destination is created when missing. Existing contents are never
     /// overwritten. On failure, already-created non-symlink entries may
     /// remain, as with conventional streaming tar extractors. The caller must
     /// not concurrently mutate `dest` while extraction is in progress.
-    pub async fn extract<P: AsRef<Path>>(mut self, dest: P) -> Result<(), ExtractError> {
+    pub async fn extract<P: AsRef<Path>>(
+        mut self,
+        dest: P,
+        policy: ExtractPolicy,
+    ) -> Result<(), ExtractError> {
         let mut root = ExtractionRoot::open(dest.as_ref()).await?;
         let mut gnu = GnuMetadata::default();
         let mut active_writer: Option<ActiveWriter> = None;
+        let mut pax_position = None;
 
         while let Some(frame) = self.frames.next().await {
             match frame? {
-                Frame::Pax(_) => {}
-                Frame::Gnu(frame) => gnu.start(frame.kind),
+                Frame::Pax(frame) => {
+                    pax_position = Some(frame.position);
+                }
+                Frame::Gnu(frame) => {
+                    policy.check_format(frame.position, ArchiveFormat::Gnu)?;
+                    gnu.start(frame.kind);
+                }
                 Frame::Header(frame) => {
                     if active_writer.is_some() {
                         return Err(ExtractError::InvalidFrameSequence {
                             reason: "received a member header while data was still pending",
                         });
                     }
-                    let format = self
-                        .frames
-                        .format()
-                        .expect("an emitted member header identifies the archive format");
+                    let format =
+                        self.frames
+                            .format()
+                            .ok_or(ExtractError::InvalidFrameSequence {
+                                reason: "member header did not identify an archive format",
+                            })?;
+                    policy.check_format(frame.position, format)?;
+                    policy.check_member_kind(frame.position, frame.kind)?;
                     let member = decode_member(format, frame, &mut gnu)?;
                     active_writer = root.start_member(member).await?;
                 }
                 Frame::Data(frame) => match frame.owner {
-                    DataOwner::Pax(_) => {}
+                    DataOwner::Pax(_) => {
+                        if let Some(records) = frame.completed_pax_records.as_deref() {
+                            let position =
+                                pax_position
+                                    .take()
+                                    .ok_or(ExtractError::InvalidFrameSequence {
+                                        reason: "pax payload appeared before its header",
+                                    })?;
+                            policy.check_pax_records(position, records)?;
+                        }
+                    }
                     DataOwner::Gnu(kind) => gnu.push(kind, &frame.block[..frame.len])?,
                     DataOwner::Member => {
                         let Some(writer) = active_writer.as_mut() else {
@@ -95,6 +216,28 @@ impl<R: AsyncRead + Unpin> Archive<R> {
         }
         root.install_symlinks().await
     }
+}
+
+/// A valid archive feature rejected by the selected [`ExtractPolicy`].
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum ExtractPolicyViolation {
+    /// A symbolic-link member appeared when links are forbidden.
+    #[error("symbolic-link members are not allowed")]
+    SymbolicLink,
+    /// A hard-link member appeared when links are forbidden.
+    #[error("hard-link members are not allowed")]
+    HardLink,
+    /// A GNU-family frame appeared when only POSIX-pax extraction is allowed.
+    #[error("GNU archives are not allowed")]
+    GnuArchive,
+    /// A vendor-namespaced POSIX pax record appeared.
+    #[error("pax vendor extension {vendor}.{name} is not allowed")]
+    PaxVendorExtension {
+        /// Uppercase vendor namespace.
+        vendor: String,
+        /// Keyword suffix following the vendor namespace.
+        name: String,
+    },
 }
 
 /// An error produced while decoding or securely extracting an archive.
@@ -207,6 +350,21 @@ pub enum ExtractError {
         /// Internal sequence expectation.
         reason: &'static str,
     },
+    /// A structurally valid archive feature was rejected by extraction policy.
+    #[error("at byte {position}: extraction policy rejected input: {violation}")]
+    PolicyViolation {
+        /// Source header position for the rejected feature.
+        position: u64,
+        /// The selected policy rule that rejected the feature.
+        violation: ExtractPolicyViolation,
+    },
+}
+
+fn policy_violation(position: u64, violation: ExtractPolicyViolation) -> ExtractError {
+    ExtractError::PolicyViolation {
+        position,
+        violation,
+    }
 }
 
 #[derive(Debug)]
@@ -1162,7 +1320,17 @@ mod tests {
     }
 
     async fn extract(bytes: Vec<u8>, dest: &Path) -> Result<(), ExtractError> {
-        Archive::new(ChunkedReader::new(bytes)).extract(dest).await
+        extract_with_policy(bytes, dest, ExtractPolicy::default()).await
+    }
+
+    async fn extract_with_policy(
+        bytes: Vec<u8>,
+        dest: &Path,
+        policy: ExtractPolicy,
+    ) -> Result<(), ExtractError> {
+        Archive::new(ChunkedReader::new(bytes))
+            .extract(dest, policy)
+            .await
     }
 
     #[tokio::test]
@@ -1337,11 +1505,12 @@ mod tests {
     async fn extracts_prior_target_hard_links_with_linkdata() {
         let temp = tempdir().unwrap();
         let dest = temp.path().join("out");
+        let policy = ExtractPolicy::default().allow_hard_links(true);
         let mut bytes = Vec::new();
         append_posix_member(&mut bytes, "a", b'0', b"old", "", 0o644);
         append_posix_member(&mut bytes, "b", b'1', b"new", "a", 0o644);
         finish(&mut bytes);
-        extract(bytes, &dest).await.unwrap();
+        extract_with_policy(bytes, &dest, policy).await.unwrap();
         assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"new");
         assert_eq!(std::fs::read(dest.join("b")).unwrap(), b"new");
 
@@ -1350,7 +1519,9 @@ mod tests {
         append_posix_member(&mut forward, "b", b'1', b"", "a", 0o644);
         finish(&mut forward);
         assert!(matches!(
-            extract(forward, &forward_dest).await.unwrap_err(),
+            extract_with_policy(forward, &forward_dest, policy)
+                .await
+                .unwrap_err(),
             ExtractError::InvalidLink { .. }
         ));
 
@@ -1360,9 +1531,165 @@ mod tests {
         append_posix_member(&mut mismatch, "b", b'1', b"", "a", 0o755);
         finish(&mut mismatch);
         assert!(matches!(
-            extract(mismatch, &mismatch_dest).await.unwrap_err(),
+            extract_with_policy(mismatch, &mismatch_dest, policy)
+                .await
+                .unwrap_err(),
             ExtractError::HardLinkExecutableMismatch { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn enforces_symbolic_and_hard_link_policies_before_link_creation() {
+        let temp = tempdir().unwrap();
+        let symlink_dest = temp.path().join("symlink");
+        let mut symlink = Vec::new();
+        append_posix_member(&mut symlink, "target", b'0', b"ok", "", 0o644);
+        append_posix_member(&mut symlink, "link", b'2', b"", "target", 0o644);
+        finish(&mut symlink);
+        assert!(matches!(
+            extract_with_policy(
+                symlink,
+                &symlink_dest,
+                ExtractPolicy::default().allow_symlinks(false)
+            )
+            .await
+            .unwrap_err(),
+            ExtractError::PolicyViolation {
+                position: 1024,
+                violation: ExtractPolicyViolation::SymbolicLink,
+            }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(symlink_dest.join("target")).unwrap(),
+            "ok"
+        );
+        assert!(!symlink_dest.join("link").exists());
+
+        let hard_link_dest = temp.path().join("hard-link");
+        let mut hard_link = Vec::new();
+        append_posix_member(&mut hard_link, "link", b'1', b"", "missing", 0o644);
+        finish(&mut hard_link);
+        assert!(matches!(
+            extract(hard_link, &hard_link_dest).await.unwrap_err(),
+            ExtractError::PolicyViolation {
+                position: 0,
+                violation: ExtractPolicyViolation::HardLink,
+            }
+        ));
+        assert!(!hard_link_dest.join("link").exists());
+    }
+
+    #[tokio::test]
+    async fn rejects_gnu_archives_when_policy_requires_posix_pax() {
+        let temp = tempdir().unwrap();
+        let dest = temp.path().join("out");
+        let mut bytes = Vec::new();
+        append_gnu_member(&mut bytes, "longname", b'L', b"renamed\0", "", 0o644);
+        append_gnu_member(&mut bytes, "raw", b'0', b"contents", "", 0o644);
+        finish(&mut bytes);
+
+        assert!(matches!(
+            extract_with_policy(bytes, &dest, ExtractPolicy::default().allow_gnu(false))
+                .await
+                .unwrap_err(),
+            ExtractError::PolicyViolation {
+                position: 0,
+                violation: ExtractPolicyViolation::GnuArchive,
+            }
+        ));
+        assert!(!dest.join("renamed").exists());
+
+        let empty_dest = temp.path().join("empty");
+        let mut empty = Vec::new();
+        finish(&mut empty);
+        extract_with_policy(
+            empty,
+            &empty_dest,
+            ExtractPolicy::default().allow_gnu(false),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_every_pax_vendor_record_by_default() {
+        let temp = tempdir().unwrap();
+        for (case, typeflag, payload, add_member) in [
+            ("local", b'x', record("ACME.attribute", "value"), true),
+            (
+                "active-global",
+                b'g',
+                record("ACME.attribute", "value"),
+                true,
+            ),
+            ("deleted-global", b'g', record("ACME.attribute", ""), false),
+            (
+                "replaced-global",
+                b'g',
+                {
+                    let mut payload = record("ACME.attribute", "value");
+                    payload.extend_from_slice(&record("ACME.attribute", ""));
+                    payload
+                },
+                false,
+            ),
+        ] {
+            let dest = temp.path().join(case);
+            let mut bytes = Vec::new();
+            append_pax(&mut bytes, typeflag, &payload);
+            if add_member {
+                append_posix_member(&mut bytes, "file", b'0', b"", "", 0o644);
+            }
+            finish(&mut bytes);
+            assert!(matches!(
+                extract(bytes, &dest).await.unwrap_err(),
+                ExtractError::PolicyViolation {
+                    position: 0,
+                    violation: ExtractPolicyViolation::PaxVendorExtension {
+                        vendor,
+                        name
+                    },
+                } if vendor == "ACME" && name == "attribute"
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn vendor_policy_reports_source_position_preserves_output_and_allows_opt_in() {
+        let temp = tempdir().unwrap();
+        let partial_dest = temp.path().join("partial");
+        let mut partial = Vec::new();
+        append_posix_member(&mut partial, "created", b'0', b"kept", "", 0o644);
+        append_pax(&mut partial, b'g', &record("ACME.attribute", "value"));
+        finish(&mut partial);
+        assert!(matches!(
+            extract(partial, &partial_dest).await.unwrap_err(),
+            ExtractError::PolicyViolation {
+                position: 1024,
+                violation: ExtractPolicyViolation::PaxVendorExtension { .. },
+            }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(partial_dest.join("created")).unwrap(),
+            "kept"
+        );
+
+        let permitted_dest = temp.path().join("permitted");
+        let mut permitted = Vec::new();
+        append_pax(&mut permitted, b'x', &record("ACME.attribute", "value"));
+        append_posix_member(&mut permitted, "file", b'0', b"ok", "", 0o644);
+        finish(&mut permitted);
+        extract_with_policy(
+            permitted,
+            &permitted_dest,
+            ExtractPolicy::default().allow_pax_vendor_extensions(true),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(permitted_dest.join("file")).unwrap(),
+            "ok"
+        );
     }
 
     #[tokio::test]
