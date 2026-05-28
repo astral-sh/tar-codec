@@ -1848,6 +1848,44 @@ mod tests {
     }
 
     #[test]
+    fn logical_reader_preserves_multiblock_gnu_metadata_payloads() {
+        let mut long_name = vec![b'n'; BLOCK_SIZE * 2 + 37];
+        long_name.push(0);
+        let mut long_link = vec![b'l'; BLOCK_SIZE + 19];
+        long_link.push(0);
+
+        let mut bytes = Vec::new();
+        append_block(&mut bytes, &gnu_header(b'L', long_name.len() as u64));
+        append_payload(&mut bytes, &long_name);
+        append_block(&mut bytes, &gnu_header(b'K', long_link.len() as u64));
+        append_payload(&mut bytes, &long_link);
+        append_block(&mut bytes, &gnu_header(b'2', 0));
+        append_terminator(&mut bytes);
+
+        let result: Result<(), FrameError> = ready(async {
+            let mut reader = TarReader::new(ChunkedReader::new(bytes, 19));
+            let Some(LogicalFrame::Member(member)) = reader.next_frame().await? else {
+                panic!("expected GNU member");
+            };
+            let MemberExtensions::Gnu {
+                long_name: Some(name_metadata),
+                long_link: Some(link_metadata),
+            } = &member.extensions
+            else {
+                panic!("expected GNU extensions");
+            };
+            assert_eq!(name_metadata.position, 0);
+            assert_eq!(name_metadata.payload, long_name);
+            assert_eq!(link_metadata.position, (BLOCK_SIZE * 4) as u64);
+            assert_eq!(link_metadata.payload, long_link);
+            member.payload.skip().await?;
+            assert!(reader.next_frame().await?.is_none());
+            Ok(())
+        });
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn logical_reader_handles_empty_archives_and_rejects_dangling_metadata() {
         let mut empty = Vec::new();
         append_terminator(&mut empty);

@@ -1483,6 +1483,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn applies_multiblock_gnu_long_name_and_long_link_metadata() {
+        let temp = tempdir().unwrap();
+        let dest = temp.path().join("out");
+        let prefix = "./".repeat(BLOCK_SIZE);
+        let mut long_name = format!("{prefix}alias").into_bytes();
+        long_name.push(0);
+        let mut long_link = format!("{prefix}target").into_bytes();
+        long_link.push(0);
+
+        let mut bytes = Vec::new();
+        append_gnu_member(&mut bytes, "target", b'0', b"contents", "", 0o644);
+        append_gnu_member(&mut bytes, "longname", b'L', &long_name, "", 0o644);
+        append_gnu_member(&mut bytes, "longlink", b'K', &long_link, "", 0o644);
+        append_gnu_member(&mut bytes, "raw", b'2', b"", "wrong", 0o644);
+        finish(&mut bytes);
+
+        extract(bytes, &dest).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dest.join("alias")).unwrap(),
+            "contents"
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_unsafe_paths_collisions_and_unsupported_members() {
         let temp = tempdir().unwrap();
         let dest = temp.path().join("out");
