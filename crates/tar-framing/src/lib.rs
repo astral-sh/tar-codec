@@ -1,3 +1,14 @@
+//! Low level framing of tar streams.
+//!
+//! This crate provides a [`TarStream`] struct that turns an asynchronous
+//! reader into a stream of [`Frame`]s, representing the logical blocks
+//! of a tar.
+//!
+//! The stream is strict in the sense that it defines a state machine
+//! that enforces the POSIX (meaning ustar and pax) or GNU format rules
+//! and rejects streams that attempt to combine the two formats or that
+//! are otherwise ambiguous.
+
 use std::{
     io,
     pin::Pin,
@@ -547,8 +558,17 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                         },
                     ));
                 }
-                let parsed = self.parse_locked_header(position, &block)?;
-                self.process_posix_header(position, block, parsed, Some((records, size)))
+                let parsed = self.parse_format_checked_header(position, &block)?;
+                if matches!(parsed.typeflag, b'x' | b'g') {
+                    return Err(FrameError::at(
+                        position,
+                        FrameErrorInner::UnexpectedOrder {
+                            expected: "ordinary ustar member header after a local pax header",
+                            found: "another pax extended header",
+                        },
+                    ));
+                }
+                self.process_ustar_header(position, block, parsed, records, size)
                     .map(Some)
             }
             State::ReadingGnu {
@@ -584,7 +604,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                         },
                     ));
                 }
-                let parsed = self.parse_locked_header(position, &block)?;
+                let parsed = self.parse_format_checked_header(position, &block)?;
                 self.process_gnu_header(position, block, parsed, pending)
                     .map(Some)
             }
@@ -626,16 +646,20 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         position: u64,
         block: [u8; BLOCK_SIZE],
     ) -> Result<Frame, FrameError> {
-        let parsed = self.parse_locked_header(position, &block)?;
+        let parsed = self.parse_format_checked_header(position, &block)?;
         match self.format.expect("header selects an archive format") {
-            ArchiveFormat::PosixPax => self.process_posix_header(position, block, parsed, None),
+            ArchiveFormat::PosixPax => self.process_posix_boundary_header(position, block, parsed),
             ArchiveFormat::Gnu => {
                 self.process_gnu_header(position, block, parsed, PendingGnu::default())
             }
         }
     }
 
-    fn parse_locked_header(
+    /// Parses a header and enforces the archive's single selected format.
+    ///
+    /// The first non-terminator header selects the format; later headers must
+    /// match that selection before their family-specific fields are parsed.
+    fn parse_format_checked_header(
         &mut self,
         position: u64,
         block: &[u8; BLOCK_SIZE],
@@ -654,80 +678,100 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         Ok(parsed)
     }
 
-    fn process_posix_header(
+    /// Processes a POSIX header at an archive-member boundary, where a new
+    /// pax extension or an ordinary ustar member may begin.
+    ///
+    /// Pax extension headers enter [`State::ReadingPax`]; ordinary ustar
+    /// headers are delegated to [`Self::process_ustar_header`].
+    fn process_posix_boundary_header(
         &mut self,
         position: u64,
         block: [u8; BLOCK_SIZE],
         parsed: ParsedHeader,
-        local: Option<(Vec<PaxRecord>, PaxSize)>,
     ) -> Result<Frame, FrameError> {
         match parsed.typeflag {
-            b'x' | b'g' if local.is_some() => Err(FrameError::at(
-                position,
-                FrameErrorInner::UnexpectedOrder {
-                    expected: "ordinary ustar member header after a local pax header",
-                    found: "another pax extended header",
-                },
-            )),
-            b'x' | b'g' => {
-                if parsed.size == 0 {
-                    return Err(FrameError::at(
-                        position,
-                        FrameErrorInner::InvalidPaxRecords {
-                            reason: "extended header payload contains no records",
-                        },
-                    ));
-                }
-                let kind = if parsed.typeflag == b'x' {
-                    PaxKind::Local
-                } else {
-                    PaxKind::Global
-                };
-                self.state = State::ReadingPax {
-                    kind,
-                    header_position: position,
-                    remaining: parsed.size,
-                    payload: Vec::new(),
-                };
-                Ok(Frame::Pax(PaxFrame {
-                    position,
-                    block,
-                    kind,
-                    payload_size: parsed.size,
-                }))
-            }
-            typeflag => {
-                let kind = member_kind(position, typeflag)?;
-                let (local_pax_records, local_size) = local.unwrap_or_default();
-                let effective_size = match local_size {
-                    PaxSize::Value(size) => Some(size),
-                    PaxSize::Deleted => None,
-                    PaxSize::Unspecified => match pax_size(&self.global_pax_records) {
-                        PaxSize::Value(size) => Some(size),
-                        PaxSize::Deleted => None,
-                        PaxSize::Unspecified => Some(parsed.size),
-                    },
-                };
-                let payload_size = posix_payload_size(position, kind, effective_size)?;
-                self.state = if payload_size == 0 {
-                    State::AwaitingHeader
-                } else {
-                    State::ReadingMember {
-                        remaining: payload_size,
-                    }
-                };
-                Ok(Frame::Header(HeaderFrame {
-                    position,
-                    block,
-                    kind,
-                    declared_size: parsed.size,
-                    effective_size,
-                    payload_size,
-                    global_pax_records: self.global_pax_records.clone(),
-                    local_pax_records,
-                }))
+            b'x' => self.process_pax_header(position, block, parsed.size, PaxKind::Local),
+            b'g' => self.process_pax_header(position, block, parsed.size, PaxKind::Global),
+            _ => {
+                self.process_ustar_header(position, block, parsed, Vec::new(), PaxSize::Unspecified)
             }
         }
+    }
+
+    /// Emits a pax extension header and enters its payload-reading state.
+    ///
+    /// This is reached only from the POSIX boundary state, before any local
+    /// pax records require an ordinary member header.
+    fn process_pax_header(
+        &mut self,
+        position: u64,
+        block: [u8; BLOCK_SIZE],
+        payload_size: u64,
+        kind: PaxKind,
+    ) -> Result<Frame, FrameError> {
+        if payload_size == 0 {
+            return Err(FrameError::at(
+                position,
+                FrameErrorInner::InvalidPaxRecords {
+                    reason: "extended header payload contains no records",
+                },
+            ));
+        }
+        self.state = State::ReadingPax {
+            kind,
+            header_position: position,
+            remaining: payload_size,
+            payload: Vec::new(),
+        };
+        Ok(Frame::Pax(PaxFrame {
+            position,
+            block,
+            kind,
+            payload_size,
+        }))
+    }
+
+    /// Emits an ordinary ustar member header after applying pax size state.
+    ///
+    /// This handles both bare members and members required by
+    /// [`State::AwaitingUstarHeader`], then enters member data reading when
+    /// the effective member size requires payload blocks.
+    fn process_ustar_header(
+        &mut self,
+        position: u64,
+        block: [u8; BLOCK_SIZE],
+        parsed: ParsedHeader,
+        local_pax_records: Vec<PaxRecord>,
+        local_size: PaxSize,
+    ) -> Result<Frame, FrameError> {
+        let kind = member_kind(position, parsed.typeflag)?;
+        let effective_size = match local_size {
+            PaxSize::Value(size) => Some(size),
+            PaxSize::Deleted => None,
+            PaxSize::Unspecified => match pax_size(&self.global_pax_records) {
+                PaxSize::Value(size) => Some(size),
+                PaxSize::Deleted => None,
+                PaxSize::Unspecified => Some(parsed.size),
+            },
+        };
+        let payload_size = posix_payload_size(position, kind, effective_size)?;
+        self.state = if payload_size == 0 {
+            State::AwaitingHeader
+        } else {
+            State::ReadingMember {
+                remaining: payload_size,
+            }
+        };
+        Ok(Frame::Header(HeaderFrame {
+            position,
+            block,
+            kind,
+            declared_size: parsed.size,
+            effective_size,
+            payload_size,
+            global_pax_records: self.global_pax_records.clone(),
+            local_pax_records,
+        }))
     }
 
     fn process_gnu_header(
