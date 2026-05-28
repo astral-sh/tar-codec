@@ -17,12 +17,11 @@ use cap_std::{
     fs::{Dir, OpenOptions},
 };
 use tar_framing::{
-    ArchiveFormat, DataFrame, DataOwner, Frame, FrameError, GnuKind, HeaderFrame, MemberKind,
-    PaxKind, PaxRecord, PaxValue, TarStream,
+    ArchiveFormat, FrameError, GnuHeader, LogicalFrame, MemberExtensions, MemberHeader, MemberKind,
+    PaxHeader, PaxKind, PaxRecord, PaxValue, PayloadBlock, TarReader,
 };
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWriteExt};
-use tokio_stream::StreamExt;
 
 const NAME_RANGE: std::ops::Range<usize> = 0..100;
 const MODE_RANGE: std::ops::Range<usize> = 100..108;
@@ -31,14 +30,14 @@ const PREFIX_RANGE: std::ops::Range<usize> = 345..500;
 
 /// A one-pass reader for a validated POSIX-pax or GNU tar archive.
 pub struct Archive<R> {
-    frames: TarStream<R>,
+    reader: TarReader<R>,
 }
 
 impl<R> Archive<R> {
     /// Creates an archive decoder from an uncompressed tar reader.
     pub fn new(reader: R) -> Self {
         Self {
-            frames: TarStream::new(reader),
+            reader: TarReader::new(reader),
         }
     }
 }
@@ -211,67 +210,34 @@ impl<R: AsyncRead + Unpin> Archive<R> {
         policy: ExtractPolicy,
     ) -> Result<(), ExtractError> {
         let mut root = ExtractionRoot::open(dest.as_ref()).await?;
-        let mut gnu = GnuMetadata::default();
-        let mut active_writer: Option<ActiveWriter> = None;
-        let mut pax_position = None;
-
-        while let Some(frame) = self.frames.next().await {
-            match frame? {
-                Frame::Pax(frame) => {
-                    pax_position = Some(frame.position);
+        while let Some(frame) = self.reader.next_frame().await? {
+            match frame {
+                LogicalFrame::GlobalPax(header) => {
+                    policy.check_pax_records(header.position, header.kind, &header.records)?;
                 }
-                Frame::Gnu(frame) => {
-                    policy.check_format(frame.position, ArchiveFormat::Gnu)?;
-                    gnu.start(frame.kind);
-                }
-                Frame::Header(frame) => {
-                    if active_writer.is_some() {
-                        return Err(ExtractError::InvalidFrameSequence {
-                            reason: "received a member header while data was still pending",
-                        });
+                LogicalFrame::Member(mut frame) => {
+                    let format = member_format(&frame.extensions);
+                    policy.check_format(
+                        member_format_position(&frame.header, &frame.extensions),
+                        format,
+                    )?;
+                    policy.check_member_kind(frame.header.position, frame.header.kind)?;
+                    if let MemberExtensions::PosixPax {
+                        local: Some(local), ..
+                    } = &frame.extensions
+                    {
+                        policy.check_pax_records(local.position, local.kind, &local.records)?;
                     }
-                    let format =
-                        self.frames
-                            .format()
-                            .ok_or(ExtractError::InvalidFrameSequence {
-                                reason: "member header did not identify an archive format",
-                            })?;
-                    policy.check_format(frame.position, format)?;
-                    policy.check_member_kind(frame.position, frame.kind)?;
-                    let member = decode_member(format, frame, &mut gnu)?;
-                    active_writer = root.start_member(member).await?;
-                }
-                Frame::Data(frame) => match frame.owner {
-                    DataOwner::Pax(kind) => {
-                        if let Some(records) = frame.completed_pax_records.as_deref() {
-                            let position =
-                                pax_position
-                                    .take()
-                                    .ok_or(ExtractError::InvalidFrameSequence {
-                                        reason: "pax payload appeared before its header",
-                                    })?;
-                            policy.check_pax_records(position, kind, records)?;
+                    let member = decode_member(&frame.header, &frame.extensions)?;
+                    if let Some(mut writer) = root.start_member(member).await? {
+                        while let Some(block) = frame.payload.next_block().await? {
+                            writer.write_block(block).await?;
                         }
+                    } else {
+                        frame.payload.skip().await?;
                     }
-                    DataOwner::Gnu(kind) => gnu.push(kind, &frame.block[..frame.len])?,
-                    DataOwner::Member => {
-                        let Some(writer) = active_writer.as_mut() else {
-                            return Err(ExtractError::InvalidFrameSequence {
-                                reason: "received member data without an extracted file",
-                            });
-                        };
-                        if writer.write_frame(frame).await? {
-                            active_writer = None;
-                        }
-                    }
-                },
+                }
             }
-        }
-
-        if active_writer.is_some() {
-            return Err(ExtractError::InvalidFrameSequence {
-                reason: "member data ended before its output file was complete",
-            });
         }
         root.install_symlinks().await
     }
@@ -468,91 +434,87 @@ struct DecodedMember {
     payload_size: u64,
 }
 
-#[derive(Default)]
-struct GnuMetadata {
-    long_name: Option<Vec<u8>>,
-    long_link: Option<Vec<u8>>,
+fn member_format(extensions: &MemberExtensions) -> ArchiveFormat {
+    match extensions {
+        MemberExtensions::PosixPax { .. } => ArchiveFormat::PosixPax,
+        MemberExtensions::Gnu { .. } => ArchiveFormat::Gnu,
+    }
 }
 
-impl GnuMetadata {
-    fn start(&mut self, kind: GnuKind) {
-        match kind {
-            GnuKind::LongName => self.long_name = Some(Vec::new()),
-            GnuKind::LongLink => self.long_link = Some(Vec::new()),
-        }
-    }
-
-    fn push(&mut self, kind: GnuKind, bytes: &[u8]) -> Result<(), ExtractError> {
-        let slot = match kind {
-            GnuKind::LongName => &mut self.long_name,
-            GnuKind::LongLink => &mut self.long_link,
-        };
-        let Some(payload) = slot.as_mut() else {
-            return Err(ExtractError::InvalidFrameSequence {
-                reason: "GNU payload appeared before its metadata header",
-            });
-        };
-        payload.extend_from_slice(bytes);
-        Ok(())
-    }
-
-    fn take_name(&mut self, position: u64) -> Result<Option<String>, ExtractError> {
-        self.long_name
-            .take()
-            .map(|bytes| parse_gnu_text(position, "long-name", &bytes))
-            .transpose()
-    }
-
-    fn take_link(&mut self, position: u64) -> Result<Option<String>, ExtractError> {
-        self.long_link
-            .take()
-            .map(|bytes| parse_gnu_text(position, "long-link", &bytes))
-            .transpose()
+fn member_format_position(header: &MemberHeader, extensions: &MemberExtensions) -> u64 {
+    match extensions {
+        MemberExtensions::PosixPax { .. } => header.position,
+        MemberExtensions::Gnu {
+            long_name,
+            long_link,
+        } => long_name
+            .iter()
+            .chain(long_link.iter())
+            .map(|header| header.position)
+            .min()
+            .unwrap_or(header.position),
     }
 }
 
 fn decode_member(
-    format: ArchiveFormat,
-    header: HeaderFrame,
-    gnu: &mut GnuMetadata,
+    header: &MemberHeader,
+    extensions: &MemberExtensions,
 ) -> Result<DecodedMember, ExtractError> {
+    let format = member_format(extensions);
     let mode = parse_mode(header.position, format, &header.block[MODE_RANGE])?;
     let executable = mode & 0o111 != 0;
-    let (path, link_target) = match format {
-        ArchiveFormat::PosixPax => {
+    let (path, link_target) = match extensions {
+        MemberExtensions::PosixPax {
+            global_records,
+            local,
+        } => {
             let raw_path = posix_header_path(header.position, &header.block)?;
-            let path = pax_text(&header, PaxTextField::Path)?
-                .map(str::to_owned)
-                .unwrap_or(raw_path);
+            let path = pax_text(
+                header.position,
+                global_records,
+                local.as_deref(),
+                PaxTextField::Path,
+            )?
+            .map(str::to_owned)
+            .unwrap_or(raw_path);
             let link_target =
                 if matches!(header.kind, MemberKind::HardLink | MemberKind::SymbolicLink) {
                     let raw_link =
                         header_text(header.position, "link name", &header.block[LINK_NAME_RANGE])?;
                     Some(
-                        pax_text(&header, PaxTextField::LinkPath)?
-                            .map(str::to_owned)
-                            .unwrap_or(raw_link),
+                        pax_text(
+                            header.position,
+                            global_records,
+                            local.as_deref(),
+                            PaxTextField::LinkPath,
+                        )?
+                        .map(str::to_owned)
+                        .unwrap_or(raw_link),
                     )
                 } else {
                     None
                 };
             (path, link_target)
         }
-        ArchiveFormat::Gnu => {
-            let path = gnu.take_name(header.position)?.unwrap_or(header_text(
+        MemberExtensions::Gnu {
+            long_name,
+            long_link,
+        } => {
+            let path = gnu_text(long_name.as_deref(), "long-name")?.unwrap_or(header_text(
                 header.position,
                 "name",
                 &header.block[NAME_RANGE],
             )?);
             let link_target =
                 if matches!(header.kind, MemberKind::HardLink | MemberKind::SymbolicLink) {
-                    Some(gnu.take_link(header.position)?.unwrap_or(header_text(
-                        header.position,
-                        "link name",
-                        &header.block[LINK_NAME_RANGE],
-                    )?))
+                    Some(
+                        gnu_text(long_link.as_deref(), "long-link")?.unwrap_or(header_text(
+                            header.position,
+                            "link name",
+                            &header.block[LINK_NAME_RANGE],
+                        )?),
+                    )
                 } else {
-                    let _ = gnu.take_link(header.position)?;
                     None
                 };
             (path, link_target)
@@ -593,15 +555,22 @@ impl PaxTextField {
     }
 }
 
-fn pax_text(header: &HeaderFrame, field: PaxTextField) -> Result<Option<&str>, ExtractError> {
-    let value = header
-        .local_pax_records
-        .iter()
-        .rev()
-        .find_map(|record| field.value(record))
+fn pax_text<'a>(
+    position: u64,
+    global_records: &'a [PaxRecord],
+    local: Option<&'a PaxHeader>,
+    field: PaxTextField,
+) -> Result<Option<&'a str>, ExtractError> {
+    let value = local
+        .and_then(|local| {
+            local
+                .records
+                .iter()
+                .rev()
+                .find_map(|record| field.value(record))
+        })
         .or_else(|| {
-            header
-                .global_pax_records
+            global_records
                 .iter()
                 .rev()
                 .find_map(|record| field.value(record))
@@ -609,7 +578,7 @@ fn pax_text(header: &HeaderFrame, field: PaxTextField) -> Result<Option<&str>, E
     match value {
         Some(PaxValue::Value(value)) => Ok(Some(value.as_str())),
         Some(PaxValue::Deleted) => Err(ExtractError::DeletedPaxMetadata {
-            position: header.position,
+            position,
             keyword: field.keyword(),
         }),
         None => Ok(None),
@@ -665,6 +634,15 @@ fn parse_gnu_text(
     std::str::from_utf8(&bytes[..terminator])
         .map(str::to_owned)
         .map_err(|_| ExtractError::InvalidUtf8 { position, field })
+}
+
+fn gnu_text(
+    header: Option<&GnuHeader>,
+    field: &'static str,
+) -> Result<Option<String>, ExtractError> {
+    header
+        .map(|header| parse_gnu_text(header.position, field, &header.payload))
+        .transpose()
 }
 
 fn parse_mode(position: u64, format: ArchiveFormat, bytes: &[u8]) -> Result<u64, ExtractError> {
@@ -1164,15 +1142,17 @@ struct ActiveWriter {
 }
 
 impl ActiveWriter {
-    async fn write_frame(&mut self, frame: DataFrame) -> Result<bool, ExtractError> {
-        let len = u64::try_from(frame.len).expect("data-frame lengths fit in u64");
+    async fn write_block(&mut self, block: PayloadBlock) -> Result<(), ExtractError> {
+        let len = u64::try_from(block.len).map_err(|_| ExtractError::InvalidFrameSequence {
+            reason: "payload block length cannot be represented",
+        })?;
         if len > self.remaining {
             return Err(ExtractError::InvalidFrameSequence {
                 reason: "member payload exceeded the decoded member size",
             });
         }
         self.file
-            .write_all(&frame.block[..frame.len])
+            .write_all(&block.block[..block.len])
             .await
             .map_err(|source| filesystem("write file", self.path.clone(), source))?;
         self.remaining -= len;
@@ -1181,10 +1161,8 @@ impl ActiveWriter {
                 .flush()
                 .await
                 .map_err(|source| filesystem("flush file", self.path.clone(), source))?;
-            Ok(true)
-        } else {
-            Ok(false)
         }
+        Ok(())
     }
 }
 

@@ -4,7 +4,10 @@ Low-level strict tar stream framing for either POSIX pax/ustar or GNU archives.
 
 This is a dependency of `tar-codec`. Most users should not use this crate's APIs directly.
 
-This crate has one primary task: to abstract an asynchronous I/O source into an asynchronous stream of tar "frames," i.e. a well-formed stream of header and data packets.
+This crate provides two views over an asynchronous I/O source:
+
+- `TarStream` emits physical 512-byte header and data frames for lossless inspection and debugging.
+- `TarReader` emits logical global-pax updates and members, grouping local pax or GNU metadata with its target member while streaming member payload blocks through a borrowing cursor.
 
 Each stream is locked to one archive family: POSIX pax/ustar or GNU, never a mixture.
 
