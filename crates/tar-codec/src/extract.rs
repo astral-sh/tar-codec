@@ -46,13 +46,15 @@ impl<R> Archive<R> {
 /// Controls which otherwise valid archive features extraction may accept.
 ///
 /// The default permits symbolic links and either supported framing family,
-/// while rejecting hard links and vendor-namespaced POSIX pax records.
+/// while rejecting hard links, vendor-namespaced POSIX pax records, and
+/// repeated keywords within one POSIX pax extended header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExtractPolicy {
     allow_symlinks: bool,
     allow_hard_links: bool,
     allow_gnu: bool,
     allow_pax_vendor_extensions: bool,
+    allow_duplicate_pax_records: bool,
 }
 
 impl Default for ExtractPolicy {
@@ -62,6 +64,7 @@ impl Default for ExtractPolicy {
             allow_hard_links: false,
             allow_gnu: true,
             allow_pax_vendor_extensions: false,
+            allow_duplicate_pax_records: false,
         }
     }
 }
@@ -94,6 +97,15 @@ impl ExtractPolicy {
         self
     }
 
+    /// Configures whether one pax extended header may repeat a keyword.
+    ///
+    /// When enabled, standard pax precedence applies and the last record for
+    /// a repeated keyword takes effect.
+    pub fn allow_duplicate_pax_records(mut self, allow: bool) -> Self {
+        self.allow_duplicate_pax_records = allow;
+        self
+    }
+
     fn check_format(&self, position: u64, format: ArchiveFormat) -> Result<(), ExtractError> {
         if format == ArchiveFormat::Gnu && !self.allow_gnu {
             return Err(policy_violation(
@@ -121,20 +133,33 @@ impl ExtractPolicy {
     }
 
     fn check_pax_records(&self, position: u64, records: &[PaxRecord]) -> Result<(), ExtractError> {
-        if self.allow_pax_vendor_extensions {
-            return Ok(());
-        }
-        for record in records {
-            if let PaxRecord::Vendor { vendor, name, .. } = record {
-                return Err(policy_violation(
-                    position,
-                    ExtractPolicyViolation::PaxVendorExtension {
-                        vendor: vendor.clone(),
-                        name: name.clone(),
-                    },
-                ));
+        if !self.allow_pax_vendor_extensions {
+            for record in records {
+                if let PaxRecord::Vendor { vendor, name, .. } = record {
+                    return Err(policy_violation(
+                        position,
+                        ExtractPolicyViolation::PaxVendorExtension {
+                            vendor: vendor.clone(),
+                            name: name.clone(),
+                        },
+                    ));
+                }
             }
         }
+
+        if !self.allow_duplicate_pax_records {
+            let mut keywords = HashSet::new();
+            for record in records {
+                let keyword = pax_record_keyword(record);
+                if !keywords.insert(keyword.clone()) {
+                    return Err(policy_violation(
+                        position,
+                        ExtractPolicyViolation::DuplicatePaxRecord { keyword },
+                    ));
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -237,6 +262,12 @@ pub enum ExtractPolicyViolation {
         vendor: String,
         /// Keyword suffix following the vendor namespace.
         name: String,
+    },
+    /// One POSIX pax extended header repeats the same logical keyword.
+    #[error("pax extended header contains duplicate record {keyword}")]
+    DuplicatePaxRecord {
+        /// The repeated POSIX pax record keyword.
+        keyword: String,
     },
 }
 
@@ -364,6 +395,26 @@ fn policy_violation(position: u64, violation: ExtractPolicyViolation) -> Extract
     ExtractError::PolicyViolation {
         position,
         violation,
+    }
+}
+
+fn pax_record_keyword(record: &PaxRecord) -> String {
+    match record {
+        PaxRecord::Atime(_) => "atime".to_owned(),
+        PaxRecord::Charset(_) => "charset".to_owned(),
+        PaxRecord::Comment(_) => "comment".to_owned(),
+        PaxRecord::Gid(_) => "gid".to_owned(),
+        PaxRecord::Gname(_) => "gname".to_owned(),
+        PaxRecord::HdrCharset(_) => "hdrcharset".to_owned(),
+        PaxRecord::LinkPath(_) => "linkpath".to_owned(),
+        PaxRecord::Mtime(_) => "mtime".to_owned(),
+        PaxRecord::Path(_) => "path".to_owned(),
+        PaxRecord::Realtime { name, .. } => format!("realtime.{name}"),
+        PaxRecord::Security { name, .. } => format!("security.{name}"),
+        PaxRecord::Size(_) => "size".to_owned(),
+        PaxRecord::Uid(_) => "uid".to_owned(),
+        PaxRecord::Uname(_) => "uname".to_owned(),
+        PaxRecord::Vendor { vendor, name, .. } => format!("{vendor}.{name}"),
     }
 }
 
@@ -1690,6 +1741,63 @@ mod tests {
             std::fs::read_to_string(permitted_dest.join("file")).unwrap(),
             "ok"
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_pax_records_by_default_and_can_apply_last_value() {
+        let temp = tempdir().unwrap();
+        let mut local = record("path", "wrong");
+        local.extend_from_slice(&record("path", "actual"));
+
+        let rejected_dest = temp.path().join("rejected");
+        let mut rejected = Vec::new();
+        append_pax(&mut rejected, b'x', &local);
+        append_posix_member(&mut rejected, "raw", b'0', b"contents", "", 0o644);
+        finish(&mut rejected);
+        assert!(matches!(
+            extract(rejected, &rejected_dest).await.unwrap_err(),
+            ExtractError::PolicyViolation {
+                position: 0,
+                violation: ExtractPolicyViolation::DuplicatePaxRecord { keyword },
+            } if keyword == "path"
+        ));
+        assert!(!rejected_dest.join("actual").exists());
+
+        let permitted_dest = temp.path().join("permitted");
+        let mut permitted = Vec::new();
+        append_pax(&mut permitted, b'x', &local);
+        append_posix_member(&mut permitted, "raw", b'0', b"contents", "", 0o644);
+        finish(&mut permitted);
+        extract_with_policy(
+            permitted,
+            &permitted_dest,
+            ExtractPolicy::default().allow_duplicate_pax_records(true),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(permitted_dest.join("actual")).unwrap(),
+            "contents"
+        );
+        assert!(!permitted_dest.join("wrong").exists());
+    }
+
+    #[tokio::test]
+    async fn permits_later_global_pax_headers_to_update_effective_values() {
+        let temp = tempdir().unwrap();
+        let dest = temp.path().join("out");
+        let mut bytes = Vec::new();
+        append_pax(&mut bytes, b'g', &record("path", "old"));
+        append_pax(&mut bytes, b'g', &record("path", "current"));
+        append_posix_member(&mut bytes, "raw", b'0', b"contents", "", 0o644);
+        finish(&mut bytes);
+
+        extract(bytes, &dest).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dest.join("current")).unwrap(),
+            "contents"
+        );
+        assert!(!dest.join("old").exists());
     }
 
     #[tokio::test]
