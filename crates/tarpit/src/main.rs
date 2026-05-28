@@ -7,8 +7,8 @@ use std::{
 use async_compression::tokio::bufread::GzipDecoder;
 use clap::{Parser, Subcommand};
 use tar_framing::{
-    ArchiveFormat, DataOwner, Frame, FrameError, GnuKind, HdrCharset, MemberKind, PaxKind,
-    PaxRecord, PaxValue, TarStream,
+    ArchiveFormat, FrameError, GnuKind, HdrCharset, MemberKind, PaxKind, PaxRecord, PaxValue,
+    physical::{DataOwner, Frame, TarStream},
 };
 use thiserror::Error;
 use tokio::{

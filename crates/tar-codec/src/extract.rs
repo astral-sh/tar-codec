@@ -17,8 +17,11 @@ use cap_std::{
     fs::{Dir, OpenOptions},
 };
 use tar_framing::{
-    ArchiveFormat, FrameError, GnuHeader, LogicalFrame, MemberExtensions, MemberHeader, MemberKind,
-    PaxHeader, PaxKind, PaxRecord, PaxValue, PayloadBlock, TarReader,
+    ArchiveFormat, FrameError, MemberKind, PaxKind, PaxRecord, PaxValue,
+    logical::{
+        GnuMetadata, LogicalFrame, MemberExtensions, MemberHeader, PaxMetadata, PayloadBlock,
+        TarReader,
+    },
 };
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWriteExt};
@@ -213,7 +216,7 @@ impl<R: AsyncRead + Unpin> Archive<R> {
         while let Some(frame) = self.reader.next_frame().await? {
             match frame {
                 LogicalFrame::GlobalPax(header) => {
-                    policy.check_pax_records(header.position, header.kind, &header.records)?;
+                    policy.check_pax_records(header.position, PaxKind::Global, &header.records)?;
                 }
                 LogicalFrame::Member(mut frame) => {
                     let format = member_format(&frame.extensions);
@@ -226,7 +229,7 @@ impl<R: AsyncRead + Unpin> Archive<R> {
                         local: Some(local), ..
                     } = &frame.extensions
                     {
-                        policy.check_pax_records(local.position, local.kind, &local.records)?;
+                        policy.check_pax_records(local.position, PaxKind::Local, &local.records)?;
                     }
                     let member = decode_member(&frame.header, &frame.extensions)?;
                     if let Some(mut writer) = root.start_member(member).await? {
@@ -472,7 +475,7 @@ fn decode_member(
             let path = pax_text(
                 header.position,
                 global_records,
-                local.as_deref(),
+                local.as_ref(),
                 PaxTextField::Path,
             )?
             .map(str::to_owned)
@@ -485,7 +488,7 @@ fn decode_member(
                         pax_text(
                             header.position,
                             global_records,
-                            local.as_deref(),
+                            local.as_ref(),
                             PaxTextField::LinkPath,
                         )?
                         .map(str::to_owned)
@@ -500,7 +503,7 @@ fn decode_member(
             long_name,
             long_link,
         } => {
-            let path = gnu_text(long_name.as_deref(), "long-name")?.unwrap_or(header_text(
+            let path = gnu_text(long_name.as_ref(), "long-name")?.unwrap_or(header_text(
                 header.position,
                 "name",
                 &header.block[NAME_RANGE],
@@ -508,7 +511,7 @@ fn decode_member(
             let link_target =
                 if matches!(header.kind, MemberKind::HardLink | MemberKind::SymbolicLink) {
                     Some(
-                        gnu_text(long_link.as_deref(), "long-link")?.unwrap_or(header_text(
+                        gnu_text(long_link.as_ref(), "long-link")?.unwrap_or(header_text(
                             header.position,
                             "link name",
                             &header.block[LINK_NAME_RANGE],
@@ -558,7 +561,7 @@ impl PaxTextField {
 fn pax_text<'a>(
     position: u64,
     global_records: &'a [PaxRecord],
-    local: Option<&'a PaxHeader>,
+    local: Option<&'a PaxMetadata>,
     field: PaxTextField,
 ) -> Result<Option<&'a str>, ExtractError> {
     let value = local
@@ -637,7 +640,7 @@ fn parse_gnu_text(
 }
 
 fn gnu_text(
-    header: Option<&GnuHeader>,
+    header: Option<&GnuMetadata>,
     field: &'static str,
 ) -> Result<Option<String>, ExtractError> {
     header
