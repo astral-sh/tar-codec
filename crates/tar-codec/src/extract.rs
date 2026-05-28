@@ -18,7 +18,7 @@ use cap_std::{
 };
 use tar_framing::{
     ArchiveFormat, DataFrame, DataOwner, Frame, FrameError, GnuKind, HeaderFrame, MemberKind,
-    PaxRecord, PaxValue, TarStream,
+    PaxKind, PaxRecord, PaxValue, TarStream,
 };
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWriteExt};
@@ -47,7 +47,8 @@ impl<R> Archive<R> {
 ///
 /// The default permits symbolic links and either supported framing family,
 /// while rejecting hard links, vendor-namespaced POSIX pax records, and
-/// repeated keywords within one POSIX pax extended header.
+/// repeated keywords or member-specific records within global POSIX pax
+/// extended headers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExtractPolicy {
     allow_symlinks: bool,
@@ -55,6 +56,7 @@ pub struct ExtractPolicy {
     allow_gnu: bool,
     allow_pax_vendor_extensions: bool,
     allow_duplicate_pax_records: bool,
+    allow_global_pax_member_metadata: bool,
 }
 
 impl Default for ExtractPolicy {
@@ -65,6 +67,7 @@ impl Default for ExtractPolicy {
             allow_gnu: true,
             allow_pax_vendor_extensions: false,
             allow_duplicate_pax_records: false,
+            allow_global_pax_member_metadata: false,
         }
     }
 }
@@ -106,6 +109,15 @@ impl ExtractPolicy {
         self
     }
 
+    /// Configures whether global pax headers may set member path or size data.
+    ///
+    /// When enabled, standard pax semantics permit global `path`, `linkpath`,
+    /// and `size` records to apply to following members until overridden.
+    pub fn allow_global_pax_member_metadata(mut self, allow: bool) -> Self {
+        self.allow_global_pax_member_metadata = allow;
+        self
+    }
+
     fn check_format(&self, position: u64, format: ArchiveFormat) -> Result<(), ExtractError> {
         if format == ArchiveFormat::Gnu && !self.allow_gnu {
             return Err(policy_violation(
@@ -132,7 +144,12 @@ impl ExtractPolicy {
         Ok(())
     }
 
-    fn check_pax_records(&self, position: u64, records: &[PaxRecord]) -> Result<(), ExtractError> {
+    fn check_pax_records(
+        &self,
+        position: u64,
+        kind: PaxKind,
+        records: &[PaxRecord],
+    ) -> Result<(), ExtractError> {
         if !self.allow_pax_vendor_extensions {
             for record in records {
                 if let PaxRecord::Vendor { vendor, name, .. } = record {
@@ -142,6 +159,23 @@ impl ExtractPolicy {
                             vendor: vendor.clone(),
                             name: name.clone(),
                         },
+                    ));
+                }
+            }
+        }
+
+        if kind == PaxKind::Global && !self.allow_global_pax_member_metadata {
+            for record in records {
+                let keyword = match record {
+                    PaxRecord::Path(_) => Some("path"),
+                    PaxRecord::LinkPath(_) => Some("linkpath"),
+                    PaxRecord::Size(_) => Some("size"),
+                    _ => None,
+                };
+                if let Some(keyword) = keyword {
+                    return Err(policy_violation(
+                        position,
+                        ExtractPolicyViolation::GlobalPaxMemberMetadata { keyword },
                     ));
                 }
             }
@@ -208,7 +242,7 @@ impl<R: AsyncRead + Unpin> Archive<R> {
                     active_writer = root.start_member(member).await?;
                 }
                 Frame::Data(frame) => match frame.owner {
-                    DataOwner::Pax(_) => {
+                    DataOwner::Pax(kind) => {
                         if let Some(records) = frame.completed_pax_records.as_deref() {
                             let position =
                                 pax_position
@@ -216,7 +250,7 @@ impl<R: AsyncRead + Unpin> Archive<R> {
                                     .ok_or(ExtractError::InvalidFrameSequence {
                                         reason: "pax payload appeared before its header",
                                     })?;
-                            policy.check_pax_records(position, records)?;
+                            policy.check_pax_records(position, kind, records)?;
                         }
                     }
                     DataOwner::Gnu(kind) => gnu.push(kind, &frame.block[..frame.len])?,
@@ -268,6 +302,12 @@ pub enum ExtractPolicyViolation {
     DuplicatePaxRecord {
         /// The repeated POSIX pax record keyword.
         keyword: String,
+    },
+    /// A global POSIX pax header supplies per-member identity or framing data.
+    #[error("global pax extended header contains restricted member metadata {keyword}")]
+    GlobalPaxMemberMetadata {
+        /// The restricted global record keyword.
+        keyword: &'static str,
     },
 }
 
@@ -1414,7 +1454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn applies_posix_path_and_linkpath_precedence() {
+    async fn applies_posix_path_and_linkpath_precedence_when_globals_are_allowed() {
         let temp = tempdir().unwrap();
         let dest = temp.path().join("out");
         let global = record("path", "wrong");
@@ -1429,7 +1469,13 @@ mod tests {
         append_posix_member(&mut bytes, "raw-link", b'2', b"", "wrong-target", 0o644);
         finish(&mut bytes);
 
-        extract(bytes, &dest).await.unwrap();
+        extract_with_policy(
+            bytes,
+            &dest,
+            ExtractPolicy::default().allow_global_pax_member_metadata(true),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(dest.join("actual/link")).unwrap(),
             "content"
@@ -1783,7 +1829,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permits_later_global_pax_headers_to_update_effective_values() {
+    async fn allows_global_member_metadata_updates_when_enabled() {
         let temp = tempdir().unwrap();
         let dest = temp.path().join("out");
         let mut bytes = Vec::new();
@@ -1792,12 +1838,51 @@ mod tests {
         append_posix_member(&mut bytes, "raw", b'0', b"contents", "", 0o644);
         finish(&mut bytes);
 
-        extract(bytes, &dest).await.unwrap();
+        extract_with_policy(
+            bytes,
+            &dest,
+            ExtractPolicy::default().allow_global_pax_member_metadata(true),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(dest.join("current")).unwrap(),
             "contents"
         );
         assert!(!dest.join("old").exists());
+    }
+
+    #[tokio::test]
+    async fn rejects_member_specific_global_pax_records_by_default() {
+        let temp = tempdir().unwrap();
+        for (keyword, value) in [("path", "file"), ("linkpath", "target"), ("size", "0")] {
+            let dest = temp.path().join(keyword);
+            let mut bytes = Vec::new();
+            append_pax(&mut bytes, b'g', &record(keyword, value));
+            finish(&mut bytes);
+
+            assert!(matches!(
+                extract(bytes, &dest).await.unwrap_err(),
+                ExtractError::PolicyViolation {
+                    position: 0,
+                    violation: ExtractPolicyViolation::GlobalPaxMemberMetadata {
+                        keyword: found,
+                    },
+                } if found == keyword
+            ));
+        }
+
+        let deleted_dest = temp.path().join("deleted");
+        let mut deleted = Vec::new();
+        append_pax(&mut deleted, b'g', &record("path", ""));
+        finish(&mut deleted);
+        assert!(matches!(
+            extract(deleted, &deleted_dest).await.unwrap_err(),
+            ExtractError::PolicyViolation {
+                position: 0,
+                violation: ExtractPolicyViolation::GlobalPaxMemberMetadata { keyword: "path" },
+            }
+        ));
     }
 
     #[tokio::test]
