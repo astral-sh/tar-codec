@@ -1,0 +1,63 @@
+---
+config:
+  layout: elk
+---
+
+stateDiagram-v2
+  state "AwaitingHeader (unclassified)" as Unclassified
+  state SelectFormat <<choice>>
+
+  [*] --> Unclassified
+  Unclassified --> AwaitingSecondZero: first zero block
+  Unclassified --> SelectFormat: first nonzero header
+  SelectFormat --> PosixHeader: ustar identity
+  SelectFormat --> GnuHeader: GNU identity
+  SelectFormat --> Failed: unsupported identity
+
+  state "POSIX-pax selected" as Pax {
+    direction TB
+    state "AwaitingHeader" as PosixBoundary
+    state PosixHeader <<choice>>
+    state "ReadingMember" as PosixMemberData
+
+    PosixBoundary --> PosixHeader: next header
+    PosixHeader --> ReadingPax: x or g
+    PosixHeader --> PosixMemberData: member data
+    PosixHeader --> PosixBoundary: empty member
+    ReadingPax --> AwaitingUstarHeader: local x payload complete
+    ReadingPax --> PosixBoundary: global g payload complete
+    AwaitingUstarHeader --> PosixMemberData: member data
+    AwaitingUstarHeader --> PosixBoundary: empty member
+    PosixMemberData --> PosixBoundary: payload complete
+  }
+
+  state "GNU selected" as Gnu {
+    direction TB
+    state "AwaitingHeader" as GnuBoundary
+    state GnuHeader <<choice>>
+    state "ReadingMember" as GnuMemberData
+
+    GnuBoundary --> GnuHeader: next header
+    GnuHeader --> ReadingGnu: L or K data
+    GnuHeader --> AwaitingGnuMember: empty L or K
+    GnuHeader --> GnuMemberData: member data
+    GnuHeader --> GnuBoundary: empty member
+    ReadingGnu --> AwaitingGnuMember: metadata payload complete
+    AwaitingGnuMember --> ReadingGnu: another L or K data
+    AwaitingGnuMember --> AwaitingGnuMember: another empty L or K
+    AwaitingGnuMember --> GnuMemberData: member data
+    AwaitingGnuMember --> GnuBoundary: empty member
+    GnuMemberData --> GnuBoundary: payload complete
+  }
+
+PosixBoundary --> AwaitingSecondZero: first zero block
+GnuBoundary --> AwaitingSecondZero: first zero block
+AwaitingSecondZero --> Complete: second zero block
+AwaitingSecondZero --> Failed: nonzero block or EOF
+Complete --> [*]
+Failed --> [*]
+
+note right of Failed
+  Validation, ordering, and family-mismatch
+  errors also enter Failed; arrows omitted.
+end note
