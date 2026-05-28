@@ -27,7 +27,6 @@ const NAME_RANGE: std::ops::Range<usize> = 0..100;
 const MODE_RANGE: std::ops::Range<usize> = 100..108;
 const LINK_NAME_RANGE: std::ops::Range<usize> = 157..257;
 const PREFIX_RANGE: std::ops::Range<usize> = 345..500;
-const UTF8_HDRCHARSET: &str = "ISO-IR 10646 2000 UTF-8";
 
 /// A one-pass reader for a validated POSIX-pax or GNU tar archive.
 pub struct Archive<R> {
@@ -143,14 +142,6 @@ pub enum ExtractError {
         position: u64,
         /// Raw mode bytes.
         found: [u8; 8],
-    },
-    /// Pax requests a text encoding not supported by this initial decoder.
-    #[error("at byte {position}: unsupported pax hdrcharset value {value:?}")]
-    UnsupportedPaxCharset {
-        /// Source member-header position.
-        position: u64,
-        /// Unsupported character-set identifier.
-        value: String,
     },
     /// Required pax metadata was explicitly removed.
     #[error("at byte {position}: pax metadata {keyword:?} is empty for this member")]
@@ -280,7 +271,6 @@ fn decode_member(
     let executable = mode & 0o111 != 0;
     let (path, link_target) = match format {
         ArchiveFormat::PosixPax => {
-            validate_pax_charset(&header)?;
             let raw_path = posix_header_path(header.position, &header.block)?;
             let path = pax_text(&header, "path")?
                 .map(str::to_owned)
@@ -328,19 +318,6 @@ fn decode_member(
         executable,
         payload_size: header.payload_size,
     })
-}
-
-fn validate_pax_charset(header: &HeaderFrame) -> Result<(), ExtractError> {
-    if let Some(charset) = pax_text_allow_deleted(header, "hdrcharset")
-        && !charset.is_empty()
-        && charset != UTF8_HDRCHARSET
-    {
-        return Err(ExtractError::UnsupportedPaxCharset {
-            position: header.position,
-            value: charset.to_owned(),
-        });
-    }
-    Ok(())
 }
 
 fn pax_text<'a>(
@@ -1373,18 +1350,6 @@ mod tests {
     #[tokio::test]
     async fn rejects_invalid_extension_text_and_preserves_partial_outputs() {
         let temp = tempdir().unwrap();
-        let charset_dest = temp.path().join("charset");
-        let mut charset = Vec::new();
-        let mut pax = record("hdrcharset", "BINARY");
-        pax.extend_from_slice(&record("path", "file"));
-        append_pax(&mut charset, b'x', &pax);
-        append_posix_member(&mut charset, "raw", b'0', b"", "", 0o644);
-        finish(&mut charset);
-        assert!(matches!(
-            extract(charset, &charset_dest).await.unwrap_err(),
-            ExtractError::UnsupportedPaxCharset { .. }
-        ));
-
         let deleted_dest = temp.path().join("deleted");
         let mut deleted = Vec::new();
         append_pax(&mut deleted, b'x', &record("path", ""));

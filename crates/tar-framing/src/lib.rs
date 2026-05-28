@@ -16,6 +16,7 @@ const TYPEFLAG_OFFSET: usize = 156;
 const IDENTITY_RANGE: std::ops::Range<usize> = 257..265;
 const POSIX_IDENTITY: &[u8; 8] = b"ustar\x0000";
 const GNU_IDENTITY: &[u8; 8] = b"ustar  \0";
+const UTF8_HDRCHARSET: &str = "ISO-IR 10646 2000 UTF-8";
 
 type PositionedBlock = (u64, [u8; BLOCK_SIZE]);
 
@@ -103,6 +104,12 @@ pub enum FrameErrorInner {
     /// A local pax record could not be represented by this UTF-8-only API.
     #[error("pax records contain non-UTF-8 text")]
     InvalidPaxUtf8,
+    /// Effective pax metadata requests a text encoding unsupported by this UTF-8-only API.
+    #[error("unsupported pax hdrcharset value {value:?}")]
+    UnsupportedPaxCharset {
+        /// The unsupported character-set identifier.
+        value: String,
+    },
     /// A pax `size` record could not be used for member framing.
     #[error("invalid pax size override: {value:?}")]
     InvalidPaxSize {
@@ -500,6 +507,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 remaining -= len as u64;
                 if remaining == 0 {
                     let records = parse_pax_records(header_position, &payload)?;
+                    validate_pax_charset(header_position, &records)?;
                     match kind {
                         PaxKind::Local => {
                             let size = pax_size(header_position, &records)?;
@@ -1122,6 +1130,25 @@ fn pax_size(position: u64, records: &[PaxRecord]) -> Result<PaxSize, FrameError>
         };
     }
     Ok(size)
+}
+
+fn validate_pax_charset(position: u64, records: &[PaxRecord]) -> Result<(), FrameError> {
+    if let Some(charset) = records
+        .iter()
+        .rev()
+        .find(|record| record.keyword == "hdrcharset")
+        .map(|record| record.value.as_str())
+        && !charset.is_empty()
+        && charset != UTF8_HDRCHARSET
+    {
+        return Err(FrameError::at(
+            position,
+            FrameErrorInner::UnsupportedPaxCharset {
+                value: charset.to_owned(),
+            },
+        ));
+    }
+    Ok(())
 }
 
 fn apply_global_pax_records(
@@ -1771,6 +1798,29 @@ mod tests {
                 FrameErrorInner::InvalidPaxSize { .. }
             ));
         }
+    }
+
+    #[test]
+    fn rejects_unsupported_effective_pax_charsets() {
+        for typeflag in [b'x', b'g'] {
+            let records = record("hdrcharset", "BINARY");
+            let mut bytes = Vec::new();
+            append_block(&mut bytes, &header(typeflag, records.len() as u64));
+            append_payload(&mut bytes, &records);
+            assert!(matches!(
+                last_error_inner(&collect(bytes, BLOCK_SIZE)),
+                FrameErrorInner::UnsupportedPaxCharset { value } if value == "BINARY"
+            ));
+        }
+
+        let mut records = record("hdrcharset", "BINARY");
+        records.extend_from_slice(&record("hdrcharset", UTF8_HDRCHARSET));
+        let mut bytes = Vec::new();
+        append_block(&mut bytes, &header(b'x', records.len() as u64));
+        append_payload(&mut bytes, &records);
+        append_block(&mut bytes, &header(b'0', 0));
+        append_terminator(&mut bytes);
+        assert!(collect(bytes, BLOCK_SIZE).iter().all(Result::is_ok));
     }
 
     #[test]
