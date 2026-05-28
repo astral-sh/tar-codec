@@ -93,22 +93,6 @@ pub(super) enum PaxSize {
 }
 
 #[derive(Debug)]
-struct DecimalValue(u64);
-
-#[derive(Debug)]
-struct InvalidDecimalValue;
-
-impl FromStr for DecimalValue {
-    type Err = InvalidDecimalValue;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        parse_decimal(value.as_bytes())
-            .map(Self)
-            .ok_or(InvalidDecimalValue)
-    }
-}
-
-#[derive(Debug)]
 struct WholeSeconds(u64);
 
 #[derive(Debug)]
@@ -318,25 +302,22 @@ fn parse_integer(
     keyword: &'static str,
     value: &str,
 ) -> Result<PaxValue<u64>, FrameError> {
-    value
-        .parse::<PaxValue<DecimalValue>>()
-        .map(map_decimal)
-        .map_err(|_| {
-            FrameError::at(
-                position,
-                FrameErrorInner::InvalidPaxInteger {
-                    keyword,
-                    value: value.to_owned(),
-                },
-            )
-        })
-}
+    let invalid = || {
+        FrameError::at(
+            position,
+            FrameErrorInner::InvalidPaxInteger {
+                keyword,
+                value: value.to_owned(),
+            },
+        )
+    };
+    let parsed = value.parse::<PaxValue<u64>>().map_err(|_| invalid())?;
 
-fn map_decimal(value: PaxValue<DecimalValue>) -> PaxValue<u64> {
-    match value {
-        PaxValue::Value(DecimalValue(value)) => PaxValue::Value(value),
-        PaxValue::Deleted => PaxValue::Deleted,
+    // `u64::from_str` allows a leading `+`, which we must reject.
+    if value.starts_with('+') {
+        return Err(invalid());
     }
+    Ok(parsed)
 }
 
 fn parse_time(
