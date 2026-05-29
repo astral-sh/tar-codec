@@ -460,7 +460,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         block: [u8; BLOCK_SIZE],
     ) -> Result<Frame, FrameError> {
         let parsed = self.parse_format_checked_header(position, &block)?;
-        match self.format.expect("header selects an archive format") {
+        match parsed.format {
             ArchiveFormat::PosixPax => self.process_posix_boundary_header(position, block, parsed),
             ArchiveFormat::Gnu => {
                 self.process_gnu_header(position, block, parsed, PendingGnu::default())
@@ -471,23 +471,25 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
     /// Parses a header and enforces the archive's single selected format.
     ///
     /// The first non-terminator header selects the format; later headers must
-    /// match that selection before their family-specific fields are parsed.
+    /// decode as valid headers of that same family.
     fn parse_format_checked_header(
         &mut self,
         position: u64,
         block: &[u8; BLOCK_SIZE],
     ) -> Result<ParsedHeader, FrameError> {
-        let found = detect_format(position, block)?;
+        let parsed = ParsedHeader::try_from_framed(position, block)?;
         if let Some(expected) = self.format
-            && found != expected
+            && parsed.format != expected
         {
             return Err(FrameError::at(
                 position,
-                FrameErrorInner::FormatMismatch { expected, found },
+                FrameErrorInner::FormatMismatch {
+                    expected,
+                    found: parsed.format,
+                },
             ));
         }
-        let parsed = parse_header(position, block, found)?;
-        self.format.get_or_insert(found);
+        self.format.get_or_insert(parsed.format);
         Ok(parsed)
     }
 
@@ -557,7 +559,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         local_pax_records: Vec<PaxRecord>,
         local_size: PaxSize,
     ) -> Result<Frame, FrameError> {
-        let kind = member_kind(position, parsed.typeflag)?;
+        let kind = MemberKind::try_from_framed(position, parsed.typeflag)?;
         let effective_size = match local_size {
             PaxSize::Value(size) => Some(size),
             PaxSize::Deleted => None,
@@ -631,7 +633,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             }));
         }
 
-        let kind = member_kind(position, parsed.typeflag)?;
+        let kind = MemberKind::try_from_framed(position, parsed.typeflag)?;
         if pending.long_link && !matches!(kind, MemberKind::HardLink | MemberKind::SymbolicLink) {
             return Err(FrameError::at(
                 position,
@@ -699,65 +701,73 @@ impl<R: AsyncRead + Unpin> Stream for TarStream<R> {
 }
 
 struct ParsedHeader {
+    format: ArchiveFormat,
     typeflag: u8,
     size: u64,
+}
+
+/// Converts raw tar input into a typed value while retaining source position
+/// for any framing error produced by the conversion.
+trait TryFromFramed<T>: Sized {
+    fn try_from_framed(position: u64, source: T) -> Result<Self, FrameError>;
 }
 
 fn is_zero_block(block: &[u8; BLOCK_SIZE]) -> bool {
     block.iter().all(|byte| *byte == 0)
 }
 
-fn detect_format(position: u64, block: &[u8; BLOCK_SIZE]) -> Result<ArchiveFormat, FrameError> {
-    match &block[IDENTITY_RANGE] {
-        identity if identity == POSIX_IDENTITY => Ok(ArchiveFormat::PosixPax),
-        identity if identity == GNU_IDENTITY => Ok(ArchiveFormat::Gnu),
-        identity => Err(FrameError::at(
-            position,
-            FrameErrorInner::InvalidIdentity {
-                found: identity.try_into().expect("fixed header range"),
-            },
-        )),
-    }
-}
-
-fn parse_header(
-    position: u64,
-    block: &[u8; BLOCK_SIZE],
-    format: ArchiveFormat,
-) -> Result<ParsedHeader, FrameError> {
-    let actual_checksum = block
-        .iter()
-        .enumerate()
-        .map(|(offset, byte)| {
-            if CHECKSUM_RANGE.contains(&offset) {
-                u64::from(b' ')
-            } else {
-                u64::from(*byte)
+impl TryFromFramed<&[u8; BLOCK_SIZE]> for ParsedHeader {
+    fn try_from_framed(position: u64, block: &[u8; BLOCK_SIZE]) -> Result<Self, FrameError> {
+        let format = match &block[IDENTITY_RANGE] {
+            identity if identity == POSIX_IDENTITY => ArchiveFormat::PosixPax,
+            identity if identity == GNU_IDENTITY => ArchiveFormat::Gnu,
+            identity => {
+                return Err(FrameError::at(
+                    position,
+                    FrameErrorInner::InvalidIdentity {
+                        found: identity.try_into().expect("fixed header range"),
+                    },
+                ));
             }
+        };
+
+        let actual_checksum = block
+            .iter()
+            .enumerate()
+            .map(|(offset, byte)| {
+                if CHECKSUM_RANGE.contains(&offset) {
+                    u64::from(b' ')
+                } else {
+                    u64::from(*byte)
+                }
+            })
+            .sum();
+        let expected_checksum = parse_octal(&block[CHECKSUM_RANGE]);
+        if expected_checksum != Some(actual_checksum) {
+            return Err(FrameError::at(
+                position,
+                FrameErrorInner::InvalidChecksum {
+                    expected: expected_checksum,
+                    actual: actual_checksum,
+                },
+            ));
+        }
+
+        let size_bytes: [u8; 12] = block[SIZE_RANGE].try_into().expect("fixed header range");
+        let size = match format {
+            ArchiveFormat::PosixPax => parse_octal(&size_bytes),
+            ArchiveFormat::Gnu => parse_gnu_size(&size_bytes),
+        }
+        .ok_or_else(|| {
+            FrameError::at(position, FrameErrorInner::InvalidSize { found: size_bytes })
+        })?;
+
+        Ok(Self {
+            format,
+            typeflag: block[TYPEFLAG_OFFSET],
+            size,
         })
-        .sum();
-    let expected_checksum = parse_octal(&block[CHECKSUM_RANGE]);
-    if expected_checksum != Some(actual_checksum) {
-        return Err(FrameError::at(
-            position,
-            FrameErrorInner::InvalidChecksum {
-                expected: expected_checksum,
-                actual: actual_checksum,
-            },
-        ));
     }
-
-    let size_bytes: [u8; 12] = block[SIZE_RANGE].try_into().expect("fixed header range");
-    let size = match format {
-        ArchiveFormat::PosixPax => parse_octal(&size_bytes),
-        ArchiveFormat::Gnu => parse_gnu_size(&size_bytes),
-    }
-    .ok_or_else(|| FrameError::at(position, FrameErrorInner::InvalidSize { found: size_bytes }))?;
-
-    Ok(ParsedHeader {
-        typeflag: block[TYPEFLAG_OFFSET],
-        size,
-    })
 }
 
 fn parse_octal(bytes: &[u8]) -> Option<u64> {
@@ -792,20 +802,22 @@ fn parse_gnu_size(bytes: &[u8]) -> Option<u64> {
     })
 }
 
-fn member_kind(position: u64, typeflag: u8) -> Result<MemberKind, FrameError> {
-    match typeflag {
-        0 | b'0' => Ok(MemberKind::Regular),
-        b'1' => Ok(MemberKind::HardLink),
-        b'2' => Ok(MemberKind::SymbolicLink),
-        b'3' => Ok(MemberKind::CharacterDevice),
-        b'4' => Ok(MemberKind::BlockDevice),
-        b'5' => Ok(MemberKind::Directory),
-        b'6' => Ok(MemberKind::Fifo),
-        b'7' => Ok(MemberKind::Contiguous),
-        _ => Err(FrameError::at(
-            position,
-            FrameErrorInner::UnsupportedTypeflag { typeflag },
-        )),
+impl TryFromFramed<u8> for MemberKind {
+    fn try_from_framed(position: u64, typeflag: u8) -> Result<Self, FrameError> {
+        match typeflag {
+            0 | b'0' => Ok(Self::Regular),
+            b'1' => Ok(Self::HardLink),
+            b'2' => Ok(Self::SymbolicLink),
+            b'3' => Ok(Self::CharacterDevice),
+            b'4' => Ok(Self::BlockDevice),
+            b'5' => Ok(Self::Directory),
+            b'6' => Ok(Self::Fifo),
+            b'7' => Ok(Self::Contiguous),
+            _ => Err(FrameError::at(
+                position,
+                FrameErrorInner::UnsupportedTypeflag { typeflag },
+            )),
+        }
     }
 }
 
@@ -1330,6 +1342,62 @@ mod tests {
     }
 
     #[test]
+    fn direct_conversion_errors_preserve_later_header_positions() {
+        let position = BLOCK_SIZE as u64;
+
+        let mut bad_identity = header(b'0', 0);
+        bad_identity[IDENTITY_RANGE.start] = b'!';
+        let mut bytes = Vec::new();
+        append_block(&mut bytes, &header(b'0', 0));
+        append_block(&mut bytes, &bad_identity);
+        assert!(matches!(
+            last_error(&collect(bytes, BLOCK_SIZE)),
+            FrameError {
+                position: found,
+                inner: FrameErrorInner::InvalidIdentity { .. },
+            } if *found == position
+        ));
+
+        let mut bad_checksum = header(b'0', 0);
+        bad_checksum[0] = b'X';
+        let mut bytes = Vec::new();
+        append_block(&mut bytes, &header(b'0', 0));
+        append_block(&mut bytes, &bad_checksum);
+        assert!(matches!(
+            last_error(&collect(bytes, BLOCK_SIZE)),
+            FrameError {
+                position: found,
+                inner: FrameErrorInner::InvalidChecksum { .. },
+            } if *found == position
+        ));
+
+        let mut bad_size = header(b'0', 0);
+        bad_size[SIZE_RANGE].copy_from_slice(b"00000000008\0");
+        set_checksum(&mut bad_size);
+        let mut bytes = Vec::new();
+        append_block(&mut bytes, &header(b'0', 0));
+        append_block(&mut bytes, &bad_size);
+        assert!(matches!(
+            last_error(&collect(bytes, BLOCK_SIZE)),
+            FrameError {
+                position: found,
+                inner: FrameErrorInner::InvalidSize { .. },
+            } if *found == position
+        ));
+
+        let mut bytes = Vec::new();
+        append_block(&mut bytes, &header(b'0', 0));
+        append_block(&mut bytes, &header(b'X', 0));
+        assert!(matches!(
+            last_error(&collect(bytes, BLOCK_SIZE)),
+            FrameError {
+                position: found,
+                inner: FrameErrorInner::UnsupportedTypeflag { typeflag: b'X' },
+            } if *found == position
+        ));
+    }
+
+    #[test]
     fn rejects_invalid_pax_sequences() {
         assert!(matches!(
             last_error_inner(&collect(header(b'x', 0).to_vec(), BLOCK_SIZE)),
@@ -1464,6 +1532,17 @@ mod tests {
                 expected: ArchiveFormat::PosixPax,
                 found: ArchiveFormat::Gnu,
             }
+        ));
+
+        // A family mismatch applies only to a successfully decoded header.
+        let mut malformed_gnu = gnu_header(b'0', 0);
+        malformed_gnu[0] = b'X';
+        let mut posix_then_malformed_gnu = Vec::new();
+        append_block(&mut posix_then_malformed_gnu, &header(b'0', 0));
+        append_block(&mut posix_then_malformed_gnu, &malformed_gnu);
+        assert!(matches!(
+            last_error_inner(&collect(posix_then_malformed_gnu, BLOCK_SIZE)),
+            FrameErrorInner::InvalidChecksum { .. }
         ));
 
         let mut gnu_then_posix = Vec::new();
