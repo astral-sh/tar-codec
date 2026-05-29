@@ -10,7 +10,7 @@ use tokio_stream::StreamExt;
 
 use crate::{
     ArchiveFormat, BLOCK_SIZE, FrameError, FrameErrorInner, GnuKind, MemberKind, PaxKind,
-    PaxRecord, PaxValue,
+    PaxRecord, PaxString, PaxValue,
     stream::{DataOwner, Frame, GnuFrame, PaxFrame, TarStream},
 };
 
@@ -499,7 +499,7 @@ impl PaxTextField {
         }
     }
 
-    fn value(self, record: &PaxRecord) -> Option<&PaxValue<String>> {
+    fn value(self, record: &PaxRecord) -> Option<&PaxValue<PaxString>> {
         match (self, record) {
             (Self::Path, PaxRecord::Path(value)) | (Self::LinkPath, PaxRecord::LinkPath(value)) => {
                 Some(value)
@@ -547,7 +547,7 @@ fn resolve_pax_text<'a>(
 fn pax_value<'a>(
     position: u64,
     keyword: &'static str,
-    value: &'a PaxValue<String>,
+    value: &'a PaxValue<PaxString>,
 ) -> Result<Cow<'a, [u8]>, FrameError> {
     match value {
         PaxValue::Value(value) => Ok(Cow::Borrowed(value.as_bytes())),

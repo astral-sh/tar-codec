@@ -15,7 +15,8 @@ It owns:
 
 - strict selection of one archive family per stream: POSIX pax/ustar or GNU;
 - header identity, checksum, size, ordering, payload, and terminator checks;
-- typed PAX record parsing and PAX size effects on framing;
+- typed PAX record parsing, including UTF-8/binary `hdrcharset` values, and
+  PAX size effects on framing;
 - byte-oriented member metadata access and PAX/GNU/header precedence;
 - mode decoding and GNU long-name/long-link structural validation;
 - the physical block API, `stream::TarStream`; and

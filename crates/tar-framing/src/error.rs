@@ -89,8 +89,8 @@ pub enum FrameErrorInner {
         /// A concise description of the grammar violation.
         reason: &'static str,
     },
-    /// A pax record could not be represented by this UTF-8-only API.
-    #[error("pax records contain non-UTF-8 text")]
+    /// A pax text component that must be UTF-8 is not valid UTF-8.
+    #[error("pax records contain invalid UTF-8 text")]
     InvalidPaxUtf8,
     /// A pax record keyword is neither standard nor an accepted namespaced extension.
     #[error("invalid or unknown pax keyword {keyword:?}")]
@@ -114,7 +114,7 @@ pub enum FrameErrorInner {
         /// The rejected textual value.
         value: String,
     },
-    /// A pax `hdrcharset` record requests text encoding unsupported by this UTF-8-only API.
+    /// A pax `hdrcharset` record requests text encoding unsupported by this API.
     #[error("unsupported pax hdrcharset value {value:?}")]
     UnsupportedPaxCharset {
         /// The unsupported character-set identifier.

@@ -15,8 +15,8 @@ use crate::{
     ArchiveFormat, BLOCK_SIZE, FrameError, FrameErrorInner, GnuKind, MemberKind, PaxKind,
     PaxRecord,
     pax::{
-        PaxSize, apply_global as apply_global_pax_records, parse_records as parse_pax_records,
-        size as pax_size,
+        PaxSize, apply_global as apply_global_pax_records, hdrcharset as pax_hdrcharset,
+        parse_records as parse_pax_records, size as pax_size,
     },
 };
 
@@ -323,7 +323,11 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 payload.extend_from_slice(&block[..len]);
                 remaining -= len as u64;
                 let completed_pax_records = if remaining == 0 {
-                    let records = parse_pax_records(header_position, &payload)?;
+                    let records = parse_pax_records(
+                        header_position,
+                        &payload,
+                        pax_hdrcharset(&self.global_pax_records),
+                    )?;
                     match kind {
                         PaxKind::Local => {
                             let size = pax_size(&records);
@@ -857,7 +861,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        ArchiveFormat, FrameError, FrameErrorInner, PaxValue,
+        ArchiveFormat, FrameError, FrameErrorInner, HdrCharset, PaxString, PaxValue,
         test_support::{
             ChunkedReader, append_block, append_payload, append_terminator, data,
             gnu_base256_header, gnu_header, header, record, set_checksum,
@@ -1370,28 +1374,42 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_pax_charsets() {
-        const UTF8_HDRCHARSET: &str = "ISO-IR 10646 2000 UTF-8";
+    fn accepts_binary_and_rejects_unknown_pax_charsets() {
+        let mut global = record("hdrcharset", "BINARY");
+        global.extend_from_slice(&record("path", "global"));
+        let local = record("path", "local");
+        let mut bytes = Vec::new();
+        append_block(&mut bytes, &header(b'g', global.len() as u64));
+        append_payload(&mut bytes, &global);
+        append_block(&mut bytes, &header(b'x', local.len() as u64));
+        append_payload(&mut bytes, &local);
+        append_block(&mut bytes, &header(b'0', 0));
+        append_terminator(&mut bytes);
+        let frames = collect(bytes, BLOCK_SIZE);
+        let Frame::Header(member_header) = frames[4].as_ref().unwrap() else {
+            panic!("expected member header");
+        };
+        assert_eq!(
+            member_header.global_pax_records,
+            [
+                PaxRecord::HdrCharset(PaxValue::Value(HdrCharset::Binary)),
+                PaxRecord::Path(PaxValue::Value(PaxString::Binary(b"global".to_vec()))),
+            ]
+        );
+        assert_eq!(
+            member_header.local_pax_records,
+            [PaxRecord::Path(PaxValue::Value(PaxString::Binary(
+                b"local".to_vec()
+            )))]
+        );
 
-        for typeflag in [b'x', b'g'] {
-            let records = record("hdrcharset", "BINARY");
-            let mut bytes = Vec::new();
-            append_block(&mut bytes, &header(typeflag, records.len() as u64));
-            append_payload(&mut bytes, &records);
-            assert!(matches!(
-                last_error_inner(&collect(bytes, BLOCK_SIZE)),
-                FrameErrorInner::UnsupportedPaxCharset { value } if value == "BINARY"
-            ));
-        }
-
-        let mut records = record("hdrcharset", "BINARY");
-        records.extend_from_slice(&record("hdrcharset", UTF8_HDRCHARSET));
+        let records = record("hdrcharset", "ISO-IR 8859 1 1998");
         let mut bytes = Vec::new();
         append_block(&mut bytes, &header(b'x', records.len() as u64));
         append_payload(&mut bytes, &records);
         assert!(matches!(
             last_error_inner(&collect(bytes, BLOCK_SIZE)),
-            FrameErrorInner::UnsupportedPaxCharset { value } if value == "BINARY"
+            FrameErrorInner::UnsupportedPaxCharset { value } if value == "ISO-IR 8859 1 1998"
         ));
     }
 

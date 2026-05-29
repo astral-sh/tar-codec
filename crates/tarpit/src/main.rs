@@ -7,7 +7,8 @@ use std::{
 use async_compression::tokio::bufread::GzipDecoder;
 use clap::{Parser, Subcommand};
 use tar_framing::{
-    ArchiveFormat, FrameError, GnuKind, HdrCharset, MemberKind, PaxKind, PaxRecord, PaxValue,
+    ArchiveFormat, FrameError, GnuKind, HdrCharset, MemberKind, PaxKind, PaxRecord, PaxString,
+    PaxValue,
     stream::{DataOwner, Frame, TarStream},
 };
 use thiserror::Error;
@@ -191,11 +192,11 @@ fn render_pax_records(
             PaxRecord::Charset(value) => render_pax_text(output, scope, "charset", value)?,
             PaxRecord::Comment(value) => render_pax_text(output, scope, "comment", value)?,
             PaxRecord::Gid(value) => render_pax_integer(output, scope, "gid", value)?,
-            PaxRecord::Gname(value) => render_pax_text(output, scope, "gname", value)?,
+            PaxRecord::Gname(value) => render_pax_string(output, scope, "gname", value)?,
             PaxRecord::HdrCharset(value) => render_pax_charset(output, scope, value)?,
-            PaxRecord::LinkPath(value) => render_pax_text(output, scope, "linkpath", value)?,
+            PaxRecord::LinkPath(value) => render_pax_string(output, scope, "linkpath", value)?,
             PaxRecord::Mtime(value) => render_pax_integer(output, scope, "mtime", value)?,
-            PaxRecord::Path(value) => render_pax_text(output, scope, "path", value)?,
+            PaxRecord::Path(value) => render_pax_string(output, scope, "path", value)?,
             PaxRecord::Realtime { name, value } => {
                 render_pax_text(output, scope, &format!("realtime.{name}"), value)?;
             }
@@ -204,7 +205,7 @@ fn render_pax_records(
             }
             PaxRecord::Size(value) => render_pax_integer(output, scope, "size", value)?,
             PaxRecord::Uid(value) => render_pax_integer(output, scope, "uid", value)?,
-            PaxRecord::Uname(value) => render_pax_text(output, scope, "uname", value)?,
+            PaxRecord::Uname(value) => render_pax_string(output, scope, "uname", value)?,
             PaxRecord::Vendor {
                 vendor,
                 name,
@@ -243,6 +244,20 @@ fn render_pax_integer(
     }
 }
 
+fn render_pax_string(
+    output: &mut impl Write,
+    scope: &str,
+    keyword: &str,
+    value: &PaxValue<PaxString>,
+) -> io::Result<()> {
+    write!(output, "        {scope} pax: {}=", keyword.escape_default())?;
+    match value {
+        PaxValue::Value(PaxString::Utf8(value)) => writeln!(output, "{value:?}"),
+        PaxValue::Value(PaxString::Binary(value)) => writeln!(output, "binary({value:?})"),
+        PaxValue::Deleted => writeln!(output, "<deleted>"),
+    }
+}
+
 fn render_pax_charset(
     output: &mut impl Write,
     scope: &str,
@@ -251,6 +266,7 @@ fn render_pax_charset(
     write!(output, "        {scope} pax: hdrcharset=")?;
     match value {
         PaxValue::Value(HdrCharset::Utf8) => writeln!(output, "{:?}", "ISO-IR 10646 2000 UTF-8"),
+        PaxValue::Value(HdrCharset::Binary) => writeln!(output, "{:?}", "BINARY"),
         PaxValue::Deleted => writeln!(output, "<deleted>"),
     }
 }

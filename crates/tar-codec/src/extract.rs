@@ -342,7 +342,7 @@ pub enum ExtractError {
     /// A blocking capability operation failed to complete.
     #[error("failed to complete blocking extraction operation: {0}")]
     BlockingTask(#[from] tokio::task::JoinError),
-    /// A tar header or GNU metadata value is not UTF-8 text.
+    /// An effective member path or link target is not UTF-8 text.
     #[error("at byte {position}: {field} is not valid UTF-8")]
     InvalidUtf8 {
         /// Source tar block position.
@@ -1149,6 +1149,23 @@ mod tests {
         }
     }
 
+    fn raw_record(keyword: &str, value: &[u8]) -> Vec<u8> {
+        let mut suffix = format!(" {keyword}=").into_bytes();
+        suffix.extend_from_slice(value);
+        suffix.push(b'\n');
+        let mut len = suffix.len() + 1;
+        loop {
+            let prefix = len.to_string();
+            let actual = prefix.len() + suffix.len();
+            if actual == len {
+                let mut record = prefix.into_bytes();
+                record.extend_from_slice(&suffix);
+                return record;
+            }
+            len = actual;
+        }
+    }
+
     fn append_block(bytes: &mut Vec<u8>, block: &[u8; BLOCK_SIZE]) {
         bytes.extend_from_slice(block);
     }
@@ -1800,6 +1817,18 @@ mod tests {
                 inner: FrameErrorInner::DeletedPaxMetadata { keyword: "path" },
                 ..
             })
+        ));
+
+        let binary_dest = temp.path().join("binary");
+        let mut binary_path = record("hdrcharset", "BINARY");
+        binary_path.extend_from_slice(&raw_record("path", &[0xff]));
+        let mut binary = Vec::new();
+        append_pax(&mut binary, b'x', &binary_path);
+        append_posix_member(&mut binary, "raw", b'0', b"", "", 0o644);
+        finish(&mut binary);
+        assert!(matches!(
+            extract(binary, &binary_dest).await.unwrap_err(),
+            ExtractError::InvalidUtf8 { field: "path", .. }
         ));
 
         let gnu_dest = temp.path().join("gnu");
