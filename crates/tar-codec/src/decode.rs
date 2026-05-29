@@ -1,7 +1,7 @@
-//! Secure high-level extraction for validated tar streams.
+//! Secure high-level decoding and extraction for validated tar streams.
 //!
 //! `tar-codec` interprets member metadata above [`tar_framing`] and extracts
-//! archive contents into a capability-scoped destination. Compression is the
+//! archive contents into a capability-scoped destination. Decompression is the
 //! caller's responsibility. Extraction requires an [`ExtractPolicy`] so that
 //! security-sensitive archive features are explicit at each call site.
 
