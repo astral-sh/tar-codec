@@ -3,7 +3,7 @@
 //! The physical API emits one frame for each accepted non-terminator physical
 //! tar block and preserves each source block verbatim.
 
-use crate::{ArchiveFormat, BLOCK_SIZE, GnuKind, MemberKind, PaxKind, PaxRecord, State};
+use crate::{ArchiveFormat, BLOCK_SIZE, GnuKind, MemberKind, PaxKind, PaxRecord, pax::PaxSize};
 
 /// Represents a single non-terminator physical block in a tar stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -95,6 +95,47 @@ pub struct DataFrame {
     /// This is `Some` only for the last data block belonging to a local or
     /// global pax header; other payload data carries `None`.
     pub completed_pax_records: Option<Vec<PaxRecord>>,
+}
+
+/// The parser phase required before the next physical frame can be emitted.
+#[derive(Debug)]
+pub(super) enum State {
+    /// No payload is pending; accept a header or the first zero end marker.
+    AwaitingHeader,
+    /// Consume the payload blocks declared by a local or global pax header.
+    ReadingPax {
+        kind: PaxKind,
+        header_position: u64,
+        remaining: u64,
+        payload: Vec<u8>,
+    },
+    /// A local pax header has completed; require its ordinary ustar header.
+    AwaitingUstarHeader {
+        records: Vec<PaxRecord>,
+        size: PaxSize,
+    },
+    /// Consume uninterpreted payload blocks for a GNU `L` or `K` extension.
+    ReadingGnu {
+        kind: GnuKind,
+        remaining: u64,
+        pending: PendingGnu,
+    },
+    /// GNU metadata is pending; accept another distinct extension or its member.
+    AwaitingGnuMember { pending: PendingGnu },
+    /// Consume the payload blocks declared for an ordinary member.
+    ReadingMember { remaining: u64 },
+    /// The first zero end marker was read; require the second zero block.
+    AwaitingSecondZero,
+    /// A valid two-block end marker was consumed; no further input is examined.
+    Complete,
+    /// An error has been emitted; subsequent polls return end-of-stream.
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct PendingGnu {
+    pub(super) long_name: bool,
+    pub(super) long_link: bool,
 }
 
 /// A strict stream of POSIX-pax or GNU frames sourced from an underlying reader.
