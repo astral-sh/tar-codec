@@ -8,8 +8,10 @@ use std::{
 use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::{
-    BLOCK_SIZE, CHECKSUM_RANGE, GNU_IDENTITY, IDENTITY_RANGE, POSIX_IDENTITY, SIZE_RANGE,
-    TYPEFLAG_OFFSET,
+    BLOCK_SIZE,
+    stream::{
+        CHECKSUM_RANGE, GNU_IDENTITY, IDENTITY_RANGE, POSIX_IDENTITY, SIZE_RANGE, TYPEFLAG_OFFSET,
+    },
 };
 
 pub(crate) struct ChunkedReader {

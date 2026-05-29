@@ -394,8 +394,8 @@ fn frame_description(frame: &Frame) -> &'static str {
 mod tests {
     use super::*;
     use crate::{
-        BLOCK_SIZE, FrameError, FrameErrorInner, PaxRecord, PaxValue, TYPEFLAG_OFFSET,
-        stream::DataOwner,
+        BLOCK_SIZE, FrameError, FrameErrorInner, PaxRecord, PaxValue,
+        stream::{DataOwner, TYPEFLAG_OFFSET},
         test_support::{
             ChunkedReader, append_block, append_payload, append_terminator, data, gnu_header,
             header, ready, record,

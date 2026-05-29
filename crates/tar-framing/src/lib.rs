@@ -21,13 +21,6 @@ pub use pax::{HdrCharset, PaxRecord, PaxValue};
 /// The size of a logical tar record.
 pub const BLOCK_SIZE: usize = 512;
 
-const SIZE_RANGE: std::ops::Range<usize> = 124..136;
-const CHECKSUM_RANGE: std::ops::Range<usize> = 148..156;
-const TYPEFLAG_OFFSET: usize = 156;
-const IDENTITY_RANGE: std::ops::Range<usize> = 257..265;
-const POSIX_IDENTITY: &[u8; 8] = b"ustar\x0000";
-const GNU_IDENTITY: &[u8; 8] = b"ustar  \0";
-
 /// An automatically detected, mutually exclusive tar archive family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArchiveFormat {

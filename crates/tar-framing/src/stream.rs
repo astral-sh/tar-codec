@@ -12,13 +12,20 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio_stream::Stream;
 
 use crate::{
-    ArchiveFormat, BLOCK_SIZE, CHECKSUM_RANGE, FrameError, FrameErrorInner, GNU_IDENTITY, GnuKind,
-    IDENTITY_RANGE, MemberKind, POSIX_IDENTITY, PaxKind, PaxRecord, SIZE_RANGE, TYPEFLAG_OFFSET,
+    ArchiveFormat, BLOCK_SIZE, FrameError, FrameErrorInner, GnuKind, MemberKind, PaxKind,
+    PaxRecord,
     pax::{
         PaxSize, apply_global as apply_global_pax_records, parse_records as parse_pax_records,
         size as pax_size,
     },
 };
+
+pub(crate) const SIZE_RANGE: std::ops::Range<usize> = 124..136;
+pub(crate) const CHECKSUM_RANGE: std::ops::Range<usize> = 148..156;
+pub(crate) const TYPEFLAG_OFFSET: usize = 156;
+pub(crate) const IDENTITY_RANGE: std::ops::Range<usize> = 257..265;
+pub(crate) const POSIX_IDENTITY: &[u8; 8] = b"ustar\x0000";
+pub(crate) const GNU_IDENTITY: &[u8; 8] = b"ustar  \0";
 
 type PositionedBlock = (u64, [u8; BLOCK_SIZE]);
 
@@ -850,7 +857,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        ArchiveFormat, FrameError, FrameErrorInner, IDENTITY_RANGE, PaxValue, SIZE_RANGE,
+        ArchiveFormat, FrameError, FrameErrorInner, PaxValue,
         test_support::{
             ChunkedReader, append_block, append_payload, append_terminator, data,
             gnu_base256_header, gnu_header, header, record, set_checksum,
