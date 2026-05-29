@@ -389,3 +389,266 @@ fn frame_description(frame: &Frame) -> &'static str {
         Frame::Data(_) => "payload data",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        BLOCK_SIZE, FrameError, FrameErrorInner, PaxRecord, PaxValue, TYPEFLAG_OFFSET,
+        physical::DataOwner,
+        test_support::{
+            ChunkedReader, append_block, append_payload, append_terminator, data, gnu_header,
+            header, ready, record,
+        },
+    };
+
+    #[test]
+    fn groups_pax_metadata_and_streams_member_payload() {
+        let global = record("comment", "global");
+        let mut local = record("path", "renamed");
+        local.extend_from_slice(&record("size", "513"));
+        let mut bytes = Vec::new();
+        append_block(&mut bytes, &header(b'g', global.len() as u64));
+        append_payload(&mut bytes, &global);
+        append_block(&mut bytes, &header(b'x', local.len() as u64));
+        append_payload(&mut bytes, &local);
+        append_block(&mut bytes, &header(b'0', 1));
+        append_block(&mut bytes, &data(&[b'a'; BLOCK_SIZE]));
+        append_block(&mut bytes, &data(b"b"));
+        append_terminator(&mut bytes);
+
+        let result: Result<(), FrameError> = ready(async {
+            let mut reader = TarReader::new(ChunkedReader::new(bytes, 17));
+            let Some(LogicalFrame::GlobalPax(global_header)) = reader.next_frame().await? else {
+                panic!("expected global pax header");
+            };
+            assert_eq!(global_header.position, 0);
+            assert_eq!(
+                global_header.records,
+                [PaxRecord::Comment(PaxValue::Value("global".to_owned()))]
+            );
+
+            {
+                let Some(LogicalFrame::Member(mut member)) = reader.next_frame().await? else {
+                    panic!("expected logical member");
+                };
+                assert_eq!(member.header.effective_size, Some(513));
+                let MemberExtensions::PosixPax {
+                    global_records,
+                    local: Some(local_header),
+                } = &member.extensions
+                else {
+                    panic!("expected local pax member metadata");
+                };
+                assert_eq!(global_records, &global_header.records);
+                assert_eq!(
+                    local_header.records.last(),
+                    Some(&PaxRecord::Size(PaxValue::Value(513)))
+                );
+                let Some(first) = member.payload.next_block().await? else {
+                    panic!("expected first member payload block");
+                };
+                let Some(last) = member.payload.next_block().await? else {
+                    panic!("expected last member payload block");
+                };
+                assert_eq!(first.len, BLOCK_SIZE);
+                assert_eq!(last.len, 1);
+                assert!(member.payload.next_block().await?.is_none());
+            }
+            assert!(reader.next_frame().await?.is_none());
+            Ok(())
+        });
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn groups_gnu_metadata_with_its_member() {
+        let mut bytes = Vec::new();
+        append_block(&mut bytes, &gnu_header(b'L', 5));
+        append_block(&mut bytes, &data(b"name\0"));
+        append_block(&mut bytes, &gnu_header(b'K', 5));
+        append_block(&mut bytes, &data(b"link\0"));
+        append_block(&mut bytes, &gnu_header(b'2', 0));
+        append_terminator(&mut bytes);
+
+        let result: Result<(), FrameError> = ready(async {
+            let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+            let Some(LogicalFrame::Member(mut member)) = reader.next_frame().await? else {
+                panic!("expected GNU member");
+            };
+            let MemberExtensions::Gnu {
+                long_name: Some(long_name),
+                long_link: Some(long_link),
+            } = &member.extensions
+            else {
+                panic!("expected GNU extensions");
+            };
+            assert_eq!(long_name.payload, b"name\0");
+            assert_eq!(long_link.payload, b"link\0");
+            assert!(member.payload.next_block().await?.is_none());
+            Ok(())
+        });
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn preserves_multiblock_gnu_metadata_payloads() {
+        let mut long_name = vec![b'n'; BLOCK_SIZE * 2 + 37];
+        long_name.push(0);
+        let mut long_link = vec![b'l'; BLOCK_SIZE + 19];
+        long_link.push(0);
+
+        let mut bytes = Vec::new();
+        append_block(&mut bytes, &gnu_header(b'L', long_name.len() as u64));
+        append_payload(&mut bytes, &long_name);
+        append_block(&mut bytes, &gnu_header(b'K', long_link.len() as u64));
+        append_payload(&mut bytes, &long_link);
+        append_block(&mut bytes, &gnu_header(b'2', 0));
+        append_terminator(&mut bytes);
+
+        let result: Result<(), FrameError> = ready(async {
+            let mut reader = TarReader::new(ChunkedReader::new(bytes, 19));
+            let Some(LogicalFrame::Member(member)) = reader.next_frame().await? else {
+                panic!("expected GNU member");
+            };
+            let MemberExtensions::Gnu {
+                long_name: Some(name_metadata),
+                long_link: Some(link_metadata),
+            } = &member.extensions
+            else {
+                panic!("expected GNU extensions");
+            };
+            assert_eq!(name_metadata.position, 0);
+            assert_eq!(name_metadata.payload, long_name);
+            assert_eq!(link_metadata.position, (BLOCK_SIZE * 4) as u64);
+            assert_eq!(link_metadata.payload, long_link);
+            member.payload.skip().await?;
+            assert!(reader.next_frame().await?.is_none());
+            Ok(())
+        });
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn handles_empty_archives_and_rejects_dangling_metadata() {
+        let mut empty = Vec::new();
+        append_terminator(&mut empty);
+        let empty_result: Result<(), FrameError> = ready(async {
+            let mut reader = TarReader::new(ChunkedReader::new(empty, BLOCK_SIZE));
+            assert!(reader.next_frame().await?.is_none());
+            assert_eq!(reader.format(), None);
+            Ok(())
+        });
+        assert!(empty_result.is_ok());
+
+        for header in [
+            header(b'x', record("path", "name").len() as u64),
+            gnu_header(b'L', 0),
+        ] {
+            let mut bytes = Vec::new();
+            append_block(&mut bytes, &header);
+            if header[TYPEFLAG_OFFSET] == b'x' {
+                append_payload(&mut bytes, &record("path", "name"));
+            }
+            let error: Result<(), FrameError> = ready(async {
+                let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+                reader.next_frame().await.map(|_| ())
+            });
+            assert!(matches!(
+                error,
+                Err(FrameError {
+                    inner: FrameErrorInner::UnexpectedEof { .. },
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn skips_unread_payload_before_advancing() {
+        let mut bytes = Vec::new();
+        append_block(&mut bytes, &header(b'0', 513));
+        append_block(&mut bytes, &data(&[b'a'; BLOCK_SIZE]));
+        append_block(&mut bytes, &data(b"b"));
+        append_block(&mut bytes, &header(b'0', 0));
+        append_terminator(&mut bytes);
+
+        let result: Result<(), FrameError> = ready(async {
+            let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+            {
+                let Some(LogicalFrame::Member(member)) = reader.next_frame().await? else {
+                    panic!("expected first member");
+                };
+                member.payload.skip().await?;
+            }
+            let Some(LogicalFrame::Member(member)) = reader.next_frame().await? else {
+                panic!("expected second member");
+            };
+            assert_eq!(member.header.payload_size, 0);
+            drop(member);
+            assert!(reader.next_frame().await?.is_none());
+            Ok(())
+        });
+        assert!(result.is_ok());
+
+        let mut auto_bytes = Vec::new();
+        append_block(&mut auto_bytes, &header(b'0', 1));
+        append_block(&mut auto_bytes, &data(b"a"));
+        append_block(&mut auto_bytes, &header(b'0', 0));
+        append_terminator(&mut auto_bytes);
+        let auto_result: Result<(), FrameError> = ready(async {
+            let mut reader = TarReader::new(ChunkedReader::new(auto_bytes, BLOCK_SIZE));
+            let Some(LogicalFrame::Member(first)) = reader.next_frame().await? else {
+                panic!("expected first member");
+            };
+            drop(first);
+            assert!(matches!(
+                reader.next_frame().await?,
+                Some(LogicalFrame::Member(_))
+            ));
+            Ok(())
+        });
+        assert!(auto_result.is_ok());
+    }
+
+    #[test]
+    fn reports_truncated_payload_when_read_or_skipped() {
+        let bytes = header(b'0', 1).to_vec();
+        let read_error = ready(async {
+            let mut reader = TarReader::new(ChunkedReader::new(bytes.clone(), BLOCK_SIZE));
+            let Ok(Some(LogicalFrame::Member(mut member))) = reader.next_frame().await else {
+                panic!("expected member");
+            };
+            member.payload.next_block().await
+        });
+        assert!(matches!(
+            read_error,
+            Err(FrameError {
+                inner: FrameErrorInner::TruncatedPayload {
+                    owner: DataOwner::Member,
+                    ..
+                },
+                ..
+            })
+        ));
+
+        let skip_error: Result<(), FrameError> = ready(async {
+            let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+            let Ok(Some(LogicalFrame::Member(member))) = reader.next_frame().await else {
+                panic!("expected member");
+            };
+            drop(member);
+            reader.next_frame().await.map(|_| ())
+        });
+        assert!(matches!(
+            skip_error,
+            Err(FrameError {
+                inner: FrameErrorInner::TruncatedPayload {
+                    owner: DataOwner::Member,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+}
