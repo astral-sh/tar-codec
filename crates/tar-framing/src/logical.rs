@@ -3,14 +3,21 @@
 //! This API assembles local pax and GNU extension payloads with the ordinary
 //! member they describe, while global pax updates remain independent items.
 
+use std::borrow::Cow;
+
 use tokio::io::AsyncRead;
 use tokio_stream::StreamExt;
 
 use crate::{
     ArchiveFormat, BLOCK_SIZE, FrameError, FrameErrorInner, GnuKind, MemberKind, PaxKind,
-    PaxRecord,
+    PaxRecord, PaxValue,
     stream::{DataOwner, Frame, GnuFrame, PaxFrame, TarStream},
 };
+
+const NAME_RANGE: std::ops::Range<usize> = 0..100;
+const MODE_RANGE: std::ops::Range<usize> = 100..108;
+const LINK_NAME_RANGE: std::ops::Range<usize> = 157..257;
+const PREFIX_RANGE: std::ops::Range<usize> = 345..500;
 
 /// Parsed pax metadata needed to interpret a logical archive item.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,6 +44,8 @@ pub struct MemberHeader {
     pub position: u64,
     /// The lossless member header block bytes.
     pub block: [u8; BLOCK_SIZE],
+    /// The selected archive family of this member header.
+    pub format: ArchiveFormat,
     /// The member type identified by the header.
     pub kind: MemberKind,
     /// The size encoded directly in the member header field.
@@ -45,6 +54,57 @@ pub struct MemberHeader {
     pub effective_size: Option<u64>,
     /// The meaningful payload size belonging to this member.
     pub payload_size: u64,
+}
+
+impl MemberHeader {
+    /// Returns the ordinary header's member-name bytes, trimmed at the first NUL.
+    pub fn name(&self) -> &[u8] {
+        trim_nul(&self.block[NAME_RANGE])
+    }
+
+    /// Returns the ordinary header's prefix bytes, trimmed at the first NUL.
+    pub fn prefix(&self) -> &[u8] {
+        trim_nul(&self.block[PREFIX_RANGE])
+    }
+
+    /// Returns the ordinary member path before extension metadata is applied.
+    pub fn header_path(&self) -> Cow<'_, [u8]> {
+        let name = self.name();
+        if self.format == ArchiveFormat::Gnu {
+            return Cow::Borrowed(name);
+        }
+        let prefix = self.prefix();
+        if prefix.is_empty() {
+            Cow::Borrowed(name)
+        } else if name.is_empty() {
+            Cow::Borrowed(prefix)
+        } else {
+            let mut path = Vec::with_capacity(prefix.len() + 1 + name.len());
+            path.extend_from_slice(prefix);
+            path.push(b'/');
+            path.extend_from_slice(name);
+            Cow::Owned(path)
+        }
+    }
+
+    /// Returns the ordinary header's link-name bytes, trimmed at the first NUL.
+    pub fn link_name(&self) -> &[u8] {
+        trim_nul(&self.block[LINK_NAME_RANGE])
+    }
+
+    /// Decodes the ordinary header's numeric mode according to its archive family.
+    pub fn mode(&self) -> Result<u64, FrameError> {
+        let bytes: [u8; 8] = self.block[MODE_RANGE]
+            .try_into()
+            .expect("fixed header range");
+        let mode = match self.format {
+            ArchiveFormat::PosixPax => parse_octal(&bytes),
+            ArchiveFormat::Gnu => parse_gnu_number(&bytes),
+        };
+        mode.ok_or_else(|| {
+            FrameError::at(self.position, FrameErrorInner::InvalidMode { found: bytes })
+        })
+    }
 }
 
 /// Extension metadata attached to one ordinary archive member.
@@ -101,6 +161,58 @@ pub struct MemberFrame<'a, R> {
     pub extensions: MemberExtensions,
     /// A cursor over the member payload bytes.
     pub payload: MemberPayload<'a, R>,
+}
+
+impl<R> MemberFrame<'_, R> {
+    /// Returns the effective member path after applying pax or GNU metadata.
+    ///
+    /// An explicit pax deletion is an error because it also removes the
+    /// ordinary-header fallback required to identify this member.
+    pub fn effective_path(&self) -> Result<Cow<'_, [u8]>, FrameError> {
+        match &self.extensions {
+            MemberExtensions::PosixPax {
+                global_records,
+                local,
+            } => resolve_pax_text(
+                &self.header,
+                global_records,
+                local.as_ref(),
+                PaxTextField::Path,
+            ),
+            MemberExtensions::Gnu { long_name, .. } => match long_name {
+                Some(metadata) => Ok(Cow::Borrowed(parse_gnu_metadata(
+                    metadata,
+                    GnuKind::LongName,
+                )?)),
+                None => Ok(self.header.header_path()),
+            },
+        }
+    }
+
+    /// Returns the effective member link target after applying pax or GNU metadata.
+    ///
+    /// An explicit pax deletion is an error because it also removes the
+    /// ordinary-header fallback required to identify a link target.
+    pub fn effective_link_path(&self) -> Result<Cow<'_, [u8]>, FrameError> {
+        match &self.extensions {
+            MemberExtensions::PosixPax {
+                global_records,
+                local,
+            } => resolve_pax_text(
+                &self.header,
+                global_records,
+                local.as_ref(),
+                PaxTextField::LinkPath,
+            ),
+            MemberExtensions::Gnu { long_link, .. } => match long_link {
+                Some(metadata) => Ok(Cow::Borrowed(parse_gnu_metadata(
+                    metadata,
+                    GnuKind::LongLink,
+                )?)),
+                None => Ok(Cow::Borrowed(self.header.link_name())),
+            },
+        }
+    }
 }
 
 /// A streaming, typed cursor over one member's payload blocks.
@@ -188,6 +300,7 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
                     let header = MemberHeader {
                         position: header.position,
                         block: header.block,
+                        format,
                         kind: header.kind,
                         declared_size: header.declared_size,
                         effective_size: header.effective_size,
@@ -372,6 +485,140 @@ impl<R: AsyncRead + Unpin> MemberPayload<'_, R> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PaxTextField {
+    Path,
+    LinkPath,
+}
+
+impl PaxTextField {
+    fn keyword(self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::LinkPath => "linkpath",
+        }
+    }
+
+    fn value(self, record: &PaxRecord) -> Option<&PaxValue<String>> {
+        match (self, record) {
+            (Self::Path, PaxRecord::Path(value)) | (Self::LinkPath, PaxRecord::LinkPath(value)) => {
+                Some(value)
+            }
+            _ => None,
+        }
+    }
+
+    fn header_value<'a>(self, header: &'a MemberHeader) -> Cow<'a, [u8]> {
+        match self {
+            Self::Path => header.header_path(),
+            Self::LinkPath => Cow::Borrowed(header.link_name()),
+        }
+    }
+}
+
+fn resolve_pax_text<'a>(
+    header: &'a MemberHeader,
+    global_records: &'a [PaxRecord],
+    local: Option<&'a PaxMetadata>,
+    field: PaxTextField,
+) -> Result<Cow<'a, [u8]>, FrameError> {
+    let local_value = local.and_then(|local| {
+        local
+            .records
+            .iter()
+            .rev()
+            .find_map(|record| field.value(record))
+    });
+    if let Some(value) = local_value {
+        return pax_value(header.position, field.keyword(), value);
+    }
+    let global_value = global_records
+        .iter()
+        .rev()
+        .find_map(|record| field.value(record));
+    if let Some(value) = global_value {
+        return pax_value(header.position, field.keyword(), value);
+    }
+    Ok(field.header_value(header))
+}
+
+fn pax_value<'a>(
+    position: u64,
+    keyword: &'static str,
+    value: &'a PaxValue<String>,
+) -> Result<Cow<'a, [u8]>, FrameError> {
+    match value {
+        PaxValue::Value(value) => Ok(Cow::Borrowed(value.as_bytes())),
+        PaxValue::Deleted => Err(FrameError::at(
+            position,
+            FrameErrorInner::DeletedPaxMetadata { keyword },
+        )),
+    }
+}
+
+fn parse_gnu_metadata(metadata: &GnuMetadata, kind: GnuKind) -> Result<&[u8], FrameError> {
+    let terminator = metadata
+        .payload
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| {
+            FrameError::at(
+                metadata.position,
+                FrameErrorInner::InvalidGnuMetadata {
+                    kind,
+                    reason: "value is not NUL-terminated",
+                },
+            )
+        })?;
+    if metadata.payload[terminator..].iter().any(|byte| *byte != 0) {
+        return Err(FrameError::at(
+            metadata.position,
+            FrameErrorInner::InvalidGnuMetadata {
+                kind,
+                reason: "non-NUL bytes follow the terminator",
+            },
+        ));
+    }
+    Ok(&metadata.payload[..terminator])
+}
+
+fn trim_nul(bytes: &[u8]) -> &[u8] {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    &bytes[..end]
+}
+
+fn parse_octal(bytes: &[u8]) -> Option<u64> {
+    if bytes.first().is_some_and(|byte| byte & 0x80 != 0) {
+        return None;
+    }
+    let terminator = bytes.iter().position(|byte| matches!(byte, 0 | b' '))?;
+    if terminator == 0
+        || bytes[..terminator]
+            .iter()
+            .any(|byte| !matches!(byte, b'0'..=b'7'))
+        || bytes[terminator..]
+            .iter()
+            .any(|byte| !matches!(byte, 0 | b' '))
+    {
+        return None;
+    }
+    bytes[..terminator].iter().try_fold(0_u64, |value, byte| {
+        value.checked_mul(8)?.checked_add(u64::from(*byte - b'0'))
+    })
+}
+
+fn parse_gnu_number(bytes: &[u8]) -> Option<u64> {
+    if bytes.first() != Some(&0x80) {
+        return parse_octal(bytes);
+    }
+    bytes[1..].iter().try_fold(0_u64, |value, byte| {
+        value.checked_mul(256)?.checked_add(u64::from(*byte))
+    })
+}
+
 fn frame_position(frame: &Frame) -> u64 {
     match frame {
         Frame::Pax(frame) => frame.position,
@@ -398,9 +645,187 @@ mod tests {
         stream::{DataOwner, TYPEFLAG_OFFSET},
         test_support::{
             ChunkedReader, append_block, append_payload, append_terminator, data, gnu_header,
-            header, ready, record,
+            header, ready, record, set_checksum,
         },
     };
+
+    fn set_field(block: &mut [u8; BLOCK_SIZE], range: std::ops::Range<usize>, value: &[u8]) {
+        block[range.clone()].fill(0);
+        block[range.start..range.start + value.len()].copy_from_slice(value);
+    }
+
+    #[test]
+    fn exposes_ordinary_header_metadata_and_decodes_modes() {
+        let mut posix_header = header(b'2', 0);
+        set_field(&mut posix_header, NAME_RANGE, b"file");
+        set_field(&mut posix_header, PREFIX_RANGE, b"dir");
+        set_field(&mut posix_header, LINK_NAME_RANGE, b"target");
+        posix_header[MODE_RANGE].copy_from_slice(b"0000755\0");
+        set_checksum(&mut posix_header);
+
+        let posix_result: Result<(), FrameError> = ready(async {
+            let mut bytes = Vec::new();
+            append_block(&mut bytes, &posix_header);
+            append_terminator(&mut bytes);
+            let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+            let Some(LogicalFrame::Member(member)) = reader.next_frame().await? else {
+                panic!("expected POSIX member");
+            };
+            assert_eq!(member.header.format, ArchiveFormat::PosixPax);
+            assert_eq!(member.header.name(), b"file");
+            assert_eq!(member.header.prefix(), b"dir");
+            assert_eq!(member.header.header_path().as_ref(), b"dir/file");
+            assert_eq!(member.header.link_name(), b"target");
+            assert_eq!(member.header.mode()?, 0o755);
+            assert_eq!(member.effective_path()?.as_ref(), b"dir/file");
+            assert_eq!(member.effective_link_path()?.as_ref(), b"target");
+            Ok(())
+        });
+        assert!(posix_result.is_ok());
+
+        let mut gnu_header = gnu_header(b'0', 0);
+        set_field(&mut gnu_header, NAME_RANGE, b"name");
+        set_field(&mut gnu_header, PREFIX_RANGE, b"ignored");
+        gnu_header[MODE_RANGE].fill(0);
+        gnu_header[MODE_RANGE.start] = 0x80;
+        gnu_header[MODE_RANGE.end - 2..MODE_RANGE.end].copy_from_slice(&[0x01, 0xed]);
+        set_checksum(&mut gnu_header);
+
+        let gnu_result: Result<(), FrameError> = ready(async {
+            let mut bytes = Vec::new();
+            append_block(&mut bytes, &gnu_header);
+            append_terminator(&mut bytes);
+            let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+            let Some(LogicalFrame::Member(member)) = reader.next_frame().await? else {
+                panic!("expected GNU member");
+            };
+            assert_eq!(member.header.format, ArchiveFormat::Gnu);
+            assert_eq!(member.header.header_path().as_ref(), b"name");
+            assert_eq!(member.header.mode()?, 0o755);
+            Ok(())
+        });
+        assert!(gnu_result.is_ok());
+    }
+
+    #[test]
+    fn resolves_pax_path_precedence_and_deletions() {
+        let mut global = record("path", "global");
+        global.extend_from_slice(&record("linkpath", "global-link"));
+        let mut local = record("path", "local");
+        local.extend_from_slice(&record("linkpath", ""));
+        let mut bytes = Vec::new();
+        append_block(&mut bytes, &header(b'g', global.len() as u64));
+        append_payload(&mut bytes, &global);
+        append_block(&mut bytes, &header(b'x', local.len() as u64));
+        append_payload(&mut bytes, &local);
+        append_block(&mut bytes, &header(b'2', 0));
+        append_block(&mut bytes, &header(b'2', 0));
+        append_terminator(&mut bytes);
+
+        let result: Result<(), FrameError> = ready(async {
+            let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+            assert!(matches!(
+                reader.next_frame().await?,
+                Some(LogicalFrame::GlobalPax(_))
+            ));
+            {
+                let Some(LogicalFrame::Member(member)) = reader.next_frame().await? else {
+                    panic!("expected local pax member");
+                };
+                assert_eq!(member.effective_path()?.as_ref(), b"local");
+                assert!(matches!(
+                    member.effective_link_path(),
+                    Err(FrameError {
+                        position: 2048,
+                        inner: FrameErrorInner::DeletedPaxMetadata {
+                            keyword: "linkpath"
+                        },
+                    })
+                ));
+            }
+            let Some(LogicalFrame::Member(member)) = reader.next_frame().await? else {
+                panic!("expected global pax member");
+            };
+            assert_eq!(member.effective_path()?.as_ref(), b"global");
+            assert_eq!(member.effective_link_path()?.as_ref(), b"global-link");
+            Ok(())
+        });
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn resolves_and_validates_gnu_metadata_lazily() {
+        let mut bytes = Vec::new();
+        append_block(&mut bytes, &gnu_header(b'L', 5));
+        append_block(&mut bytes, &data(b"name\0"));
+        append_block(&mut bytes, &gnu_header(b'K', 5));
+        append_block(&mut bytes, &data(b"link\0"));
+        append_block(&mut bytes, &gnu_header(b'2', 0));
+        append_terminator(&mut bytes);
+
+        let resolved_result: Result<(), FrameError> = ready(async {
+            let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+            let Some(LogicalFrame::Member(member)) = reader.next_frame().await? else {
+                panic!("expected GNU member");
+            };
+            assert_eq!(member.effective_path()?.as_ref(), b"name");
+            assert_eq!(member.effective_link_path()?.as_ref(), b"link");
+            Ok(())
+        });
+        assert!(resolved_result.is_ok());
+
+        for (typeflag, payload, kind) in [
+            (b'L', b"no-nul".as_slice(), GnuKind::LongName),
+            (b'K', b"link\0bad".as_slice(), GnuKind::LongLink),
+        ] {
+            let mut bytes = Vec::new();
+            append_block(&mut bytes, &gnu_header(typeflag, payload.len() as u64));
+            append_payload(&mut bytes, payload);
+            append_block(&mut bytes, &gnu_header(b'2', 0));
+            append_terminator(&mut bytes);
+            let result: Result<(), FrameError> = ready(async {
+                let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+                let Some(LogicalFrame::Member(member)) = reader.next_frame().await? else {
+                    panic!("expected GNU member before metadata interpretation");
+                };
+                match kind {
+                    GnuKind::LongName => member.effective_path().map(|_| ()),
+                    GnuKind::LongLink => member.effective_link_path().map(|_| ()),
+                }
+            });
+            assert!(matches!(
+                result,
+                Err(FrameError {
+                    position: 0,
+                    inner: FrameErrorInner::InvalidGnuMetadata { kind: found, .. },
+                }) if found == kind
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_member_modes_when_decoded() {
+        let mut header = header(b'0', 0);
+        header[MODE_RANGE].copy_from_slice(b"0000080\0");
+        set_checksum(&mut header);
+        let result: Result<(), FrameError> = ready(async {
+            let mut bytes = Vec::new();
+            append_block(&mut bytes, &header);
+            append_terminator(&mut bytes);
+            let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+            let Some(LogicalFrame::Member(member)) = reader.next_frame().await? else {
+                panic!("expected member before mode interpretation");
+            };
+            member.header.mode().map(|_| ())
+        });
+        assert!(matches!(
+            result,
+            Err(FrameError {
+                position: 0,
+                inner: FrameErrorInner::InvalidMode { .. },
+            })
+        ));
+    }
 
     #[test]
     fn groups_pax_metadata_and_streams_member_payload() {

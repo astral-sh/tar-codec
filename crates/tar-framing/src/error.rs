@@ -1,6 +1,6 @@
 use std::io;
 
-use crate::{ArchiveFormat, BLOCK_SIZE, MemberKind, stream::DataOwner};
+use crate::{ArchiveFormat, BLOCK_SIZE, GnuKind, MemberKind, stream::DataOwner};
 
 /// An error encountered at an absolute position in a tar stream.
 #[derive(Debug, thiserror::Error)]
@@ -54,6 +54,12 @@ pub enum FrameErrorInner {
     InvalidSize {
         /// The bytes found in the size field.
         found: [u8; 12],
+    },
+    /// An ordinary member header's mode field cannot be decoded.
+    #[error("invalid tar mode field: found {found:?}")]
+    InvalidMode {
+        /// The bytes found in the mode field.
+        found: [u8; 8],
     },
     /// A tar type is not supported within the selected archive family.
     #[error("unsupported tar typeflag {typeflag:?}")]
@@ -113,6 +119,20 @@ pub enum FrameErrorInner {
     UnsupportedPaxCharset {
         /// The unsupported character-set identifier.
         value: String,
+    },
+    /// A GNU long-name or long-link metadata payload is not a valid value.
+    #[error("malformed GNU {kind:?} metadata payload: {reason}")]
+    InvalidGnuMetadata {
+        /// The GNU metadata extension being decoded.
+        kind: GnuKind,
+        /// The reason the metadata value was rejected.
+        reason: &'static str,
+    },
+    /// A pax record removed metadata required to interpret a member.
+    #[error("pax metadata {keyword:?} deletes a required member field")]
+    DeletedPaxMetadata {
+        /// The standard pax keyword that deleted its header fallback.
+        keyword: &'static str,
     },
     /// Pax records removed the size needed to frame a data-bearing member.
     #[error("member type {kind:?} has no effective size after applying pax records")]

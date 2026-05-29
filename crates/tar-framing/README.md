@@ -7,7 +7,7 @@ This is a dependency of `tar-codec`. Most users should not use this crate's APIs
 This crate provides two views over an asynchronous I/O source:
 
 - `stream::TarStream` emits physical 512-byte header and data frames for lossless inspection and debugging.
-- `logical::TarReader` emits logical global-pax updates and members, retaining only the pax records or GNU payload values needed to interpret each member while streaming member payload blocks through a borrowing cursor.
+- `logical::TarReader` emits logical global-pax updates and members, resolves byte-oriented member path/link metadata according to PAX/GNU precedence, and streams member payload blocks through a borrowing cursor.
 
 Each stream is "locked" to one archive family: POSIX pax/ustar or GNU, never a mixture.
 
@@ -17,3 +17,6 @@ accepts reserved `realtime.*` and `security.*` records plus uppercase
 `hdrcharset` records are accepted only for POSIX UTF-8 (or as deletion
 tombstones); other declared header-text encodings are intentionally out of
 scope for this UTF-8-only layer.
+
+Logical metadata access remains lossless bytes; consumers such as
+`tar-codec` decide how filenames and link targets may be decoded and used.

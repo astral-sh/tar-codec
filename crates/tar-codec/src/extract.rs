@@ -6,6 +6,7 @@
 //! security-sensitive archive features are explicit at each call site.
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     io,
     path::{Component, Path, PathBuf},
@@ -17,19 +18,11 @@ use cap_std::{
     fs::{Dir, OpenOptions},
 };
 use tar_framing::{
-    ArchiveFormat, FrameError, MemberKind, PaxKind, PaxRecord, PaxValue,
-    logical::{
-        GnuMetadata, LogicalFrame, MemberExtensions, MemberHeader, PaxMetadata, PayloadBlock,
-        TarReader,
-    },
+    ArchiveFormat, FrameError, MemberKind, PaxKind, PaxRecord,
+    logical::{LogicalFrame, MemberExtensions, MemberFrame, MemberHeader, PayloadBlock, TarReader},
 };
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWriteExt};
-
-const NAME_RANGE: std::ops::Range<usize> = 0..100;
-const MODE_RANGE: std::ops::Range<usize> = 100..108;
-const LINK_NAME_RANGE: std::ops::Range<usize> = 157..257;
-const PREFIX_RANGE: std::ops::Range<usize> = 345..500;
 
 /// A one-pass reader for a validated POSIX-pax or GNU tar archive.
 pub struct Archive<R> {
@@ -262,10 +255,9 @@ impl<R: AsyncRead + Unpin> Archive<R> {
                     )?;
                 }
                 LogicalFrame::Member(mut frame) => {
-                    let format = member_format(&frame.extensions);
                     policy.check_format(
                         member_format_position(&frame.header, &frame.extensions),
-                        format,
+                        frame.header.format,
                     )?;
                     policy.check_member_kind(frame.header.position, frame.header.kind)?;
                     if let MemberExtensions::PosixPax {
@@ -278,7 +270,7 @@ impl<R: AsyncRead + Unpin> Archive<R> {
                             &local.records,
                         )?;
                     }
-                    let member = decode_member(&frame.header, &frame.extensions)?;
+                    let member = decode_member(&frame)?;
                     if let Some(mut writer) = root.start_member(member).await? {
                         while let Some(block) = frame.payload.next_block().await? {
                             writer.write_block(block).await?;
@@ -357,32 +349,6 @@ pub enum ExtractError {
         position: u64,
         /// Metadata field being decoded.
         field: &'static str,
-    },
-    /// A GNU long-name or long-link value is malformed.
-    #[error("at byte {position}: malformed GNU {field}: {reason}")]
-    InvalidGnuMetadata {
-        /// Source tar block position.
-        position: u64,
-        /// GNU metadata field being decoded.
-        field: &'static str,
-        /// The reason decoding failed.
-        reason: &'static str,
-    },
-    /// A member mode field cannot be decoded.
-    #[error("at byte {position}: invalid tar mode field: found {found:?}")]
-    InvalidMode {
-        /// Source tar block position.
-        position: u64,
-        /// Raw mode bytes.
-        found: [u8; 8],
-    },
-    /// Required pax metadata was explicitly removed.
-    #[error("at byte {position}: pax metadata {keyword:?} is empty for this member")]
-    DeletedPaxMetadata {
-        /// Source member-header position.
-        position: u64,
-        /// Metadata keyword.
-        keyword: &'static str,
     },
     /// An archive member path or link value is unsafe to extract.
     #[error("at byte {position}: unsafe {context} {value:?}: {reason}")]
@@ -487,13 +453,6 @@ struct DecodedMember {
     payload_size: u64,
 }
 
-fn member_format(extensions: &MemberExtensions) -> ArchiveFormat {
-    match extensions {
-        MemberExtensions::PosixPax { .. } => ArchiveFormat::PosixPax,
-        MemberExtensions::Gnu { .. } => ArchiveFormat::Gnu,
-    }
-}
-
 fn member_format_position(header: &MemberHeader, extensions: &MemberExtensions) -> u64 {
     match extensions {
         MemberExtensions::PosixPax { .. } => header.position,
@@ -509,69 +468,19 @@ fn member_format_position(header: &MemberHeader, extensions: &MemberExtensions) 
     }
 }
 
-fn decode_member(
-    header: &MemberHeader,
-    extensions: &MemberExtensions,
-) -> Result<DecodedMember, ExtractError> {
-    let format = member_format(extensions);
-    let mode = parse_mode(header.position, format, &header.block[MODE_RANGE])?;
+fn decode_member<R>(frame: &MemberFrame<'_, R>) -> Result<DecodedMember, ExtractError> {
+    let header = &frame.header;
+    let mode = header.mode()?;
     let executable = mode & 0o111 != 0;
-    let (path, link_target) = match extensions {
-        MemberExtensions::PosixPax {
-            global_records,
-            local,
-        } => {
-            let raw_path = posix_header_path(header.position, &header.block)?;
-            let path = pax_text(
-                header.position,
-                global_records,
-                local.as_ref(),
-                PaxTextField::Path,
-            )?
-            .map(str::to_owned)
-            .unwrap_or(raw_path);
-            let link_target =
-                if matches!(header.kind, MemberKind::HardLink | MemberKind::SymbolicLink) {
-                    let raw_link =
-                        header_text(header.position, "link name", &header.block[LINK_NAME_RANGE])?;
-                    Some(
-                        pax_text(
-                            header.position,
-                            global_records,
-                            local.as_ref(),
-                            PaxTextField::LinkPath,
-                        )?
-                        .map(str::to_owned)
-                        .unwrap_or(raw_link),
-                    )
-                } else {
-                    None
-                };
-            (path, link_target)
-        }
-        MemberExtensions::Gnu {
-            long_name,
-            long_link,
-        } => {
-            let path = gnu_text(long_name.as_ref(), "long-name")?.unwrap_or(header_text(
-                header.position,
-                "name",
-                &header.block[NAME_RANGE],
-            )?);
-            let link_target =
-                if matches!(header.kind, MemberKind::HardLink | MemberKind::SymbolicLink) {
-                    Some(
-                        gnu_text(long_link.as_ref(), "long-link")?.unwrap_or(header_text(
-                            header.position,
-                            "link name",
-                            &header.block[LINK_NAME_RANGE],
-                        )?),
-                    )
-                } else {
-                    None
-                };
-            (path, link_target)
-        }
+    let path = resolved_text(header.position, "path", frame.effective_path()?)?;
+    let link_target = if matches!(header.kind, MemberKind::HardLink | MemberKind::SymbolicLink) {
+        Some(resolved_text(
+            header.position,
+            "linkpath",
+            frame.effective_link_path()?,
+        )?)
+    } else {
+        None
     };
 
     Ok(DecodedMember {
@@ -584,156 +493,17 @@ fn decode_member(
     })
 }
 
-#[derive(Clone, Copy)]
-enum PaxTextField {
-    Path,
-    LinkPath,
-}
-
-impl PaxTextField {
-    fn keyword(self) -> &'static str {
-        match self {
-            Self::Path => "path",
-            Self::LinkPath => "linkpath",
-        }
-    }
-
-    fn value(self, record: &PaxRecord) -> Option<&PaxValue<String>> {
-        match (self, record) {
-            (Self::Path, PaxRecord::Path(value)) | (Self::LinkPath, PaxRecord::LinkPath(value)) => {
-                Some(value)
-            }
-            _ => None,
-        }
-    }
-}
-
-fn pax_text<'a>(
+fn resolved_text(
     position: u64,
-    global_records: &'a [PaxRecord],
-    local: Option<&'a PaxMetadata>,
-    field: PaxTextField,
-) -> Result<Option<&'a str>, ExtractError> {
-    let value = local
-        .and_then(|local| {
-            local
-                .records
-                .iter()
-                .rev()
-                .find_map(|record| field.value(record))
+    keyword: &'static str,
+    value: Cow<'_, [u8]>,
+) -> Result<String, ExtractError> {
+    std::str::from_utf8(value.as_ref())
+        .map(str::to_owned)
+        .map_err(|_| ExtractError::InvalidUtf8 {
+            position,
+            field: keyword,
         })
-        .or_else(|| {
-            global_records
-                .iter()
-                .rev()
-                .find_map(|record| field.value(record))
-        });
-    match value {
-        Some(PaxValue::Value(value)) => Ok(Some(value.as_str())),
-        Some(PaxValue::Deleted) => Err(ExtractError::DeletedPaxMetadata {
-            position,
-            keyword: field.keyword(),
-        }),
-        None => Ok(None),
-    }
-}
-
-fn posix_header_path(
-    position: u64,
-    block: &[u8; tar_framing::BLOCK_SIZE],
-) -> Result<String, ExtractError> {
-    let name = header_text(position, "name", &block[NAME_RANGE])?;
-    let prefix = header_text(position, "prefix", &block[PREFIX_RANGE])?;
-    if prefix.is_empty() {
-        Ok(name)
-    } else if name.is_empty() {
-        Ok(prefix)
-    } else {
-        Ok(format!("{prefix}/{name}"))
-    }
-}
-
-fn header_text(position: u64, field: &'static str, bytes: &[u8]) -> Result<String, ExtractError> {
-    let end = bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(bytes.len());
-    std::str::from_utf8(&bytes[..end])
-        .map(str::to_owned)
-        .map_err(|_| ExtractError::InvalidUtf8 { position, field })
-}
-
-fn parse_gnu_text(
-    position: u64,
-    field: &'static str,
-    bytes: &[u8],
-) -> Result<String, ExtractError> {
-    let terminator =
-        bytes
-            .iter()
-            .position(|byte| *byte == 0)
-            .ok_or(ExtractError::InvalidGnuMetadata {
-                position,
-                field,
-                reason: "value is not NUL-terminated",
-            })?;
-    if bytes[terminator..].iter().any(|byte| *byte != 0) {
-        return Err(ExtractError::InvalidGnuMetadata {
-            position,
-            field,
-            reason: "non-NUL bytes follow the terminator",
-        });
-    }
-    std::str::from_utf8(&bytes[..terminator])
-        .map(str::to_owned)
-        .map_err(|_| ExtractError::InvalidUtf8 { position, field })
-}
-
-fn gnu_text(
-    header: Option<&GnuMetadata>,
-    field: &'static str,
-) -> Result<Option<String>, ExtractError> {
-    header
-        .map(|header| parse_gnu_text(header.position, field, &header.payload))
-        .transpose()
-}
-
-fn parse_mode(position: u64, format: ArchiveFormat, bytes: &[u8]) -> Result<u64, ExtractError> {
-    let found: [u8; 8] = bytes.try_into().expect("fixed mode field range");
-    let mode = match format {
-        ArchiveFormat::PosixPax => parse_octal(bytes),
-        ArchiveFormat::Gnu => parse_gnu_number(bytes),
-    };
-    mode.ok_or(ExtractError::InvalidMode { position, found })
-}
-
-fn parse_octal(bytes: &[u8]) -> Option<u64> {
-    if bytes.first().is_some_and(|byte| byte & 0x80 != 0) {
-        return None;
-    }
-    let terminator = bytes.iter().position(|byte| matches!(byte, 0 | b' '))?;
-    if terminator == 0
-        || bytes[..terminator]
-            .iter()
-            .any(|byte| !matches!(byte, b'0'..=b'7'))
-        || bytes[terminator..]
-            .iter()
-            .any(|byte| !matches!(byte, 0 | b' '))
-    {
-        return None;
-    }
-    bytes[..terminator].iter().try_fold(0_u64, |value, byte| {
-        value.checked_mul(8)?.checked_add(u64::from(*byte - b'0'))
-    })
-}
-
-fn parse_gnu_number(bytes: &[u8]) -> Option<u64> {
-    if bytes.first() != Some(&0x80) {
-        return parse_octal(bytes);
-    }
-    bytes[1..].iter().try_fold(0_u64, |value, byte| {
-        value.checked_mul(256)?.checked_add(u64::from(*byte))
-    })
 }
 
 fn normalize_member_path(position: u64, value: &str) -> Result<PathBuf, ExtractError> {
@@ -1292,10 +1062,13 @@ mod tests {
     };
 
     use super::*;
-    use tar_framing::BLOCK_SIZE;
+    use tar_framing::{BLOCK_SIZE, FrameErrorInner};
     use tempfile::tempdir;
     use tokio::io::ReadBuf;
 
+    const NAME_RANGE: std::ops::Range<usize> = 0..100;
+    const MODE_RANGE: std::ops::Range<usize> = 100..108;
+    const LINK_NAME_RANGE: std::ops::Range<usize> = 157..257;
     const SIZE_RANGE: std::ops::Range<usize> = 124..136;
     const CHECKSUM_RANGE: std::ops::Range<usize> = 148..156;
     const TYPEFLAG_OFFSET: usize = 156;
@@ -2023,7 +1796,10 @@ mod tests {
         finish(&mut deleted);
         assert!(matches!(
             extract(deleted, &deleted_dest).await.unwrap_err(),
-            ExtractError::DeletedPaxMetadata { .. }
+            ExtractError::Framing(FrameError {
+                inner: FrameErrorInner::DeletedPaxMetadata { keyword: "path" },
+                ..
+            })
         ));
 
         let gnu_dest = temp.path().join("gnu");
@@ -2033,7 +1809,10 @@ mod tests {
         finish(&mut malformed_gnu);
         assert!(matches!(
             extract(malformed_gnu, &gnu_dest).await.unwrap_err(),
-            ExtractError::InvalidGnuMetadata { .. }
+            ExtractError::Framing(FrameError {
+                inner: FrameErrorInner::InvalidGnuMetadata { .. },
+                ..
+            })
         ));
 
         let utf8_dest = temp.path().join("utf8");
@@ -2055,7 +1834,10 @@ mod tests {
         finish(&mut invalid_mode_archive);
         assert!(matches!(
             extract(invalid_mode_archive, &mode_dest).await.unwrap_err(),
-            ExtractError::InvalidMode { .. }
+            ExtractError::Framing(FrameError {
+                inner: FrameErrorInner::InvalidMode { .. },
+                ..
+            })
         ));
 
         let partial_dest = temp.path().join("partial");
