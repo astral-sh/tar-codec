@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio_stream::Stream;
 
 use crate::{
-    ArchiveFormat, BLOCK_SIZE, FrameError, FrameErrorInner, GnuKind, MemberKind, PaxKind,
+    ArchiveFormat, BLOCK_SIZE, Block, FrameError, FrameErrorInner, GnuKind, MemberKind, PaxKind,
     PaxRecord, PaxValue,
     pax::{
         apply_global as apply_global_pax_records, hdrcharset as pax_hdrcharset,
@@ -27,7 +27,7 @@ pub(crate) const IDENTITY_RANGE: std::ops::Range<usize> = 257..265;
 pub(crate) const POSIX_IDENTITY: &[u8; 8] = b"ustar\x0000";
 pub(crate) const GNU_IDENTITY: &[u8; 8] = b"ustar  \0";
 
-type PositionedBlock = (u64, [u8; BLOCK_SIZE]);
+type PositionedBlock = (u64, Block);
 
 /// Represents a single non-terminator physical block in a tar stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,7 +48,7 @@ pub struct PaxFrame {
     /// The absolute byte position of this block in the source stream.
     pub position: u64,
     /// The lossless header block bytes.
-    pub block: [u8; BLOCK_SIZE],
+    pub block: Block,
     /// Whether this header is local or global.
     pub kind: PaxKind,
     /// The number of bytes occupied by the extended header records.
@@ -61,7 +61,7 @@ pub struct GnuFrame {
     /// The absolute byte position of this block in the source stream.
     pub position: u64,
     /// The lossless header block bytes.
-    pub block: [u8; BLOCK_SIZE],
+    pub block: Block,
     /// The GNU extension kind.
     pub kind: GnuKind,
     /// The number of metadata payload bytes following the header.
@@ -74,7 +74,7 @@ pub struct HeaderFrame {
     /// The absolute byte position of this block in the source stream.
     pub position: u64,
     /// The lossless header block bytes.
-    pub block: [u8; BLOCK_SIZE],
+    pub block: Block,
     /// The member type identified by the header.
     pub kind: MemberKind,
     /// The size encoded directly in the member header field.
@@ -109,7 +109,7 @@ pub struct DataFrame {
     /// The absolute byte position of this block in the source stream.
     pub position: u64,
     /// The lossless payload block bytes, including any final padding.
-    pub block: [u8; BLOCK_SIZE],
+    pub block: Block,
     /// The number of meaningful payload bytes in this block.
     pub len: usize,
     /// Whether this block carries metadata-extension or member data.
@@ -163,7 +163,7 @@ pub(super) struct PendingGnu {
 pub struct TarStream<R> {
     pub(super) position: u64,
     pub(super) inner: R,
-    pub(super) block: [u8; BLOCK_SIZE],
+    pub(super) block: Block,
     pub(super) block_len: usize,
     pub(super) format: Option<ArchiveFormat>,
     pub(super) global_pax_records: Vec<PaxRecord>,
@@ -295,11 +295,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         }
     }
 
-    fn process_block(
-        &mut self,
-        position: u64,
-        block: [u8; BLOCK_SIZE],
-    ) -> Result<Option<Frame>, FrameError> {
+    fn process_block(&mut self, position: u64, block: Block) -> Result<Option<Frame>, FrameError> {
         let state = std::mem::replace(&mut self.state, State::Failed);
         match state {
             State::AwaitingHeader => {
@@ -452,7 +448,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
     fn process_boundary_header(
         &mut self,
         position: u64,
-        block: [u8; BLOCK_SIZE],
+        block: Block,
     ) -> Result<Frame, FrameError> {
         let parsed = self.parse_format_checked_header(position, &block)?;
         match parsed.format {
@@ -470,7 +466,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
     fn parse_format_checked_header(
         &mut self,
         position: u64,
-        block: &[u8; BLOCK_SIZE],
+        block: &Block,
     ) -> Result<ParsedHeader, FrameError> {
         let parsed = ParsedHeader::try_from_framed(position, block)?;
         if let Some(expected) = self.format
@@ -496,7 +492,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
     fn process_posix_boundary_header(
         &mut self,
         position: u64,
-        block: [u8; BLOCK_SIZE],
+        block: Block,
         parsed: ParsedHeader,
     ) -> Result<Frame, FrameError> {
         match parsed.typeflag {
@@ -513,7 +509,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
     fn process_pax_header(
         &mut self,
         position: u64,
-        block: [u8; BLOCK_SIZE],
+        block: Block,
         payload_size: u64,
         kind: PaxKind,
     ) -> Result<Frame, FrameError> {
@@ -547,7 +543,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
     fn process_ustar_header(
         &mut self,
         position: u64,
-        block: [u8; BLOCK_SIZE],
+        block: Block,
         parsed: ParsedHeader,
         local_pax_records: Vec<PaxRecord>,
     ) -> Result<Frame, FrameError> {
@@ -584,7 +580,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
     fn process_gnu_header(
         &mut self,
         position: u64,
-        block: [u8; BLOCK_SIZE],
+        block: Block,
         parsed: ParsedHeader,
         mut pending: PendingGnu,
     ) -> Result<Frame, FrameError> {
@@ -704,12 +700,12 @@ trait TryFromFramed<T>: Sized {
     fn try_from_framed(position: u64, source: T) -> Result<Self, FrameError>;
 }
 
-fn is_zero_block(block: &[u8; BLOCK_SIZE]) -> bool {
+fn is_zero_block(block: &Block) -> bool {
     block.iter().all(|byte| *byte == 0)
 }
 
-impl TryFromFramed<&[u8; BLOCK_SIZE]> for ParsedHeader {
-    fn try_from_framed(position: u64, block: &[u8; BLOCK_SIZE]) -> Result<Self, FrameError> {
+impl TryFromFramed<&Block> for ParsedHeader {
+    fn try_from_framed(position: u64, block: &Block) -> Result<Self, FrameError> {
         let format = match &block[IDENTITY_RANGE] {
             identity if identity == POSIX_IDENTITY => ArchiveFormat::Pax,
             identity if identity == GNU_IDENTITY => ArchiveFormat::Gnu,

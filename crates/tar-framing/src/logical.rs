@@ -9,8 +9,8 @@ use tokio::io::AsyncRead;
 use tokio_stream::StreamExt;
 
 use crate::{
-    ArchiveFormat, BLOCK_SIZE, FrameError, FrameErrorInner, GnuKind, MemberKind, PaxKind,
-    PaxRecord, PaxString, PaxValue,
+    ArchiveFormat, Block, FrameError, FrameErrorInner, GnuKind, MemberKind, PaxKind, PaxRecord,
+    PaxString, PaxValue,
     stream::{DataOwner, Frame, GnuFrame, PaxFrame, TarStream, parse_number},
 };
 
@@ -43,7 +43,7 @@ pub struct MemberHeader {
     /// The absolute byte position of this header block in the source stream.
     pub position: u64,
     /// The lossless member header block bytes.
-    pub block: [u8; BLOCK_SIZE],
+    pub block: Block,
     /// The selected archive family of this member header.
     pub format: ArchiveFormat,
     /// The member type identified by the header.
@@ -128,7 +128,7 @@ pub struct PayloadBlock {
     /// The absolute byte position of this payload block.
     pub position: u64,
     /// The lossless payload block bytes, including any final padding.
-    pub block: [u8; BLOCK_SIZE],
+    pub block: Block,
     /// The number of meaningful bytes in this block.
     pub len: usize,
 }
@@ -610,7 +610,7 @@ mod tests {
         },
     };
 
-    fn set_field(block: &mut [u8; BLOCK_SIZE], range: std::ops::Range<usize>, value: &[u8]) {
+    fn set_field(block: &mut Block, range: std::ops::Range<usize>, value: &[u8]) {
         block[range.clone()].fill(0);
         block[range.start..range.start + value.len()].copy_from_slice(value);
     }

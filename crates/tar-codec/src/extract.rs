@@ -1042,7 +1042,7 @@ mod tests {
     };
 
     use super::*;
-    use tar_framing::{BLOCK_SIZE, FrameErrorInner};
+    use tar_framing::{BLOCK_SIZE, Block, FrameErrorInner};
     use tempfile::tempdir;
     use tokio::io::ReadBuf;
 
@@ -1094,7 +1094,7 @@ mod tests {
         size: u64,
         link_name: &str,
         mode: u32,
-    ) -> [u8; BLOCK_SIZE] {
+    ) -> Block {
         let mut block = [0; BLOCK_SIZE];
         set_text(&mut block[NAME_RANGE], name);
         block[MODE_RANGE].copy_from_slice(format!("{mode:07o}\0").as_bytes());
@@ -1111,7 +1111,7 @@ mod tests {
         field[..value.len()].copy_from_slice(value.as_bytes());
     }
 
-    fn set_checksum(block: &mut [u8; BLOCK_SIZE]) {
+    fn set_checksum(block: &mut Block) {
         block[CHECKSUM_RANGE].fill(b' ');
         let checksum: u64 = block.iter().map(|byte| u64::from(*byte)).sum();
         block[CHECKSUM_RANGE].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
@@ -1146,7 +1146,7 @@ mod tests {
         }
     }
 
-    fn append_block(bytes: &mut Vec<u8>, block: &[u8; BLOCK_SIZE]) {
+    fn append_block(bytes: &mut Vec<u8>, block: &Block) {
         bytes.extend_from_slice(block);
     }
 

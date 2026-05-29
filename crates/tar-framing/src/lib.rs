@@ -21,6 +21,8 @@ pub use pax::{HdrCharset, PaxRecord, PaxString, PaxValue};
 /// The size of a logical tar record.
 pub const BLOCK_SIZE: usize = 512;
 
+pub type Block = [u8; BLOCK_SIZE];
+
 /// An automatically detected, mutually exclusive tar archive family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArchiveFormat {
