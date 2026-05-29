@@ -4,7 +4,7 @@
 //! the assembled member-level [`logical`] reader API.
 //!
 //! The stream is strict in the sense that it defines a state machine
-//! that enforces the POSIX (meaning ustar and pax) or GNU format rules
+//! that enforces the pax (ustar superset) or GNU format rules
 //! and rejects streams that attempt to combine the two formats or that
 //! are otherwise ambiguous.
 
@@ -24,8 +24,8 @@ pub const BLOCK_SIZE: usize = 512;
 /// An automatically detected, mutually exclusive tar archive family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArchiveFormat {
-    /// POSIX ustar headers with optional pax extended headers.
-    PosixPax,
+    /// pax ustar headers with optional pax extended headers.
+    Pax,
     /// Old GNU tar headers with optional `L` and `K` extension entries.
     Gnu,
 }

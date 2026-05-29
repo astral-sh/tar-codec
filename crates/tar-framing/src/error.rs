@@ -49,7 +49,8 @@ pub enum FrameErrorInner {
         /// The checksum computed from the header block.
         actual: u64,
     },
-    /// A header's size field was not a strict POSIX octal value.
+    /// A header's size field was not a strict number.
+    /// The underlying format of the number might be octal or GNU-style base256.
     #[error("invalid tar size field: found {found:?}")]
     InvalidSize {
         /// The bytes found in the size field.
@@ -134,12 +135,6 @@ pub enum FrameErrorInner {
         /// The standard pax keyword that deleted its header fallback.
         keyword: &'static str,
     },
-    /// Pax records removed the size needed to frame a data-bearing member.
-    #[error("member type {kind:?} has no effective size after applying pax records")]
-    IndeterminateMemberSize {
-        /// The member type whose payload length cannot be determined.
-        kind: MemberKind,
-    },
     /// A framing offset or record length overflowed.
     #[error("arithmetic overflow while computing {context}")]
     ArithmeticOverflow {
@@ -168,7 +163,7 @@ pub enum FrameErrorInner {
         /// A description of the required next input.
         expected: &'static str,
     },
-    /// The POSIX two-block end marker was absent or incomplete.
+    /// The two-block end marker was absent or incomplete.
     #[error("missing two-block end-of-archive marker")]
     MissingEndMarker,
     /// The first zero terminator block was not followed by a second zero block.

@@ -150,16 +150,13 @@ fn render_frame(output: &mut impl Write, index: usize, frame: &Frame) -> io::Res
             frame.payload_size
         ),
         Frame::Header(frame) => {
-            let effective_size = frame
-                .effective_size
-                .map_or_else(|| "<deleted>".to_owned(), |size| size.to_string());
             writeln!(
                 output,
                 "    [{index}] @{} header {} declared={} effective={} payload={}",
                 frame.position,
                 member_kind_name(frame.kind),
                 frame.declared_size,
-                effective_size,
+                frame.effective_size,
                 frame.payload_size
             )?;
             render_pax_records(output, "global", &frame.global_pax_records)?;
@@ -258,7 +255,7 @@ fn render_pax_charset(
 
 fn format_name(format: ArchiveFormat) -> &'static str {
     match format {
-        ArchiveFormat::PosixPax => "posix-pax",
+        ArchiveFormat::Pax => "posix-pax",
         ArchiveFormat::Gnu => "gnu",
     }
 }

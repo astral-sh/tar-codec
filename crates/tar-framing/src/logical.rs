@@ -50,8 +50,8 @@ pub struct MemberHeader {
     pub kind: MemberKind,
     /// The size encoded directly in the member header field.
     pub declared_size: u64,
-    /// The size after applying applicable pax `size` records, or `None` if deleted.
-    pub effective_size: Option<u64>,
+    /// The size after applying applicable pax `size` records.
+    pub effective_size: u64,
     /// The meaningful payload size belonging to this member.
     pub payload_size: u64,
 }
@@ -106,8 +106,8 @@ impl MemberHeader {
 /// Extension metadata attached to one ordinary archive member.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MemberExtensions {
-    /// POSIX-pax state applicable to an ordinary ustar member.
-    PosixPax {
+    /// pax state applicable to an ordinary ustar member.
+    Pax {
         /// Effective global records active for this member.
         global_records: Vec<PaxRecord>,
         /// Local pax metadata applying only to this member.
@@ -166,7 +166,7 @@ impl<R> MemberFrame<'_, R> {
     /// ordinary-header fallback required to identify this member.
     pub fn effective_path(&self) -> Result<Cow<'_, [u8]>, FrameError> {
         match &self.extensions {
-            MemberExtensions::PosixPax {
+            MemberExtensions::Pax {
                 global_records,
                 local,
             } => resolve_pax_text(
@@ -193,7 +193,7 @@ impl<R> MemberFrame<'_, R> {
     /// ordinary-header fallback required to identify a link target.
     pub fn effective_link_path(&self) -> Result<Cow<'_, [u8]>, FrameError> {
         match &self.extensions {
-            MemberExtensions::PosixPax {
+            MemberExtensions::Pax {
                 global_records,
                 local,
             } => resolve_pax_text(
@@ -288,7 +288,7 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
                         )
                     })?;
                     let extensions = match format {
-                        ArchiveFormat::PosixPax => MemberExtensions::PosixPax {
+                        ArchiveFormat::Pax => MemberExtensions::Pax {
                             global_records: header.global_pax_records.clone(),
                             local: local_pax,
                         },
@@ -617,22 +617,22 @@ mod tests {
 
     #[test]
     fn exposes_ordinary_header_metadata_and_decodes_modes() {
-        let mut posix_header = header(b'2', 0);
-        set_field(&mut posix_header, NAME_RANGE, b"file");
-        set_field(&mut posix_header, PREFIX_RANGE, b"dir");
-        set_field(&mut posix_header, LINK_NAME_RANGE, b"target");
-        posix_header[MODE_RANGE].copy_from_slice(b"0000755\0");
-        set_checksum(&mut posix_header);
+        let mut ustar_header = header(b'2', 0);
+        set_field(&mut ustar_header, NAME_RANGE, b"file");
+        set_field(&mut ustar_header, PREFIX_RANGE, b"dir");
+        set_field(&mut ustar_header, LINK_NAME_RANGE, b"target");
+        ustar_header[MODE_RANGE].copy_from_slice(b"0000755\0");
+        set_checksum(&mut ustar_header);
 
-        let posix_result: Result<(), FrameError> = ready(async {
+        let ustar_result: Result<(), FrameError> = ready(async {
             let mut bytes = Vec::new();
-            append_block(&mut bytes, &posix_header);
+            append_block(&mut bytes, &ustar_header);
             append_terminator(&mut bytes);
             let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
             let Some(LogicalFrame::Member(member)) = reader.next_frame().await? else {
-                panic!("expected POSIX member");
+                panic!("expected ustar member");
             };
-            assert_eq!(member.header.format, ArchiveFormat::PosixPax);
+            assert_eq!(member.header.format, ArchiveFormat::Pax);
             assert_eq!(member.header.name(), b"file");
             assert_eq!(member.header.prefix(), b"dir");
             assert_eq!(member.header.header_path().as_ref(), b"dir/file");
@@ -642,7 +642,7 @@ mod tests {
             assert_eq!(member.effective_link_path()?.as_ref(), b"target");
             Ok(())
         });
-        assert!(posix_result.is_ok());
+        assert!(ustar_result.is_ok());
 
         let mut gnu_header = gnu_header(b'0', 0);
         set_field(&mut gnu_header, NAME_RANGE, b"name");
@@ -818,8 +818,8 @@ mod tests {
                 let Some(LogicalFrame::Member(mut member)) = reader.next_frame().await? else {
                     panic!("expected logical member");
                 };
-                assert_eq!(member.header.effective_size, Some(513));
-                let MemberExtensions::PosixPax {
+                assert_eq!(member.header.effective_size, 513);
+                let MemberExtensions::Pax {
                     global_records,
                     local: Some(local_header),
                 } = &member.extensions

@@ -24,7 +24,7 @@ use tar_framing::{
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWriteExt};
 
-/// A one-pass reader for a validated POSIX-pax or GNU tar archive.
+/// A one-pass reader for a validated pax or GNU tar archive.
 pub struct Archive<R> {
     reader: TarReader<R>,
 }
@@ -41,8 +41,8 @@ impl<R> Archive<R> {
 /// Controls which otherwise valid archive features extraction may accept.
 ///
 /// The default permits symbolic links and either supported framing family,
-/// while rejecting hard links, global POSIX pax extensions,
-/// vendor-namespaced POSIX pax records, and repeated keywords.
+/// while rejecting hard links, global pax extensions,
+/// vendor-namespaced pax records, and repeated keywords.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExtractPolicy {
     allow_symlinks: bool,
@@ -51,7 +51,7 @@ pub struct ExtractPolicy {
     pax_policy: PaxExtractPolicy,
 }
 
-/// Controls which otherwise valid POSIX pax features extraction may accept.
+/// Controls which otherwise valid pax features extraction may accept.
 ///
 /// The default rejects global pax extensions, vendor-namespaced records, and
 /// duplicate records. Global per-member metadata remains separately disabled
@@ -84,7 +84,7 @@ impl ExtractPolicy {
 
     /// Configures whether hard-link members may be extracted.
     ///
-    /// When enabled, POSIX `linkdata` payloads may update the contents of an
+    /// When enabled, pax `linkdata` payloads may update the contents of an
     /// earlier extracted file through its shared inode.
     pub fn allow_hard_links(mut self, allow: bool) -> Self {
         self.allow_hard_links = allow;
@@ -97,7 +97,7 @@ impl ExtractPolicy {
         self
     }
 
-    /// Configures the accepted POSIX pax feature subset.
+    /// Configures the accepted pax feature subset.
     pub fn pax_policy(mut self, policy: PaxExtractPolicy) -> Self {
         self.pax_policy = policy;
         self
@@ -131,7 +131,7 @@ impl ExtractPolicy {
 }
 
 impl PaxExtractPolicy {
-    /// Configures whether global POSIX pax extension headers may be accepted.
+    /// Configures whether global pax extension headers may be accepted.
     ///
     /// When enabled, [`Self::allow_global_pax_member_metadata`] separately
     /// controls whether global `path`, `linkpath`, and `size` records are
@@ -141,7 +141,7 @@ impl PaxExtractPolicy {
         self
     }
 
-    /// Configures whether vendor-namespaced POSIX pax records may be accepted.
+    /// Configures whether vendor-namespaced pax records may be accepted.
     pub fn allow_pax_vendor_extensions(mut self, allow: bool) -> Self {
         self.allow_pax_vendor_extensions = allow;
         self
@@ -260,7 +260,7 @@ impl<R: AsyncRead + Unpin> Archive<R> {
                         frame.header.format,
                     )?;
                     policy.check_member_kind(frame.header.position, frame.header.kind)?;
-                    if let MemberExtensions::PosixPax {
+                    if let MemberExtensions::Pax {
                         local: Some(local), ..
                     } = &frame.extensions
                     {
@@ -435,7 +435,7 @@ struct DecodedMember {
 
 fn member_format_position(header: &MemberHeader, extensions: &MemberExtensions) -> u64 {
     match extensions {
-        MemberExtensions::PosixPax { .. } => header.position,
+        MemberExtensions::Pax { .. } => header.position,
         MemberExtensions::Gnu {
             long_name,
             long_link,

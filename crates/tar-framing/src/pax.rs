@@ -74,7 +74,7 @@ impl<T: FromStr> FromStr for PaxValue<T> {
     }
 }
 
-/// A parsed POSIX pax extended-header record.
+/// A parsed pax extended-header record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PaxRecord {
     /// File access time in integral seconds; fractional seconds are discarded.
@@ -147,21 +147,6 @@ impl PaxRecord {
             Self::Vendor { vendor, name, .. } => Cow::Owned(format!("{vendor}.{name}")),
         }
     }
-}
-
-/// The effect of pax `size` records within one precedence scope.
-///
-/// Local `x` records are consulted before active global `g` records, and
-/// the raw member-header size is used only when both scopes are unspecified.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) enum PaxSize {
-    /// No `size` record appears in this scope, so resolution continues outward.
-    #[default]
-    Unspecified,
-    /// The last `size` record in this scope supplies a decimal member size.
-    Value(u64),
-    /// The last `size` record in this scope deletes any lower-precedence size.
-    Deleted,
 }
 
 pub(super) fn parse_records(
@@ -466,17 +451,14 @@ fn parse_time(
         .ok_or_else(invalid)
 }
 
-pub(super) fn size(records: &[PaxRecord]) -> PaxSize {
-    let mut size = PaxSize::Unspecified;
-    for record in records {
-        if let PaxRecord::Size(value) = record {
-            size = match value {
-                PaxValue::Value(size) => PaxSize::Value(*size),
-                PaxValue::Deleted => PaxSize::Deleted,
-            };
-        }
-    }
-    size
+pub(super) fn size(records: &[PaxRecord]) -> Option<&PaxValue<u64>> {
+    records
+        .iter()
+        .filter_map(|record| match record {
+            PaxRecord::Size(value) => Some(value),
+            _ => None,
+        })
+        .next_back()
 }
 
 pub(super) fn hdrcharset(records: &[PaxRecord]) -> HdrCharset {
