@@ -1,4 +1,5 @@
 - Read CONTRIBUTING.md for guidelines on how to run tools
+- Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) before changing crate boundaries, format behavior, or extraction policy
 - ALWAYS attempt to add a test case for changed behavior
 - NEVER perform builds with the release profile, unless asked or reproducing performance issues
 - PREFER running specific tests over running the entire test suite
