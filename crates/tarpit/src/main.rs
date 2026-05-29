@@ -43,12 +43,6 @@ enum CliError {
         source: io::Error,
     },
     #[error(transparent)]
-    Dump(#[from] DumpError),
-}
-
-#[derive(Debug, Error)]
-enum DumpError {
-    #[error(transparent)]
     Framing(#[from] FrameError),
     #[error("failed to write frame dump: {0}")]
     Output(#[from] io::Error),
@@ -100,7 +94,7 @@ async fn dump_frames<R: AsyncRead + Unpin, W: Write>(
     reader: R,
     archive: &str,
     output: &mut W,
-) -> Result<(), DumpError> {
+) -> Result<(), CliError> {
     let mut stream = TarStream::new(reader);
     let mut started = false;
     let mut index = 0;
@@ -187,32 +181,23 @@ fn render_pax_records(
     records: &[PaxRecord],
 ) -> io::Result<()> {
     for record in records {
+        let keyword = record.keyword();
         match record {
-            PaxRecord::Atime(value) => render_pax_integer(output, scope, "atime", value)?,
-            PaxRecord::Charset(value) => render_pax_text(output, scope, "charset", value)?,
-            PaxRecord::Comment(value) => render_pax_text(output, scope, "comment", value)?,
-            PaxRecord::Gid(value) => render_pax_integer(output, scope, "gid", value)?,
-            PaxRecord::Gname(value) => render_pax_string(output, scope, "gname", value)?,
+            PaxRecord::Atime(value)
+            | PaxRecord::Gid(value)
+            | PaxRecord::Mtime(value)
+            | PaxRecord::Size(value)
+            | PaxRecord::Uid(value) => render_pax_integer(output, scope, &keyword, value)?,
+            PaxRecord::Charset(value)
+            | PaxRecord::Comment(value)
+            | PaxRecord::Realtime { value, .. }
+            | PaxRecord::Security { value, .. }
+            | PaxRecord::Vendor { value, .. } => render_pax_text(output, scope, &keyword, value)?,
+            PaxRecord::Gname(value)
+            | PaxRecord::LinkPath(value)
+            | PaxRecord::Path(value)
+            | PaxRecord::Uname(value) => render_pax_string(output, scope, &keyword, value)?,
             PaxRecord::HdrCharset(value) => render_pax_charset(output, scope, value)?,
-            PaxRecord::LinkPath(value) => render_pax_string(output, scope, "linkpath", value)?,
-            PaxRecord::Mtime(value) => render_pax_integer(output, scope, "mtime", value)?,
-            PaxRecord::Path(value) => render_pax_string(output, scope, "path", value)?,
-            PaxRecord::Realtime { name, value } => {
-                render_pax_text(output, scope, &format!("realtime.{name}"), value)?;
-            }
-            PaxRecord::Security { name, value } => {
-                render_pax_text(output, scope, &format!("security.{name}"), value)?;
-            }
-            PaxRecord::Size(value) => render_pax_integer(output, scope, "size", value)?,
-            PaxRecord::Uid(value) => render_pax_integer(output, scope, "uid", value)?,
-            PaxRecord::Uname(value) => render_pax_string(output, scope, "uname", value)?,
-            PaxRecord::Vendor {
-                vendor,
-                name,
-                value,
-            } => {
-                render_pax_text(output, scope, &format!("{vendor}.{name}"), value)?;
-            }
         }
     }
     Ok(())

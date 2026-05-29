@@ -215,7 +215,7 @@ impl PaxExtractPolicy {
         if !self.allow_duplicate_pax_records {
             let mut keywords = HashSet::new();
             for record in records {
-                let keyword = pax_record_keyword(record);
+                let keyword = record.keyword().into_owned();
                 if !keywords.insert(keyword.clone()) {
                     return Err(policy_violation(
                         position,
@@ -420,26 +420,6 @@ fn policy_violation(position: u64, violation: ExtractPolicyViolation) -> Extract
     ExtractError::PolicyViolation {
         position,
         violation,
-    }
-}
-
-fn pax_record_keyword(record: &PaxRecord) -> String {
-    match record {
-        PaxRecord::Atime(_) => "atime".to_owned(),
-        PaxRecord::Charset(_) => "charset".to_owned(),
-        PaxRecord::Comment(_) => "comment".to_owned(),
-        PaxRecord::Gid(_) => "gid".to_owned(),
-        PaxRecord::Gname(_) => "gname".to_owned(),
-        PaxRecord::HdrCharset(_) => "hdrcharset".to_owned(),
-        PaxRecord::LinkPath(_) => "linkpath".to_owned(),
-        PaxRecord::Mtime(_) => "mtime".to_owned(),
-        PaxRecord::Path(_) => "path".to_owned(),
-        PaxRecord::Realtime { name, .. } => format!("realtime.{name}"),
-        PaxRecord::Security { name, .. } => format!("security.{name}"),
-        PaxRecord::Size(_) => "size".to_owned(),
-        PaxRecord::Uid(_) => "uid".to_owned(),
-        PaxRecord::Uname(_) => "uname".to_owned(),
-        PaxRecord::Vendor { vendor, name, .. } => format!("{vendor}.{name}"),
     }
 }
 

@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{borrow::Cow, str::FromStr};
 
 use super::{FrameError, FrameErrorInner};
 
@@ -124,6 +124,29 @@ pub enum PaxRecord {
         /// Attribute value or deletion tombstone.
         value: PaxValue<String>,
     },
+}
+
+impl PaxRecord {
+    /// Returns this record's PAX keyword exactly as it appears on the wire.
+    pub fn keyword(&self) -> Cow<'_, str> {
+        match self {
+            Self::Atime(_) => Cow::Borrowed("atime"),
+            Self::Charset(_) => Cow::Borrowed("charset"),
+            Self::Comment(_) => Cow::Borrowed("comment"),
+            Self::Gid(_) => Cow::Borrowed("gid"),
+            Self::Gname(_) => Cow::Borrowed("gname"),
+            Self::HdrCharset(_) => Cow::Borrowed("hdrcharset"),
+            Self::LinkPath(_) => Cow::Borrowed("linkpath"),
+            Self::Mtime(_) => Cow::Borrowed("mtime"),
+            Self::Path(_) => Cow::Borrowed("path"),
+            Self::Realtime { name, .. } => Cow::Owned(format!("realtime.{name}")),
+            Self::Security { name, .. } => Cow::Owned(format!("security.{name}")),
+            Self::Size(_) => Cow::Borrowed("size"),
+            Self::Uid(_) => Cow::Borrowed("uid"),
+            Self::Uname(_) => Cow::Borrowed("uname"),
+            Self::Vendor { vendor, name, .. } => Cow::Owned(format!("{vendor}.{name}")),
+        }
+    }
 }
 
 /// The effect of pax `size` records within one precedence scope.
@@ -472,42 +495,9 @@ pub(super) fn hdrcharset(records: &[PaxRecord]) -> HdrCharset {
 
 pub(super) fn apply_global(active: &mut Vec<PaxRecord>, records: Vec<PaxRecord>) {
     for record in records {
-        active.retain(|existing| !same_keyword(existing, &record));
+        let keyword = record.keyword();
+        active.retain(|existing| existing.keyword() != keyword);
         active.push(record);
-    }
-}
-
-fn same_keyword(left: &PaxRecord, right: &PaxRecord) -> bool {
-    match (left, right) {
-        (PaxRecord::Atime(_), PaxRecord::Atime(_))
-        | (PaxRecord::Charset(_), PaxRecord::Charset(_))
-        | (PaxRecord::Comment(_), PaxRecord::Comment(_))
-        | (PaxRecord::Gid(_), PaxRecord::Gid(_))
-        | (PaxRecord::Gname(_), PaxRecord::Gname(_))
-        | (PaxRecord::HdrCharset(_), PaxRecord::HdrCharset(_))
-        | (PaxRecord::LinkPath(_), PaxRecord::LinkPath(_))
-        | (PaxRecord::Mtime(_), PaxRecord::Mtime(_))
-        | (PaxRecord::Path(_), PaxRecord::Path(_))
-        | (PaxRecord::Size(_), PaxRecord::Size(_))
-        | (PaxRecord::Uid(_), PaxRecord::Uid(_))
-        | (PaxRecord::Uname(_), PaxRecord::Uname(_)) => true,
-        (PaxRecord::Realtime { name: left, .. }, PaxRecord::Realtime { name: right, .. })
-        | (PaxRecord::Security { name: left, .. }, PaxRecord::Security { name: right, .. }) => {
-            left == right
-        }
-        (
-            PaxRecord::Vendor {
-                vendor: left_vendor,
-                name: left_name,
-                ..
-            },
-            PaxRecord::Vendor {
-                vendor: right_vendor,
-                name: right_name,
-                ..
-            },
-        ) => left_vendor == right_vendor && left_name == right_name,
-        _ => false,
     }
 }
 
@@ -659,6 +649,29 @@ mod tests {
                     name: "attribute".to_owned(),
                     value: PaxValue::Value("custom".to_owned()),
                 },
+            ]
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.keyword().into_owned())
+                .collect::<Vec<_>>(),
+            [
+                "atime",
+                "charset",
+                "comment",
+                "gid",
+                "gname",
+                "hdrcharset",
+                "linkpath",
+                "mtime",
+                "path",
+                "realtime.deadline",
+                "security.label",
+                "size",
+                "uid",
+                "uname",
+                "ACME.attribute",
             ]
         );
     }
