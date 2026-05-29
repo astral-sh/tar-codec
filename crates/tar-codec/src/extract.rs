@@ -55,6 +55,16 @@ pub struct ExtractPolicy {
     allow_symlinks: bool,
     allow_hard_links: bool,
     allow_gnu: bool,
+    pax_policy: PaxExtractPolicy,
+}
+
+/// Controls which otherwise valid POSIX pax features extraction may accept.
+///
+/// The default rejects global pax extensions, vendor-namespaced records, and
+/// duplicate records. Global per-member metadata remains separately disabled
+/// for callers that enable global pax extensions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PaxExtractPolicy {
     allow_global_pax_extensions: bool,
     allow_pax_vendor_extensions: bool,
     allow_duplicate_pax_records: bool,
@@ -67,10 +77,7 @@ impl Default for ExtractPolicy {
             allow_symlinks: true,
             allow_hard_links: false,
             allow_gnu: true,
-            allow_global_pax_extensions: false,
-            allow_pax_vendor_extensions: false,
-            allow_duplicate_pax_records: false,
-            allow_global_pax_member_metadata: false,
+            pax_policy: PaxExtractPolicy::default(),
         }
     }
 }
@@ -97,6 +104,40 @@ impl ExtractPolicy {
         self
     }
 
+    /// Configures the accepted POSIX pax feature subset.
+    pub fn pax_policy(mut self, policy: PaxExtractPolicy) -> Self {
+        self.pax_policy = policy;
+        self
+    }
+
+    fn check_format(&self, position: u64, format: ArchiveFormat) -> Result<(), ExtractError> {
+        if format == ArchiveFormat::Gnu && !self.allow_gnu {
+            return Err(policy_violation(
+                position,
+                ExtractPolicyViolation::GnuArchive,
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_member_kind(&self, position: u64, kind: MemberKind) -> Result<(), ExtractError> {
+        let violation = match kind {
+            MemberKind::SymbolicLink if !self.allow_symlinks => {
+                Some(ExtractPolicyViolation::SymbolicLink)
+            }
+            MemberKind::HardLink if !self.allow_hard_links => {
+                Some(ExtractPolicyViolation::HardLink)
+            }
+            _ => None,
+        };
+        if let Some(violation) = violation {
+            return Err(policy_violation(position, violation));
+        }
+        Ok(())
+    }
+}
+
+impl PaxExtractPolicy {
     /// Configures whether global POSIX pax extension headers may be accepted.
     ///
     /// When enabled, [`Self::allow_global_pax_member_metadata`] separately
@@ -131,38 +172,12 @@ impl ExtractPolicy {
         self
     }
 
-    fn check_format(&self, position: u64, format: ArchiveFormat) -> Result<(), ExtractError> {
-        if format == ArchiveFormat::Gnu && !self.allow_gnu {
-            return Err(policy_violation(
-                position,
-                ExtractPolicyViolation::GnuArchive,
-            ));
-        }
-        Ok(())
-    }
-
     fn check_global_pax_extension(&self, position: u64) -> Result<(), ExtractError> {
         if !self.allow_global_pax_extensions {
             return Err(policy_violation(
                 position,
                 ExtractPolicyViolation::GlobalPaxExtension,
             ));
-        }
-        Ok(())
-    }
-
-    fn check_member_kind(&self, position: u64, kind: MemberKind) -> Result<(), ExtractError> {
-        let violation = match kind {
-            MemberKind::SymbolicLink if !self.allow_symlinks => {
-                Some(ExtractPolicyViolation::SymbolicLink)
-            }
-            MemberKind::HardLink if !self.allow_hard_links => {
-                Some(ExtractPolicyViolation::HardLink)
-            }
-            _ => None,
-        };
-        if let Some(violation) = violation {
-            return Err(policy_violation(position, violation));
         }
         Ok(())
     }
@@ -237,8 +252,14 @@ impl<R: AsyncRead + Unpin> Archive<R> {
         while let Some(frame) = self.reader.next_frame().await? {
             match frame {
                 LogicalFrame::GlobalPax(header) => {
-                    policy.check_global_pax_extension(header.position)?;
-                    policy.check_pax_records(header.position, PaxKind::Global, &header.records)?;
+                    policy
+                        .pax_policy
+                        .check_global_pax_extension(header.position)?;
+                    policy.pax_policy.check_pax_records(
+                        header.position,
+                        PaxKind::Global,
+                        &header.records,
+                    )?;
                 }
                 LogicalFrame::Member(mut frame) => {
                     let format = member_format(&frame.extensions);
@@ -251,7 +272,11 @@ impl<R: AsyncRead + Unpin> Archive<R> {
                         local: Some(local), ..
                     } = &frame.extensions
                     {
-                        policy.check_pax_records(local.position, PaxKind::Local, &local.records)?;
+                        policy.pax_policy.check_pax_records(
+                            local.position,
+                            PaxKind::Local,
+                            &local.records,
+                        )?;
                     }
                     let member = decode_member(&frame.header, &frame.extensions)?;
                     if let Some(mut writer) = root.start_member(member).await? {
@@ -1478,9 +1503,11 @@ mod tests {
         extract_with_policy(
             bytes,
             &dest,
-            ExtractPolicy::default()
-                .allow_global_pax_extensions(true)
-                .allow_global_pax_member_metadata(true),
+            ExtractPolicy::default().pax_policy(
+                PaxExtractPolicy::default()
+                    .allow_global_pax_extensions(true)
+                    .allow_global_pax_member_metadata(true),
+            ),
         )
         .await
         .unwrap();
@@ -1774,7 +1801,9 @@ mod tests {
                 extract_with_policy(
                     bytes,
                     &dest,
-                    ExtractPolicy::default().allow_global_pax_extensions(typeflag == b'g')
+                    ExtractPolicy::default().pax_policy(
+                        PaxExtractPolicy::default().allow_global_pax_extensions(typeflag == b'g')
+                    )
                 )
                 .await
                 .unwrap_err(),
@@ -1801,7 +1830,8 @@ mod tests {
             extract_with_policy(
                 partial,
                 &partial_dest,
-                ExtractPolicy::default().allow_global_pax_extensions(true)
+                ExtractPolicy::default()
+                    .pax_policy(PaxExtractPolicy::default().allow_global_pax_extensions(true))
             )
             .await
             .unwrap_err(),
@@ -1823,7 +1853,8 @@ mod tests {
         extract_with_policy(
             permitted,
             &permitted_dest,
-            ExtractPolicy::default().allow_pax_vendor_extensions(true),
+            ExtractPolicy::default()
+                .pax_policy(PaxExtractPolicy::default().allow_pax_vendor_extensions(true)),
         )
         .await
         .unwrap();
@@ -1861,7 +1892,8 @@ mod tests {
         extract_with_policy(
             permitted,
             &permitted_dest,
-            ExtractPolicy::default().allow_duplicate_pax_records(true),
+            ExtractPolicy::default()
+                .pax_policy(PaxExtractPolicy::default().allow_duplicate_pax_records(true)),
         )
         .await
         .unwrap();
@@ -1895,7 +1927,8 @@ mod tests {
         extract_with_policy(
             permitted,
             &permitted_dest,
-            ExtractPolicy::default().allow_global_pax_extensions(true),
+            ExtractPolicy::default()
+                .pax_policy(PaxExtractPolicy::default().allow_global_pax_extensions(true)),
         )
         .await
         .unwrap();
@@ -1918,9 +1951,11 @@ mod tests {
         extract_with_policy(
             bytes,
             &dest,
-            ExtractPolicy::default()
-                .allow_global_pax_extensions(true)
-                .allow_global_pax_member_metadata(true),
+            ExtractPolicy::default().pax_policy(
+                PaxExtractPolicy::default()
+                    .allow_global_pax_extensions(true)
+                    .allow_global_pax_member_metadata(true),
+            ),
         )
         .await
         .unwrap();
@@ -1944,7 +1979,8 @@ mod tests {
                 extract_with_policy(
                     bytes,
                     &dest,
-                    ExtractPolicy::default().allow_global_pax_extensions(true)
+                    ExtractPolicy::default()
+                        .pax_policy(PaxExtractPolicy::default().allow_global_pax_extensions(true))
                 )
                 .await
                 .unwrap_err(),
@@ -1965,7 +2001,8 @@ mod tests {
             extract_with_policy(
                 deleted,
                 &deleted_dest,
-                ExtractPolicy::default().allow_global_pax_extensions(true)
+                ExtractPolicy::default()
+                    .pax_policy(PaxExtractPolicy::default().allow_global_pax_extensions(true))
             )
             .await
             .unwrap_err(),
