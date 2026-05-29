@@ -9,7 +9,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::{
     BLOCK_SIZE, Block,
-    stream::{
+    header::{
         CHECKSUM_RANGE, GNU_IDENTITY, IDENTITY_RANGE, POSIX_IDENTITY, SIZE_RANGE, TYPEFLAG_OFFSET,
     },
 };

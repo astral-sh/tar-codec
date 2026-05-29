@@ -11,13 +11,9 @@ use tokio_stream::StreamExt;
 use crate::{
     ArchiveFormat, Block, FrameError, FrameErrorInner, GnuKind, MemberKind, PaxKind, PaxRecord,
     PaxString, PaxValue,
+    header::{LINK_NAME_RANGE, MODE_RANGE, NAME_RANGE, PREFIX_RANGE},
     stream::{DataOwner, Frame, GnuFrame, PaxFrame, TarStream, parse_number},
 };
-
-const NAME_RANGE: std::ops::Range<usize> = 0..100;
-const MODE_RANGE: std::ops::Range<usize> = 100..108;
-const LINK_NAME_RANGE: std::ops::Range<usize> = 157..257;
-const PREFIX_RANGE: std::ops::Range<usize> = 345..500;
 
 /// Parsed pax metadata needed to interpret a logical archive item.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -611,7 +607,8 @@ mod tests {
     use super::*;
     use crate::{
         BLOCK_SIZE, FrameError, FrameErrorInner, PaxRecord, PaxValue,
-        stream::{DataOwner, TYPEFLAG_OFFSET},
+        header::TYPEFLAG_OFFSET,
+        stream::DataOwner,
         test_support::{
             ChunkedReader, append_block, append_payload, append_terminator, data, gnu_header,
             header, ready, record, set_checksum,

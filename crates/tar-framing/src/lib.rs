@@ -9,11 +9,13 @@
 //! are otherwise ambiguous.
 
 mod error;
+mod header;
 pub mod logical;
 mod pax;
 pub mod stream;
 #[cfg(test)]
 mod test_support;
+pub mod write;
 
 pub use error::{FrameError, FrameErrorInner};
 pub use pax::{HdrCharset, PaxRecord, PaxString, PaxValue};

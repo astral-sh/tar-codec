@@ -9,6 +9,9 @@ This crate provides two views over an asynchronous I/O source:
 - `stream::TarStream` emits physical 512-byte header and data frames for lossless inspection and debugging.
 - `logical::TarReader` emits logical global-pax updates and members, resolves byte-oriented member path/link metadata according to PAX/GNU precedence, and streams member payload blocks through a borrowing cursor.
 
+It also provides `write` helpers for constructing deterministic POSIX-pax
+member blocks without performing I/O.
+
 Each stream is "locked" to one archive family: POSIX pax/ustar or GNU, never a mixture.
 
 The POSIX pax subset parses standard extended-header records into typed values,

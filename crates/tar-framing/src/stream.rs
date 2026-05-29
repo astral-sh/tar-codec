@@ -14,18 +14,15 @@ use tokio_stream::Stream;
 use crate::{
     ArchiveFormat, BLOCK_SIZE, Block, FrameError, FrameErrorInner, GnuKind, MemberKind, PaxKind,
     PaxRecord, PaxValue,
+    header::{
+        CHECKSUM_RANGE, GNU_IDENTITY, IDENTITY_RANGE, POSIX_IDENTITY, SIZE_RANGE, TYPEFLAG_OFFSET,
+        checksum, parse_octal,
+    },
     pax::{
         apply_global as apply_global_pax_records, hdrcharset as pax_hdrcharset,
         parse_records as parse_pax_records, size as pax_size,
     },
 };
-
-pub(crate) const SIZE_RANGE: std::ops::Range<usize> = 124..136;
-pub(crate) const CHECKSUM_RANGE: std::ops::Range<usize> = 148..156;
-pub(crate) const TYPEFLAG_OFFSET: usize = 156;
-pub(crate) const IDENTITY_RANGE: std::ops::Range<usize> = 257..265;
-pub(crate) const POSIX_IDENTITY: &[u8; 8] = b"ustar\x0000";
-pub(crate) const GNU_IDENTITY: &[u8; 8] = b"ustar  \0";
 
 type PositionedBlock = (u64, Block);
 
@@ -719,17 +716,7 @@ impl TryFromFramed<&Block> for ParsedHeader {
             }
         };
 
-        let actual_checksum = block
-            .iter()
-            .enumerate()
-            .map(|(offset, byte)| {
-                if CHECKSUM_RANGE.contains(&offset) {
-                    u64::from(b' ')
-                } else {
-                    u64::from(*byte)
-                }
-            })
-            .sum();
+        let actual_checksum = checksum(block);
         let expected_checksum = parse_octal(&block[CHECKSUM_RANGE]);
         if expected_checksum != Some(actual_checksum) {
             return Err(FrameError::at(
@@ -759,29 +746,6 @@ pub(crate) fn parse_number(format: ArchiveFormat, bytes: &[u8]) -> Option<u64> {
         ArchiveFormat::Pax => parse_octal(bytes),
         ArchiveFormat::Gnu => parse_gnu_number(bytes),
     }
-}
-
-fn parse_octal(bytes: &[u8]) -> Option<u64> {
-    if bytes.first().is_some_and(|byte| byte & 0x80 != 0) {
-        return None;
-    }
-    let terminator = bytes.iter().position(|byte| matches!(byte, 0 | b' '))?;
-    if terminator == 0
-        || bytes[..terminator]
-            .iter()
-            .any(|byte| !matches!(byte, b'0'..=b'7'))
-    {
-        return None;
-    }
-    if bytes[terminator..]
-        .iter()
-        .any(|byte| !matches!(byte, 0 | b' '))
-    {
-        return None;
-    }
-    bytes[..terminator].iter().try_fold(0_u64, |value, byte| {
-        value.checked_mul(8)?.checked_add(u64::from(*byte - b'0'))
-    })
 }
 
 fn parse_gnu_number(bytes: &[u8]) -> Option<u64> {
