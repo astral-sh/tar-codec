@@ -11,7 +11,7 @@ use tokio_stream::StreamExt;
 use crate::{
     ArchiveFormat, BLOCK_SIZE, FrameError, FrameErrorInner, GnuKind, MemberKind, PaxKind,
     PaxRecord, PaxString, PaxValue,
-    stream::{DataOwner, Frame, GnuFrame, PaxFrame, TarStream},
+    stream::{DataOwner, Frame, GnuFrame, PaxFrame, TarStream, parse_number},
 };
 
 const NAME_RANGE: std::ops::Range<usize> = 0..100;
@@ -97,11 +97,7 @@ impl MemberHeader {
         let bytes: [u8; 8] = self.block[MODE_RANGE]
             .try_into()
             .expect("fixed header range");
-        let mode = match self.format {
-            ArchiveFormat::PosixPax => parse_octal(&bytes),
-            ArchiveFormat::Gnu => parse_gnu_number(&bytes),
-        };
-        mode.ok_or_else(|| {
+        parse_number(self.format, &bytes).ok_or_else(|| {
             FrameError::at(self.position, FrameErrorInner::InvalidMode { found: bytes })
         })
     }
@@ -174,10 +170,12 @@ impl<R> MemberFrame<'_, R> {
                 global_records,
                 local,
             } => resolve_pax_text(
-                &self.header,
+                self.header.position,
                 global_records,
                 local.as_ref(),
-                PaxTextField::Path,
+                "path",
+                self.header.header_path(),
+                path_value,
             ),
             MemberExtensions::Gnu { long_name, .. } => match long_name {
                 Some(metadata) => Ok(Cow::Borrowed(parse_gnu_metadata(
@@ -199,10 +197,12 @@ impl<R> MemberFrame<'_, R> {
                 global_records,
                 local,
             } => resolve_pax_text(
-                &self.header,
+                self.header.position,
                 global_records,
                 local.as_ref(),
-                PaxTextField::LinkPath,
+                "linkpath",
+                Cow::Borrowed(self.header.link_name()),
+                link_path_value,
             ),
             MemberExtensions::Gnu { long_link, .. } => match long_link {
                 Some(metadata) => Ok(Cow::Borrowed(parse_gnu_metadata(
@@ -485,61 +485,37 @@ impl<R: AsyncRead + Unpin> MemberPayload<'_, R> {
     }
 }
 
-#[derive(Clone, Copy)]
-enum PaxTextField {
-    Path,
-    LinkPath,
-}
-
-impl PaxTextField {
-    fn keyword(self) -> &'static str {
-        match self {
-            Self::Path => "path",
-            Self::LinkPath => "linkpath",
-        }
-    }
-
-    fn value(self, record: &PaxRecord) -> Option<&PaxValue<PaxString>> {
-        match (self, record) {
-            (Self::Path, PaxRecord::Path(value)) | (Self::LinkPath, PaxRecord::LinkPath(value)) => {
-                Some(value)
-            }
-            _ => None,
-        }
-    }
-
-    fn header_value<'a>(self, header: &'a MemberHeader) -> Cow<'a, [u8]> {
-        match self {
-            Self::Path => header.header_path(),
-            Self::LinkPath => Cow::Borrowed(header.link_name()),
-        }
-    }
-}
-
 fn resolve_pax_text<'a>(
-    header: &'a MemberHeader,
+    position: u64,
     global_records: &'a [PaxRecord],
     local: Option<&'a PaxMetadata>,
-    field: PaxTextField,
+    keyword: &'static str,
+    header_value: Cow<'a, [u8]>,
+    select: fn(&PaxRecord) -> Option<&PaxValue<PaxString>>,
 ) -> Result<Cow<'a, [u8]>, FrameError> {
-    let local_value = local.and_then(|local| {
-        local
-            .records
-            .iter()
-            .rev()
-            .find_map(|record| field.value(record))
-    });
-    if let Some(value) = local_value {
-        return pax_value(header.position, field.keyword(), value);
+    let value = local
+        .and_then(|local| local.records.iter().rev().find_map(select))
+        .or_else(|| global_records.iter().rev().find_map(select));
+    if let Some(value) = value {
+        return pax_value(position, keyword, value);
     }
-    let global_value = global_records
-        .iter()
-        .rev()
-        .find_map(|record| field.value(record));
-    if let Some(value) = global_value {
-        return pax_value(header.position, field.keyword(), value);
+    Ok(header_value)
+}
+
+fn path_value(record: &PaxRecord) -> Option<&PaxValue<PaxString>> {
+    if let PaxRecord::Path(value) = record {
+        Some(value)
+    } else {
+        None
     }
-    Ok(field.header_value(header))
+}
+
+fn link_path_value(record: &PaxRecord) -> Option<&PaxValue<PaxString>> {
+    if let PaxRecord::LinkPath(value) = record {
+        Some(value)
+    } else {
+        None
+    }
 }
 
 /// Return the raw bytes of a pax record, erroring if the record is a tombstone
@@ -602,35 +578,6 @@ fn trim_nul(bytes: &[u8]) -> &[u8] {
         .position(|byte| *byte == 0)
         .unwrap_or(bytes.len());
     &bytes[..end]
-}
-
-fn parse_octal(bytes: &[u8]) -> Option<u64> {
-    if bytes.first().is_some_and(|byte| byte & 0x80 != 0) {
-        return None;
-    }
-    let terminator = bytes.iter().position(|byte| matches!(byte, 0 | b' '))?;
-    if terminator == 0
-        || bytes[..terminator]
-            .iter()
-            .any(|byte| !matches!(byte, b'0'..=b'7'))
-        || bytes[terminator..]
-            .iter()
-            .any(|byte| !matches!(byte, 0 | b' '))
-    {
-        return None;
-    }
-    bytes[..terminator].iter().try_fold(0_u64, |value, byte| {
-        value.checked_mul(8)?.checked_add(u64::from(*byte - b'0'))
-    })
-}
-
-fn parse_gnu_number(bytes: &[u8]) -> Option<u64> {
-    if bytes.first() != Some(&0x80) {
-        return parse_octal(bytes);
-    }
-    bytes[1..].iter().try_fold(0_u64, |value, byte| {
-        value.checked_mul(256)?.checked_add(u64::from(*byte))
-    })
 }
 
 fn frame_position(frame: &Frame) -> u64 {

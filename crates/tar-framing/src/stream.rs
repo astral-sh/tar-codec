@@ -754,11 +754,7 @@ impl TryFromFramed<&[u8; BLOCK_SIZE]> for ParsedHeader {
         }
 
         let size_bytes: [u8; 12] = block[SIZE_RANGE].try_into().expect("fixed header range");
-        let size = match format {
-            ArchiveFormat::PosixPax => parse_octal(&size_bytes),
-            ArchiveFormat::Gnu => parse_gnu_size(&size_bytes),
-        }
-        .ok_or_else(|| {
+        let size = parse_number(format, &size_bytes).ok_or_else(|| {
             FrameError::at(position, FrameErrorInner::InvalidSize { found: size_bytes })
         })?;
 
@@ -767,6 +763,13 @@ impl TryFromFramed<&[u8; BLOCK_SIZE]> for ParsedHeader {
             typeflag: block[TYPEFLAG_OFFSET],
             size,
         })
+    }
+}
+
+pub(crate) fn parse_number(format: ArchiveFormat, bytes: &[u8]) -> Option<u64> {
+    match format {
+        ArchiveFormat::PosixPax => parse_octal(bytes),
+        ArchiveFormat::Gnu => parse_gnu_number(bytes),
     }
 }
 
@@ -793,7 +796,7 @@ fn parse_octal(bytes: &[u8]) -> Option<u64> {
     })
 }
 
-fn parse_gnu_size(bytes: &[u8]) -> Option<u64> {
+fn parse_gnu_number(bytes: &[u8]) -> Option<u64> {
     if bytes.first() != Some(&0x80) {
         return parse_octal(bytes);
     }
