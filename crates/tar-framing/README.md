@@ -9,7 +9,7 @@ This crate provides two views over an asynchronous I/O source:
 - `physical::TarStream` emits physical 512-byte header and data frames for lossless inspection and debugging.
 - `logical::TarReader` emits logical global-pax updates and members, retaining only the pax records or GNU payload values needed to interpret each member while streaming member payload blocks through a borrowing cursor.
 
-Each stream is locked to one archive family: POSIX pax/ustar or GNU, never a mixture.
+Each stream is "locked" to one archive family: POSIX pax/ustar or GNU, never a mixture.
 
 The POSIX pax subset parses standard extended-header records into typed values,
 accepts reserved `realtime.*` and `security.*` records plus uppercase
