@@ -48,14 +48,14 @@ impl<R> Archive<R> {
 /// Controls which otherwise valid archive features extraction may accept.
 ///
 /// The default permits symbolic links and either supported framing family,
-/// while rejecting hard links, vendor-namespaced POSIX pax records, and
-/// repeated keywords or member-specific records within global POSIX pax
-/// extended headers.
+/// while rejecting hard links, global POSIX pax extensions,
+/// vendor-namespaced POSIX pax records, and repeated keywords.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExtractPolicy {
     allow_symlinks: bool,
     allow_hard_links: bool,
     allow_gnu: bool,
+    allow_global_pax_extensions: bool,
     allow_pax_vendor_extensions: bool,
     allow_duplicate_pax_records: bool,
     allow_global_pax_member_metadata: bool,
@@ -67,6 +67,7 @@ impl Default for ExtractPolicy {
             allow_symlinks: true,
             allow_hard_links: false,
             allow_gnu: true,
+            allow_global_pax_extensions: false,
             allow_pax_vendor_extensions: false,
             allow_duplicate_pax_records: false,
             allow_global_pax_member_metadata: false,
@@ -93,6 +94,16 @@ impl ExtractPolicy {
     /// Configures whether archives in the GNU framing family may be extracted.
     pub fn allow_gnu(mut self, allow: bool) -> Self {
         self.allow_gnu = allow;
+        self
+    }
+
+    /// Configures whether global POSIX pax extension headers may be accepted.
+    ///
+    /// When enabled, [`Self::allow_global_pax_member_metadata`] separately
+    /// controls whether global `path`, `linkpath`, and `size` records are
+    /// accepted.
+    pub fn allow_global_pax_extensions(mut self, allow: bool) -> Self {
+        self.allow_global_pax_extensions = allow;
         self
     }
 
@@ -125,6 +136,16 @@ impl ExtractPolicy {
             return Err(policy_violation(
                 position,
                 ExtractPolicyViolation::GnuArchive,
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_global_pax_extension(&self, position: u64) -> Result<(), ExtractError> {
+        if !self.allow_global_pax_extensions {
+            return Err(policy_violation(
+                position,
+                ExtractPolicyViolation::GlobalPaxExtension,
             ));
         }
         Ok(())
@@ -216,6 +237,7 @@ impl<R: AsyncRead + Unpin> Archive<R> {
         while let Some(frame) = self.reader.next_frame().await? {
             match frame {
                 LogicalFrame::GlobalPax(header) => {
+                    policy.check_global_pax_extension(header.position)?;
                     policy.check_pax_records(header.position, PaxKind::Global, &header.records)?;
                 }
                 LogicalFrame::Member(mut frame) => {
@@ -258,6 +280,9 @@ pub enum ExtractPolicyViolation {
     /// A GNU-family frame appeared when only POSIX-pax extraction is allowed.
     #[error("GNU archives are not allowed")]
     GnuArchive,
+    /// A global POSIX pax extended header appeared when it is forbidden.
+    #[error("global pax extended headers are not allowed")]
+    GlobalPaxExtension,
     /// A vendor-namespaced POSIX pax record appeared.
     #[error("pax vendor extension {vendor}.{name} is not allowed")]
     PaxVendorExtension {
@@ -1453,7 +1478,9 @@ mod tests {
         extract_with_policy(
             bytes,
             &dest,
-            ExtractPolicy::default().allow_global_pax_member_metadata(true),
+            ExtractPolicy::default()
+                .allow_global_pax_extensions(true)
+                .allow_global_pax_member_metadata(true),
         )
         .await
         .unwrap();
@@ -1714,7 +1741,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_every_pax_vendor_record_by_default() {
+    async fn rejects_every_pax_vendor_record_when_otherwise_permitted() {
         let temp = tempdir().unwrap();
         for (case, typeflag, payload, add_member) in [
             ("local", b'x', record("ACME.attribute", "value"), true),
@@ -1744,7 +1771,13 @@ mod tests {
             }
             finish(&mut bytes);
             assert!(matches!(
-                extract(bytes, &dest).await.unwrap_err(),
+                extract_with_policy(
+                    bytes,
+                    &dest,
+                    ExtractPolicy::default().allow_global_pax_extensions(typeflag == b'g')
+                )
+                .await
+                .unwrap_err(),
                 ExtractError::PolicyViolation {
                     position: 0,
                     violation: ExtractPolicyViolation::PaxVendorExtension {
@@ -1765,7 +1798,13 @@ mod tests {
         append_pax(&mut partial, b'g', &record("ACME.attribute", "value"));
         finish(&mut partial);
         assert!(matches!(
-            extract(partial, &partial_dest).await.unwrap_err(),
+            extract_with_policy(
+                partial,
+                &partial_dest,
+                ExtractPolicy::default().allow_global_pax_extensions(true)
+            )
+            .await
+            .unwrap_err(),
             ExtractError::PolicyViolation {
                 position: 1024,
                 violation: ExtractPolicyViolation::PaxVendorExtension { .. },
@@ -1834,6 +1873,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_global_pax_extensions_by_default_and_allows_opt_in() {
+        let temp = tempdir().unwrap();
+        let rejected_dest = temp.path().join("rejected");
+        let mut rejected = Vec::new();
+        append_pax(&mut rejected, b'g', &record("comment", "metadata"));
+        finish(&mut rejected);
+        assert!(matches!(
+            extract(rejected, &rejected_dest).await.unwrap_err(),
+            ExtractError::PolicyViolation {
+                position: 0,
+                violation: ExtractPolicyViolation::GlobalPaxExtension,
+            }
+        ));
+
+        let permitted_dest = temp.path().join("permitted");
+        let mut permitted = Vec::new();
+        append_pax(&mut permitted, b'g', &record("comment", "metadata"));
+        append_posix_member(&mut permitted, "file", b'0', b"contents", "", 0o644);
+        finish(&mut permitted);
+        extract_with_policy(
+            permitted,
+            &permitted_dest,
+            ExtractPolicy::default().allow_global_pax_extensions(true),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(permitted_dest.join("file")).unwrap(),
+            "contents"
+        );
+    }
+
+    #[tokio::test]
     async fn allows_global_member_metadata_updates_when_enabled() {
         let temp = tempdir().unwrap();
         let dest = temp.path().join("out");
@@ -1846,7 +1918,9 @@ mod tests {
         extract_with_policy(
             bytes,
             &dest,
-            ExtractPolicy::default().allow_global_pax_member_metadata(true),
+            ExtractPolicy::default()
+                .allow_global_pax_extensions(true)
+                .allow_global_pax_member_metadata(true),
         )
         .await
         .unwrap();
@@ -1858,7 +1932,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_member_specific_global_pax_records_by_default() {
+    async fn rejects_member_specific_global_pax_records_when_global_extensions_are_allowed() {
         let temp = tempdir().unwrap();
         for (keyword, value) in [("path", "file"), ("linkpath", "target"), ("size", "0")] {
             let dest = temp.path().join(keyword);
@@ -1867,7 +1941,13 @@ mod tests {
             finish(&mut bytes);
 
             assert!(matches!(
-                extract(bytes, &dest).await.unwrap_err(),
+                extract_with_policy(
+                    bytes,
+                    &dest,
+                    ExtractPolicy::default().allow_global_pax_extensions(true)
+                )
+                .await
+                .unwrap_err(),
                 ExtractError::PolicyViolation {
                     position: 0,
                     violation: ExtractPolicyViolation::GlobalPaxMemberMetadata {
@@ -1882,7 +1962,13 @@ mod tests {
         append_pax(&mut deleted, b'g', &record("path", ""));
         finish(&mut deleted);
         assert!(matches!(
-            extract(deleted, &deleted_dest).await.unwrap_err(),
+            extract_with_policy(
+                deleted,
+                &deleted_dest,
+                ExtractPolicy::default().allow_global_pax_extensions(true)
+            )
+            .await
+            .unwrap_err(),
             ExtractError::PolicyViolation {
                 position: 0,
                 violation: ExtractPolicyViolation::GlobalPaxMemberMetadata { keyword: "path" },
