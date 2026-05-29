@@ -68,6 +68,14 @@ impl MemberHeader {
     }
 
     /// Returns the ordinary member path before extension metadata is applied.
+    ///
+    /// For ustar headers, this is the concatenation of the prefix and name fields.
+    /// For GNU headers, this is just the name field.
+    ///
+    /// **IMPORTANT**: This path is **not** guaranteed to be meaningful, valid, or
+    /// correct in the presence of pax or GNU metadata. Some tar encoders will place
+    /// a sentinel value in these fields. Unless you're writing a forensic tar
+    /// inspector, you probably want [`MemberFrame::effective_path`] instead.
     pub fn header_path(&self) -> Cow<'_, [u8]> {
         let name = self.name();
         if self.format == ArchiveFormat::Gnu {
