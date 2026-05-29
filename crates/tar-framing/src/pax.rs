@@ -342,6 +342,8 @@ fn parse_text(position: u64, value: &[u8]) -> Result<PaxValue<String>, FrameErro
     }
 }
 
+/// Parse a pax "string". This is distinct from [`parse_text`] or the common
+/// underlying [`parse_utf8`] since it's [`HdrCharset`]-aware.
 fn parse_pax_string(
     position: u64,
     value: &[u8],
