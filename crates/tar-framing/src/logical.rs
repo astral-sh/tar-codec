@@ -542,6 +542,8 @@ fn resolve_pax_text<'a>(
     Ok(field.header_value(header))
 }
 
+/// Return the raw bytes of a pax record, erroring if the record is a tombstone
+/// (i.e.) explicitly deleted.
 fn pax_value<'a>(
     position: u64,
     keyword: &'static str,
@@ -549,6 +551,15 @@ fn pax_value<'a>(
 ) -> Result<Cow<'a, [u8]>, FrameError> {
     match value {
         PaxValue::Value(value) => Ok(Cow::Borrowed(value.as_bytes())),
+        // A pax value that has been explicitly deleted does *not*
+        // result in a fallthrough to the corresponding ustar header value:
+        //
+        // "If a keyword in an extended header record (or in a -o option-
+        // argument) overrides or deletes a corresponding field in the ustar
+        // header block, pax shall ignore the contents of that header block
+        // field."
+        //
+        // See: pax spec, "pax Extended Header"
         PaxValue::Deleted => Err(FrameError::at(
             position,
             FrameErrorInner::DeletedPaxMetadata { keyword },
@@ -570,6 +581,9 @@ fn parse_gnu_metadata(metadata: &GnuMetadata, kind: GnuKind) -> Result<&[u8], Fr
                 },
             )
         })?;
+
+    // TODO: Make this configurable through some kind of policy?
+    // Might be overly strict in practice.
     if metadata.payload[terminator..].iter().any(|byte| *byte != 0) {
         return Err(FrameError::at(
             metadata.position,
