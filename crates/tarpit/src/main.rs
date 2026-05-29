@@ -8,7 +8,7 @@ use async_compression::tokio::bufread::GzipDecoder;
 use clap::{Parser, Subcommand};
 use tar_framing::{
     ArchiveFormat, FrameError, GnuKind, HdrCharset, MemberKind, PaxKind, PaxRecord, PaxValue,
-    physical::{DataOwner, Frame, TarStream},
+    stream::{DataOwner, Frame, TarStream},
 };
 use thiserror::Error;
 use tokio::{

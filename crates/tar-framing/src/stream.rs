@@ -1,9 +1,26 @@
-//! Lossless, block-oriented tar framing.
+//! Lossless, block-oriented tar streaming.
 //!
-//! The physical API emits one frame for each accepted non-terminator physical
+//! This API emits one frame for each accepted non-terminator physical
 //! tar block and preserves each source block verbatim.
 
-use crate::{ArchiveFormat, BLOCK_SIZE, GnuKind, MemberKind, PaxKind, PaxRecord, pax::PaxSize};
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
+
+use tokio::io::{AsyncRead, ReadBuf};
+use tokio_stream::Stream;
+
+use crate::{
+    ArchiveFormat, BLOCK_SIZE, CHECKSUM_RANGE, FrameError, FrameErrorInner, GNU_IDENTITY, GnuKind,
+    IDENTITY_RANGE, MemberKind, POSIX_IDENTITY, PaxKind, PaxRecord, SIZE_RANGE, TYPEFLAG_OFFSET,
+    pax::{
+        PaxSize, apply_global as apply_global_pax_records, parse_records as parse_pax_records,
+        size as pax_size,
+    },
+};
+
+type PositionedBlock = (u64, [u8; BLOCK_SIZE]);
 
 /// Represents a single non-terminator physical block in a tar stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -149,6 +166,679 @@ pub struct TarStream<R> {
     pub(super) state: State,
 }
 
+impl<R> TarStream<R> {
+    /// Creates a new [`TarStream`] from the given reader.
+    pub fn new(reader: R) -> Self {
+        Self {
+            position: 0,
+            inner: reader,
+            block: [0; BLOCK_SIZE],
+            block_len: 0,
+            format: None,
+            global_pax_records: Vec::new(),
+            state: State::AwaitingHeader,
+        }
+    }
+
+    /// Returns the selected archive family after the first header is read.
+    pub fn format(&self) -> Option<ArchiveFormat> {
+        self.format
+    }
+
+    pub(crate) fn position(&self) -> u64 {
+        self.position
+    }
+}
+
+impl<R: AsyncRead + Unpin> TarStream<R> {
+    fn poll_read_block(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<PositionedBlock>, FrameError>> {
+        while self.block_len < BLOCK_SIZE {
+            let mut read_buf = ReadBuf::new(&mut self.block[self.block_len..]);
+            match Pin::new(&mut self.inner).poll_read(cx, &mut read_buf) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(source)) => {
+                    return Poll::Ready(Err(FrameError::at(
+                        self.position + self.block_len as u64,
+                        FrameErrorInner::Io { source },
+                    )));
+                }
+                Poll::Ready(Ok(())) => {
+                    let read = read_buf.filled().len();
+                    if read == 0 {
+                        if self.block_len == 0 {
+                            return Poll::Ready(Ok(None));
+                        }
+                        return Poll::Ready(Err(FrameError::at(
+                            self.position,
+                            FrameErrorInner::IncompleteBlock {
+                                read: self.block_len,
+                            },
+                        )));
+                    }
+                    self.block_len += read;
+                }
+            }
+        }
+
+        let position = self.position;
+        self.position = self
+            .position
+            .checked_add(BLOCK_SIZE as u64)
+            .ok_or_else(|| {
+                FrameError::at(
+                    position,
+                    FrameErrorInner::ArithmeticOverflow {
+                        context: "stream position",
+                    },
+                )
+            })?;
+        self.block_len = 0;
+        let block = std::mem::replace(&mut self.block, [0; BLOCK_SIZE]);
+        Poll::Ready(Ok(Some((position, block))))
+    }
+
+    fn handle_eof(&mut self) -> FrameError {
+        match &self.state {
+            State::AwaitingHeader | State::AwaitingSecondZero => {
+                FrameError::at(self.position, FrameErrorInner::MissingEndMarker)
+            }
+            State::ReadingPax {
+                kind, remaining, ..
+            } => FrameError::at(
+                self.position,
+                FrameErrorInner::TruncatedPayload {
+                    owner: DataOwner::Pax(*kind),
+                    remaining: *remaining,
+                },
+            ),
+            State::AwaitingUstarHeader { .. } => FrameError::at(
+                self.position,
+                FrameErrorInner::UnexpectedEof {
+                    expected: "ordinary ustar member header after a local pax header",
+                },
+            ),
+            State::ReadingGnu {
+                kind, remaining, ..
+            } => FrameError::at(
+                self.position,
+                FrameErrorInner::TruncatedPayload {
+                    owner: DataOwner::Gnu(*kind),
+                    remaining: *remaining,
+                },
+            ),
+            State::AwaitingGnuMember { .. } => FrameError::at(
+                self.position,
+                FrameErrorInner::UnexpectedEof {
+                    expected: "ordinary GNU member header after a GNU metadata extension",
+                },
+            ),
+            State::ReadingMember { remaining } => FrameError::at(
+                self.position,
+                FrameErrorInner::TruncatedPayload {
+                    owner: DataOwner::Member,
+                    remaining: *remaining,
+                },
+            ),
+            State::Complete | State::Failed => FrameError::at(
+                self.position,
+                FrameErrorInner::UnexpectedEof {
+                    expected: "no further input",
+                },
+            ),
+        }
+    }
+
+    fn process_block(
+        &mut self,
+        position: u64,
+        block: [u8; BLOCK_SIZE],
+    ) -> Result<Option<Frame>, FrameError> {
+        let state = std::mem::replace(&mut self.state, State::Failed);
+        match state {
+            State::AwaitingHeader => {
+                if is_zero_block(&block) {
+                    self.state = State::AwaitingSecondZero;
+                    Ok(None)
+                } else {
+                    self.process_boundary_header(position, block).map(Some)
+                }
+            }
+            State::ReadingPax {
+                kind,
+                header_position,
+                mut remaining,
+                mut payload,
+            } => {
+                let len = remaining.min(BLOCK_SIZE as u64) as usize;
+                payload.extend_from_slice(&block[..len]);
+                remaining -= len as u64;
+                let completed_pax_records = if remaining == 0 {
+                    let records = parse_pax_records(header_position, &payload)?;
+                    match kind {
+                        PaxKind::Local => {
+                            let size = pax_size(&records);
+                            self.state = State::AwaitingUstarHeader {
+                                records: records.clone(),
+                                size,
+                            };
+                        }
+                        PaxKind::Global => {
+                            apply_global_pax_records(&mut self.global_pax_records, records.clone());
+                            self.state = State::AwaitingHeader;
+                        }
+                    }
+                    Some(records)
+                } else {
+                    self.state = State::ReadingPax {
+                        kind,
+                        header_position,
+                        remaining,
+                        payload,
+                    };
+                    None
+                };
+                Ok(Some(Frame::Data(DataFrame {
+                    position,
+                    block,
+                    len,
+                    owner: DataOwner::Pax(kind),
+                    completed_pax_records,
+                })))
+            }
+            State::AwaitingUstarHeader { records, size } => {
+                if is_zero_block(&block) {
+                    return Err(FrameError::at(
+                        position,
+                        FrameErrorInner::UnexpectedOrder {
+                            expected: "ordinary ustar member header after a local pax header",
+                            found: "end-of-archive marker",
+                        },
+                    ));
+                }
+                let parsed = self.parse_format_checked_header(position, &block)?;
+                if matches!(parsed.typeflag, b'x' | b'g') {
+                    return Err(FrameError::at(
+                        position,
+                        FrameErrorInner::UnexpectedOrder {
+                            expected: "ordinary ustar member header after a local pax header",
+                            found: "another pax extended header",
+                        },
+                    ));
+                }
+                self.process_ustar_header(position, block, parsed, records, size)
+                    .map(Some)
+            }
+            State::ReadingGnu {
+                kind,
+                mut remaining,
+                pending,
+            } => {
+                let len = remaining.min(BLOCK_SIZE as u64) as usize;
+                remaining -= len as u64;
+                if remaining == 0 {
+                    self.state = State::AwaitingGnuMember { pending };
+                } else {
+                    self.state = State::ReadingGnu {
+                        kind,
+                        remaining,
+                        pending,
+                    };
+                }
+                Ok(Some(Frame::Data(DataFrame {
+                    position,
+                    block,
+                    len,
+                    owner: DataOwner::Gnu(kind),
+                    completed_pax_records: None,
+                })))
+            }
+            State::AwaitingGnuMember { pending } => {
+                if is_zero_block(&block) {
+                    return Err(FrameError::at(
+                        position,
+                        FrameErrorInner::UnexpectedOrder {
+                            expected: "ordinary GNU member header after a GNU metadata extension",
+                            found: "end-of-archive marker",
+                        },
+                    ));
+                }
+                let parsed = self.parse_format_checked_header(position, &block)?;
+                self.process_gnu_header(position, block, parsed, pending)
+                    .map(Some)
+            }
+            State::ReadingMember { mut remaining } => {
+                let len = remaining.min(BLOCK_SIZE as u64) as usize;
+                remaining -= len as u64;
+                if remaining == 0 {
+                    self.state = State::AwaitingHeader;
+                } else {
+                    self.state = State::ReadingMember { remaining };
+                }
+                Ok(Some(Frame::Data(DataFrame {
+                    position,
+                    block,
+                    len,
+                    owner: DataOwner::Member,
+                    completed_pax_records: None,
+                })))
+            }
+            State::AwaitingSecondZero => {
+                if !is_zero_block(&block) {
+                    return Err(FrameError::at(position, FrameErrorInner::InvalidEndMarker));
+                }
+                self.state = State::Complete;
+                Ok(None)
+            }
+            State::Complete => {
+                self.state = State::Complete;
+                Ok(None)
+            }
+            State::Failed => {
+                self.state = State::Failed;
+                Ok(None)
+            }
+        }
+    }
+
+    fn process_boundary_header(
+        &mut self,
+        position: u64,
+        block: [u8; BLOCK_SIZE],
+    ) -> Result<Frame, FrameError> {
+        let parsed = self.parse_format_checked_header(position, &block)?;
+        match self.format.expect("header selects an archive format") {
+            ArchiveFormat::PosixPax => self.process_posix_boundary_header(position, block, parsed),
+            ArchiveFormat::Gnu => {
+                self.process_gnu_header(position, block, parsed, PendingGnu::default())
+            }
+        }
+    }
+
+    /// Parses a header and enforces the archive's single selected format.
+    ///
+    /// The first non-terminator header selects the format; later headers must
+    /// match that selection before their family-specific fields are parsed.
+    fn parse_format_checked_header(
+        &mut self,
+        position: u64,
+        block: &[u8; BLOCK_SIZE],
+    ) -> Result<ParsedHeader, FrameError> {
+        let found = detect_format(position, block)?;
+        if let Some(expected) = self.format
+            && found != expected
+        {
+            return Err(FrameError::at(
+                position,
+                FrameErrorInner::FormatMismatch { expected, found },
+            ));
+        }
+        let parsed = parse_header(position, block, found)?;
+        self.format.get_or_insert(found);
+        Ok(parsed)
+    }
+
+    /// Processes a POSIX header at an archive-member boundary, where a new
+    /// pax extension or an ordinary ustar member may begin.
+    ///
+    /// Pax extension headers enter [`State::ReadingPax`]; ordinary ustar
+    /// headers are delegated to [`Self::process_ustar_header`].
+    fn process_posix_boundary_header(
+        &mut self,
+        position: u64,
+        block: [u8; BLOCK_SIZE],
+        parsed: ParsedHeader,
+    ) -> Result<Frame, FrameError> {
+        match parsed.typeflag {
+            b'x' => self.process_pax_header(position, block, parsed.size, PaxKind::Local),
+            b'g' => self.process_pax_header(position, block, parsed.size, PaxKind::Global),
+            _ => {
+                self.process_ustar_header(position, block, parsed, Vec::new(), PaxSize::Unspecified)
+            }
+        }
+    }
+
+    /// Emits a pax extension header and enters its payload-reading state.
+    ///
+    /// This is reached only from the POSIX boundary state, before any local
+    /// pax records require an ordinary member header.
+    fn process_pax_header(
+        &mut self,
+        position: u64,
+        block: [u8; BLOCK_SIZE],
+        payload_size: u64,
+        kind: PaxKind,
+    ) -> Result<Frame, FrameError> {
+        if payload_size == 0 {
+            return Err(FrameError::at(
+                position,
+                FrameErrorInner::InvalidPaxRecords {
+                    reason: "extended header payload contains no records",
+                },
+            ));
+        }
+        self.state = State::ReadingPax {
+            kind,
+            header_position: position,
+            remaining: payload_size,
+            payload: Vec::new(),
+        };
+        Ok(Frame::Pax(PaxFrame {
+            position,
+            block,
+            kind,
+            payload_size,
+        }))
+    }
+
+    /// Emits an ordinary ustar member header after applying pax size state.
+    ///
+    /// This handles both bare members and members required by
+    /// [`State::AwaitingUstarHeader`], then enters member data reading when
+    /// the effective member size requires payload blocks.
+    fn process_ustar_header(
+        &mut self,
+        position: u64,
+        block: [u8; BLOCK_SIZE],
+        parsed: ParsedHeader,
+        local_pax_records: Vec<PaxRecord>,
+        local_size: PaxSize,
+    ) -> Result<Frame, FrameError> {
+        let kind = member_kind(position, parsed.typeflag)?;
+        let effective_size = match local_size {
+            PaxSize::Value(size) => Some(size),
+            PaxSize::Deleted => None,
+            PaxSize::Unspecified => match pax_size(&self.global_pax_records) {
+                PaxSize::Value(size) => Some(size),
+                PaxSize::Deleted => None,
+                PaxSize::Unspecified => Some(parsed.size),
+            },
+        };
+        let payload_size = posix_payload_size(position, kind, effective_size)?;
+        self.state = if payload_size == 0 {
+            State::AwaitingHeader
+        } else {
+            State::ReadingMember {
+                remaining: payload_size,
+            }
+        };
+        Ok(Frame::Header(HeaderFrame {
+            position,
+            block,
+            kind,
+            declared_size: parsed.size,
+            effective_size,
+            payload_size,
+            global_pax_records: self.global_pax_records.clone(),
+            local_pax_records,
+        }))
+    }
+
+    fn process_gnu_header(
+        &mut self,
+        position: u64,
+        block: [u8; BLOCK_SIZE],
+        parsed: ParsedHeader,
+        mut pending: PendingGnu,
+    ) -> Result<Frame, FrameError> {
+        let extension = match parsed.typeflag {
+            b'L' => Some(GnuKind::LongName),
+            b'K' => Some(GnuKind::LongLink),
+            _ => None,
+        };
+        if let Some(kind) = extension {
+            let already_seen = match kind {
+                GnuKind::LongName => &mut pending.long_name,
+                GnuKind::LongLink => &mut pending.long_link,
+            };
+            if *already_seen {
+                return Err(FrameError::at(
+                    position,
+                    FrameErrorInner::UnexpectedOrder {
+                        expected: "ordinary GNU member header or the other GNU metadata extension",
+                        found: "duplicate GNU metadata extension",
+                    },
+                ));
+            }
+            *already_seen = true;
+            self.state = if parsed.size == 0 {
+                State::AwaitingGnuMember { pending }
+            } else {
+                State::ReadingGnu {
+                    kind,
+                    remaining: parsed.size,
+                    pending,
+                }
+            };
+            return Ok(Frame::Gnu(GnuFrame {
+                position,
+                block,
+                kind,
+                payload_size: parsed.size,
+            }));
+        }
+
+        let kind = member_kind(position, parsed.typeflag)?;
+        if pending.long_link && !matches!(kind, MemberKind::HardLink | MemberKind::SymbolicLink) {
+            return Err(FrameError::at(
+                position,
+                FrameErrorInner::UnexpectedOrder {
+                    expected: "hard-link or symbolic-link member after GNU long-link extension",
+                    found: "non-link ordinary member",
+                },
+            ));
+        }
+        let payload_size = gnu_payload_size(position, kind, parsed.size)?;
+        self.state = if payload_size == 0 {
+            State::AwaitingHeader
+        } else {
+            State::ReadingMember {
+                remaining: payload_size,
+            }
+        };
+        Ok(Frame::Header(HeaderFrame {
+            position,
+            block,
+            kind,
+            declared_size: parsed.size,
+            effective_size: Some(parsed.size),
+            payload_size,
+            global_pax_records: Vec::new(),
+            local_pax_records: Vec::new(),
+        }))
+    }
+}
+
+impl<R: AsyncRead + Unpin> Stream for TarStream<R> {
+    type Item = Result<Frame, FrameError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if matches!(this.state, State::Complete | State::Failed) {
+                return Poll::Ready(None);
+            }
+
+            let (position, block) = match this.poll_read_block(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(Some(block))) => block,
+                Poll::Ready(Ok(None)) => {
+                    let error = this.handle_eof();
+                    this.state = State::Failed;
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Poll::Ready(Err(error)) => {
+                    this.state = State::Failed;
+                    return Poll::Ready(Some(Err(error)));
+                }
+            };
+
+            match this.process_block(position, block) {
+                Ok(Some(frame)) => return Poll::Ready(Some(Ok(frame))),
+                Ok(None) => continue,
+                Err(error) => {
+                    this.state = State::Failed;
+                    return Poll::Ready(Some(Err(error)));
+                }
+            }
+        }
+    }
+}
+
+struct ParsedHeader {
+    typeflag: u8,
+    size: u64,
+}
+
+fn is_zero_block(block: &[u8; BLOCK_SIZE]) -> bool {
+    block.iter().all(|byte| *byte == 0)
+}
+
+fn detect_format(position: u64, block: &[u8; BLOCK_SIZE]) -> Result<ArchiveFormat, FrameError> {
+    match &block[IDENTITY_RANGE] {
+        identity if identity == POSIX_IDENTITY => Ok(ArchiveFormat::PosixPax),
+        identity if identity == GNU_IDENTITY => Ok(ArchiveFormat::Gnu),
+        identity => Err(FrameError::at(
+            position,
+            FrameErrorInner::InvalidIdentity {
+                found: identity.try_into().expect("fixed header range"),
+            },
+        )),
+    }
+}
+
+fn parse_header(
+    position: u64,
+    block: &[u8; BLOCK_SIZE],
+    format: ArchiveFormat,
+) -> Result<ParsedHeader, FrameError> {
+    let actual_checksum = block
+        .iter()
+        .enumerate()
+        .map(|(offset, byte)| {
+            if CHECKSUM_RANGE.contains(&offset) {
+                u64::from(b' ')
+            } else {
+                u64::from(*byte)
+            }
+        })
+        .sum();
+    let expected_checksum = parse_octal(&block[CHECKSUM_RANGE]);
+    if expected_checksum != Some(actual_checksum) {
+        return Err(FrameError::at(
+            position,
+            FrameErrorInner::InvalidChecksum {
+                expected: expected_checksum,
+                actual: actual_checksum,
+            },
+        ));
+    }
+
+    let size_bytes: [u8; 12] = block[SIZE_RANGE].try_into().expect("fixed header range");
+    let size = match format {
+        ArchiveFormat::PosixPax => parse_octal(&size_bytes),
+        ArchiveFormat::Gnu => parse_gnu_size(&size_bytes),
+    }
+    .ok_or_else(|| FrameError::at(position, FrameErrorInner::InvalidSize { found: size_bytes }))?;
+
+    Ok(ParsedHeader {
+        typeflag: block[TYPEFLAG_OFFSET],
+        size,
+    })
+}
+
+fn parse_octal(bytes: &[u8]) -> Option<u64> {
+    if bytes.first().is_some_and(|byte| byte & 0x80 != 0) {
+        return None;
+    }
+    let terminator = bytes.iter().position(|byte| matches!(byte, 0 | b' '))?;
+    if terminator == 0
+        || bytes[..terminator]
+            .iter()
+            .any(|byte| !matches!(byte, b'0'..=b'7'))
+    {
+        return None;
+    }
+    if bytes[terminator..]
+        .iter()
+        .any(|byte| !matches!(byte, 0 | b' '))
+    {
+        return None;
+    }
+    bytes[..terminator].iter().try_fold(0_u64, |value, byte| {
+        value.checked_mul(8)?.checked_add(u64::from(*byte - b'0'))
+    })
+}
+
+fn parse_gnu_size(bytes: &[u8]) -> Option<u64> {
+    if bytes.first() != Some(&0x80) {
+        return parse_octal(bytes);
+    }
+    bytes[1..].iter().try_fold(0_u64, |value, byte| {
+        value.checked_mul(256)?.checked_add(u64::from(*byte))
+    })
+}
+
+fn member_kind(position: u64, typeflag: u8) -> Result<MemberKind, FrameError> {
+    match typeflag {
+        0 | b'0' => Ok(MemberKind::Regular),
+        b'1' => Ok(MemberKind::HardLink),
+        b'2' => Ok(MemberKind::SymbolicLink),
+        b'3' => Ok(MemberKind::CharacterDevice),
+        b'4' => Ok(MemberKind::BlockDevice),
+        b'5' => Ok(MemberKind::Directory),
+        b'6' => Ok(MemberKind::Fifo),
+        b'7' => Ok(MemberKind::Contiguous),
+        _ => Err(FrameError::at(
+            position,
+            FrameErrorInner::UnsupportedTypeflag { typeflag },
+        )),
+    }
+}
+
+fn posix_payload_size(
+    position: u64,
+    kind: MemberKind,
+    size: Option<u64>,
+) -> Result<u64, FrameError> {
+    match kind {
+        MemberKind::Regular | MemberKind::HardLink | MemberKind::Contiguous => {
+            size.ok_or_else(|| {
+                FrameError::at(position, FrameErrorInner::IndeterminateMemberSize { kind })
+            })
+        }
+        MemberKind::SymbolicLink => match size {
+            Some(size) if size != 0 => Err(FrameError::at(
+                position,
+                FrameErrorInner::InvalidMemberSize { kind, size },
+            )),
+            _ => Ok(0),
+        },
+        MemberKind::CharacterDevice
+        | MemberKind::BlockDevice
+        | MemberKind::Directory
+        | MemberKind::Fifo => Ok(0),
+    }
+}
+
+fn gnu_payload_size(position: u64, kind: MemberKind, size: u64) -> Result<u64, FrameError> {
+    match kind {
+        MemberKind::Regular | MemberKind::Contiguous => Ok(size),
+        MemberKind::HardLink | MemberKind::SymbolicLink if size != 0 => Err(FrameError::at(
+            position,
+            FrameErrorInner::InvalidMemberSize { kind, size },
+        )),
+        MemberKind::HardLink
+        | MemberKind::SymbolicLink
+        | MemberKind::CharacterDevice
+        | MemberKind::BlockDevice
+        | MemberKind::Directory
+        | MemberKind::Fifo => Ok(0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -161,7 +851,6 @@ mod tests {
     use super::*;
     use crate::{
         ArchiveFormat, FrameError, FrameErrorInner, IDENTITY_RANGE, PaxValue, SIZE_RANGE,
-        is_zero_block,
         test_support::{
             ChunkedReader, append_block, append_payload, append_terminator, data,
             gnu_base256_header, gnu_header, header, record, set_checksum,

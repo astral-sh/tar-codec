@@ -16,7 +16,7 @@ It owns:
 - strict selection of one archive family per stream: POSIX pax/ustar or GNU;
 - header identity, checksum, size, ordering, payload, and terminator checks;
 - typed PAX record parsing and PAX size effects on framing;
-- the physical block API, `physical::TarStream`; and
+- the physical block API, `stream::TarStream`; and
 - the assembled read API, `logical::TarReader`.
 
 `TarStream` preserves accepted 512-byte source blocks for low-level consumers.

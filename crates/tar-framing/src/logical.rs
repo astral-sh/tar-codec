@@ -9,7 +9,7 @@ use tokio_stream::StreamExt;
 use crate::{
     ArchiveFormat, BLOCK_SIZE, FrameError, FrameErrorInner, GnuKind, MemberKind, PaxKind,
     PaxRecord,
-    physical::{DataOwner, Frame, GnuFrame, PaxFrame, TarStream},
+    stream::{DataOwner, Frame, GnuFrame, PaxFrame, TarStream},
 };
 
 /// Parsed pax metadata needed to interpret a logical archive item.
@@ -395,7 +395,7 @@ mod tests {
     use super::*;
     use crate::{
         BLOCK_SIZE, FrameError, FrameErrorInner, PaxRecord, PaxValue, TYPEFLAG_OFFSET,
-        physical::DataOwner,
+        stream::DataOwner,
         test_support::{
             ChunkedReader, append_block, append_payload, append_terminator, data, gnu_header,
             header, ready, record,
