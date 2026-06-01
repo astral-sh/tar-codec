@@ -568,7 +568,9 @@ version = "0.1.0"
 dependencies = [
  "async-compression",
  "clap",
+ "tar-codec",
  "tar-framing",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-stream",
