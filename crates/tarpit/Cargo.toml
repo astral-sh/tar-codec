@@ -1,6 +1,6 @@
 [package]
 name = "tarpit"
-description = "A CLI for visualizing tar streams"
+description = "A CLI for inspecting and extracting tar streams"
 edition.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -10,6 +10,7 @@ version.workspace = true
 readme.workspace = true
 
 [dependencies]
+tar-codec = { workspace = true }
 tar-framing = { workspace = true }
 
 async-compression = { workspace = true }
@@ -17,3 +18,6 @@ clap = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt"] }
 tokio-stream = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

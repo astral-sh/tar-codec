@@ -41,8 +41,8 @@ impl<R> Archive<R> {
 /// Controls which otherwise valid archive features extraction may accept.
 ///
 /// The default permits symbolic links and either supported framing family,
-/// while rejecting hard links, global pax extensions,
-/// vendor-namespaced pax records, and repeated keywords.
+/// while rejecting hard links, global pax member metadata, vendor-namespaced
+/// pax records, and repeated keywords.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExtractPolicy {
     allow_symlinks: bool,
@@ -53,15 +53,25 @@ pub struct ExtractPolicy {
 
 /// Controls which otherwise valid pax features extraction may accept.
 ///
-/// The default rejects global pax extensions, vendor-namespaced records, and
-/// duplicate records. Global per-member metadata remains separately disabled
-/// for callers that enable global pax extensions.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// The default permits global pax extension headers while rejecting global
+/// per-member metadata, vendor-namespaced records, and duplicate records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PaxExtractPolicy {
     allow_global_pax_extensions: bool,
     allow_pax_vendor_extensions: bool,
     allow_duplicate_pax_records: bool,
     allow_global_pax_member_metadata: bool,
+}
+
+impl Default for PaxExtractPolicy {
+    fn default() -> Self {
+        Self {
+            allow_global_pax_extensions: true,
+            allow_pax_vendor_extensions: false,
+            allow_duplicate_pax_records: false,
+            allow_global_pax_member_metadata: false,
+        }
+    }
 }
 
 impl Default for ExtractPolicy {
@@ -527,13 +537,18 @@ fn normalize_path(
                     return unsafe_path(position, context, value, "escapes the destination root");
                 }
             }
-            component if component.contains(':') => {
+            component if has_windows_prefix(component) => {
                 return unsafe_path(position, context, value, "contains a platform path prefix");
             }
             component => components.push(component.to_owned()),
         }
     }
     Ok(components.iter().collect())
+}
+
+fn has_windows_prefix(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 fn unsafe_path<T>(
@@ -1254,6 +1269,46 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn extracts_paths_with_non_prefix_colons() {
+        let temp = tempdir().unwrap();
+        let dest = temp.path().join("out");
+        let mut bytes = Vec::new();
+        append_posix_member(
+            &mut bytes,
+            "tests/snippets/ballon:main.py",
+            b'0',
+            b"ok",
+            "",
+            0o644,
+        );
+        finish(&mut bytes);
+
+        extract(bytes, &dest).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dest.join("tests/snippets/ballon:main.py")).unwrap(),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn rejects_windows_drive_prefixes_during_path_normalization() {
+        assert_eq!(
+            normalize_member_path(0, "tests/snippets/ballon:main.py").unwrap(),
+            PathBuf::from("tests/snippets/ballon:main.py")
+        );
+        for value in ["C:", "C:/escape", "nested/C:/escape"] {
+            assert!(matches!(
+                normalize_member_path(0, value),
+                Err(ExtractError::UnsafePath {
+                    reason: "contains a platform path prefix",
+                    ..
+                })
+            ));
+        }
+    }
+
     #[tokio::test]
     async fn applies_posix_path_and_linkpath_precedence_when_globals_are_allowed() {
         let temp = tempdir().unwrap();
@@ -1675,14 +1730,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_global_pax_extensions_by_default_and_allows_opt_in() {
+    async fn allows_harmless_global_pax_extensions_by_default_and_supports_opt_out() {
         let temp = tempdir().unwrap();
         let rejected_dest = temp.path().join("rejected");
         let mut rejected = Vec::new();
         append_pax(&mut rejected, b'g', &record("comment", "metadata"));
         finish(&mut rejected);
         assert!(matches!(
-            extract(rejected, &rejected_dest).await.unwrap_err(),
+            extract_with_policy(
+                rejected,
+                &rejected_dest,
+                ExtractPolicy::default()
+                    .pax_policy(PaxExtractPolicy::default().allow_global_pax_extensions(false))
+            )
+            .await
+            .unwrap_err(),
             ExtractError::PolicyViolation {
                 position: 0,
                 violation: ExtractPolicyViolation::GlobalPaxExtension,
@@ -1694,14 +1756,7 @@ mod tests {
         append_pax(&mut permitted, b'g', &record("comment", "metadata"));
         append_posix_member(&mut permitted, "file", b'0', b"contents", "", 0o644);
         finish(&mut permitted);
-        extract_with_policy(
-            permitted,
-            &permitted_dest,
-            ExtractPolicy::default()
-                .pax_policy(PaxExtractPolicy::default().allow_global_pax_extensions(true)),
-        )
-        .await
-        .unwrap();
+        extract(permitted, &permitted_dest).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(permitted_dest.join("file")).unwrap(),
             "contents"
