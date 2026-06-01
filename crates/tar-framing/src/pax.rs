@@ -83,6 +83,15 @@ pub enum PaxRecord {
     Charset(PaxValue<String>),
     /// An uninterpreted archive comment.
     Comment(PaxValue<String>),
+    /// File status-change time compatibility extension in integral seconds.
+    ///
+    /// NOTE: newer versions of the pax spec don't include this record.
+    /// We support it for backwards compatibility.
+    ///
+    /// See: <https://www.opengroup.org/austin/aardvark/finaltext/xcubug.txt>
+    /// See: <https://www.opengroup.org/austin/docs/austin_166.txt>
+    /// See: <https://www.opengroup.org/austin/docs/austin_206.txt>
+    Ctime(PaxValue<u64>),
     /// Numeric group identifier.
     Gid(PaxValue<u64>),
     /// Group name encoded according to the effective [`HdrCharset`].
@@ -133,6 +142,7 @@ impl PaxRecord {
             Self::Atime(_) => Cow::Borrowed("atime"),
             Self::Charset(_) => Cow::Borrowed("charset"),
             Self::Comment(_) => Cow::Borrowed("comment"),
+            Self::Ctime(_) => Cow::Borrowed("ctime"),
             Self::Gid(_) => Cow::Borrowed("gid"),
             Self::Gname(_) => Cow::Borrowed("gname"),
             Self::HdrCharset(_) => Cow::Borrowed("hdrcharset"),
@@ -282,6 +292,9 @@ fn parse_record(
         }
         "charset" => parse_text(position, value).map(PaxRecord::Charset),
         "comment" => parse_text(position, value).map(PaxRecord::Comment),
+        "ctime" => {
+            parse_time(position, "ctime", parse_utf8(position, value)?).map(PaxRecord::Ctime)
+        }
         "gid" => {
             parse_record_integer(position, "gid", parse_utf8(position, value)?).map(PaxRecord::Gid)
         }
@@ -584,6 +597,7 @@ mod tests {
         for (keyword, value) in [
             ("charset", "BINARY"),
             ("comment", "a=b"),
+            ("ctime", "17.500"),
             ("gid", "7"),
             ("gname", "group"),
             ("hdrcharset", UTF8_HDRCHARSET),
@@ -609,6 +623,7 @@ mod tests {
                 PaxRecord::Atime(PaxValue::Value(12)),
                 PaxRecord::Charset(PaxValue::Value("BINARY".to_owned())),
                 PaxRecord::Comment(PaxValue::Value("a=b".to_owned())),
+                PaxRecord::Ctime(PaxValue::Value(17)),
                 PaxRecord::Gid(PaxValue::Value(7)),
                 PaxRecord::Gname(PaxValue::Value(PaxString::Utf8("group".to_owned()))),
                 PaxRecord::HdrCharset(PaxValue::Value(HdrCharset::Utf8)),
@@ -642,6 +657,7 @@ mod tests {
                 "atime",
                 "charset",
                 "comment",
+                "ctime",
                 "gid",
                 "gname",
                 "hdrcharset",
@@ -656,6 +672,14 @@ mod tests {
                 "ACME.attribute",
             ]
         );
+    }
+
+    #[test]
+    fn parses_deleted_ctime_compatibility_extension() {
+        let Ok(records) = parse_records(0, &encoded_record("ctime", ""), HdrCharset::Utf8) else {
+            panic!("ctime deletion should parse");
+        };
+        assert_eq!(records, vec![PaxRecord::Ctime(PaxValue::Deleted)]);
     }
 
     #[test]
