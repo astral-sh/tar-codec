@@ -5,16 +5,19 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    io,
+    io::{self, Read},
+    mem,
     path::{Path, PathBuf},
 };
 
 use tar_framing::{
     BLOCK_SIZE, MemberKind,
-    write::{FramingWriteError, PaxMember, end_marker, frame_pax_member},
+    write::{FramingWriteError, PaxMember, end_marker, frame_pax_member_into},
 };
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+const SOURCE_FILE_CHUNK_BYTES: usize = 1024 * 1024;
 
 /// Minimal regular-file metadata accepted by [`Encoder::add_entry`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -35,6 +38,7 @@ pub struct Encoder<W> {
     writer: W,
     sequence: u64,
     entries: HashMap<String, ArchivedEntry>,
+    framing_buffer: Vec<u8>,
     poisoned: bool,
 }
 
@@ -45,6 +49,7 @@ impl<W> Encoder<W> {
             writer,
             sequence: 0,
             entries: HashMap::new(),
+            framing_buffer: Vec::new(),
             poisoned: false,
         }
     }
@@ -64,8 +69,7 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
     {
         self.ensure_active()?;
         let path = normalize_archive_path(path.as_ref())?;
-        let mut entries = self.entries.clone();
-        reserve_entry(&mut entries, &path, ArchivedEntry::Regular)?;
+        let implicit_ancestors = preflight_regular_entry(&self.entries, &path)?;
         let data = data.as_ref();
         let size = u64::try_from(data.len()).map_err(|_| EncodeError::ArithmeticOverflow {
             context: "manual entry payload size",
@@ -80,7 +84,11 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
         .await?;
         self.write_bytes(data).await?;
         self.write_padding(size).await?;
-        self.entries = entries;
+        for ancestor in implicit_ancestors {
+            self.entries
+                .insert(ancestor, ArchivedEntry::Directory { explicit: false });
+        }
+        self.entries.insert(path, ArchivedEntry::Regular);
         Ok(())
     }
 
@@ -99,8 +107,9 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
     }
 
     async fn write_manifest(&mut self, manifest: &[ManifestEntry]) -> Result<(), EncodeError> {
+        let mut buffer = Vec::new();
         for entry in manifest {
-            if let Err(error) = self.write_manifest_entry(entry).await {
+            if let Err(error) = self.write_manifest_entry(entry, &mut buffer).await {
                 self.poisoned = true;
                 return Err(error);
             }
@@ -117,7 +126,11 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
         Ok(self.writer)
     }
 
-    async fn write_manifest_entry(&mut self, entry: &ManifestEntry) -> Result<(), EncodeError> {
+    async fn write_manifest_entry(
+        &mut self,
+        entry: &ManifestEntry,
+        buffer: &mut Vec<u8>,
+    ) -> Result<(), EncodeError> {
         match &entry.kind {
             ManifestKind::Directory => {
                 self.write_member(PaxMember {
@@ -140,26 +153,16 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
                 .await
             }
             ManifestKind::Regular { size, executable } => {
-                let mut file = tokio::fs::File::open(&entry.source)
-                    .await
-                    .map_err(|source| EncodeError::Filesystem {
-                        operation: "open source file",
-                        path: entry.source.clone(),
-                        source,
-                    })?;
-                let metadata = file
-                    .metadata()
-                    .await
-                    .map_err(|source| EncodeError::Filesystem {
-                        operation: "inspect source file",
-                        path: entry.source.clone(),
-                        source,
-                    })?;
-                if !metadata.is_file() || metadata.len() != *size {
-                    return Err(EncodeError::ChangedSourceFile {
-                        path: entry.source.clone(),
-                    });
-                }
+                let mut file = if *size <= SOURCE_FILE_CHUNK_BYTES as u64 {
+                    let reusable_buffer = mem::take(buffer);
+                    let (returned_buffer, result) =
+                        read_small_source_file(&entry.source, *size, reusable_buffer).await;
+                    *buffer = returned_buffer;
+                    result?;
+                    None
+                } else {
+                    Some(open_source_file(&entry.source, *size).await?)
+                };
                 self.write_member(PaxMember {
                     path: &entry.archive_path,
                     kind: MemberKind::Regular,
@@ -168,8 +171,12 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
                     executable: *executable,
                 })
                 .await?;
-                self.write_file_payload(&mut file, &entry.source, *size)
-                    .await?;
+                if let Some(file) = &mut file {
+                    self.write_file_payload(file, &entry.source, *size, buffer)
+                        .await?;
+                } else {
+                    self.write_bytes(buffer).await?;
+                }
                 self.write_padding(*size).await
             }
         }
@@ -182,12 +189,11 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
                 .ok_or(EncodeError::ArithmeticOverflow {
                     context: "pax member sequence",
                 })?;
-        let blocks = frame_pax_member(self.sequence, member)?;
-        self.write_bytes(&blocks.extended_header).await?;
-        for block in blocks.extended_payload {
-            self.write_bytes(&block).await?;
+        frame_pax_member_into(self.sequence, member, &mut self.framing_buffer)?;
+        if let Err(source) = self.writer.write_all(&self.framing_buffer).await {
+            self.poisoned = true;
+            return Err(EncodeError::Write { source });
         }
-        self.write_bytes(&blocks.member_header).await?;
         self.sequence = next_sequence;
         Ok(())
     }
@@ -197,8 +203,15 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
         file: &mut tokio::fs::File,
         path: &Path,
         size: u64,
+        buffer: &mut Vec<u8>,
     ) -> Result<(), EncodeError> {
-        let mut buffer = [0; 16 * 1024];
+        let chunk_len =
+            usize::try_from(size.min(SOURCE_FILE_CHUNK_BYTES as u64)).map_err(|_| {
+                EncodeError::ArithmeticOverflow {
+                    context: "source file read buffer size",
+                }
+            })?;
+        buffer.resize(chunk_len, 0);
         let mut remaining = size;
         while remaining != 0 {
             let read_len = usize::try_from(remaining.min(buffer.len() as u64)).map_err(|_| {
@@ -267,6 +280,67 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
         }
         Ok(())
     }
+}
+
+async fn open_source_file(path: &Path, expected_size: u64) -> Result<tokio::fs::File, EncodeError> {
+    let path = path.to_path_buf();
+    let file = tokio::task::spawn_blocking(move || open_verified_source_file(&path, expected_size))
+        .await??;
+    Ok(tokio::fs::File::from_std(file))
+}
+
+async fn read_small_source_file(
+    path: &Path,
+    expected_size: u64,
+    mut buffer: Vec<u8>,
+) -> (Vec<u8>, Result<(), EncodeError>) {
+    let path = path.to_path_buf();
+    match tokio::task::spawn_blocking(move || {
+        let result = (|| {
+            let file = open_verified_source_file(&path, expected_size)?;
+            let read_limit =
+                expected_size
+                    .checked_add(1)
+                    .ok_or(EncodeError::ArithmeticOverflow {
+                        context: "buffered source file read limit",
+                    })?;
+            buffer.clear();
+            file.take(read_limit)
+                .read_to_end(&mut buffer)
+                .map_err(|source| filesystem_error("read source file", &path, source))?;
+            let actual_size =
+                u64::try_from(buffer.len()).map_err(|_| EncodeError::ArithmeticOverflow {
+                    context: "buffered source file payload size",
+                })?;
+            if actual_size != expected_size {
+                return Err(EncodeError::ChangedSourceFile { path });
+            }
+            Ok(())
+        })();
+        (buffer, result)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => (Vec::new(), Err(error.into())),
+    }
+}
+
+fn open_verified_source_file(
+    path: &Path,
+    expected_size: u64,
+) -> Result<std::fs::File, EncodeError> {
+    let file = std::fs::File::open(path)
+        .map_err(|source| filesystem_error("open source file", path, source))?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| filesystem_error("inspect source file", path, source))?;
+    if !metadata.is_file() || metadata.len() != expected_size {
+        return Err(EncodeError::ChangedSourceFile {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(file)
 }
 
 /// A failure while creating a pure-pax archive.
@@ -514,6 +588,31 @@ fn reserve_entry(
         }
     }
     Ok(())
+}
+
+fn preflight_regular_entry(
+    entries: &HashMap<String, ArchivedEntry>,
+    path: &str,
+) -> Result<Vec<String>, EncodeError> {
+    let mut implicit_ancestors = Vec::new();
+    for (separator, _) in path.match_indices('/') {
+        let ancestor = &path[..separator];
+        match entries.get(ancestor) {
+            Some(ArchivedEntry::Directory { .. }) => {}
+            Some(_) => {
+                return Err(EncodeError::PathCollision {
+                    path: ancestor.to_owned(),
+                });
+            }
+            None => implicit_ancestors.push(ancestor.to_owned()),
+        }
+    }
+    if entries.contains_key(path) {
+        return Err(EncodeError::PathCollision {
+            path: path.to_owned(),
+        });
+    }
+    Ok(implicit_ancestors)
 }
 
 fn validate_symlink(
@@ -799,6 +898,10 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
+            encoder.entries.get("dir"),
+            Some(ArchivedEntry::Directory { explicit: false })
+        ));
+        assert!(matches!(
             encoder
                 .add_entry("dir/file", b"second", EntryMetadata::default())
                 .await,
@@ -814,6 +917,10 @@ mod tests {
             .add_entry("dir/other", b"ok", EntryMetadata::default())
             .await
             .unwrap();
+        assert!(matches!(
+            encoder.entries.get("dir/other"),
+            Some(ArchivedEntry::Regular)
+        ));
         encoder.finish().await.unwrap();
     }
 
@@ -894,6 +1001,25 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[tokio::test]
+    async fn recursively_streams_files_larger_than_the_buffered_threshold() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("tree");
+        std::fs::create_dir(&source).unwrap();
+        let contents = vec![b'x'; SOURCE_FILE_CHUNK_BYTES + 17];
+        std::fs::write(source.join("large"), &contents).unwrap();
+
+        let mut encoder = Encoder::new(Vec::new());
+        encoder.add_directory(&source).await.unwrap();
+        let bytes = encoder.finish().await.unwrap();
+        let dest = temp.path().join("out");
+        Archive::new(VecReader::new(bytes))
+            .extract(&dest, ExtractPolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(dest.join("tree/large")).unwrap(), contents);
     }
 
     #[cfg(unix)]
@@ -997,6 +1123,20 @@ mod tests {
                 Err(EncodeError::Poisoned)
             ));
         }
+
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("tree");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("file"), "initial").unwrap();
+        let manifest = scan_directory(&source).unwrap();
+        std::fs::remove_file(source.join("file")).unwrap();
+        std::fs::create_dir(source.join("file")).unwrap();
+
+        let mut encoder = Encoder::new(Vec::new());
+        assert!(matches!(
+            encoder.write_manifest(&manifest).await,
+            Err(EncodeError::ChangedSourceFile { .. })
+        ));
     }
 
     #[cfg(unix)]

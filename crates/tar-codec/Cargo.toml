@@ -18,5 +18,12 @@ tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
 tokio-stream = { workspace = true }
 
 [dev-dependencies]
+astral-tokio-tar = { workspace = true }
+criterion = { workspace = true }
+tar = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
+
+[[bench]]
+name = "comparison"
+harness = false
