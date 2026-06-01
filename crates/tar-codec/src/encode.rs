@@ -99,6 +99,9 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
     pub async fn add_directory<P: AsRef<Path>>(&mut self, source: P) -> Result<(), EncodeError> {
         self.ensure_active()?;
         let source = source.as_ref().to_path_buf();
+        // TODO: Revisit streaming traversal instead of a full manifest preflight.
+        // This would reduce many-small overhead, but permit partial output and
+        // require incremental collision and symbolic-link graph validation.
         let manifest = tokio::task::spawn_blocking(move || scan_directory(&source)).await??;
         let entries = reserve_manifest(&self.entries, &manifest)?;
         self.write_manifest(&manifest).await?;
@@ -1020,6 +1023,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read(dest.join("tree/large")).unwrap(), contents);
+    }
+
+    #[tokio::test]
+    async fn recursively_combines_buffered_and_streamed_source_files() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("tree");
+        std::fs::create_dir(&source).unwrap();
+        let large = vec![b'x'; SOURCE_FILE_CHUNK_BYTES + 17];
+        std::fs::write(source.join("a-small"), "first").unwrap();
+        std::fs::write(source.join("m-large"), &large).unwrap();
+        std::fs::write(source.join("z-small"), "last").unwrap();
+
+        let mut encoder = Encoder::new(Vec::new());
+        encoder.add_directory(&source).await.unwrap();
+        let bytes = encoder.finish().await.unwrap();
+        let dest = temp.path().join("out");
+        Archive::new(VecReader::new(bytes))
+            .extract(&dest, ExtractPolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dest.join("tree/a-small")).unwrap(),
+            "first"
+        );
+        assert_eq!(std::fs::read(dest.join("tree/m-large")).unwrap(), large);
+        assert_eq!(
+            std::fs::read_to_string(dest.join("tree/z-small")).unwrap(),
+            "last"
+        );
     }
 
     #[cfg(unix)]
