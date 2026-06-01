@@ -94,8 +94,8 @@ impl ExtractPolicy {
         self
     }
 
-    /// Configures whether symbolic links may name safe targets that were not
-    /// created by this extraction.
+    /// Configures whether symbolic links may name safe targets other than
+    /// entries created by this extraction or the extraction root.
     pub fn allow_dangling_symlinks(mut self, allow: bool) -> Self {
         self.allow_dangling_symlinks = allow;
         self
@@ -105,7 +105,8 @@ impl ExtractPolicy {
     ///
     /// When enabled, pax `linkdata` payloads may update the contents of an
     /// earlier extracted file through its shared inode. Hard-link headers with
-    /// modes different from their targets are accepted.
+    /// modes different from their targets are accepted without changing the
+    /// shared inode mode.
     pub fn allow_hard_links(mut self, allow: bool) -> Self {
         self.allow_hard_links = allow;
         self
@@ -583,6 +584,10 @@ struct PendingSymlink {
     contents: PathBuf,
 }
 
+// Keep graph validation bounded when each symbolic-link substitution grows the
+// remaining path instead of revisiting an identical expansion.
+const MAX_SYMLINK_EXPANSIONS: usize = 256;
+
 struct ExtractionRoot {
     dir: Arc<Dir>,
     extracted_files: HashSet<PathBuf>,
@@ -664,7 +669,7 @@ impl ExtractionRoot {
     ) -> Result<Option<ActiveWriter>, ExtractError> {
         self.prepare_file_path(&member.path).await?;
         let std_file = self
-            .create_new_file(&member.path, member.executable, false)
+            .create_new_file(&member.path, member.executable)
             .await?;
         self.extracted_files.insert(member.path.clone());
         Ok(active_writer(member, std_file))
@@ -722,9 +727,7 @@ impl ExtractionRoot {
         if member.payload_size == 0 {
             return Ok(None);
         }
-        let std_file = self
-            .create_new_file(&member.path, member.executable, true)
-            .await?;
+        let std_file = self.truncate_file(&member.path).await?;
         Ok(active_writer(member, std_file))
     }
 
@@ -732,14 +735,14 @@ impl ExtractionRoot {
         let mut terminal_kinds = Vec::with_capacity(self.symlink_paths.len());
         for path in &self.symlink_paths {
             let link = self.pending_symlinks.get(path).expect("tracked symlink");
-            let kind = self
-                .resolve_terminal(&link.target, &mut HashSet::new())
-                .map_err(|reason| ExtractError::InvalidLink {
+            let kind = self.resolve_terminal(&link.target).map_err(|reason| {
+                ExtractError::InvalidLink {
                     position: link.position,
                     path: path.clone(),
                     target: link.target_text.clone(),
                     reason,
-                })?;
+                }
+            })?;
             if kind == TerminalKind::Dangling && !allow_dangling_symlinks {
                 return Err(ExtractError::InvalidLink {
                     position: link.position,
@@ -757,32 +760,41 @@ impl ExtractionRoot {
         Ok(())
     }
 
-    fn resolve_terminal(
-        &self,
-        path: &Path,
-        visited: &mut HashSet<PathBuf>,
-    ) -> Result<TerminalKind, &'static str> {
-        if !visited.insert(path.to_owned()) {
-            return Err("symbolic-link target cycle");
-        }
-        let components: Vec<_> = path.components().collect();
-        let mut prefix = PathBuf::new();
-        for (index, component) in components.iter().enumerate() {
-            prefix.push(component.as_os_str());
-            if let Some(link) = self.pending_symlinks.get(&prefix) {
-                let mut rewritten = link.target.clone();
-                for remainder in components.iter().skip(index + 1) {
-                    rewritten.push(remainder.as_os_str());
-                }
-                return self.resolve_terminal(&rewritten, visited);
+    fn resolve_terminal(&self, path: &Path) -> Result<TerminalKind, &'static str> {
+        let mut path = path.to_owned();
+        let mut visited = HashSet::new();
+        let mut expansions = 0;
+        loop {
+            if !visited.insert(path.clone()) {
+                return Err("symbolic-link target cycle");
             }
-        }
-        if self.extracted_files.contains(path) {
-            Ok(TerminalKind::File)
-        } else if self.extracted_directories.contains(path) {
-            Ok(TerminalKind::Directory)
-        } else {
-            Ok(TerminalKind::Dangling)
+            let components: Vec<_> = path.components().collect();
+            let mut prefix = PathBuf::new();
+            let mut rewritten = None;
+            for (index, component) in components.iter().enumerate() {
+                prefix.push(component.as_os_str());
+                if let Some(link) = self.pending_symlinks.get(&prefix) {
+                    let mut target = link.target.clone();
+                    for remainder in components.iter().skip(index + 1) {
+                        target.push(remainder.as_os_str());
+                    }
+                    rewritten = Some(target);
+                    break;
+                }
+            }
+            if let Some(rewritten) = rewritten {
+                if expansions == MAX_SYMLINK_EXPANSIONS {
+                    return Err("symbolic-link target expansion limit exceeded");
+                }
+                expansions += 1;
+                path = rewritten;
+            } else if path.as_os_str().is_empty() || self.extracted_directories.contains(&path) {
+                return Ok(TerminalKind::Directory);
+            } else if self.extracted_files.contains(&path) {
+                return Ok(TerminalKind::File);
+            } else {
+                return Ok(TerminalKind::Dangling);
+            }
         }
     }
 
@@ -889,25 +901,33 @@ impl ExtractionRoot {
         &self,
         path: &Path,
         executable: bool,
-        truncate: bool,
     ) -> Result<std::fs::File, ExtractError> {
         let relative = path.to_owned();
         let error_path = relative.clone();
         let dir = Arc::clone(&self.dir);
         tokio::task::spawn_blocking(move || {
             let mut options = OpenOptions::new();
-            options.write(true);
-            if truncate {
-                options.truncate(true);
-            } else {
-                options.create_new(true);
-            }
+            options.write(true).create_new(true);
             let file = dir.open_with(relative, &options)?;
             add_executable(&file, executable)?;
             Ok(file.into_std())
         })
         .await?
         .map_err(|source| filesystem("create file", error_path, source))
+    }
+
+    async fn truncate_file(&self, path: &Path) -> Result<std::fs::File, ExtractError> {
+        let relative = path.to_owned();
+        let error_path = relative.clone();
+        let dir = Arc::clone(&self.dir);
+        tokio::task::spawn_blocking(move || {
+            let mut options = OpenOptions::new();
+            options.write(true).truncate(true);
+            dir.open_with(relative, &options)
+                .map(cap_std::fs::File::into_std)
+        })
+        .await?
+        .map_err(|source| filesystem("truncate file", error_path, source))
     }
 
     async fn hard_link(&self, target: &Path, path: &Path) -> Result<(), ExtractError> {
@@ -1644,6 +1664,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn strict_dangling_symlinks_allow_the_extraction_root() {
+        let temp = tempdir().unwrap();
+        let dest = temp.path().join("out");
+        let mut bytes = Vec::new();
+        append_posix_member(&mut bytes, "link", b'2', b"", ".", 0o644);
+        finish(&mut bytes);
+        extract_with_policy(
+            bytes,
+            &dest,
+            ExtractPolicy::default().allow_dangling_symlinks(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_link(dest.join("link")).unwrap(),
+            Path::new(".")
+        );
+    }
+
+    #[tokio::test]
+    async fn allows_repeated_finite_symbolic_link_expansion() {
+        let temp = tempdir().unwrap();
+        let dest = temp.path().join("out");
+        let mut bytes = Vec::new();
+        append_posix_member(&mut bytes, "file", b'0', b"ok", "", 0o644);
+        append_posix_member(&mut bytes, "a", b'2', b"", ".", 0o644);
+        append_posix_member(&mut bytes, "b", b'2', b"", "a/a/file", 0o644);
+        finish(&mut bytes);
+        extract(bytes, &dest).await.unwrap();
+        assert_eq!(std::fs::read_to_string(dest.join("b")).unwrap(), "ok");
+    }
+
+    #[tokio::test]
     async fn rejects_symbolic_link_cycles_and_root_escapes() {
         let temp = tempdir().unwrap();
         let cycle_dest = temp.path().join("cycle");
@@ -1657,6 +1710,23 @@ mod tests {
         ));
         assert!(!cycle_dest.join("a").exists());
         assert!(!cycle_dest.join("b").exists());
+
+        let growing_cycle_dest = temp.path().join("growing-cycle");
+        let mut growing_cycle = Vec::new();
+        append_posix_member(&mut growing_cycle, "a", b'2', b"", "b/x", 0o644);
+        append_posix_member(&mut growing_cycle, "b", b'2', b"", "a/y", 0o644);
+        finish(&mut growing_cycle);
+        assert!(matches!(
+            extract(growing_cycle, &growing_cycle_dest)
+                .await
+                .unwrap_err(),
+            ExtractError::InvalidLink {
+                reason: "symbolic-link target expansion limit exceeded",
+                ..
+            }
+        ));
+        assert!(!growing_cycle_dest.join("a").exists());
+        assert!(!growing_cycle_dest.join("b").exists());
 
         let escape_dest = temp.path().join("escape");
         let mut escape = Vec::new();
@@ -1717,6 +1787,26 @@ mod tests {
             .await
             .unwrap();
         assert!(differing_mode_dest.join("b").is_file());
+
+        #[cfg(unix)]
+        {
+            let linkdata_mode_dest = temp.path().join("linkdata-mode");
+            let mut linkdata_mode = Vec::new();
+            append_posix_member(&mut linkdata_mode, "a", b'0', b"old", "", 0o644);
+            append_posix_member(&mut linkdata_mode, "b", b'1', b"new", "a", 0o755);
+            finish(&mut linkdata_mode);
+            extract_with_policy(linkdata_mode, &linkdata_mode_dest, policy)
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::metadata(linkdata_mode_dest.join("a"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0
+            );
+        }
     }
 
     #[tokio::test]
