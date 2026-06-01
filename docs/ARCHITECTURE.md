@@ -38,7 +38,11 @@ It owns:
 
 - applying UTF-8 extraction policy to effective member path and link bytes;
 - extraction policy, including `ExtractPolicy` and `PaxExtractPolicy`;
-- archive-path normalization and collision handling; and
+- archive-path normalization and collision handling, including unconditional
+  regular-file replacement and reuse of real directories;
+- deferred symbolic-link installation, including bounded graph validation,
+  policy-controlled dangling links, and unconditional rejection of escaping
+  targets; and
 - capability-relative creation of files, directories, and permitted links;
 - recursive encoding traversal, source symlink validation, and async writes.
 
