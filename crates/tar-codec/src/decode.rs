@@ -40,12 +40,13 @@ impl<R> Archive<R> {
 
 /// Controls which otherwise valid archive features extraction may accept.
 ///
-/// The default permits symbolic links and either supported framing family,
-/// while rejecting hard links, global pax member metadata, vendor-namespaced
-/// pax records, and repeated keywords.
+/// The default permits symbolic links, safe dangling symbolic links, and
+/// either supported framing family, while rejecting hard links, global pax
+/// member metadata, vendor-namespaced pax records, and repeated keywords.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExtractPolicy {
     allow_symlinks: bool,
+    allow_dangling_symlinks: bool,
     allow_hard_links: bool,
     allow_gnu: bool,
     pax_policy: PaxExtractPolicy,
@@ -78,6 +79,7 @@ impl Default for ExtractPolicy {
     fn default() -> Self {
         Self {
             allow_symlinks: true,
+            allow_dangling_symlinks: true,
             allow_hard_links: false,
             allow_gnu: true,
             pax_policy: PaxExtractPolicy::default(),
@@ -92,10 +94,18 @@ impl ExtractPolicy {
         self
     }
 
+    /// Configures whether symbolic links may name safe targets that were not
+    /// created by this extraction.
+    pub fn allow_dangling_symlinks(mut self, allow: bool) -> Self {
+        self.allow_dangling_symlinks = allow;
+        self
+    }
+
     /// Configures whether hard-link members may be extracted.
     ///
     /// When enabled, pax `linkdata` payloads may update the contents of an
-    /// earlier extracted file through its shared inode.
+    /// earlier extracted file through its shared inode. Hard-link headers with
+    /// modes different from their targets are accepted.
     pub fn allow_hard_links(mut self, allow: bool) -> Self {
         self.allow_hard_links = allow;
         self
@@ -242,10 +252,11 @@ impl PaxExtractPolicy {
 impl<R: AsyncRead + Unpin> Archive<R> {
     /// Securely extracts this archive beneath `dest` under `policy`.
     ///
-    /// The destination is created when missing. Existing contents are never
-    /// overwritten. On failure, already-created non-symlink entries may
-    /// remain, as with conventional streaming tar extractors. The caller must
-    /// not concurrently mutate `dest` while extraction is in progress.
+    /// The destination is created when missing. Regular files replace existing
+    /// regular files by unlinking and recreating them. On failure,
+    /// already-created entries and replaced regular files may remain, as with
+    /// conventional streaming tar extractors. The caller must not concurrently
+    /// mutate `dest` while extraction is in progress.
     pub async fn extract<P: AsRef<Path>>(
         mut self,
         dest: P,
@@ -291,7 +302,7 @@ impl<R: AsyncRead + Unpin> Archive<R> {
                 }
             }
         }
-        root.install_symlinks().await
+        root.install_symlinks(policy.allow_dangling_symlinks).await
     }
 }
 
@@ -399,16 +410,6 @@ pub enum ExtractError {
         target: String,
         /// Rejection reason.
         reason: &'static str,
-    },
-    /// A hard link would mutate executable intent on an existing inode.
-    #[error("at byte {position}: hard link {path} has executable status different from {target}")]
-    HardLinkExecutableMismatch {
-        /// Source member-header position.
-        position: u64,
-        /// New hard-link path.
-        path: PathBuf,
-        /// Existing linked target.
-        target: PathBuf,
     },
     /// A frame stream violated the contract expected from `tar-framing`.
     #[error("invalid tar frame sequence: {reason}")]
@@ -575,13 +576,6 @@ fn path_components(path: &Path) -> Vec<String> {
 }
 
 #[derive(Clone, Debug)]
-enum EntryKind {
-    File { executable: bool },
-    Directory { declared: bool },
-    SymbolicLink(PendingSymlink),
-}
-
-#[derive(Clone, Debug)]
 struct PendingSymlink {
     position: u64,
     target_text: String,
@@ -591,8 +585,10 @@ struct PendingSymlink {
 
 struct ExtractionRoot {
     dir: Arc<Dir>,
-    entries: HashMap<PathBuf, EntryKind>,
-    symlinks: Vec<PathBuf>,
+    extracted_files: HashSet<PathBuf>,
+    extracted_directories: HashSet<PathBuf>,
+    pending_symlinks: HashMap<PathBuf, PendingSymlink>,
+    symlink_paths: Vec<PathBuf>,
 }
 
 impl ExtractionRoot {
@@ -618,8 +614,10 @@ impl ExtractionRoot {
         .map_err(|source| filesystem("open destination directory", path, source))?;
         Ok(Self {
             dir: Arc::new(dir),
-            entries: HashMap::new(),
-            symlinks: Vec::new(),
+            extracted_files: HashSet::new(),
+            extracted_directories: HashSet::new(),
+            pending_symlinks: HashMap::new(),
+            symlink_paths: Vec::new(),
         })
     }
 
@@ -664,34 +662,25 @@ impl ExtractionRoot {
         &mut self,
         member: DecodedMember,
     ) -> Result<Option<ActiveWriter>, ExtractError> {
-        self.ensure_new_path(&member.path).await?;
+        self.prepare_file_path(&member.path).await?;
         let std_file = self
             .create_new_file(&member.path, member.executable, false)
             .await?;
-        self.entries.insert(
-            member.path.clone(),
-            EntryKind::File {
-                executable: member.executable,
-            },
-        );
+        self.extracted_files.insert(member.path.clone());
         Ok(active_writer(member, std_file))
     }
 
     async fn create_directory(&mut self, member: DecodedMember) -> Result<(), ExtractError> {
         self.ensure_parents(&member.path).await?;
-        if let Some(entry) = self.entries.get_mut(&member.path) {
-            return match entry {
-                EntryKind::Directory { declared: false } => {
-                    *entry = EntryKind::Directory { declared: true };
-                    Ok(())
-                }
-                _ => Err(ExtractError::PathCollision { path: member.path }),
-            };
+        if self.pending_symlinks.contains_key(&member.path) {
+            return Err(ExtractError::PathCollision { path: member.path });
         }
-        self.reject_existing(&member.path).await?;
-        self.create_dir(&member.path).await?;
-        self.entries
-            .insert(member.path, EntryKind::Directory { declared: true });
+        match self.symlink_metadata(&member.path).await? {
+            Some(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Some(_) => return Err(ExtractError::PathCollision { path: member.path }),
+            None => self.create_dir(&member.path).await?,
+        }
+        self.extracted_directories.insert(member.path);
         Ok(())
     }
 
@@ -700,16 +689,16 @@ impl ExtractionRoot {
         let target = normalize_symlink_target(member.position, &member.path, &target_text)?;
         self.ensure_new_path(&member.path).await?;
         let contents = relative_link_contents(&member.path, &target);
-        self.entries.insert(
+        self.pending_symlinks.insert(
             member.path.clone(),
-            EntryKind::SymbolicLink(PendingSymlink {
+            PendingSymlink {
                 position: member.position,
                 target_text,
                 target,
                 contents,
-            }),
+            },
         );
-        self.symlinks.push(member.path);
+        self.symlink_paths.push(member.path);
         Ok(())
     }
 
@@ -719,32 +708,17 @@ impl ExtractionRoot {
     ) -> Result<Option<ActiveWriter>, ExtractError> {
         let target_text = required_link_target(&member)?;
         let target = normalize_hard_link_target(member.position, &target_text)?;
-        let target_executable = match self.entries.get(&target) {
-            Some(EntryKind::File { executable }) => *executable,
-            _ => {
-                return Err(ExtractError::InvalidLink {
-                    position: member.position,
-                    path: member.path,
-                    target: target_text,
-                    reason: "hard-link target is not a previously extracted file",
-                });
-            }
-        };
-        if target_executable != member.executable {
-            return Err(ExtractError::HardLinkExecutableMismatch {
+        if !self.extracted_files.contains(&target) {
+            return Err(ExtractError::InvalidLink {
                 position: member.position,
                 path: member.path,
-                target,
+                target: target_text,
+                reason: "hard-link target is not a previously extracted file",
             });
         }
         self.ensure_new_path(&member.path).await?;
         self.hard_link(&target, &member.path).await?;
-        self.entries.insert(
-            member.path.clone(),
-            EntryKind::File {
-                executable: member.executable,
-            },
-        );
+        self.extracted_files.insert(member.path.clone());
         if member.payload_size == 0 {
             return Ok(None);
         }
@@ -754,13 +728,10 @@ impl ExtractionRoot {
         Ok(active_writer(member, std_file))
     }
 
-    async fn install_symlinks(&self) -> Result<(), ExtractError> {
-        let mut terminal_kinds = Vec::with_capacity(self.symlinks.len());
-        for path in &self.symlinks {
-            let EntryKind::SymbolicLink(link) = self.entries.get(path).expect("tracked symlink")
-            else {
-                unreachable!("symlink list contains only symbolic links");
-            };
+    async fn install_symlinks(&self, allow_dangling_symlinks: bool) -> Result<(), ExtractError> {
+        let mut terminal_kinds = Vec::with_capacity(self.symlink_paths.len());
+        for path in &self.symlink_paths {
+            let link = self.pending_symlinks.get(path).expect("tracked symlink");
             let kind = self
                 .resolve_terminal(&link.target, &mut HashSet::new())
                 .map_err(|reason| ExtractError::InvalidLink {
@@ -769,6 +740,14 @@ impl ExtractionRoot {
                     target: link.target_text.clone(),
                     reason,
                 })?;
+            if kind == TerminalKind::Dangling && !allow_dangling_symlinks {
+                return Err(ExtractError::InvalidLink {
+                    position: link.position,
+                    path: path.clone(),
+                    target: link.target_text.clone(),
+                    reason: "target was not created by this extraction",
+                });
+            }
             terminal_kinds.push((path.clone(), link.clone(), kind));
         }
 
@@ -790,7 +769,7 @@ impl ExtractionRoot {
         let mut prefix = PathBuf::new();
         for (index, component) in components.iter().enumerate() {
             prefix.push(component.as_os_str());
-            if let Some(EntryKind::SymbolicLink(link)) = self.entries.get(&prefix) {
+            if let Some(link) = self.pending_symlinks.get(&prefix) {
                 let mut rewritten = link.target.clone();
                 for remainder in components.iter().skip(index + 1) {
                     rewritten.push(remainder.as_os_str());
@@ -798,17 +777,37 @@ impl ExtractionRoot {
                 return self.resolve_terminal(&rewritten, visited);
             }
         }
-        match self.entries.get(path) {
-            Some(EntryKind::File { .. }) => Ok(TerminalKind::File),
-            Some(EntryKind::Directory { .. }) => Ok(TerminalKind::Directory),
-            Some(EntryKind::SymbolicLink(_)) => unreachable!("handled while scanning prefixes"),
-            None => Err("target was not created by this extraction"),
+        if self.extracted_files.contains(path) {
+            Ok(TerminalKind::File)
+        } else if self.extracted_directories.contains(path) {
+            Ok(TerminalKind::Directory)
+        } else {
+            Ok(TerminalKind::Dangling)
+        }
+    }
+
+    async fn prepare_file_path(&mut self, path: &Path) -> Result<(), ExtractError> {
+        self.ensure_parents(path).await?;
+        if self.pending_symlinks.contains_key(path) {
+            return Err(ExtractError::PathCollision {
+                path: path.to_owned(),
+            });
+        }
+        match self.symlink_metadata(path).await? {
+            Some(metadata) if metadata.is_file() => {
+                self.remove_file(path).await?;
+                Ok(())
+            }
+            Some(_) => Err(ExtractError::PathCollision {
+                path: path.to_owned(),
+            }),
+            None => Ok(()),
         }
     }
 
     async fn ensure_new_path(&mut self, path: &Path) -> Result<(), ExtractError> {
         self.ensure_parents(path).await?;
-        if self.entries.contains_key(path) {
+        if self.pending_symlinks.contains_key(path) {
             return Err(ExtractError::PathCollision {
                 path: path.to_owned(),
             });
@@ -823,14 +822,10 @@ impl ExtractionRoot {
         let mut current = PathBuf::new();
         for component in parent.components() {
             current.push(component.as_os_str());
-            match self.entries.get(&current) {
-                Some(EntryKind::Directory { .. }) => continue,
-                Some(_) => {
-                    return Err(ExtractError::PathCollision {
-                        path: current.clone(),
-                    });
-                }
-                None => {}
+            if self.pending_symlinks.contains_key(&current) {
+                return Err(ExtractError::PathCollision {
+                    path: current.clone(),
+                });
             }
             match self.symlink_metadata(&current).await? {
                 Some(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
@@ -841,8 +836,7 @@ impl ExtractionRoot {
                 }
                 None => {
                     self.create_dir(&current).await?;
-                    self.entries
-                        .insert(current.clone(), EntryKind::Directory { declared: false });
+                    self.extracted_directories.insert(current.clone());
                 }
             }
         }
@@ -880,6 +874,15 @@ impl ExtractionRoot {
         tokio::task::spawn_blocking(move || dir.create_dir(relative))
             .await?
             .map_err(|source| filesystem("create directory", error_path, source))
+    }
+
+    async fn remove_file(&self, path: &Path) -> Result<(), ExtractError> {
+        let relative = path.to_owned();
+        let error_path = relative.clone();
+        let dir = Arc::clone(&self.dir);
+        tokio::task::spawn_blocking(move || dir.remove_file(relative))
+            .await?
+            .map_err(|source| filesystem("remove file", error_path, source))
     }
 
     async fn create_new_file(
@@ -992,10 +995,11 @@ fn active_writer(member: DecodedMember, file: std::fs::File) -> Option<ActiveWri
     })
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum TerminalKind {
     File,
     Directory,
+    Dangling,
 }
 
 fn relative_link_contents(link: &Path, target: &Path) -> PathBuf {
@@ -1046,6 +1050,7 @@ fn create_symlink(dir: &Dir, contents: &Path, path: &Path, kind: TerminalKind) -
     match kind {
         TerminalKind::File => dir.symlink_file(contents, path),
         TerminalKind::Directory => dir.symlink_dir(contents, path),
+        TerminalKind::Dangling => dir.symlink_file(contents, path),
     }
 }
 
@@ -1055,6 +1060,9 @@ mod tests {
         pin::Pin,
         task::{Context, Poll},
     };
+
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
     use super::*;
     use tar_framing::{BLOCK_SIZE, Block, FrameErrorInner};
@@ -1256,8 +1264,6 @@ mod tests {
         assert!(dest.join("empty").is_dir());
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-
             assert_ne!(
                 std::fs::metadata(dest.join("bin/tool"))
                     .unwrap()
@@ -1386,11 +1392,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_unsafe_paths_collisions_and_unsupported_members() {
+    async fn rejects_unsafe_paths_cross_kind_collisions_and_unsupported_members() {
         let temp = tempdir().unwrap();
         let dest = temp.path().join("out");
         std::fs::create_dir_all(&dest).unwrap();
-        std::fs::write(dest.join("occupied"), "keep").unwrap();
+        std::fs::create_dir(dest.join("occupied")).unwrap();
 
         for (name, kind, expected) in [
             ("../escape", b'0', "unsafe"),
@@ -1408,28 +1414,140 @@ mod tests {
                 _ => unreachable!(),
             }
         }
-        assert_eq!(
-            std::fs::read_to_string(dest.join("occupied")).unwrap(),
-            "keep"
-        );
+        assert!(dest.join("occupied").is_dir());
         assert!(!temp.path().join("escape").exists());
+    }
 
-        let duplicate_dest = temp.path().join("duplicates");
-        let mut duplicate = Vec::new();
-        append_posix_member(&mut duplicate, "nested/../same", b'0', b"one", "", 0o644);
-        append_posix_member(&mut duplicate, "same", b'0', b"two", "", 0o644);
-        finish(&mut duplicate);
+    #[tokio::test]
+    async fn overwrites_duplicate_and_normalized_regular_file_paths_by_default() {
+        let temp = tempdir().unwrap();
+        let dest = temp.path().join("out");
+        let mut bytes = Vec::new();
+        append_posix_member(&mut bytes, "same", b'0', b"old", "", 0o644);
+        append_posix_member(&mut bytes, "same", b'0', b"new", "", 0o644);
+        append_posix_member(&mut bytes, "nested/../normalized", b'0', b"old", "", 0o644);
+        append_posix_member(&mut bytes, "normalized", b'0', b"new", "", 0o644);
+        finish(&mut bytes);
+
+        extract(bytes, &dest).await.unwrap();
+        assert_eq!(std::fs::read(dest.join("same")).unwrap(), b"new");
+        assert_eq!(std::fs::read(dest.join("normalized")).unwrap(), b"new");
+    }
+
+    #[tokio::test]
+    async fn overwrites_ambient_regular_files_by_default() {
+        let temp = tempdir().unwrap();
+        let dest = temp.path().join("out");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("same"), b"ambient").unwrap();
+        let mut bytes = Vec::new();
+        append_posix_member(&mut bytes, "same", b'0', b"archive", "", 0o644);
+        finish(&mut bytes);
+
+        extract(bytes, &dest).await.unwrap();
+        assert_eq!(std::fs::read(dest.join("same")).unwrap(), b"archive");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ambient_regular_file_replacement_unlinks_inode_and_applies_mode() {
+        let temp = tempdir().unwrap();
+        let dest = temp.path().join("out");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("same"), b"ambient").unwrap();
+        std::fs::hard_link(dest.join("same"), dest.join("sibling")).unwrap();
+        let mut bytes = Vec::new();
+        append_posix_member(&mut bytes, "same", b'0', b"archive", "", 0o755);
+        finish(&mut bytes);
+
+        extract(bytes, &dest).await.unwrap();
+        assert_eq!(std::fs::read(dest.join("same")).unwrap(), b"archive");
+        assert_eq!(std::fs::read(dest.join("sibling")).unwrap(), b"ambient");
+        let replaced = std::fs::metadata(dest.join("same")).unwrap();
+        let sibling = std::fs::metadata(dest.join("sibling")).unwrap();
+        assert_ne!(replaced.ino(), sibling.ino());
+        assert_ne!(replaced.permissions().mode() & 0o111, 0);
+    }
+
+    #[tokio::test]
+    async fn rejects_cross_kind_conflicts_and_reuses_real_directories() {
+        let temp = tempdir().unwrap();
+
+        let directory_dest = temp.path().join("directory");
+        let mut directory = Vec::new();
+        append_posix_member(&mut directory, "same", b'5', b"", "", 0o755);
+        append_posix_member(&mut directory, "same", b'0', b"file", "", 0o644);
+        finish(&mut directory);
         assert!(matches!(
-            extract(duplicate, &duplicate_dest).await.unwrap_err(),
+            extract(directory, &directory_dest).await.unwrap_err(),
             ExtractError::PathCollision { .. }
         ));
+        assert!(directory_dest.join("same").is_dir());
+
+        let repeated_directory_dest = temp.path().join("repeated-directory");
+        let mut repeated_directory = Vec::new();
+        append_posix_member(&mut repeated_directory, "same", b'5', b"", "", 0o755);
+        append_posix_member(&mut repeated_directory, "same", b'5', b"", "", 0o755);
+        finish(&mut repeated_directory);
+        extract(repeated_directory, &repeated_directory_dest)
+            .await
+            .unwrap();
+        assert!(repeated_directory_dest.join("same").is_dir());
+
+        let ambient_directory_dest = temp.path().join("ambient-directory");
+        std::fs::create_dir_all(ambient_directory_dest.join("same")).unwrap();
+        let mut ambient_directory = Vec::new();
+        append_posix_member(&mut ambient_directory, "same", b'5', b"", "", 0o755);
+        finish(&mut ambient_directory);
+        extract(ambient_directory, &ambient_directory_dest)
+            .await
+            .unwrap();
+        assert!(ambient_directory_dest.join("same").is_dir());
+
+        let symbolic_link_dest = temp.path().join("symbolic-link");
+        let mut symbolic_link = Vec::new();
+        append_posix_member(&mut symbolic_link, "same", b'2', b"", "missing", 0o644);
+        append_posix_member(&mut symbolic_link, "same", b'0', b"file", "", 0o644);
+        finish(&mut symbolic_link);
+        assert!(matches!(
+            extract(symbolic_link, &symbolic_link_dest)
+                .await
+                .unwrap_err(),
+            ExtractError::PathCollision { .. }
+        ));
+        assert!(!symbolic_link_dest.join("same").exists());
+
+        let symbolic_link_parent_dest = temp.path().join("symbolic-link-parent");
+        let mut symbolic_link_parent = Vec::new();
+        append_posix_member(
+            &mut symbolic_link_parent,
+            "parent",
+            b'2',
+            b"",
+            "missing",
+            0o644,
+        );
+        append_posix_member(
+            &mut symbolic_link_parent,
+            "parent/file",
+            b'0',
+            b"file",
+            "",
+            0o644,
+        );
+        finish(&mut symbolic_link_parent);
+        assert!(matches!(
+            extract(symbolic_link_parent, &symbolic_link_parent_dest)
+                .await
+                .unwrap_err(),
+            ExtractError::PathCollision { .. }
+        ));
+        assert!(!symbolic_link_parent_dest.join("parent").exists());
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn rejects_preexisting_symlink_parents() {
-        use std::os::unix::fs::symlink;
-
         let temp = tempdir().unwrap();
         let dest = temp.path().join("out");
         let outside = temp.path().join("outside");
@@ -1447,8 +1565,28 @@ mod tests {
         assert!(!outside.join("file").exists());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn creates_safe_symlink_chains_and_rejects_dangling_links() {
+    async fn rejects_preexisting_final_symlinks_instead_of_following_them() {
+        let temp = tempdir().unwrap();
+        let dest = temp.path().join("out");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(&outside, b"keep").unwrap();
+        symlink(&outside, dest.join("same")).unwrap();
+        let mut bytes = Vec::new();
+        append_posix_member(&mut bytes, "same", b'0', b"bad", "", 0o644);
+        finish(&mut bytes);
+
+        assert!(matches!(
+            extract(bytes, &dest).await.unwrap_err(),
+            ExtractError::PathCollision { .. }
+        ));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+    }
+
+    #[tokio::test]
+    async fn creates_safe_and_dangling_symlink_chains() {
         let temp = tempdir().unwrap();
         let dest = temp.path().join("good");
         let mut bytes = Vec::new();
@@ -1459,16 +1597,55 @@ mod tests {
         extract(bytes, &dest).await.unwrap();
         assert_eq!(std::fs::read_to_string(dest.join("two")).unwrap(), "ok");
 
-        let bad_dest = temp.path().join("bad");
+        let dangling_dest = temp.path().join("dangling");
         let mut dangling = Vec::new();
         append_posix_member(&mut dangling, "link", b'2', b"", "missing", 0o644);
         finish(&mut dangling);
+        extract(dangling, &dangling_dest).await.unwrap();
+        assert_eq!(
+            std::fs::read_link(dangling_dest.join("link")).unwrap(),
+            Path::new("missing")
+        );
+
+        let chain_dest = temp.path().join("dangling-chain");
+        let mut chain = Vec::new();
+        append_posix_member(&mut chain, "one", b'2', b"", "two", 0o644);
+        append_posix_member(&mut chain, "two", b'2', b"", "missing", 0o644);
+        finish(&mut chain);
+        extract(chain, &chain_dest).await.unwrap();
+        assert_eq!(
+            std::fs::read_link(chain_dest.join("one")).unwrap(),
+            Path::new("two")
+        );
+        assert_eq!(
+            std::fs::read_link(chain_dest.join("two")).unwrap(),
+            Path::new("missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_dangling_symlinks_reject_missing_targets() {
+        let temp = tempdir().unwrap();
+        let dest = temp.path().join("out");
+        let mut bytes = Vec::new();
+        append_posix_member(&mut bytes, "link", b'2', b"", "missing", 0o644);
+        finish(&mut bytes);
         assert!(matches!(
-            extract(dangling, &bad_dest).await.unwrap_err(),
+            extract_with_policy(
+                bytes,
+                &dest,
+                ExtractPolicy::default().allow_dangling_symlinks(false)
+            )
+            .await
+            .unwrap_err(),
             ExtractError::InvalidLink { .. }
         ));
-        assert!(!bad_dest.join("link").exists());
+        assert!(!dest.join("link").exists());
+    }
 
+    #[tokio::test]
+    async fn rejects_symbolic_link_cycles_and_root_escapes() {
+        let temp = tempdir().unwrap();
         let cycle_dest = temp.path().join("cycle");
         let mut cycle = Vec::new();
         append_posix_member(&mut cycle, "a", b'2', b"", "b", 0o644);
@@ -1480,10 +1657,20 @@ mod tests {
         ));
         assert!(!cycle_dest.join("a").exists());
         assert!(!cycle_dest.join("b").exists());
+
+        let escape_dest = temp.path().join("escape");
+        let mut escape = Vec::new();
+        append_posix_member(&mut escape, "link", b'2', b"", "../outside", 0o644);
+        finish(&mut escape);
+        assert!(matches!(
+            extract(escape, &escape_dest).await.unwrap_err(),
+            ExtractError::UnsafePath { .. }
+        ));
+        assert!(!escape_dest.join("link").exists());
     }
 
     #[tokio::test]
-    async fn extracts_prior_target_hard_links_with_linkdata() {
+    async fn extracts_prior_target_hard_links_with_linkdata_and_differing_modes() {
         let temp = tempdir().unwrap();
         let dest = temp.path().join("out");
         let policy = ExtractPolicy::default().allow_hard_links(true);
@@ -1506,17 +1693,30 @@ mod tests {
             ExtractError::InvalidLink { .. }
         ));
 
-        let mismatch_dest = temp.path().join("mismatch");
-        let mut mismatch = Vec::new();
-        append_posix_member(&mut mismatch, "a", b'0', b"", "", 0o644);
-        append_posix_member(&mut mismatch, "b", b'1', b"", "a", 0o755);
-        finish(&mut mismatch);
+        let ambient_dest = temp.path().join("ambient");
+        std::fs::create_dir(&ambient_dest).unwrap();
+        std::fs::write(ambient_dest.join("a"), b"ambient").unwrap();
+        let mut ambient = Vec::new();
+        append_posix_member(&mut ambient, "b", b'1', b"", "a", 0o644);
+        finish(&mut ambient);
         assert!(matches!(
-            extract_with_policy(mismatch, &mismatch_dest, policy)
+            extract_with_policy(ambient, &ambient_dest, policy)
                 .await
                 .unwrap_err(),
-            ExtractError::HardLinkExecutableMismatch { .. }
+            ExtractError::InvalidLink { .. }
         ));
+        assert_eq!(std::fs::read(ambient_dest.join("a")).unwrap(), b"ambient");
+        assert!(!ambient_dest.join("b").exists());
+
+        let differing_mode_dest = temp.path().join("differing-mode");
+        let mut differing_mode = Vec::new();
+        append_posix_member(&mut differing_mode, "a", b'0', b"", "", 0o644);
+        append_posix_member(&mut differing_mode, "b", b'1', b"", "a", 0o755);
+        finish(&mut differing_mode);
+        extract_with_policy(differing_mode, &differing_mode_dest, policy)
+            .await
+            .unwrap();
+        assert!(differing_mode_dest.join("b").is_file());
     }
 
     #[tokio::test]
