@@ -9,8 +9,7 @@ use tokio::io::AsyncRead;
 use tokio_stream::StreamExt;
 
 use crate::{
-    ArchiveFormat, Block, FrameError, FrameErrorInner, GnuKind, PaxKind, PaxRecord, PaxString,
-    PaxValue,
+    ArchiveFormat, Block, FrameError, GnuKind, PaxKind, PaxRecord, PaxString, PaxValue,
     stream::{DataOwner, Frame, GnuFrame, HeaderFrame, PaxFrame, TarStream},
 };
 
@@ -101,7 +100,10 @@ impl<R> MemberFrame<'_, R> {
                 &self.header.local_pax_records,
                 "path",
                 self.header.header_path(),
-                path_value,
+                |record| match record {
+                    PaxRecord::Path(value) => Some(value),
+                    _ => None,
+                },
             ),
             MemberExtensions::Gnu { long_name, .. } => match long_name {
                 Some(metadata) => Ok(Cow::Borrowed(parse_gnu_metadata(
@@ -125,7 +127,10 @@ impl<R> MemberFrame<'_, R> {
                 &self.header.local_pax_records,
                 "linkpath",
                 Cow::Borrowed(self.header.link_name()),
-                link_path_value,
+                |record| match record {
+                    PaxRecord::LinkPath(value) => Some(value),
+                    _ => None,
+                },
             ),
             MemberExtensions::Gnu { long_link, .. } => match long_link {
                 Some(metadata) => Ok(Cow::Borrowed(parse_gnu_metadata(
@@ -217,7 +222,7 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
                     })));
                 }
                 Frame::Data(frame) => {
-                    return Err(self.unexpected_logical_frame(
+                    return Err(FrameError::unexpected_order(
                         frame.position,
                         "extension header or ordinary member header",
                         "unattached payload data",
@@ -246,11 +251,7 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
                     }
                 }
                 other => {
-                    return Err(self.unexpected_logical_frame(
-                        frame_position(&other),
-                        "pax extension payload",
-                        frame_description(&other),
-                    ));
+                    return Err(self.unexpected_frame(&other, "pax extension payload"));
                 }
             }
         }
@@ -266,30 +267,22 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
             match next {
                 Frame::Data(data) if data.owner == DataOwner::Gnu(frame.kind) => {
                     let len = u64::try_from(data.len).map_err(|_| {
-                        FrameError::at(
+                        FrameError::arithmetic_overflow(
                             data.position,
-                            FrameErrorInner::ArithmeticOverflow {
-                                context: "GNU metadata payload length",
-                            },
+                            "GNU metadata payload length",
                         )
                     })?;
                     remaining = remaining.checked_sub(len).ok_or_else(|| {
-                        FrameError::at(
+                        FrameError::unexpected_order(
                             data.position,
-                            FrameErrorInner::UnexpectedOrder {
-                                expected: "bounded GNU metadata payload",
-                                found: "oversized GNU metadata payload",
-                            },
+                            "bounded GNU metadata payload",
+                            "oversized GNU metadata payload",
                         )
                     })?;
                     payload.extend_from_slice(&data.block[..data.len]);
                 }
                 other => {
-                    return Err(self.unexpected_logical_frame(
-                        frame_position(&other),
-                        "GNU metadata payload",
-                        frame_description(&other),
-                    ));
+                    return Err(self.unexpected_frame(&other, "GNU metadata payload"));
                 }
             }
         }
@@ -305,32 +298,23 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
         }
         let Some(frame) = self.next_physical_frame().await? else {
             let remaining = std::mem::take(&mut self.payload_remaining);
-            return Err(FrameError::at(
+            return Err(FrameError::truncated_payload(
                 self.stream.position(),
-                FrameErrorInner::TruncatedPayload {
-                    owner: DataOwner::Member,
-                    remaining,
-                },
+                DataOwner::Member,
+                remaining,
             ));
         };
         match frame {
             Frame::Data(data) if data.owner == DataOwner::Member => {
                 let len = u64::try_from(data.len).map_err(|_| {
-                    FrameError::at(
-                        data.position,
-                        FrameErrorInner::ArithmeticOverflow {
-                            context: "member payload length",
-                        },
-                    )
+                    FrameError::arithmetic_overflow(data.position, "member payload length")
                 })?;
                 self.payload_remaining =
                     self.payload_remaining.checked_sub(len).ok_or_else(|| {
-                        FrameError::at(
+                        FrameError::unexpected_order(
                             data.position,
-                            FrameErrorInner::UnexpectedOrder {
-                                expected: "bounded member payload",
-                                found: "oversized member payload",
-                            },
+                            "bounded member payload",
+                            "oversized member payload",
                         )
                     })?;
                 Ok(Some(PayloadBlock {
@@ -341,11 +325,7 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
             }
             other => {
                 self.payload_remaining = 0;
-                Err(self.unexpected_logical_frame(
-                    frame_position(&other),
-                    "ordinary member payload",
-                    frame_description(&other),
-                ))
+                Err(self.unexpected_frame(&other, "ordinary member payload"))
             }
         }
     }
@@ -362,20 +342,13 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
         let position = self.stream.position();
         let len = self.stream.read_member_chunk(buffer, target_len).await?;
         let len = u64::try_from(len).map_err(|_| {
-            FrameError::at(
-                position,
-                FrameErrorInner::ArithmeticOverflow {
-                    context: "member payload chunk length",
-                },
-            )
+            FrameError::arithmetic_overflow(position, "member payload chunk length")
         })?;
         self.payload_remaining = self.payload_remaining.checked_sub(len).ok_or_else(|| {
-            FrameError::at(
+            FrameError::unexpected_order(
                 position,
-                FrameErrorInner::UnexpectedOrder {
-                    expected: "bounded member payload",
-                    found: "oversized member payload chunk",
-                },
+                "bounded member payload",
+                "oversized member payload chunk",
             )
         })?;
         Ok(true)
@@ -383,41 +356,32 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
 
     async fn drain_payload(&mut self) -> Result<(), FrameError> {
         let mut buffer = mem::take(&mut self.drain_buffer);
-        loop {
+        let result = loop {
             match self
                 .next_payload_chunk(&mut buffer, PAYLOAD_DRAIN_CHUNK_BYTES)
                 .await
             {
                 Ok(true) => {}
-                Ok(false) => {
-                    self.drain_buffer = buffer;
-                    return Ok(());
-                }
-                Err(error) => {
-                    self.drain_buffer = buffer;
-                    return Err(error);
-                }
+                Ok(false) => break Ok(()),
+                Err(error) => break Err(error),
             }
-        }
+        };
+        self.drain_buffer = buffer;
+        result
     }
 
     fn unexpected_end(&self, expected: &'static str) -> FrameError {
-        FrameError::at(
-            self.stream.position(),
-            FrameErrorInner::UnexpectedEof { expected },
-        )
+        FrameError::unexpected_eof(self.stream.position(), expected)
     }
 
-    fn unexpected_logical_frame(
-        &self,
-        position: u64,
-        expected: &'static str,
-        found: &'static str,
-    ) -> FrameError {
-        FrameError::at(
-            position,
-            FrameErrorInner::UnexpectedOrder { expected, found },
-        )
+    fn unexpected_frame(&self, frame: &Frame, expected: &'static str) -> FrameError {
+        let (position, found) = match frame {
+            Frame::Pax(frame) => (frame.position, "pax extension header"),
+            Frame::Gnu(frame) => (frame.position, "GNU metadata header"),
+            Frame::Header(frame) => (frame.position, "ordinary member header"),
+            Frame::Data(frame) => (frame.position, "payload data"),
+        };
+        FrameError::unexpected_order(position, expected, found)
     }
 }
 
@@ -468,22 +432,6 @@ fn resolve_pax_text<'a>(
     Ok(header_value)
 }
 
-fn path_value(record: &PaxRecord) -> Option<&PaxValue<PaxString>> {
-    if let PaxRecord::Path(value) = record {
-        Some(value)
-    } else {
-        None
-    }
-}
-
-fn link_path_value(record: &PaxRecord) -> Option<&PaxValue<PaxString>> {
-    if let PaxRecord::LinkPath(value) = record {
-        Some(value)
-    } else {
-        None
-    }
-}
-
 /// Return the raw bytes of a pax record, erroring if the record is a tombstone
 /// (i.e.) explicitly deleted.
 fn pax_value<'a>(
@@ -503,10 +451,7 @@ fn pax_value<'a>(
         // field."
         //
         // See: pax spec, "pax Extended Header"
-        PaxValue::Deleted => Err(FrameError::at(
-            position,
-            FrameErrorInner::DeletedPaxMetadata { keyword },
-        )),
+        PaxValue::Deleted => Err(FrameError::deleted_pax_metadata(position, keyword)),
     }
 }
 
@@ -516,45 +461,19 @@ fn parse_gnu_metadata(metadata: &GnuMetadata, kind: GnuKind) -> Result<&[u8], Fr
         .iter()
         .position(|byte| *byte == 0)
         .ok_or_else(|| {
-            FrameError::at(
-                metadata.position,
-                FrameErrorInner::InvalidGnuMetadata {
-                    kind,
-                    reason: "value is not NUL-terminated",
-                },
-            )
+            FrameError::invalid_gnu_metadata(metadata.position, kind, "value is not NUL-terminated")
         })?;
 
     // TODO: Make this configurable through some kind of policy?
     // Might be overly strict in practice.
     if metadata.payload[terminator..].iter().any(|byte| *byte != 0) {
-        return Err(FrameError::at(
+        return Err(FrameError::invalid_gnu_metadata(
             metadata.position,
-            FrameErrorInner::InvalidGnuMetadata {
-                kind,
-                reason: "non-NUL bytes follow the terminator",
-            },
+            kind,
+            "non-NUL bytes follow the terminator",
         ));
     }
     Ok(&metadata.payload[..terminator])
-}
-
-fn frame_position(frame: &Frame) -> u64 {
-    match frame {
-        Frame::Pax(frame) => frame.position,
-        Frame::Gnu(frame) => frame.position,
-        Frame::Header(frame) => frame.position,
-        Frame::Data(frame) => frame.position,
-    }
-}
-
-fn frame_description(frame: &Frame) -> &'static str {
-    match frame {
-        Frame::Pax(_) => "pax extension header",
-        Frame::Gnu(_) => "GNU metadata header",
-        Frame::Header(_) => "ordinary member header",
-        Frame::Data(_) => "payload data",
-    }
 }
 
 #[cfg(test)]

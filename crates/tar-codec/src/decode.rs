@@ -21,7 +21,6 @@ use cap_std::{
 use tar_framing::{
     ArchiveFormat, FrameError, MemberKind, PaxKind, PaxRecord,
     logical::{LogicalFrame, MemberExtensions, MemberFrame, TarReader},
-    stream::HeaderFrame,
 };
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWriteExt};
@@ -282,10 +281,19 @@ impl<R: AsyncRead + Unpin> Archive<R> {
                     )?;
                 }
                 LogicalFrame::Member(mut frame) => {
-                    policy.check_format(
-                        member_format_position(&frame.header, &frame.extensions),
-                        frame.header.format,
-                    )?;
+                    let format_position = match &frame.extensions {
+                        MemberExtensions::Pax { .. } => frame.header.position,
+                        MemberExtensions::Gnu {
+                            long_name,
+                            long_link,
+                        } => long_name
+                            .iter()
+                            .chain(long_link.iter())
+                            .map(|header| header.position)
+                            .min()
+                            .unwrap_or(frame.header.position),
+                    };
+                    policy.check_format(format_position, frame.header.format)?;
                     policy.check_member_kind(frame.header.position, frame.header.kind)?;
                     if let MemberExtensions::Pax {
                         local_position: Some(position),
@@ -298,7 +306,9 @@ impl<R: AsyncRead + Unpin> Archive<R> {
                         )?;
                     }
                     let member = decode_member(&frame)?;
-                    if is_buffered_regular_member(&member) {
+                    if matches!(member.kind, MemberKind::Regular | MemberKind::Contiguous)
+                        && member.payload_size <= EXTRACTION_CHUNK_BYTES as u64
+                    {
                         root.prepare_file_path(&member.path).await?;
                         payload_chunk.clear();
                         if member.payload_size != 0
@@ -307,9 +317,9 @@ impl<R: AsyncRead + Unpin> Archive<R> {
                                 .next_chunk(&mut payload_chunk, EXTRACTION_CHUNK_BYTES)
                                 .await?
                         {
-                            return Err(DecodeError::InvalidFrameSequence {
-                                reason: "buffered member payload ended before its decoded size",
-                            });
+                            return Err(invalid_frame_sequence(
+                                "buffered member payload ended before its decoded size",
+                            ));
                         }
                         let buffer = mem::take(&mut payload_chunk);
                         let (returned_buffer, result) =
@@ -462,6 +472,30 @@ fn policy_violation(position: u64, violation: DecodePolicyViolation) -> DecodeEr
     }
 }
 
+fn invalid_frame_sequence(reason: &'static str) -> DecodeError {
+    DecodeError::InvalidFrameSequence { reason }
+}
+
+fn buffered_payload_error(
+    buffer: Vec<u8>,
+    reason: &'static str,
+) -> (Vec<u8>, Result<(), DecodeError>) {
+    (buffer, Err(invalid_frame_sequence(reason)))
+}
+
+fn path_collision(path: PathBuf) -> DecodeError {
+    DecodeError::PathCollision { path }
+}
+
+fn invalid_link(position: u64, path: PathBuf, target: String, reason: &'static str) -> DecodeError {
+    DecodeError::InvalidLink {
+        position,
+        path,
+        target,
+        reason,
+    }
+}
+
 #[derive(Debug)]
 struct DecodedMember {
     position: u64,
@@ -470,21 +504,6 @@ struct DecodedMember {
     link_target: Option<String>,
     executable: bool,
     payload_size: u64,
-}
-
-fn member_format_position(header: &HeaderFrame, extensions: &MemberExtensions) -> u64 {
-    match extensions {
-        MemberExtensions::Pax { .. } => header.position,
-        MemberExtensions::Gnu {
-            long_name,
-            long_link,
-        } => long_name
-            .iter()
-            .chain(long_link.iter())
-            .map(|header| header.position)
-            .min()
-            .unwrap_or(header.position),
-    }
 }
 
 fn decode_member<R>(frame: &MemberFrame<'_, R>) -> Result<DecodedMember, DecodeError> {
@@ -512,11 +531,6 @@ fn decode_member<R>(frame: &MemberFrame<'_, R>) -> Result<DecodedMember, DecodeE
     })
 }
 
-fn is_buffered_regular_member(member: &DecodedMember) -> bool {
-    matches!(member.kind, MemberKind::Regular | MemberKind::Contiguous)
-        && member.payload_size <= EXTRACTION_CHUNK_BYTES as u64
-}
-
 fn resolved_text(
     position: u64,
     keyword: &'static str,
@@ -532,10 +546,6 @@ fn resolved_text(
 
 fn normalize_member_path(position: u64, value: &str) -> Result<PathBuf, DecodeError> {
     normalize_path(position, "member path", value, &[])
-}
-
-fn normalize_hard_link_target(position: u64, value: &str) -> Result<PathBuf, DecodeError> {
-    normalize_path(position, "hard-link target", value, &[])
 }
 
 fn normalize_symlink_target(
@@ -673,14 +683,8 @@ impl ExtractionRoot {
         }
         match member.kind {
             MemberKind::Regular | MemberKind::Contiguous => self.create_file(member).await,
-            MemberKind::Directory => {
-                self.create_directory(member).await?;
-                Ok(None)
-            }
-            MemberKind::SymbolicLink => {
-                self.reserve_symlink(member).await?;
-                Ok(None)
-            }
+            MemberKind::Directory => self.create_directory(member).await.map(|()| None),
+            MemberKind::SymbolicLink => self.reserve_symlink(member).await.map(|()| None),
             MemberKind::HardLink => self.create_hard_link(member).await,
             MemberKind::CharacterDevice | MemberKind::BlockDevice | MemberKind::Fifo => {
                 Err(DecodeError::UnsupportedMember {
@@ -711,20 +715,16 @@ impl ExtractionRoot {
         let payload_size = match u64::try_from(buffer.len()) {
             Ok(payload_size) => payload_size,
             Err(_) => {
-                return (
+                return buffered_payload_error(
                     buffer,
-                    Err(DecodeError::InvalidFrameSequence {
-                        reason: "buffered payload length cannot be represented",
-                    }),
+                    "buffered payload length cannot be represented",
                 );
             }
         };
         if payload_size != member.payload_size {
-            return (
+            return buffered_payload_error(
                 buffer,
-                Err(DecodeError::InvalidFrameSequence {
-                    reason: "buffered payload length did not match the decoded member size",
-                }),
+                "buffered payload length did not match the decoded member size",
             );
         }
         let (buffer, result) = self
@@ -742,7 +742,7 @@ impl ExtractionRoot {
         if !self.verified_directories.contains(&member.path) {
             match self.symlink_metadata(&member.path).await? {
                 Some(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-                Some(_) => return Err(DecodeError::PathCollision { path: member.path }),
+                Some(_) => return Err(path_collision(member.path)),
                 None => self.create_dir(&member.path).await?,
             }
             self.verified_directories.insert(member.path.clone());
@@ -774,14 +774,14 @@ impl ExtractionRoot {
         member: DecodedMember,
     ) -> Result<Option<ActiveWriter>, DecodeError> {
         let target_text = required_link_target(&member)?;
-        let target = normalize_hard_link_target(member.position, &target_text)?;
+        let target = normalize_path(member.position, "hard-link target", &target_text, &[])?;
         if !self.extracted_files.contains(&target) {
-            return Err(DecodeError::InvalidLink {
-                position: member.position,
-                path: member.path,
-                target: target_text,
-                reason: "hard-link target is not a previously extracted file",
-            });
+            return Err(invalid_link(
+                member.position,
+                member.path,
+                target_text,
+                "hard-link target is not a previously extracted file",
+            ));
         }
         self.ensure_new_path(&member.path).await?;
         self.hard_link(&target, &member.path).await?;
@@ -797,21 +797,21 @@ impl ExtractionRoot {
         let mut terminal_kinds = Vec::with_capacity(self.symlink_paths.len());
         for path in &self.symlink_paths {
             let link = self.pending_symlinks.get(path).expect("tracked symlink");
-            let kind =
-                self.resolve_terminal(&link.target)
-                    .map_err(|reason| DecodeError::InvalidLink {
-                        position: link.position,
-                        path: path.clone(),
-                        target: link.target_text.clone(),
-                        reason,
-                    })?;
+            let kind = self.resolve_terminal(&link.target).map_err(|reason| {
+                invalid_link(
+                    link.position,
+                    path.clone(),
+                    link.target_text.clone(),
+                    reason,
+                )
+            })?;
             if kind == TerminalKind::Dangling && !allow_dangling_symlinks {
-                return Err(DecodeError::InvalidLink {
-                    position: link.position,
-                    path: path.clone(),
-                    target: link.target_text.clone(),
-                    reason: "target was not created by this extraction",
-                });
+                return Err(invalid_link(
+                    link.position,
+                    path.clone(),
+                    link.target_text.clone(),
+                    "target was not created by this extraction",
+                ));
             }
             terminal_kinds.push((path.clone(), link.clone(), kind));
         }
@@ -923,9 +923,7 @@ impl ExtractionRoot {
                     self.verified_directories.insert(current.clone());
                 }
                 Some(_) => {
-                    return Err(DecodeError::PathCollision {
-                        path: current.clone(),
-                    });
+                    return Err(path_collision(current.clone()));
                 }
                 None => {
                     self.create_dir(&current).await?;
@@ -938,23 +936,17 @@ impl ExtractionRoot {
     }
 
     fn reject_pending_symlink(&self, path: &Path) -> Result<(), DecodeError> {
-        if self.pending_symlinks.contains_key(path) {
-            Err(DecodeError::PathCollision {
-                path: path.to_owned(),
-            })
-        } else {
-            Ok(())
-        }
+        (!self.pending_symlinks.contains_key(path))
+            .then_some(())
+            .ok_or_else(|| path_collision(path.to_owned()))
     }
 
     async fn reject_existing(&self, path: &Path) -> Result<(), DecodeError> {
-        if self.symlink_metadata(path).await?.is_some() {
-            Err(DecodeError::PathCollision {
-                path: path.to_owned(),
-            })
-        } else {
-            Ok(())
-        }
+        self.symlink_metadata(path)
+            .await?
+            .is_none()
+            .then_some(())
+            .ok_or_else(|| path_collision(path.to_owned()))
     }
 
     async fn symlink_metadata(
@@ -1082,7 +1074,7 @@ fn file_operation_error(operation: &'static str, source: io::Error) -> FileOpera
 
 fn map_file_operation_error(path: PathBuf, error: FileOperationError) -> DecodeError {
     match error {
-        FileOperationError::Collision => DecodeError::PathCollision { path },
+        FileOperationError::Collision => path_collision(path),
         FileOperationError::Filesystem { operation, source } => filesystem(operation, path, source),
     }
 }
@@ -1090,12 +1082,12 @@ fn map_file_operation_error(path: PathBuf, error: FileOperationError) -> DecodeE
 fn required_link_target(member: &DecodedMember) -> Result<String, DecodeError> {
     match member.link_target.clone() {
         Some(target) if !target.is_empty() => Ok(target),
-        _ => Err(DecodeError::InvalidLink {
-            position: member.position,
-            path: member.path.clone(),
-            target: String::new(),
-            reason: "link target is empty",
-        }),
+        _ => Err(invalid_link(
+            member.position,
+            member.path.clone(),
+            String::new(),
+            "link target is empty",
+        )),
     }
 }
 
@@ -1115,13 +1107,12 @@ struct ActiveWriter {
 
 impl ActiveWriter {
     async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), DecodeError> {
-        let len = u64::try_from(chunk.len()).map_err(|_| DecodeError::InvalidFrameSequence {
-            reason: "payload chunk length cannot be represented",
-        })?;
+        let len = u64::try_from(chunk.len())
+            .map_err(|_| invalid_frame_sequence("payload chunk length cannot be represented"))?;
         if len > self.remaining {
-            return Err(DecodeError::InvalidFrameSequence {
-                reason: "member payload exceeded the decoded member size",
-            });
+            return Err(invalid_frame_sequence(
+                "member payload exceeded the decoded member size",
+            ));
         }
         self.file
             .write_all(chunk)

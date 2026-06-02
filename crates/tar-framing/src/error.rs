@@ -17,6 +17,51 @@ impl FrameError {
     pub(crate) fn at(position: u64, inner: FrameErrorInner) -> Self {
         Self { position, inner }
     }
+
+    pub(crate) fn arithmetic_overflow(position: u64, context: &'static str) -> Self {
+        Self::at(position, FrameErrorInner::ArithmeticOverflow { context })
+    }
+
+    pub(crate) fn deleted_pax_metadata(position: u64, keyword: &'static str) -> Self {
+        Self::at(position, FrameErrorInner::DeletedPaxMetadata { keyword })
+    }
+
+    pub(crate) fn invalid_gnu_metadata(position: u64, kind: GnuKind, reason: &'static str) -> Self {
+        Self::at(
+            position,
+            FrameErrorInner::InvalidGnuMetadata { kind, reason },
+        )
+    }
+
+    pub(crate) fn invalid_member_size(position: u64, kind: MemberKind, size: u64) -> Self {
+        Self::at(position, FrameErrorInner::InvalidMemberSize { kind, size })
+    }
+
+    pub(crate) fn invalid_pax_records(position: u64, reason: &'static str) -> Self {
+        Self::at(position, FrameErrorInner::InvalidPaxRecords { reason })
+    }
+
+    pub(crate) fn truncated_payload(position: u64, owner: DataOwner, remaining: u64) -> Self {
+        Self::at(
+            position,
+            FrameErrorInner::TruncatedPayload { owner, remaining },
+        )
+    }
+
+    pub(crate) fn unexpected_eof(position: u64, expected: &'static str) -> Self {
+        Self::at(position, FrameErrorInner::UnexpectedEof { expected })
+    }
+
+    pub(crate) fn unexpected_order(
+        position: u64,
+        expected: &'static str,
+        found: &'static str,
+    ) -> Self {
+        Self::at(
+            position,
+            FrameErrorInner::UnexpectedOrder { expected, found },
+        )
+    }
 }
 
 /// Specific errors that can occur while processing tar frames.

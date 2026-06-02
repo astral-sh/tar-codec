@@ -245,63 +245,42 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             State::ReadingMember { remaining } => *remaining,
             _ => {
                 self.state = State::Failed;
-                return Err(FrameError::at(
+                return Err(FrameError::unexpected_order(
                     self.position,
-                    FrameErrorInner::UnexpectedOrder {
-                        expected: "ordinary member payload",
-                        found: "parser state without member payload",
-                    },
+                    "ordinary member payload",
+                    "parser state without member payload",
                 ));
             }
         };
         if self.block_len != 0 {
             self.state = State::Failed;
-            return Err(FrameError::at(
+            return Err(FrameError::unexpected_order(
                 self.position,
-                FrameErrorInner::UnexpectedOrder {
-                    expected: "aligned ordinary member payload",
-                    found: "partially buffered physical block",
-                },
+                "aligned ordinary member payload",
+                "partially buffered physical block",
             ));
         }
 
         let target_blocks = target_len.max(BLOCK_SIZE).div_ceil(BLOCK_SIZE);
         let target_blocks = u64::try_from(target_blocks).map_err(|_| {
-            FrameError::at(
-                self.position,
-                FrameErrorInner::ArithmeticOverflow {
-                    context: "member payload chunk block count",
-                },
-            )
+            FrameError::arithmetic_overflow(self.position, "member payload chunk block count")
         })?;
         let remaining_blocks = remaining.div_ceil(BLOCK_SIZE as u64);
         let physical_len = target_blocks
             .min(remaining_blocks)
             .checked_mul(BLOCK_SIZE as u64)
             .ok_or_else(|| {
-                FrameError::at(
+                FrameError::arithmetic_overflow(
                     self.position,
-                    FrameErrorInner::ArithmeticOverflow {
-                        context: "member payload chunk physical length",
-                    },
+                    "member payload chunk physical length",
                 )
             })?;
         let meaningful_len = remaining.min(physical_len);
         let physical_len = usize::try_from(physical_len).map_err(|_| {
-            FrameError::at(
-                self.position,
-                FrameErrorInner::ArithmeticOverflow {
-                    context: "member payload chunk physical length",
-                },
-            )
+            FrameError::arithmetic_overflow(self.position, "member payload chunk physical length")
         })?;
         let meaningful_len = usize::try_from(meaningful_len).map_err(|_| {
-            FrameError::at(
-                self.position,
-                FrameErrorInner::ArithmeticOverflow {
-                    context: "member payload chunk meaningful length",
-                },
-            )
+            FrameError::arithmetic_overflow(self.position, "member payload chunk meaningful length")
         })?;
 
         buffer.resize(physical_len, 0);
@@ -322,8 +301,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 Err(source) => {
                     self.state = State::Failed;
                     let error_position = checked_position(start_position, filled)?;
-                    self.position =
-                        checked_position(start_position, completed_block_bytes(filled))?;
+                    self.position = checked_position(start_position, filled - filled % BLOCK_SIZE)?;
                     return Err(FrameError::at(
                         error_position,
                         FrameErrorInner::Io { source },
@@ -342,19 +320,15 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                     ));
                 }
                 let completed_len = u64::try_from(completed_len).map_err(|_| {
-                    FrameError::at(
+                    FrameError::arithmetic_overflow(
                         self.position,
-                        FrameErrorInner::ArithmeticOverflow {
-                            context: "completed member payload chunk length",
-                        },
+                        "completed member payload chunk length",
                     )
                 })?;
-                return Err(FrameError::at(
+                return Err(FrameError::truncated_payload(
                     self.position,
-                    FrameErrorInner::TruncatedPayload {
-                        owner: DataOwner::Member,
-                        remaining: remaining - remaining.min(completed_len),
-                    },
+                    DataOwner::Member,
+                    remaining - remaining.min(completed_len),
                 ));
             }
             filled += read;
@@ -367,12 +341,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             .checked_sub(meaningful_len as u64)
             .ok_or_else(|| {
                 self.state = State::Failed;
-                FrameError::at(
-                    start_position,
-                    FrameErrorInner::ArithmeticOverflow {
-                        context: "remaining member payload length",
-                    },
-                )
+                FrameError::arithmetic_overflow(start_position, "remaining member payload length")
             })?;
         self.state = member_payload_state(remaining);
         buffer.truncate(meaningful_len);
@@ -415,68 +384,42 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         self.position = self
             .position
             .checked_add(BLOCK_SIZE as u64)
-            .ok_or_else(|| {
-                FrameError::at(
-                    position,
-                    FrameErrorInner::ArithmeticOverflow {
-                        context: "stream position",
-                    },
-                )
-            })?;
+            .ok_or_else(|| FrameError::arithmetic_overflow(position, "stream position"))?;
         self.block_len = 0;
         let block = std::mem::replace(&mut self.block, [0; BLOCK_SIZE]);
         Poll::Ready(Ok(Some((position, block))))
     }
 
     fn handle_eof(&mut self) -> FrameError {
-        match &self.state {
-            State::AwaitingHeader | State::AwaitingSecondZero => {
-                FrameError::at(self.position, FrameErrorInner::MissingEndMarker)
-            }
+        let inner = match &self.state {
+            State::AwaitingHeader | State::AwaitingSecondZero => FrameErrorInner::MissingEndMarker,
             State::ReadingPax {
                 kind, remaining, ..
-            } => FrameError::at(
-                self.position,
-                FrameErrorInner::TruncatedPayload {
-                    owner: DataOwner::Pax(*kind),
-                    remaining: *remaining,
-                },
-            ),
-            State::AwaitingUstarHeader { .. } => FrameError::at(
-                self.position,
-                FrameErrorInner::UnexpectedEof {
-                    expected: "ordinary ustar member header after a local pax header",
-                },
-            ),
+            } => FrameErrorInner::TruncatedPayload {
+                owner: DataOwner::Pax(*kind),
+                remaining: *remaining,
+            },
+            State::AwaitingUstarHeader { .. } => FrameErrorInner::UnexpectedEof {
+                expected: "ordinary ustar member header after a local pax header",
+            },
             State::ReadingGnu {
                 kind, remaining, ..
-            } => FrameError::at(
-                self.position,
-                FrameErrorInner::TruncatedPayload {
-                    owner: DataOwner::Gnu(*kind),
-                    remaining: *remaining,
-                },
-            ),
-            State::AwaitingGnuMember { .. } => FrameError::at(
-                self.position,
-                FrameErrorInner::UnexpectedEof {
-                    expected: "ordinary GNU member header after a GNU metadata extension",
-                },
-            ),
-            State::ReadingMember { remaining } => FrameError::at(
-                self.position,
-                FrameErrorInner::TruncatedPayload {
-                    owner: DataOwner::Member,
-                    remaining: *remaining,
-                },
-            ),
-            State::Complete | State::Failed => FrameError::at(
-                self.position,
-                FrameErrorInner::UnexpectedEof {
-                    expected: "no further input",
-                },
-            ),
-        }
+            } => FrameErrorInner::TruncatedPayload {
+                owner: DataOwner::Gnu(*kind),
+                remaining: *remaining,
+            },
+            State::AwaitingGnuMember { .. } => FrameErrorInner::UnexpectedEof {
+                expected: "ordinary GNU member header after a GNU metadata extension",
+            },
+            State::ReadingMember { remaining } => FrameErrorInner::TruncatedPayload {
+                owner: DataOwner::Member,
+                remaining: *remaining,
+            },
+            State::Complete | State::Failed => FrameErrorInner::UnexpectedEof {
+                expected: "no further input",
+            },
+        };
+        FrameError::at(self.position, inner)
     }
 
     fn process_block(&mut self, position: u64, block: Block) -> Result<Option<Frame>, FrameError> {
@@ -536,22 +479,18 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             }
             State::AwaitingUstarHeader { records } => {
                 if is_zero_block(&block) {
-                    return Err(FrameError::at(
+                    return Err(FrameError::unexpected_order(
                         position,
-                        FrameErrorInner::UnexpectedOrder {
-                            expected: "ordinary ustar member header after a local pax header",
-                            found: "end-of-archive marker",
-                        },
+                        "ordinary ustar member header after a local pax header",
+                        "end-of-archive marker",
                     ));
                 }
                 let parsed = self.parse_format_checked_header(position, &block)?;
                 if matches!(parsed.typeflag, b'x' | b'g') {
-                    return Err(FrameError::at(
+                    return Err(FrameError::unexpected_order(
                         position,
-                        FrameErrorInner::UnexpectedOrder {
-                            expected: "ordinary ustar member header after a local pax header",
-                            found: "another pax extended header",
-                        },
+                        "ordinary ustar member header after a local pax header",
+                        "another pax extended header",
                     ));
                 }
                 self.process_ustar_header(position, block, parsed, records)
@@ -583,12 +522,10 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             }
             State::AwaitingGnuMember { pending } => {
                 if is_zero_block(&block) {
-                    return Err(FrameError::at(
+                    return Err(FrameError::unexpected_order(
                         position,
-                        FrameErrorInner::UnexpectedOrder {
-                            expected: "ordinary GNU member header after a GNU metadata extension",
-                            found: "end-of-archive marker",
-                        },
+                        "ordinary GNU member header after a GNU metadata extension",
+                        "end-of-archive marker",
                     ));
                 }
                 let parsed = self.parse_format_checked_header(position, &block)?;
@@ -618,10 +555,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 self.state = State::Complete;
                 Ok(None)
             }
-            State::Failed => {
-                self.state = State::Failed;
-                Ok(None)
-            }
+            State::Failed => Ok(None),
         }
     }
 
@@ -694,11 +628,9 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         kind: PaxKind,
     ) -> Result<Frame, FrameError> {
         if payload_size == 0 {
-            return Err(FrameError::at(
+            return Err(FrameError::invalid_pax_records(
                 position,
-                FrameErrorInner::InvalidPaxRecords {
-                    reason: "extended header payload contains no records",
-                },
+                "extended header payload contains no records",
             ));
         }
         self.state = State::ReadingPax {
@@ -732,10 +664,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             .or_else(|| pax_size(&self.global_pax_records))
             .map_or(Ok(parsed.size), |size| match size {
                 PaxValue::Value(size) => Ok(*size),
-                PaxValue::Deleted => Err(FrameError::at(
-                    position,
-                    FrameErrorInner::DeletedPaxMetadata { keyword: "size" },
-                )),
+                PaxValue::Deleted => Err(FrameError::deleted_pax_metadata(position, "size")),
             })?;
         let payload_size = posix_payload_size(position, kind, effective_size)?;
         self.state = member_payload_state(payload_size);
@@ -770,12 +699,10 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 GnuKind::LongLink => &mut pending.long_link,
             };
             if *already_seen {
-                return Err(FrameError::at(
+                return Err(FrameError::unexpected_order(
                     position,
-                    FrameErrorInner::UnexpectedOrder {
-                        expected: "ordinary GNU member header or the other GNU metadata extension",
-                        found: "duplicate GNU metadata extension",
-                    },
+                    "ordinary GNU member header or the other GNU metadata extension",
+                    "duplicate GNU metadata extension",
                 ));
             }
             *already_seen = true;
@@ -798,12 +725,10 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
 
         let kind = MemberKind::try_from_framed(position, parsed.typeflag)?;
         if pending.long_link && !matches!(kind, MemberKind::HardLink | MemberKind::SymbolicLink) {
-            return Err(FrameError::at(
+            return Err(FrameError::unexpected_order(
                 position,
-                FrameErrorInner::UnexpectedOrder {
-                    expected: "hard-link or symbolic-link member after GNU long-link extension",
-                    found: "non-link ordinary member",
-                },
+                "hard-link or symbolic-link member after GNU long-link extension",
+                "non-link ordinary member",
             ));
         }
         let payload_size = gnu_payload_size(position, kind, parsed.size)?;
@@ -890,27 +815,12 @@ fn member_payload_state(remaining: u64) -> State {
     }
 }
 
-fn completed_block_bytes(len: usize) -> usize {
-    len - len % BLOCK_SIZE
-}
-
 fn checked_position(position: u64, len: usize) -> Result<u64, FrameError> {
-    let len = u64::try_from(len).map_err(|_| {
-        FrameError::at(
-            position,
-            FrameErrorInner::ArithmeticOverflow {
-                context: "stream position",
-            },
-        )
-    })?;
-    position.checked_add(len).ok_or_else(|| {
-        FrameError::at(
-            position,
-            FrameErrorInner::ArithmeticOverflow {
-                context: "stream position",
-            },
-        )
-    })
+    let len = u64::try_from(len)
+        .map_err(|_| FrameError::arithmetic_overflow(position, "stream position"))?;
+    position
+        .checked_add(len)
+        .ok_or_else(|| FrameError::arithmetic_overflow(position, "stream position"))
 }
 
 impl TryFromFramed<&Block> for ParsedHeader {
@@ -993,10 +903,7 @@ fn posix_payload_size(position: u64, kind: MemberKind, size: u64) -> Result<u64,
         MemberKind::Regular | MemberKind::HardLink | MemberKind::Contiguous => Ok(size),
         MemberKind::SymbolicLink => {
             if size != 0 {
-                return Err(FrameError::at(
-                    position,
-                    FrameErrorInner::InvalidMemberSize { kind, size },
-                ));
+                return Err(FrameError::invalid_member_size(position, kind, size));
             }
             Ok(0)
         }
@@ -1010,10 +917,9 @@ fn posix_payload_size(position: u64, kind: MemberKind, size: u64) -> Result<u64,
 fn gnu_payload_size(position: u64, kind: MemberKind, size: u64) -> Result<u64, FrameError> {
     match kind {
         MemberKind::Regular | MemberKind::Contiguous => Ok(size),
-        MemberKind::HardLink | MemberKind::SymbolicLink if size != 0 => Err(FrameError::at(
-            position,
-            FrameErrorInner::InvalidMemberSize { kind, size },
-        )),
+        MemberKind::HardLink | MemberKind::SymbolicLink if size != 0 => {
+            Err(FrameError::invalid_member_size(position, kind, size))
+        }
         MemberKind::HardLink
         | MemberKind::SymbolicLink
         | MemberKind::CharacterDevice

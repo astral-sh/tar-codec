@@ -80,9 +80,8 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
         let path = normalize_archive_path(path.as_ref())?;
         let implicit_ancestors = preflight_regular_entry(&self.entries, &path)?;
         let data = data.as_ref();
-        let size = u64::try_from(data.len()).map_err(|_| EncodeError::ArithmeticOverflow {
-            context: "manual entry payload size",
-        })?;
+        let size = u64::try_from(data.len())
+            .map_err(|_| arithmetic_overflow("manual entry payload size"))?;
         self.write_member(PaxMember {
             path: &path,
             kind: MemberKind::Regular,
@@ -227,12 +226,10 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
     }
 
     async fn write_member(&mut self, member: PaxMember<'_>) -> Result<(), EncodeError> {
-        let next_sequence =
-            self.sequence
-                .checked_add(1)
-                .ok_or(EncodeError::ArithmeticOverflow {
-                    context: "pax member sequence",
-                })?;
+        let next_sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| arithmetic_overflow("pax member sequence"))?;
         frame_pax_member_into(self.sequence, member, &mut self.framing_buffer)?;
         if let Err(source) = self.writer.write_all(&self.framing_buffer).await {
             self.poisoned = true;
@@ -249,20 +246,13 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
         size: u64,
         buffer: &mut Vec<u8>,
     ) -> Result<(), EncodeError> {
-        let chunk_len =
-            usize::try_from(size.min(SOURCE_FILE_CHUNK_BYTES as u64)).map_err(|_| {
-                EncodeError::ArithmeticOverflow {
-                    context: "source file read buffer size",
-                }
-            })?;
+        let chunk_len = usize::try_from(size.min(SOURCE_FILE_CHUNK_BYTES as u64))
+            .map_err(|_| arithmetic_overflow("source file read buffer size"))?;
         buffer.resize(chunk_len, 0);
         let mut remaining = size;
         while remaining != 0 {
-            let read_len = usize::try_from(remaining.min(buffer.len() as u64)).map_err(|_| {
-                EncodeError::ArithmeticOverflow {
-                    context: "source file read size",
-                }
-            })?;
+            let read_len = usize::try_from(remaining.min(buffer.len() as u64))
+                .map_err(|_| arithmetic_overflow("source file read size"))?;
             let len = file.read(&mut buffer[..read_len]).await.map_err(|source| {
                 EncodeError::Filesystem {
                     operation: "read source file",
@@ -271,9 +261,7 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
                 }
             })?;
             if len == 0 {
-                return Err(EncodeError::ChangedSourceFile {
-                    path: path.to_path_buf(),
-                });
+                return Err(changed_source_file(path.to_path_buf()));
             }
             self.write_bytes(&buffer[..len]).await?;
             remaining -= len as u64;
@@ -289,9 +277,7 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
             })?
             != 0
         {
-            return Err(EncodeError::ChangedSourceFile {
-                path: path.to_path_buf(),
-            });
+            return Err(changed_source_file(path.to_path_buf()));
         }
         Ok(())
     }
@@ -332,7 +318,7 @@ async fn prepare_source_file(
             .metadata()
             .map_err(|source| filesystem_error("inspect source file", &path, source))?;
         if !metadata.is_file() {
-            return Err(EncodeError::ChangedSourceFile { path });
+            return Err(changed_source_file(path));
         }
         let size = metadata.len();
         let executable = is_executable(&metadata);
@@ -343,19 +329,17 @@ async fn prepare_source_file(
                 executable,
             });
         }
-        let read_limit = size.checked_add(1).ok_or(EncodeError::ArithmeticOverflow {
-            context: "buffered source file read limit",
-        })?;
+        let read_limit = size
+            .checked_add(1)
+            .ok_or_else(|| arithmetic_overflow("buffered source file read limit"))?;
         buffer.clear();
         file.take(read_limit)
             .read_to_end(buffer)
             .map_err(|source| filesystem_error("read source file", &path, source))?;
-        let actual_size =
-            u64::try_from(buffer.len()).map_err(|_| EncodeError::ArithmeticOverflow {
-                context: "buffered source file payload size",
-            })?;
+        let actual_size = u64::try_from(buffer.len())
+            .map_err(|_| arithmetic_overflow("buffered source file payload size"))?;
         if actual_size != size {
-            return Err(EncodeError::ChangedSourceFile { path });
+            return Err(changed_source_file(path));
         }
         Ok(PreparedSourceFile::Buffered { size, executable })
     })
@@ -469,9 +453,7 @@ fn reserve_entry(
         match entries.get(ancestor) {
             Some(ArchivedEntry::Directory { .. }) => {}
             Some(_) => {
-                return Err(EncodeError::PathCollision {
-                    path: ancestor.to_owned(),
-                });
+                return Err(path_collision(ancestor));
             }
             None => {
                 entries.insert(
@@ -486,9 +468,7 @@ fn reserve_entry(
             entries.insert(path.to_owned(), ArchivedEntry::Directory { explicit: true });
         }
         (Some(_), _) => {
-            return Err(EncodeError::PathCollision {
-                path: path.to_owned(),
-            });
+            return Err(path_collision(path));
         }
         (None, entry) => {
             entries.insert(path.to_owned(), entry);
@@ -507,17 +487,13 @@ fn preflight_regular_entry(
         match entries.get(ancestor) {
             Some(ArchivedEntry::Directory { .. }) => {}
             Some(_) => {
-                return Err(EncodeError::PathCollision {
-                    path: ancestor.to_owned(),
-                });
+                return Err(path_collision(ancestor));
             }
             None => implicit_ancestors.push(ancestor.to_owned()),
         }
     }
     if entries.contains_key(path) {
-        return Err(EncodeError::PathCollision {
-            path: path.to_owned(),
-        });
+        return Err(path_collision(path));
     }
     Ok(implicit_ancestors)
 }
@@ -558,6 +534,20 @@ fn filesystem_error(operation: &'static str, path: &Path, source: io::Error) -> 
         operation,
         path: path.to_path_buf(),
         source,
+    }
+}
+
+fn arithmetic_overflow(context: &'static str) -> EncodeError {
+    EncodeError::ArithmeticOverflow { context }
+}
+
+fn changed_source_file(path: PathBuf) -> EncodeError {
+    EncodeError::ChangedSourceFile { path }
+}
+
+fn path_collision(path: &str) -> EncodeError {
+    EncodeError::PathCollision {
+        path: path.to_owned(),
     }
 }
 

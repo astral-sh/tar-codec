@@ -155,11 +155,9 @@ pub(super) fn parse_records(
     inherited_hdrcharset: HdrCharset,
 ) -> Result<Vec<PaxRecord>, FrameError> {
     if payload.is_empty() {
-        return Err(FrameError::at(
+        return Err(FrameError::invalid_pax_records(
             position,
-            FrameErrorInner::InvalidPaxRecords {
-                reason: "local extended header payload contains no records",
-            },
+            "local extended header payload contains no records",
         ));
     }
 
@@ -170,64 +168,40 @@ pub(super) fn parse_records(
             .iter()
             .position(|byte| *byte == b' ')
             .ok_or_else(|| {
-                FrameError::at(
-                    position,
-                    FrameErrorInner::InvalidPaxRecords {
-                        reason: "record is missing its length separator",
-                    },
-                )
+                FrameError::invalid_pax_records(position, "record is missing its length separator")
             })?
             + cursor;
         if length_end == cursor {
-            return Err(FrameError::at(
+            return Err(FrameError::invalid_pax_records(
                 position,
-                FrameErrorInner::InvalidPaxRecords {
-                    reason: "record length is empty",
-                },
+                "record length is empty",
             ));
         }
         let record_len = std::str::from_utf8(&payload[cursor..length_end])
             .ok()
             .and_then(parse_integer)
             .ok_or_else(|| {
-                FrameError::at(
+                FrameError::invalid_pax_records(
                     position,
-                    FrameErrorInner::InvalidPaxRecords {
-                        reason: "record length is not a valid decimal integer",
-                    },
+                    "record length is not a valid decimal integer",
                 )
             })?;
-        let record_len = usize::try_from(record_len).map_err(|_| {
-            FrameError::at(
-                position,
-                FrameErrorInner::ArithmeticOverflow {
-                    context: "pax record length",
-                },
-            )
-        })?;
-        let record_end = cursor.checked_add(record_len).ok_or_else(|| {
-            FrameError::at(
-                position,
-                FrameErrorInner::ArithmeticOverflow {
-                    context: "pax record end",
-                },
-            )
-        })?;
+        let record_len = usize::try_from(record_len)
+            .map_err(|_| FrameError::arithmetic_overflow(position, "pax record length"))?;
+        let record_end = cursor
+            .checked_add(record_len)
+            .ok_or_else(|| FrameError::arithmetic_overflow(position, "pax record end"))?;
         if record_end > payload.len() {
-            return Err(FrameError::at(
+            return Err(FrameError::invalid_pax_records(
                 position,
-                FrameErrorInner::InvalidPaxRecords {
-                    reason: "record length exceeds extended header payload",
-                },
+                "record length exceeds extended header payload",
             ));
         }
         let record = &payload[cursor..record_end];
         if record.last() != Some(&b'\n') {
-            return Err(FrameError::at(
+            return Err(FrameError::invalid_pax_records(
                 position,
-                FrameErrorInner::InvalidPaxRecords {
-                    reason: "record is not newline terminated",
-                },
+                "record is not newline terminated",
             ));
         }
         let content_start = length_end - cursor + 1;
@@ -235,20 +209,16 @@ pub(super) fn parse_records(
             .iter()
             .position(|byte| *byte == b'=')
             .ok_or_else(|| {
-                FrameError::at(
+                FrameError::invalid_pax_records(
                     position,
-                    FrameErrorInner::InvalidPaxRecords {
-                        reason: "record is missing its keyword/value separator",
-                    },
+                    "record is missing its keyword/value separator",
                 )
             })?
             + content_start;
         if equals == content_start {
-            return Err(FrameError::at(
+            return Err(FrameError::invalid_pax_records(
                 position,
-                FrameErrorInner::InvalidPaxRecords {
-                    reason: "record keyword is empty",
-                },
+                "record keyword is empty",
             ));
         }
         let keyword = std::str::from_utf8(&record[content_start..equals])
@@ -299,47 +269,43 @@ fn parse_namespaced_record(
     keyword: &str,
     value: &[u8],
 ) -> Result<PaxRecord, FrameError> {
-    if let Some(name) = keyword.strip_prefix("realtime.")
-        && !name.is_empty()
-    {
-        return Ok(PaxRecord::Realtime {
+    let invalid = || {
+        FrameError::at(
+            position,
+            FrameErrorInner::InvalidPaxKeyword {
+                keyword: keyword.to_owned(),
+            },
+        )
+    };
+    let (namespace, name) = match keyword.split_once('.') {
+        Some((namespace, name)) if !name.is_empty() => (namespace, name),
+        _ => return Err(invalid()),
+    };
+    match namespace {
+        "realtime" => Ok(PaxRecord::Realtime {
             name: name.to_owned(),
             value: parse_text(position, value)?,
-        });
-    }
-    if let Some(name) = keyword.strip_prefix("security.")
-        && !name.is_empty()
-    {
-        return Ok(PaxRecord::Security {
+        }),
+        "security" => Ok(PaxRecord::Security {
             name: name.to_owned(),
             value: parse_text(position, value)?,
-        });
+        }),
+        vendor if !vendor.is_empty() && vendor.bytes().all(|byte| byte.is_ascii_uppercase()) => {
+            Ok(PaxRecord::Vendor {
+                vendor: vendor.to_owned(),
+                name: name.to_owned(),
+                value: parse_text(position, value)?,
+            })
+        }
+        _ => Err(invalid()),
     }
-    if let Some((vendor, name)) = keyword.split_once('.')
-        && !vendor.is_empty()
-        && vendor.bytes().all(|byte| byte.is_ascii_uppercase())
-        && !name.is_empty()
-    {
-        return Ok(PaxRecord::Vendor {
-            vendor: vendor.to_owned(),
-            name: name.to_owned(),
-            value: parse_text(position, value)?,
-        });
-    }
-    Err(FrameError::at(
-        position,
-        FrameErrorInner::InvalidPaxKeyword {
-            keyword: keyword.to_owned(),
-        },
-    ))
 }
 
 fn parse_text(position: u64, value: &[u8]) -> Result<PaxValue<String>, FrameError> {
-    let value = parse_utf8(position, value)?;
-    match value.parse() {
-        Ok(value) => Ok(value),
-        Err(error) => match error {},
-    }
+    parse_utf8(position, value).map(|value| match value {
+        "" => PaxValue::Deleted,
+        value => PaxValue::Value(value.to_owned()),
+    })
 }
 
 /// Parse a pax "string". This is distinct from [`parse_text`] or the common
@@ -446,23 +412,20 @@ fn parse_time(
 }
 
 pub(super) fn size(records: &[PaxRecord]) -> Option<&PaxValue<u64>> {
-    records
-        .iter()
-        .filter_map(|record| match record {
-            PaxRecord::Size(value) => Some(value),
-            _ => None,
-        })
-        .next_back()
+    records.iter().rev().find_map(|record| match record {
+        PaxRecord::Size(value) => Some(value),
+        _ => None,
+    })
 }
 
 pub(super) fn hdrcharset(records: &[PaxRecord]) -> HdrCharset {
     records
         .iter()
-        .filter_map(|record| match record {
+        .rev()
+        .find_map(|record| match record {
             PaxRecord::HdrCharset(value) => Some(value),
             _ => None,
         })
-        .next_back()
         .map_or(HdrCharset::Utf8, |value| match value {
             PaxValue::Value(value) => *value,
             PaxValue::Deleted => HdrCharset::Utf8,

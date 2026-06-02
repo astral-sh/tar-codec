@@ -177,46 +177,31 @@ pub fn end_marker_bytes() -> &'static [u8] {
 
 /// Returns the zero padding required after a payload of `size` meaningful bytes.
 pub fn payload_padding(size: u64) -> &'static [u8] {
-    let remainder = size % BLOCK_SIZE as u64;
-    if remainder == 0 {
-        &[]
-    } else {
-        let len = (BLOCK_SIZE as u64 - remainder) as usize;
-        &ZERO_BLOCK[..len]
+    match size % BLOCK_SIZE as u64 {
+        0 => &[],
+        remainder => &ZERO_BLOCK[..(BLOCK_SIZE as u64 - remainder) as usize],
     }
 }
 
 fn validate_member(member: PaxMember<'_>) -> Result<(), FramingWriteError> {
     validate_text("path", member.path)?;
     match member.kind {
-        MemberKind::Regular | MemberKind::Directory => {
-            if member.link_path.is_some() {
-                return Err(FramingWriteError::UnexpectedLinkPath { kind: member.kind });
-            }
-            if member.kind == MemberKind::Directory && member.size != 0 {
-                return Err(FramingWriteError::InvalidMemberSize {
-                    kind: member.kind,
-                    size: member.size,
-                });
-            }
+        MemberKind::Regular | MemberKind::Directory if member.link_path.is_some() => {
+            Err(FramingWriteError::UnexpectedLinkPath { kind: member.kind })
         }
-        MemberKind::SymbolicLink => {
-            if member.size != 0 {
-                return Err(FramingWriteError::InvalidMemberSize {
-                    kind: member.kind,
-                    size: member.size,
-                });
-            }
-            let Some(link_path) = member.link_path else {
-                return Err(FramingWriteError::MissingLinkPath);
-            };
-            validate_text("linkpath", link_path)?;
+        MemberKind::Directory | MemberKind::SymbolicLink if member.size != 0 => {
+            Err(FramingWriteError::InvalidMemberSize {
+                kind: member.kind,
+                size: member.size,
+            })
         }
-        _ => {
-            return Err(FramingWriteError::UnsupportedMemberKind { kind: member.kind });
-        }
+        MemberKind::Regular | MemberKind::Directory => Ok(()),
+        MemberKind::SymbolicLink => validate_text(
+            "linkpath",
+            member.link_path.ok_or(FramingWriteError::MissingLinkPath)?,
+        ),
+        _ => Err(FramingWriteError::UnsupportedMemberKind { kind: member.kind }),
     }
-    Ok(())
 }
 
 fn validate_text(field: &'static str, value: &str) -> Result<(), FramingWriteError> {

@@ -132,7 +132,7 @@ mod tests {
     }
 
     #[test]
-    fn encodes_known_checksums() {
+    fn checksums_known_blocks() {
         let zero_block = [0; crate::BLOCK_SIZE];
         let mut x_typeflag_block = zero_block;
         x_typeflag_block[TYPEFLAG_OFFSET] = b'x';
@@ -148,6 +148,7 @@ mod tests {
             ),
             ("maximum block", maximum_block, b"373410\0 "),
         ] {
+            assert_eq!(Some(checksum(&block)), parse_octal(expected), "{name}");
             encode_checksum(&mut block);
             assert_eq!(&block[CHECKSUM_RANGE], expected, "{name}");
         }
