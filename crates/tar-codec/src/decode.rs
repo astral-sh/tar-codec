@@ -8,7 +8,8 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
-    io,
+    io::{self, Write},
+    mem,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -19,10 +20,14 @@ use cap_std::{
 };
 use tar_framing::{
     ArchiveFormat, FrameError, MemberKind, PaxKind, PaxRecord,
-    logical::{LogicalFrame, MemberExtensions, MemberFrame, MemberHeader, PayloadBlock, TarReader},
+    logical::{LogicalFrame, MemberExtensions, MemberFrame, MemberHeader, TarReader},
 };
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWriteExt};
+
+use crate::blocking::with_reusable_buffer;
+
+const EXTRACTION_CHUNK_BYTES: usize = 1024 * 1024;
 
 /// A one-pass reader for a validated pax or GNU tar archive.
 pub struct Archive<R> {
@@ -264,6 +269,7 @@ impl<R: AsyncRead + Unpin> Archive<R> {
         policy: ExtractPolicy,
     ) -> Result<(), ExtractError> {
         let mut root = ExtractionRoot::open(dest.as_ref()).await?;
+        let mut payload_chunk = Vec::new();
         while let Some(frame) = self.reader.next_frame().await? {
             match frame {
                 LogicalFrame::GlobalPax(header) => {
@@ -293,9 +299,31 @@ impl<R: AsyncRead + Unpin> Archive<R> {
                         )?;
                     }
                     let member = decode_member(&frame)?;
-                    if let Some(mut writer) = root.start_member(member).await? {
-                        while let Some(block) = frame.payload.next_block().await? {
-                            writer.write_block(block).await?;
+                    if is_buffered_regular_member(&member) {
+                        root.prepare_file_path(&member.path).await?;
+                        payload_chunk.clear();
+                        if member.payload_size != 0
+                            && !frame
+                                .payload
+                                .next_chunk(&mut payload_chunk, EXTRACTION_CHUNK_BYTES)
+                                .await?
+                        {
+                            return Err(ExtractError::InvalidFrameSequence {
+                                reason: "buffered member payload ended before its decoded size",
+                            });
+                        }
+                        let buffer = mem::take(&mut payload_chunk);
+                        let (returned_buffer, result) =
+                            root.create_buffered_file(member, buffer).await;
+                        payload_chunk = returned_buffer;
+                        result?;
+                    } else if let Some(mut writer) = root.start_member(member).await? {
+                        while frame
+                            .payload
+                            .next_chunk(&mut payload_chunk, EXTRACTION_CHUNK_BYTES)
+                            .await?
+                        {
+                            writer.write_chunk(&payload_chunk).await?;
                         }
                     } else {
                         frame.payload.skip().await?;
@@ -485,6 +513,11 @@ fn decode_member<R>(frame: &MemberFrame<'_, R>) -> Result<DecodedMember, Extract
     })
 }
 
+fn is_buffered_regular_member(member: &DecodedMember) -> bool {
+    matches!(member.kind, MemberKind::Regular | MemberKind::Contiguous)
+        && member.payload_size <= EXTRACTION_CHUNK_BYTES as u64
+}
+
 fn resolved_text(
     position: u64,
     keyword: &'static str,
@@ -592,6 +625,7 @@ struct ExtractionRoot {
     dir: Arc<Dir>,
     extracted_files: HashSet<PathBuf>,
     extracted_directories: HashSet<PathBuf>,
+    verified_directories: HashSet<PathBuf>,
     pending_symlinks: HashMap<PathBuf, PendingSymlink>,
     symlink_paths: Vec<PathBuf>,
 }
@@ -621,6 +655,7 @@ impl ExtractionRoot {
             dir: Arc::new(dir),
             extracted_files: HashSet::new(),
             extracted_directories: HashSet::new(),
+            verified_directories: HashSet::new(),
             pending_symlinks: HashMap::new(),
             symlink_paths: Vec::new(),
         })
@@ -667,12 +702,44 @@ impl ExtractionRoot {
         &mut self,
         member: DecodedMember,
     ) -> Result<Option<ActiveWriter>, ExtractError> {
-        self.prepare_file_path(&member.path).await?;
         let std_file = self
-            .create_new_file(&member.path, member.executable)
+            .create_or_replace_file(&member.path, member.executable)
             .await?;
         self.extracted_files.insert(member.path.clone());
         Ok(active_writer(member, std_file))
+    }
+
+    async fn create_buffered_file(
+        &mut self,
+        member: DecodedMember,
+        buffer: Vec<u8>,
+    ) -> (Vec<u8>, Result<(), ExtractError>) {
+        let payload_size = match u64::try_from(buffer.len()) {
+            Ok(payload_size) => payload_size,
+            Err(_) => {
+                return (
+                    buffer,
+                    Err(ExtractError::InvalidFrameSequence {
+                        reason: "buffered payload length cannot be represented",
+                    }),
+                );
+            }
+        };
+        if payload_size != member.payload_size {
+            return (
+                buffer,
+                Err(ExtractError::InvalidFrameSequence {
+                    reason: "buffered payload length did not match the decoded member size",
+                }),
+            );
+        }
+        let (buffer, result) = self
+            .create_or_replace_buffered_file(&member.path, member.executable, buffer)
+            .await;
+        if result.is_ok() {
+            self.extracted_files.insert(member.path);
+        }
+        (buffer, result)
     }
 
     async fn create_directory(&mut self, member: DecodedMember) -> Result<(), ExtractError> {
@@ -680,10 +747,13 @@ impl ExtractionRoot {
         if self.pending_symlinks.contains_key(&member.path) {
             return Err(ExtractError::PathCollision { path: member.path });
         }
-        match self.symlink_metadata(&member.path).await? {
-            Some(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-            Some(_) => return Err(ExtractError::PathCollision { path: member.path }),
-            None => self.create_dir(&member.path).await?,
+        if !self.verified_directories.contains(&member.path) {
+            match self.symlink_metadata(&member.path).await? {
+                Some(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Some(_) => return Err(ExtractError::PathCollision { path: member.path }),
+                None => self.create_dir(&member.path).await?,
+            }
+            self.verified_directories.insert(member.path.clone());
         }
         self.extracted_directories.insert(member.path);
         Ok(())
@@ -798,6 +868,41 @@ impl ExtractionRoot {
         }
     }
 
+    async fn create_or_replace_file(
+        &mut self,
+        path: &Path,
+        executable: bool,
+    ) -> Result<std::fs::File, ExtractError> {
+        self.prepare_file_path(path).await?;
+        let relative = path.to_owned();
+        let error_path = relative.clone();
+        let dir = Arc::clone(&self.dir);
+        tokio::task::spawn_blocking(move || open_or_replace_file(&dir, &relative, executable))
+            .await?
+            .map(cap_std::fs::File::into_std)
+            .map_err(|error| map_file_operation_error(error_path, error))
+    }
+
+    async fn create_or_replace_buffered_file(
+        &self,
+        path: &Path,
+        executable: bool,
+        buffer: Vec<u8>,
+    ) -> (Vec<u8>, Result<(), ExtractError>) {
+        let relative = path.to_owned();
+        let error_path = relative.clone();
+        let dir = Arc::clone(&self.dir);
+        with_reusable_buffer(buffer, move |buffer| {
+            let result = open_or_replace_file(&dir, &relative, executable).and_then(|mut file| {
+                file.write_all(buffer)
+                    .map_err(|source| file_operation_error("write file", source))
+            });
+            buffer.clear();
+            result.map_err(|error| map_file_operation_error(error_path, error))
+        })
+        .await
+    }
+
     async fn prepare_file_path(&mut self, path: &Path) -> Result<(), ExtractError> {
         self.ensure_parents(path).await?;
         if self.pending_symlinks.contains_key(path) {
@@ -805,16 +910,7 @@ impl ExtractionRoot {
                 path: path.to_owned(),
             });
         }
-        match self.symlink_metadata(path).await? {
-            Some(metadata) if metadata.is_file() => {
-                self.remove_file(path).await?;
-                Ok(())
-            }
-            Some(_) => Err(ExtractError::PathCollision {
-                path: path.to_owned(),
-            }),
-            None => Ok(()),
-        }
+        Ok(())
     }
 
     async fn ensure_new_path(&mut self, path: &Path) -> Result<(), ExtractError> {
@@ -839,8 +935,13 @@ impl ExtractionRoot {
                     path: current.clone(),
                 });
             }
+            if self.verified_directories.contains(&current) {
+                continue;
+            }
             match self.symlink_metadata(&current).await? {
-                Some(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Some(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                    self.verified_directories.insert(current.clone());
+                }
                 Some(_) => {
                     return Err(ExtractError::PathCollision {
                         path: current.clone(),
@@ -849,6 +950,7 @@ impl ExtractionRoot {
                 None => {
                     self.create_dir(&current).await?;
                     self.extracted_directories.insert(current.clone());
+                    self.verified_directories.insert(current.clone());
                 }
             }
         }
@@ -886,34 +988,6 @@ impl ExtractionRoot {
         tokio::task::spawn_blocking(move || dir.create_dir(relative))
             .await?
             .map_err(|source| filesystem("create directory", error_path, source))
-    }
-
-    async fn remove_file(&self, path: &Path) -> Result<(), ExtractError> {
-        let relative = path.to_owned();
-        let error_path = relative.clone();
-        let dir = Arc::clone(&self.dir);
-        tokio::task::spawn_blocking(move || dir.remove_file(relative))
-            .await?
-            .map_err(|source| filesystem("remove file", error_path, source))
-    }
-
-    async fn create_new_file(
-        &self,
-        path: &Path,
-        executable: bool,
-    ) -> Result<std::fs::File, ExtractError> {
-        let relative = path.to_owned();
-        let error_path = relative.clone();
-        let dir = Arc::clone(&self.dir);
-        tokio::task::spawn_blocking(move || {
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            let file = dir.open_with(relative, &options)?;
-            add_executable(&file, executable)?;
-            Ok(file.into_std())
-        })
-        .await?
-        .map_err(|source| filesystem("create file", error_path, source))
     }
 
     async fn truncate_file(&self, path: &Path) -> Result<std::fs::File, ExtractError> {
@@ -956,6 +1030,59 @@ impl ExtractionRoot {
     }
 }
 
+enum FileOperationError {
+    Collision,
+    Filesystem {
+        operation: &'static str,
+        source: io::Error,
+    },
+}
+
+fn open_or_replace_file(
+    dir: &Dir,
+    path: &Path,
+    executable: bool,
+) -> Result<cap_std::fs::File, FileOperationError> {
+    match create_new_file(dir, path, executable) {
+        Ok(file) => Ok(file),
+        Err(create_error) if create_error.kind() == io::ErrorKind::AlreadyExists => {
+            match dir.symlink_metadata(path) {
+                Ok(metadata) if metadata.is_file() => {
+                    dir.remove_file(path)
+                        .map_err(|source| file_operation_error("remove file", source))?;
+                    create_new_file(dir, path, executable)
+                        .map_err(|source| file_operation_error("create file", source))
+                }
+                Ok(_) => Err(FileOperationError::Collision),
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                    Err(file_operation_error("create file", create_error))
+                }
+                Err(source) => Err(file_operation_error("inspect", source)),
+            }
+        }
+        Err(source) => Err(file_operation_error("create file", source)),
+    }
+}
+
+fn create_new_file(dir: &Dir, path: &Path, executable: bool) -> io::Result<cap_std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    let file = dir.open_with(path, &options)?;
+    add_executable(&file, executable)?;
+    Ok(file)
+}
+
+fn file_operation_error(operation: &'static str, source: io::Error) -> FileOperationError {
+    FileOperationError::Filesystem { operation, source }
+}
+
+fn map_file_operation_error(path: PathBuf, error: FileOperationError) -> ExtractError {
+    match error {
+        FileOperationError::Collision => ExtractError::PathCollision { path },
+        FileOperationError::Filesystem { operation, source } => filesystem(operation, path, source),
+    }
+}
+
 fn required_link_target(member: &DecodedMember) -> Result<String, ExtractError> {
     match member.link_target.clone() {
         Some(target) if !target.is_empty() => Ok(target),
@@ -983,9 +1110,9 @@ struct ActiveWriter {
 }
 
 impl ActiveWriter {
-    async fn write_block(&mut self, block: PayloadBlock) -> Result<(), ExtractError> {
-        let len = u64::try_from(block.len).map_err(|_| ExtractError::InvalidFrameSequence {
-            reason: "payload block length cannot be represented",
+    async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), ExtractError> {
+        let len = u64::try_from(chunk.len()).map_err(|_| ExtractError::InvalidFrameSequence {
+            reason: "payload chunk length cannot be represented",
         })?;
         if len > self.remaining {
             return Err(ExtractError::InvalidFrameSequence {
@@ -993,7 +1120,7 @@ impl ActiveWriter {
             });
         }
         self.file
-            .write_all(&block.block[..block.len])
+            .write_all(chunk)
             .await
             .map_err(|source| filesystem("write file", self.path.clone(), source))?;
         self.remaining -= len;
@@ -1293,6 +1420,36 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[tokio::test]
+    async fn extracts_chunked_multiblock_payload_with_partial_final_block() {
+        let temp = tempdir().unwrap();
+        let dest = temp.path().join("out");
+        let payload = (0..16 * 1024 + BLOCK_SIZE + 7)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect::<Vec<_>>();
+        let mut bytes = Vec::new();
+        append_posix_member(&mut bytes, "file", b'0', &payload, "", 0o644);
+        finish(&mut bytes);
+
+        extract(bytes, &dest).await.unwrap();
+        assert_eq!(std::fs::read(dest.join("file")).unwrap(), payload);
+    }
+
+    #[tokio::test]
+    async fn extracts_streamed_payload_larger_than_the_buffered_threshold() {
+        let temp = tempdir().unwrap();
+        let dest = temp.path().join("out");
+        let payload = (0..EXTRACTION_CHUNK_BYTES + 7)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect::<Vec<_>>();
+        let mut bytes = Vec::new();
+        append_posix_member(&mut bytes, "file", b'0', &payload, "", 0o644);
+        finish(&mut bytes);
+
+        extract(bytes, &dest).await.unwrap();
+        assert_eq!(std::fs::read(dest.join("file")).unwrap(), payload);
     }
 
     #[cfg(unix)]

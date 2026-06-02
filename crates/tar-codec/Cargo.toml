@@ -14,9 +14,17 @@ readme = { workspace = true }
 cap-std = { workspace = true }
 tar-framing = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync"] }
 tokio-stream = { workspace = true }
+walkdir = { workspace = true }
 
 [dev-dependencies]
+astral-tokio-tar = { workspace = true }
+criterion = { workspace = true }
+tar = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
+
+[[bench]]
+name = "comparison"
+harness = false

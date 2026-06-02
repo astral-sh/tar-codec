@@ -3,18 +3,30 @@
 //! The encoder emits one local pax header before every member. Compression is
 //! intentionally left to callers, which may wrap the underlying async writer.
 
+mod traversal;
+
+pub use self::traversal::TraversalError;
+
 use std::{
-    collections::{HashMap, HashSet},
-    io,
+    collections::HashMap,
+    io::{self, Read},
+    mem,
     path::{Path, PathBuf},
 };
 
 use tar_framing::{
-    BLOCK_SIZE, MemberKind,
-    write::{FramingWriteError, PaxMember, end_marker, frame_pax_member},
+    MemberKind,
+    write::{
+        FramingWriteError, PaxMember, end_marker_bytes, frame_pax_member_into, payload_padding,
+    },
 };
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use self::traversal::{TraversalEntry, TraversalKind, TraversalStream, stream_directory_entries};
+use crate::blocking::with_reusable_buffer;
+
+const SOURCE_FILE_CHUNK_BYTES: usize = 1024 * 1024;
 
 /// Minimal regular-file metadata accepted by [`Encoder::add_entry`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -35,6 +47,7 @@ pub struct Encoder<W> {
     writer: W,
     sequence: u64,
     entries: HashMap<String, ArchivedEntry>,
+    framing_buffer: Vec<u8>,
     poisoned: bool,
 }
 
@@ -45,6 +58,7 @@ impl<W> Encoder<W> {
             writer,
             sequence: 0,
             entries: HashMap::new(),
+            framing_buffer: Vec::new(),
             poisoned: false,
         }
     }
@@ -64,8 +78,7 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
     {
         self.ensure_active()?;
         let path = normalize_archive_path(path.as_ref())?;
-        let mut entries = self.entries.clone();
-        reserve_entry(&mut entries, &path, ArchivedEntry::Regular)?;
+        let implicit_ancestors = preflight_regular_entry(&self.entries, &path)?;
         let data = data.as_ref();
         let size = u64::try_from(data.len()).map_err(|_| EncodeError::ArithmeticOverflow {
             context: "manual entry payload size",
@@ -80,99 +93,140 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
         .await?;
         self.write_bytes(data).await?;
         self.write_padding(size).await?;
-        self.entries = entries;
+        for ancestor in implicit_ancestors {
+            self.entries
+                .insert(ancestor, ArchivedEntry::Directory { explicit: false });
+        }
+        self.entries.insert(path, ArchivedEntry::Regular);
         Ok(())
     }
 
     /// Recursively adds a filesystem directory beneath its UTF-8 basename.
     ///
-    /// The complete tree is scanned and validated before any bytes belonging
-    /// to this directory are written. Files are streamed with bounded memory.
+    /// Entries are visited in deterministic sorted order and files are streamed
+    /// with bounded memory. Source symbolic-link targets are preserved without
+    /// applying extraction policy. A late traversal or validation failure may
+    /// leave partial output and poison this encoder.
     pub async fn add_directory<P: AsRef<Path>>(&mut self, source: P) -> Result<(), EncodeError> {
         self.ensure_active()?;
         let source = source.as_ref().to_path_buf();
-        let manifest = tokio::task::spawn_blocking(move || scan_directory(&source)).await??;
-        let entries = reserve_manifest(&self.entries, &manifest)?;
-        self.write_manifest(&manifest).await?;
-        self.entries = entries;
+        let initial_sequence = self.sequence;
+        let result = self.write_directory(source).await;
+        if result.is_err() && self.sequence != initial_sequence {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    async fn write_directory(&mut self, source: PathBuf) -> Result<(), EncodeError> {
+        let mut traversal = DirectoryTraversal {
+            entries: self.entries.clone(),
+            buffer: Vec::new(),
+        };
+        let mut entries = stream_directory_entries(source)?;
+        let result = self
+            .write_directory_entries(&mut entries, &mut traversal)
+            .await;
+        let traversal_result = entries.finish().await;
+        result?;
+        traversal_result?;
+        self.entries = traversal.entries;
         Ok(())
     }
 
-    async fn write_manifest(&mut self, manifest: &[ManifestEntry]) -> Result<(), EncodeError> {
-        for entry in manifest {
-            if let Err(error) = self.write_manifest_entry(entry).await {
-                self.poisoned = true;
-                return Err(error);
+    async fn write_directory_entries(
+        &mut self,
+        entries: &mut TraversalStream,
+        traversal: &mut DirectoryTraversal,
+    ) -> Result<(), EncodeError> {
+        while let Some(entries) = entries.recv().await {
+            for entry in entries {
+                match entry.kind {
+                    TraversalKind::Directory => {
+                        reserve_entry(
+                            &mut traversal.entries,
+                            &entry.archive_path,
+                            ArchivedEntry::Directory { explicit: true },
+                        )?;
+                        self.write_member(PaxMember {
+                            path: &entry.archive_path,
+                            kind: MemberKind::Directory,
+                            size: 0,
+                            link_path: None,
+                            executable: false,
+                        })
+                        .await?;
+                    }
+                    TraversalKind::Regular => {
+                        reserve_entry(
+                            &mut traversal.entries,
+                            &entry.archive_path,
+                            ArchivedEntry::Regular,
+                        )?;
+                        self.write_source_file(&entry, &mut traversal.buffer)
+                            .await?;
+                    }
+                    TraversalKind::SymbolicLink { target } => {
+                        reserve_entry(
+                            &mut traversal.entries,
+                            &entry.archive_path,
+                            ArchivedEntry::SymbolicLink,
+                        )?;
+                        self.write_member(PaxMember {
+                            path: &entry.archive_path,
+                            kind: MemberKind::SymbolicLink,
+                            size: 0,
+                            link_path: Some(&target),
+                            executable: false,
+                        })
+                        .await?;
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    async fn write_source_file(
+        &mut self,
+        entry: &TraversalEntry,
+        buffer: &mut Vec<u8>,
+    ) -> Result<(), EncodeError> {
+        let reusable_buffer = mem::take(buffer);
+        let (returned_buffer, result) = prepare_source_file(&entry.source, reusable_buffer).await;
+        *buffer = returned_buffer;
+        let file = result?;
+        self.write_member(PaxMember {
+            path: &entry.archive_path,
+            kind: MemberKind::Regular,
+            size: file.size(),
+            link_path: None,
+            executable: file.executable(),
+        })
+        .await?;
+        match file {
+            PreparedSourceFile::Buffered { size, .. } => {
+                self.write_bytes(buffer).await?;
+                self.write_padding(size).await
+            }
+            PreparedSourceFile::Streaming {
+                file,
+                size,
+                executable: _,
+            } => {
+                let mut file = tokio::fs::File::from_std(file);
+                self.write_file_payload(&mut file, &entry.source, size, buffer)
+                    .await?;
+                self.write_padding(size).await
+            }
+        }
     }
 
     /// Writes the required two-zero-block terminator and returns the writer.
     pub async fn finish(mut self) -> Result<W, EncodeError> {
         self.ensure_active()?;
-        for block in end_marker() {
-            self.write_bytes(&block).await?;
-        }
+        self.write_bytes(end_marker_bytes()).await?;
         Ok(self.writer)
-    }
-
-    async fn write_manifest_entry(&mut self, entry: &ManifestEntry) -> Result<(), EncodeError> {
-        match &entry.kind {
-            ManifestKind::Directory => {
-                self.write_member(PaxMember {
-                    path: &entry.archive_path,
-                    kind: MemberKind::Directory,
-                    size: 0,
-                    link_path: None,
-                    executable: false,
-                })
-                .await
-            }
-            ManifestKind::SymbolicLink { target } => {
-                self.write_member(PaxMember {
-                    path: &entry.archive_path,
-                    kind: MemberKind::SymbolicLink,
-                    size: 0,
-                    link_path: Some(target),
-                    executable: false,
-                })
-                .await
-            }
-            ManifestKind::Regular { size, executable } => {
-                let mut file = tokio::fs::File::open(&entry.source)
-                    .await
-                    .map_err(|source| EncodeError::Filesystem {
-                        operation: "open source file",
-                        path: entry.source.clone(),
-                        source,
-                    })?;
-                let metadata = file
-                    .metadata()
-                    .await
-                    .map_err(|source| EncodeError::Filesystem {
-                        operation: "inspect source file",
-                        path: entry.source.clone(),
-                        source,
-                    })?;
-                if !metadata.is_file() || metadata.len() != *size {
-                    return Err(EncodeError::ChangedSourceFile {
-                        path: entry.source.clone(),
-                    });
-                }
-                self.write_member(PaxMember {
-                    path: &entry.archive_path,
-                    kind: MemberKind::Regular,
-                    size: *size,
-                    link_path: None,
-                    executable: *executable,
-                })
-                .await?;
-                self.write_file_payload(&mut file, &entry.source, *size)
-                    .await?;
-                self.write_padding(*size).await
-            }
-        }
     }
 
     async fn write_member(&mut self, member: PaxMember<'_>) -> Result<(), EncodeError> {
@@ -182,12 +236,11 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
                 .ok_or(EncodeError::ArithmeticOverflow {
                     context: "pax member sequence",
                 })?;
-        let blocks = frame_pax_member(self.sequence, member)?;
-        self.write_bytes(&blocks.extended_header).await?;
-        for block in blocks.extended_payload {
-            self.write_bytes(&block).await?;
+        frame_pax_member_into(self.sequence, member, &mut self.framing_buffer)?;
+        if let Err(source) = self.writer.write_all(&self.framing_buffer).await {
+            self.poisoned = true;
+            return Err(EncodeError::Write { source });
         }
-        self.write_bytes(&blocks.member_header).await?;
         self.sequence = next_sequence;
         Ok(())
     }
@@ -197,8 +250,15 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
         file: &mut tokio::fs::File,
         path: &Path,
         size: u64,
+        buffer: &mut Vec<u8>,
     ) -> Result<(), EncodeError> {
-        let mut buffer = [0; 16 * 1024];
+        let chunk_len =
+            usize::try_from(size.min(SOURCE_FILE_CHUNK_BYTES as u64)).map_err(|_| {
+                EncodeError::ArithmeticOverflow {
+                    context: "source file read buffer size",
+                }
+            })?;
+        buffer.resize(chunk_len, 0);
         let mut remaining = size;
         while remaining != 0 {
             let read_len = usize::try_from(remaining.min(buffer.len() as u64)).map_err(|_| {
@@ -240,15 +300,9 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
     }
 
     async fn write_padding(&mut self, size: u64) -> Result<(), EncodeError> {
-        let remainder = size % BLOCK_SIZE as u64;
-        if remainder != 0 {
-            let padding = [0; BLOCK_SIZE];
-            let len = usize::try_from(BLOCK_SIZE as u64 - remainder).map_err(|_| {
-                EncodeError::ArithmeticOverflow {
-                    context: "payload padding size",
-                }
-            })?;
-            self.write_bytes(&padding[..len]).await?;
+        let padding = payload_padding(size);
+        if !padding.is_empty() {
+            self.write_bytes(padding).await?;
         }
         Ok(())
     }
@@ -269,12 +323,71 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
     }
 }
 
+async fn prepare_source_file(
+    path: &Path,
+    buffer: Vec<u8>,
+) -> (Vec<u8>, Result<PreparedSourceFile, EncodeError>) {
+    let path = path.to_path_buf();
+    with_reusable_buffer(buffer, move |buffer| {
+        let file = std::fs::File::open(&path)
+            .map_err(|source| filesystem_error("open source file", &path, source))?;
+        let metadata = file
+            .metadata()
+            .map_err(|source| filesystem_error("inspect source file", &path, source))?;
+        if !metadata.is_file() {
+            return Err(EncodeError::ChangedSourceFile { path });
+        }
+        let size = metadata.len();
+        let executable = is_executable(&metadata);
+        if size > SOURCE_FILE_CHUNK_BYTES as u64 {
+            return Ok(PreparedSourceFile::Streaming {
+                file,
+                size,
+                executable,
+            });
+        }
+        let read_limit = size.checked_add(1).ok_or(EncodeError::ArithmeticOverflow {
+            context: "buffered source file read limit",
+        })?;
+        buffer.clear();
+        file.take(read_limit)
+            .read_to_end(buffer)
+            .map_err(|source| filesystem_error("read source file", &path, source))?;
+        let actual_size =
+            u64::try_from(buffer.len()).map_err(|_| EncodeError::ArithmeticOverflow {
+                context: "buffered source file payload size",
+            })?;
+        if actual_size != size {
+            return Err(EncodeError::ChangedSourceFile { path });
+        }
+        Ok(PreparedSourceFile::Buffered { size, executable })
+    })
+    .await
+}
+
+impl PreparedSourceFile {
+    fn size(&self) -> u64 {
+        match self {
+            Self::Buffered { size, .. } | Self::Streaming { size, .. } => *size,
+        }
+    }
+
+    fn executable(&self) -> bool {
+        match self {
+            Self::Buffered { executable, .. } | Self::Streaming { executable, .. } => *executable,
+        }
+    }
+}
+
 /// A failure while creating a pure-pax archive.
 #[derive(Debug, Error)]
 pub enum EncodeError {
     /// A wire-format member could not be framed.
     #[error(transparent)]
     Framing(#[from] FramingWriteError),
+    /// Traversing a recursive encoding source failed.
+    #[error(transparent)]
+    Traversal(#[from] TraversalError),
     /// A requested archive path is not safe and portable.
     #[error("invalid archive path {path:?}: {reason}")]
     InvalidArchivePath {
@@ -283,47 +396,13 @@ pub enum EncodeError {
         /// The reason the path is not accepted.
         reason: &'static str,
     },
-    /// A source path component cannot be represented by this UTF-8-only encoder.
-    #[error("source path is not valid UTF-8: {path}")]
-    NonUtf8SourcePath {
-        /// The affected source filesystem path.
-        path: PathBuf,
-    },
-    /// A symbolic-link target cannot be represented by this UTF-8-only encoder.
-    #[error("symbolic-link target is not valid UTF-8: {path}")]
-    NonUtf8LinkTarget {
-        /// The affected symbolic-link source path.
-        path: PathBuf,
-    },
-    /// The recursive source root is not a directory.
-    #[error("source root is not a directory: {path}")]
-    SourceNotDirectory {
-        /// The rejected source root.
-        path: PathBuf,
-    },
-    /// A recursive source contains a filesystem node outside the supported subset.
-    #[error("unsupported filesystem entry type: {path}")]
-    UnsupportedFilesystemType {
-        /// The rejected source filesystem path.
-        path: PathBuf,
-    },
-    /// A symbolic-link target cannot be safely represented within the archive.
-    #[error("unsafe symbolic link {path} -> {target:?}: {reason}")]
-    UnsafeSymlink {
-        /// The archive path of the rejected link.
-        path: String,
-        /// The source link target.
-        target: String,
-        /// The rejection reason.
-        reason: &'static str,
-    },
     /// An archive path collides with a previously reserved entry.
     #[error("archive entry collides with existing path {path}")]
     PathCollision {
         /// The conflicting normalized archive path.
         path: String,
     },
-    /// A source file changed after recursive preflight.
+    /// A source file changed while it was being archived.
     #[error("source file changed while archiving: {path}")]
     ChangedSourceFile {
         /// The unstable source path.
@@ -340,8 +419,8 @@ pub enum EncodeError {
         #[source]
         source: io::Error,
     },
-    /// A blocking filesystem scan failed to complete.
-    #[error("failed to complete blocking archive scan: {0}")]
+    /// A blocking filesystem operation failed to complete.
+    #[error("failed to complete blocking archive filesystem operation: {0}")]
     BlockingTask(#[from] tokio::task::JoinError),
     /// Writing the output archive failed.
     #[error("failed to write archive output")]
@@ -365,123 +444,25 @@ pub enum EncodeError {
 enum ArchivedEntry {
     Directory { explicit: bool },
     Regular,
-    SymbolicLink { target: String },
+    SymbolicLink,
 }
 
 #[derive(Debug)]
-struct ManifestEntry {
-    source: PathBuf,
-    archive_path: String,
-    kind: ManifestKind,
+struct DirectoryTraversal {
+    entries: HashMap<String, ArchivedEntry>,
+    buffer: Vec<u8>,
 }
 
-#[derive(Debug)]
-enum ManifestKind {
-    Directory,
-    Regular { size: u64, executable: bool },
-    SymbolicLink { target: String },
-}
-
-fn scan_directory(source: &Path) -> Result<Vec<ManifestEntry>, EncodeError> {
-    let metadata = std::fs::symlink_metadata(source)
-        .map_err(|error| filesystem_error("inspect source directory", source, error))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(EncodeError::SourceNotDirectory {
-            path: source.to_path_buf(),
-        });
-    }
-    let Some(name) = source.file_name().and_then(|name| name.to_str()) else {
-        return Err(EncodeError::NonUtf8SourcePath {
-            path: source.to_path_buf(),
-        });
-    };
-    let archive_path = normalize_archive_path(Path::new(name))?;
-    let mut entries = Vec::new();
-    scan_directory_at(source, &archive_path, &mut entries)?;
-    Ok(entries)
-}
-
-fn scan_directory_at(
-    source: &Path,
-    archive_path: &str,
-    entries: &mut Vec<ManifestEntry>,
-) -> Result<(), EncodeError> {
-    entries.push(ManifestEntry {
-        source: source.to_path_buf(),
-        archive_path: archive_path.to_owned(),
-        kind: ManifestKind::Directory,
-    });
-    let children = std::fs::read_dir(source)
-        .map_err(|error| filesystem_error("read source directory", source, error))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| filesystem_error("read source directory", source, error))?;
-    let mut children = children
-        .into_iter()
-        .map(|child| {
-            let path = child.path();
-            let Some(name) = child.file_name().to_str().map(str::to_owned) else {
-                return Err(EncodeError::NonUtf8SourcePath { path });
-            };
-            Ok((name, path))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    children.sort_by(|(left, _), (right, _)| left.cmp(right));
-    for (name, path) in children {
-        let child_archive_path =
-            normalize_archive_path(Path::new(&format!("{archive_path}/{name}")))?;
-        let metadata = std::fs::symlink_metadata(&path)
-            .map_err(|error| filesystem_error("inspect source entry", &path, error))?;
-        let file_type = metadata.file_type();
-        if file_type.is_dir() {
-            scan_directory_at(&path, &child_archive_path, entries)?;
-        } else if file_type.is_file() {
-            entries.push(ManifestEntry {
-                source: path,
-                archive_path: child_archive_path,
-                kind: ManifestKind::Regular {
-                    size: metadata.len(),
-                    executable: is_executable(&metadata),
-                },
-            });
-        } else if file_type.is_symlink() {
-            let target = std::fs::read_link(&path)
-                .map_err(|error| filesystem_error("read symbolic link", &path, error))?;
-            let Some(target) = target.to_str().map(str::to_owned) else {
-                return Err(EncodeError::NonUtf8LinkTarget { path });
-            };
-            entries.push(ManifestEntry {
-                source: path,
-                archive_path: child_archive_path,
-                kind: ManifestKind::SymbolicLink { target },
-            });
-        } else {
-            return Err(EncodeError::UnsupportedFilesystemType { path });
-        }
-    }
-    Ok(())
-}
-
-fn reserve_manifest(
-    existing: &HashMap<String, ArchivedEntry>,
-    manifest: &[ManifestEntry],
-) -> Result<HashMap<String, ArchivedEntry>, EncodeError> {
-    let mut entries = existing.clone();
-    for entry in manifest {
-        let archived = match &entry.kind {
-            ManifestKind::Directory => ArchivedEntry::Directory { explicit: true },
-            ManifestKind::Regular { .. } => ArchivedEntry::Regular,
-            ManifestKind::SymbolicLink { target } => ArchivedEntry::SymbolicLink {
-                target: target.clone(),
-            },
-        };
-        reserve_entry(&mut entries, &entry.archive_path, archived)?;
-    }
-    for entry in manifest {
-        if let ManifestKind::SymbolicLink { target } = &entry.kind {
-            validate_symlink(&entries, &entry.archive_path, target)?;
-        }
-    }
-    Ok(entries)
+enum PreparedSourceFile {
+    Buffered {
+        size: u64,
+        executable: bool,
+    },
+    Streaming {
+        file: std::fs::File,
+        size: u64,
+        executable: bool,
+    },
 }
 
 fn reserve_entry(
@@ -489,14 +470,20 @@ fn reserve_entry(
     path: &str,
     entry: ArchivedEntry,
 ) -> Result<(), EncodeError> {
-    let components = path.split('/').collect::<Vec<_>>();
-    for end in 1..components.len() {
-        let ancestor = components[..end].join("/");
-        match entries.get(&ancestor) {
+    for (separator, _) in path.match_indices('/') {
+        let ancestor = &path[..separator];
+        match entries.get(ancestor) {
             Some(ArchivedEntry::Directory { .. }) => {}
-            Some(_) => return Err(EncodeError::PathCollision { path: ancestor }),
+            Some(_) => {
+                return Err(EncodeError::PathCollision {
+                    path: ancestor.to_owned(),
+                });
+            }
             None => {
-                entries.insert(ancestor, ArchivedEntry::Directory { explicit: false });
+                entries.insert(
+                    ancestor.to_owned(),
+                    ArchivedEntry::Directory { explicit: false },
+                );
             }
         }
     }
@@ -516,113 +503,60 @@ fn reserve_entry(
     Ok(())
 }
 
-fn validate_symlink(
+fn preflight_regular_entry(
     entries: &HashMap<String, ArchivedEntry>,
     path: &str,
-    target: &str,
-) -> Result<(), EncodeError> {
-    let mut resolved = resolve_link_target(path, target, &[])?;
-    let mut visited = HashSet::new();
-    loop {
-        let components = resolved.split('/').collect::<Vec<_>>();
-        let mut followed = false;
-        for end in 1..=components.len() {
-            let prefix = components[..end].join("/");
-            if let Some(ArchivedEntry::SymbolicLink { target: nested }) = entries.get(&prefix) {
-                if !visited.insert(prefix.clone()) {
-                    return Err(unsafe_symlink(path, target, "symbolic-link cycle"));
-                }
-                resolved = resolve_link_target(&prefix, nested, &components[end..])?;
-                followed = true;
-                break;
+) -> Result<Vec<String>, EncodeError> {
+    let mut implicit_ancestors = Vec::new();
+    for (separator, _) in path.match_indices('/') {
+        let ancestor = &path[..separator];
+        match entries.get(ancestor) {
+            Some(ArchivedEntry::Directory { .. }) => {}
+            Some(_) => {
+                return Err(EncodeError::PathCollision {
+                    path: ancestor.to_owned(),
+                });
             }
-        }
-        if followed {
-            continue;
-        }
-        return match entries.get(&resolved) {
-            Some(ArchivedEntry::Regular | ArchivedEntry::Directory { .. }) => Ok(()),
-            _ => Err(unsafe_symlink(
-                path,
-                target,
-                "target does not resolve to an archived file or directory",
-            )),
-        };
-    }
-}
-
-fn resolve_link_target(
-    path: &str,
-    target: &str,
-    remainder: &[&str],
-) -> Result<String, EncodeError> {
-    if target.is_empty() || target.contains('\0') || target.contains('\\') {
-        return Err(unsafe_symlink(
-            path,
-            target,
-            "target is not a portable path",
-        ));
-    }
-    if Path::new(target).is_absolute() || has_windows_prefix(target) {
-        return Err(unsafe_symlink(path, target, "absolute target"));
-    }
-    let mut components = path.split('/').rev().skip(1).collect::<Vec<_>>();
-    components.reverse();
-    for component in target.split('/').chain(remainder.iter().copied()) {
-        match component {
-            "" | "." => {}
-            ".." => {
-                if components.pop().is_none() {
-                    return Err(unsafe_symlink(path, target, "target escapes archive root"));
-                }
-            }
-            _ => components.push(component),
+            None => implicit_ancestors.push(ancestor.to_owned()),
         }
     }
-    if components.is_empty() {
-        return Err(unsafe_symlink(
-            path,
-            target,
-            "target resolves to archive root",
-        ));
+    if entries.contains_key(path) {
+        return Err(EncodeError::PathCollision {
+            path: path.to_owned(),
+        });
     }
-    Ok(components.join("/"))
+    Ok(implicit_ancestors)
 }
 
-fn unsafe_symlink(path: &str, target: &str, reason: &'static str) -> EncodeError {
-    EncodeError::UnsafeSymlink {
-        path: path.to_owned(),
-        target: target.to_owned(),
-        reason,
-    }
+pub(crate) fn normalize_archive_path(path: &Path) -> Result<String, EncodeError> {
+    validate_archive_path(path)
+        .map(str::to_owned)
+        .map_err(|reason| EncodeError::InvalidArchivePath {
+            path: path.to_path_buf(),
+            reason,
+        })
 }
 
-fn normalize_archive_path(path: &Path) -> Result<String, EncodeError> {
-    let invalid = |reason| EncodeError::InvalidArchivePath {
-        path: path.to_path_buf(),
-        reason,
-    };
+fn validate_archive_path(path: &Path) -> Result<&str, &'static str> {
     let Some(path) = path.to_str() else {
-        return Err(invalid("path is not valid UTF-8"));
+        return Err("path is not valid UTF-8");
     };
     if path.is_empty() {
-        return Err(invalid("path is empty"));
+        return Err("path is empty");
     }
     if Path::new(path).is_absolute() || has_windows_prefix(path) {
-        return Err(invalid("path is absolute"));
+        return Err("path is absolute");
     }
     if path.contains('\0') || path.contains('\\') {
-        return Err(invalid("path contains an ambiguous separator or NUL byte"));
+        return Err("path contains an ambiguous separator or NUL byte");
     }
     if path
         .split('/')
         .any(|component| matches!(component, "" | "." | ".."))
     {
-        return Err(invalid(
-            "path contains an empty, current, or parent component",
-        ));
+        return Err("path contains an empty, current, or parent component");
     }
-    Ok(path.to_owned())
+    Ok(path)
 }
 
 fn has_windows_prefix(path: &str) -> bool {
@@ -666,8 +600,8 @@ mod tests {
     use tokio::io::{AsyncRead, ReadBuf};
     use tokio_stream::StreamExt;
 
-    use super::*;
-    use crate::decode::{Archive, ExtractPolicy};
+    use super::{traversal::DIRECTORY_TRAVERSAL_BATCH_ENTRIES, *};
+    use crate::decode::{Archive, ExtractError, ExtractPolicy};
 
     struct VecReader {
         bytes: Vec<u8>,
@@ -799,6 +733,10 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
+            encoder.entries.get("dir"),
+            Some(ArchivedEntry::Directory { explicit: false })
+        ));
+        assert!(matches!(
             encoder
                 .add_entry("dir/file", b"second", EntryMetadata::default())
                 .await,
@@ -814,6 +752,10 @@ mod tests {
             .add_entry("dir/other", b"ok", EntryMetadata::default())
             .await
             .unwrap();
+        assert!(matches!(
+            encoder.entries.get("dir/other"),
+            Some(ArchivedEntry::Regular)
+        ));
         encoder.finish().await.unwrap();
     }
 
@@ -896,9 +838,78 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn recursively_streams_files_larger_than_the_buffered_threshold() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("tree");
+        std::fs::create_dir(&source).unwrap();
+        let contents = vec![b'x'; SOURCE_FILE_CHUNK_BYTES + 17];
+        std::fs::write(source.join("large"), &contents).unwrap();
+
+        let mut encoder = Encoder::new(Vec::new());
+        encoder.add_directory(&source).await.unwrap();
+        let bytes = encoder.finish().await.unwrap();
+        let dest = temp.path().join("out");
+        Archive::new(VecReader::new(bytes))
+            .extract(&dest, ExtractPolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(dest.join("tree/large")).unwrap(), contents);
+    }
+
+    #[tokio::test]
+    async fn recursively_combines_buffered_and_streamed_source_files() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("tree");
+        std::fs::create_dir(&source).unwrap();
+        let large = vec![b'x'; SOURCE_FILE_CHUNK_BYTES + 17];
+        std::fs::write(source.join("a-small"), "first").unwrap();
+        std::fs::write(source.join("m-large"), &large).unwrap();
+        std::fs::write(source.join("z-small"), "last").unwrap();
+
+        let mut encoder = Encoder::new(Vec::new());
+        encoder.add_directory(&source).await.unwrap();
+        let bytes = encoder.finish().await.unwrap();
+        let dest = temp.path().join("out");
+        Archive::new(VecReader::new(bytes))
+            .extract(&dest, ExtractPolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dest.join("tree/a-small")).unwrap(),
+            "first"
+        );
+        assert_eq!(std::fs::read(dest.join("tree/m-large")).unwrap(), large);
+        assert_eq!(
+            std::fs::read_to_string(dest.join("tree/z-small")).unwrap(),
+            "last"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
-    async fn recursively_preserves_safe_symlinks_and_rejects_unsafe_graphs_before_writing() {
+    async fn rejects_symbolic_link_roots_before_writing() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let source = temp.path().join("source");
+        symlink(&target, &source).unwrap();
+
+        let mut encoder = Encoder::new(Vec::new());
+        assert!(matches!(
+            encoder.add_directory(&source).await,
+            Err(EncodeError::Traversal(
+                TraversalError::SourceNotDirectory { .. }
+            ))
+        ));
+        assert!(encoder.writer.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recursively_preserves_symlinks_for_extraction_policy_to_validate() {
         use std::os::unix::fs::symlink;
 
         let temp = tempdir().unwrap();
@@ -921,21 +932,50 @@ mod tests {
             "contents"
         );
 
-        for (name, target) in [
-            ("escape", "../../outside"),
-            ("dangling", "missing"),
-            ("cycle", "cycle"),
-        ] {
-            let source = temp.path().join(name);
-            std::fs::create_dir(&source).unwrap();
-            symlink(target, source.join("link")).unwrap();
-            let mut encoder = Encoder::new(Vec::new());
-            assert!(matches!(
-                encoder.add_directory(&source).await,
-                Err(EncodeError::UnsafeSymlink { .. })
-            ));
-            assert!(encoder.writer.is_empty());
-        }
+        let source = temp.path().join("escape");
+        std::fs::create_dir(&source).unwrap();
+        symlink("../../outside", source.join("link")).unwrap();
+        let mut encoder = Encoder::new(Vec::new());
+        encoder.add_directory(&source).await.unwrap();
+        let bytes = encoder.finish().await.unwrap();
+        assert!(matches!(
+            Archive::new(VecReader::new(bytes))
+                .extract(&temp.path().join("escape-out"), ExtractPolicy::default())
+                .await,
+            Err(ExtractError::UnsafePath {
+                context: "symbolic-link target",
+                ..
+            })
+        ));
+
+        let source = temp.path().join("dangling");
+        std::fs::create_dir(&source).unwrap();
+        symlink("missing", source.join("link")).unwrap();
+        let mut encoder = Encoder::new(Vec::new());
+        encoder.add_directory(&source).await.unwrap();
+        let bytes = encoder.finish().await.unwrap();
+        let dest = temp.path().join("dangling-out");
+        Archive::new(VecReader::new(bytes))
+            .extract(&dest, ExtractPolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_link(dest.join("dangling/link")).unwrap(),
+            Path::new("missing")
+        );
+
+        let source = temp.path().join("cycle");
+        std::fs::create_dir(&source).unwrap();
+        symlink("link", source.join("link")).unwrap();
+        let mut encoder = Encoder::new(Vec::new());
+        encoder.add_directory(&source).await.unwrap();
+        let bytes = encoder.finish().await.unwrap();
+        assert!(matches!(
+            Archive::new(VecReader::new(bytes))
+                .extract(&temp.path().join("cycle-out"), ExtractPolicy::default())
+                .await,
+            Err(ExtractError::InvalidLink { .. })
+        ));
     }
 
     #[cfg(unix)]
@@ -970,33 +1010,66 @@ mod tests {
         let mut encoder = Encoder::new(Vec::new());
         assert!(matches!(
             encoder.add_directory(&source).await,
-            Err(EncodeError::UnsupportedFilesystemType { .. })
+            Err(EncodeError::Traversal(
+                TraversalError::UnsupportedFilesystemType { .. }
+            ))
         ));
         assert!(encoder.writer.is_empty());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn detects_changed_source_files_and_poisons_partial_directory_output() {
-        for contents in [b"longer contents".as_slice(), b""] {
-            let temp = tempdir().unwrap();
-            let source = temp.path().join("tree");
-            std::fs::create_dir(&source).unwrap();
-            std::fs::write(source.join("file"), "initial").unwrap();
-            let manifest = scan_directory(&source).unwrap();
-            std::fs::write(source.join("file"), contents).unwrap();
+    async fn late_recursive_errors_poison_partial_directory_output() {
+        use std::os::unix::net::UnixListener;
 
-            let mut encoder = Encoder::new(Vec::new());
-            assert!(matches!(
-                encoder.write_manifest(&manifest).await,
-                Err(EncodeError::ChangedSourceFile { .. })
-            ));
-            assert!(matches!(
-                encoder
-                    .add_entry("other", b"", EntryMetadata::default())
-                    .await,
-                Err(EncodeError::Poisoned)
-            ));
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("tree");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        for index in 0..DIRECTORY_TRAVERSAL_BATCH_ENTRIES {
+            std::fs::write(source.join(format!("file-{index:03}")), "contents").unwrap();
         }
+        let _listener = UnixListener::bind(source.join("nested/listener")).unwrap();
+
+        let mut encoder = Encoder::new(Vec::new());
+        assert!(matches!(
+            encoder.add_directory(&source).await,
+            Err(EncodeError::Traversal(
+                TraversalError::UnsupportedFilesystemType { .. }
+            ))
+        ));
+        assert!(!encoder.writer.is_empty());
+        assert!(matches!(
+            encoder
+                .add_entry("other", b"", EntryMetadata::default())
+                .await,
+            Err(EncodeError::Poisoned)
+        ));
+    }
+
+    #[tokio::test]
+    async fn late_recursive_collisions_poison_partial_directory_output() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("tree");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("file"), "new").unwrap();
+
+        let mut encoder = Encoder::new(Vec::new());
+        encoder
+            .add_entry("tree/file", b"existing", EntryMetadata::default())
+            .await
+            .unwrap();
+        let prior_len = encoder.writer.len();
+        assert!(matches!(
+            encoder.add_directory(&source).await,
+            Err(EncodeError::PathCollision { .. })
+        ));
+        assert!(encoder.writer.len() > prior_len);
+        assert!(matches!(
+            encoder
+                .add_entry("other", b"", EntryMetadata::default())
+                .await,
+            Err(EncodeError::Poisoned)
+        ));
     }
 
     #[cfg(unix)]
@@ -1019,7 +1092,9 @@ mod tests {
         let mut encoder = Encoder::new(Vec::new());
         assert!(matches!(
             encoder.add_directory(&source).await,
-            Err(EncodeError::NonUtf8SourcePath { .. })
+            Err(EncodeError::Traversal(
+                TraversalError::NonUtf8SourcePath { .. }
+            ))
         ));
         assert!(encoder.writer.is_empty());
     }

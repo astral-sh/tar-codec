@@ -23,3 +23,15 @@ as typed UTF-8 strings or unencoded bytes accordingly.
 
 Logical metadata access remains lossless bytes; consumers such as
 `tar-codec` decide how filenames and link targets may be decoded and used.
+
+## Benchmarking
+
+Run the internal framing benchmarks with:
+
+```shell
+cargo bench -p tar-framing --bench framing
+```
+
+`encode_pax_framing` measures reusable pure-pax framing without payload reads.
+`decode_payload` compares lossless block iteration, validated chunk reads, and
+payload skipping over in-memory archives.

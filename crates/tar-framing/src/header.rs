@@ -28,29 +28,42 @@ pub(crate) fn checksum(block: &Block) -> u64 {
         .sum()
 }
 
+#[cfg(test)]
 pub(crate) fn encode_checksum(block: &mut Block) -> bool {
     block[CHECKSUM_RANGE].fill(b' ');
-    let encoded = format!("{:06o}\0 ", checksum(block));
-    if encoded.len() != CHECKSUM_RANGE.len() {
+    let value = block.iter().map(|byte| u64::from(*byte)).sum();
+    encode_checksum_value(block, value)
+}
+
+pub(crate) fn encode_checksum_value(block: &mut Block, value: u64) -> bool {
+    let field = &mut block[CHECKSUM_RANGE];
+    let Some(width) = field.len().checked_sub(2) else {
         return false;
-    }
-    block[CHECKSUM_RANGE].copy_from_slice(encoded.as_bytes());
-    true
+    };
+    field.fill(b'0');
+    field[width] = 0;
+    field[width + 1] = b' ';
+    encode_octal_digits(&mut field[..width], value)
 }
 
 pub(crate) fn encode_octal(field: &mut [u8], value: u64) -> bool {
-    let encoded = format!("{value:o}");
     let Some(width) = field.len().checked_sub(1) else {
         return false;
     };
-    if encoded.len() > width {
+    if width == 0 {
         return false;
     }
     field.fill(b'0');
-    let start = width - encoded.len();
-    field[start..width].copy_from_slice(encoded.as_bytes());
     field[width] = 0;
-    true
+    encode_octal_digits(&mut field[..width], value)
+}
+
+fn encode_octal_digits(field: &mut [u8], mut value: u64) -> bool {
+    for byte in field.iter_mut().rev() {
+        *byte = b'0' + (value & 0o7) as u8;
+        value >>= 3;
+    }
+    value == 0
 }
 
 pub(crate) fn parse_octal(bytes: &[u8]) -> Option<u64> {
@@ -74,4 +87,32 @@ pub(crate) fn parse_octal(bytes: &[u8]) -> Option<u64> {
     bytes[..terminator].iter().try_fold(0_u64, |value, byte| {
         value.checked_mul(8)?.checked_add(u64::from(*byte - b'0'))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encodes_octal_values_that_fit_the_field() {
+        let mut field = [0xff; 4];
+        assert!(encode_octal(&mut field, 0o17));
+        assert_eq!(&field, b"017\0");
+        assert_eq!(parse_octal(&field), Some(0o17));
+
+        assert!(encode_octal(&mut field, 0o777));
+        assert_eq!(&field, b"777\0");
+        assert!(!encode_octal(&mut field, 0o1000));
+        assert!(!encode_octal(&mut [], 0));
+        assert!(!encode_octal(&mut [0], 0));
+    }
+
+    #[test]
+    fn encodes_checksum_with_the_standard_terminator() {
+        let mut block = [0; crate::BLOCK_SIZE];
+        block[0] = b'x';
+        assert!(encode_checksum(&mut block));
+        assert_eq!(parse_octal(&block[CHECKSUM_RANGE]), Some(checksum(&block)));
+        assert_eq!(&block[CHECKSUM_RANGE.end - 2..CHECKSUM_RANGE.end], b"\0 ");
+    }
 }
