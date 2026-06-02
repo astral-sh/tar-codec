@@ -61,38 +61,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_reusable_buffer_after_success() {
-        let mut buffer = Vec::with_capacity(64);
-        buffer.extend_from_slice(b"old");
-        let capacity = buffer.capacity();
+    async fn returns_reusable_buffer_after_operation_results() {
+        for expected in [Ok(()), Err(TestError::Operation)] {
+            let should_error = expected.is_err();
+            let mut buffer = Vec::with_capacity(64);
+            buffer.extend_from_slice(b"old");
+            let capacity = buffer.capacity();
 
-        let (buffer, result) = with_reusable_buffer(buffer, |buffer| {
-            buffer.clear();
-            buffer.extend_from_slice(b"new");
-            Ok::<_, TestError>(())
-        })
-        .await;
+            let (buffer, result) = with_reusable_buffer(buffer, move |buffer| {
+                buffer.clear();
+                buffer.extend_from_slice(b"new");
+                if should_error {
+                    Err(TestError::Operation)
+                } else {
+                    Ok(())
+                }
+            })
+            .await;
 
-        assert_eq!(result, Ok(()));
-        assert_eq!(buffer, b"new");
-        assert_eq!(buffer.capacity(), capacity);
-    }
-
-    #[tokio::test]
-    async fn returns_reusable_buffer_after_operation_error() {
-        let mut buffer = Vec::with_capacity(64);
-        buffer.extend_from_slice(b"old");
-        let capacity = buffer.capacity();
-
-        let (buffer, result) = with_reusable_buffer(buffer, |buffer| {
-            buffer.clear();
-            buffer.extend_from_slice(b"new");
-            Err::<(), _>(TestError::Operation)
-        })
-        .await;
-
-        assert_eq!(result, Err(TestError::Operation));
-        assert_eq!(buffer, b"new");
-        assert_eq!(buffer.capacity(), capacity);
+            assert_eq!(result, expected);
+            assert_eq!(buffer, b"new");
+            assert_eq!(buffer.capacity(), capacity);
+        }
     }
 }

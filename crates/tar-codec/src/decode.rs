@@ -1384,6 +1384,21 @@ mod tests {
         append_block(bytes, &[0; BLOCK_SIZE]);
     }
 
+    fn single_posix_member_archive(
+        name: &str,
+        typeflag: u8,
+        payload: &[u8],
+        link_name: &str,
+        mode: u32,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        append_posix_member(&mut bytes, name, typeflag, payload, link_name, mode);
+        finish(&mut bytes);
+        bytes
+    }
+
+    type DecodeErrorMatcher = fn(&DecodeError) -> bool;
+
     async fn extract(bytes: Vec<u8>, dest: &Path) -> Result<(), DecodeError> {
         extract_with_policy(bytes, dest, DecodePolicy::default()).await
     }
@@ -1426,33 +1441,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extracts_chunked_multiblock_payload_with_partial_final_block() {
-        let temp = tempdir().unwrap();
-        let dest = temp.path().join("out");
-        let payload = (0..16 * 1024 + BLOCK_SIZE + 7)
-            .map(|index| u8::try_from(index % 251).unwrap())
-            .collect::<Vec<_>>();
-        let mut bytes = Vec::new();
-        append_posix_member(&mut bytes, "file", b'0', &payload, "", 0o644);
-        finish(&mut bytes);
+    async fn extracts_buffered_and_streamed_multiblock_payloads() {
+        for (case, payload_len) in [
+            ("buffered", 16 * 1024 + BLOCK_SIZE + 7),
+            ("streamed", EXTRACTION_CHUNK_BYTES + 7),
+        ] {
+            let temp = tempdir().unwrap();
+            let dest = temp.path().join("out");
+            let payload = (0..payload_len)
+                .map(|index| u8::try_from(index % 251).unwrap())
+                .collect::<Vec<_>>();
+            let bytes = single_posix_member_archive("file", b'0', &payload, "", 0o644);
 
-        extract(bytes, &dest).await.unwrap();
-        assert_eq!(std::fs::read(dest.join("file")).unwrap(), payload);
-    }
-
-    #[tokio::test]
-    async fn extracts_streamed_payload_larger_than_the_buffered_threshold() {
-        let temp = tempdir().unwrap();
-        let dest = temp.path().join("out");
-        let payload = (0..EXTRACTION_CHUNK_BYTES + 7)
-            .map(|index| u8::try_from(index % 251).unwrap())
-            .collect::<Vec<_>>();
-        let mut bytes = Vec::new();
-        append_posix_member(&mut bytes, "file", b'0', &payload, "", 0o644);
-        finish(&mut bytes);
-
-        extract(bytes, &dest).await.unwrap();
-        assert_eq!(std::fs::read(dest.join("file")).unwrap(), payload);
+            extract(bytes, &dest).await.unwrap();
+            assert_eq!(std::fs::read(dest.join("file")).unwrap(), payload, "{case}");
+        }
     }
 
     #[cfg(unix)]
@@ -1530,45 +1533,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn applies_gnu_long_name_and_long_link_metadata() {
-        let temp = tempdir().unwrap();
-        let dest = temp.path().join("out");
-        let mut bytes = Vec::new();
-        append_gnu_member(&mut bytes, "dir/target", b'0', b"target", "", 0o644);
-        append_gnu_member(&mut bytes, "longname", b'L', b"dir/long/link\0", "", 0o644);
-        append_gnu_member(&mut bytes, "longlink", b'K', b"../target\0", "", 0o644);
-        append_gnu_member(&mut bytes, "raw", b'2', b"", "wrong", 0o644);
-        finish(&mut bytes);
-
-        extract(bytes, &dest).await.unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dest.join("dir/long/link")).unwrap(),
-            "target"
-        );
-    }
-
-    #[tokio::test]
-    async fn applies_multiblock_gnu_long_name_and_long_link_metadata() {
-        let temp = tempdir().unwrap();
-        let dest = temp.path().join("out");
+    async fn applies_single_and_multiblock_gnu_long_name_and_long_link_metadata() {
         let prefix = "./".repeat(BLOCK_SIZE);
         let mut long_name = format!("{prefix}alias").into_bytes();
         long_name.push(0);
         let mut long_link = format!("{prefix}target").into_bytes();
         long_link.push(0);
 
-        let mut bytes = Vec::new();
-        append_gnu_member(&mut bytes, "target", b'0', b"contents", "", 0o644);
-        append_gnu_member(&mut bytes, "longname", b'L', &long_name, "", 0o644);
-        append_gnu_member(&mut bytes, "longlink", b'K', &long_link, "", 0o644);
-        append_gnu_member(&mut bytes, "raw", b'2', b"", "wrong", 0o644);
-        finish(&mut bytes);
+        for (case, target, long_name, long_link, expected_path) in [
+            (
+                "single-block",
+                "dir/target",
+                b"dir/long/link\0".to_vec(),
+                b"../target\0".to_vec(),
+                "dir/long/link",
+            ),
+            ("multiblock", "target", long_name, long_link, "alias"),
+        ] {
+            let temp = tempdir().unwrap();
+            let dest = temp.path().join("out");
+            let mut bytes = Vec::new();
+            append_gnu_member(&mut bytes, target, b'0', b"contents", "", 0o644);
+            append_gnu_member(&mut bytes, "longname", b'L', &long_name, "", 0o644);
+            append_gnu_member(&mut bytes, "longlink", b'K', &long_link, "", 0o644);
+            append_gnu_member(&mut bytes, "raw", b'2', b"", "wrong", 0o644);
+            finish(&mut bytes);
 
-        extract(bytes, &dest).await.unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dest.join("alias")).unwrap(),
-            "contents"
-        );
+            extract(bytes, &dest).await.unwrap();
+            assert_eq!(
+                std::fs::read_to_string(dest.join(expected_path)).unwrap(),
+                "contents",
+                "{case}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1578,21 +1575,23 @@ mod tests {
         std::fs::create_dir_all(&dest).unwrap();
         std::fs::create_dir(dest.join("occupied")).unwrap();
 
-        for (name, kind, expected) in [
-            ("../escape", b'0', "unsafe"),
-            ("occupied", b'0', "collision"),
-            ("device", b'3', "unsupported"),
+        for (case, name, kind, expected) in [
+            (
+                "unsafe path",
+                "../escape",
+                b'0',
+                (|error| matches!(error, DecodeError::UnsafePath { .. })) as DecodeErrorMatcher,
+            ),
+            ("path collision", "occupied", b'0', |error| {
+                matches!(error, DecodeError::PathCollision { .. })
+            }),
+            ("unsupported member", "device", b'3', |error| {
+                matches!(error, DecodeError::UnsupportedMember { .. })
+            }),
         ] {
-            let mut bytes = Vec::new();
-            append_posix_member(&mut bytes, name, kind, b"", "", 0o644);
-            finish(&mut bytes);
+            let bytes = single_posix_member_archive(name, kind, b"", "", 0o644);
             let error = extract(bytes, &dest).await.unwrap_err();
-            match expected {
-                "unsafe" => assert!(matches!(error, DecodeError::UnsafePath { .. })),
-                "collision" => assert!(matches!(error, DecodeError::PathCollision { .. })),
-                "unsupported" => assert!(matches!(error, DecodeError::UnsupportedMember { .. })),
-                _ => unreachable!(),
-            }
+            assert!(expected(&error), "{case}: {error:?}");
         }
         assert!(dest.join("occupied").is_dir());
         assert!(!temp.path().join("escape").exists());
@@ -1620,9 +1619,7 @@ mod tests {
         let dest = temp.path().join("out");
         std::fs::create_dir(&dest).unwrap();
         std::fs::write(dest.join("same"), b"ambient").unwrap();
-        let mut bytes = Vec::new();
-        append_posix_member(&mut bytes, "same", b'0', b"archive", "", 0o644);
-        finish(&mut bytes);
+        let bytes = single_posix_member_archive("same", b'0', b"archive", "", 0o644);
 
         extract(bytes, &dest).await.unwrap();
         assert_eq!(std::fs::read(dest.join("same")).unwrap(), b"archive");
@@ -1636,9 +1633,7 @@ mod tests {
         std::fs::create_dir(&dest).unwrap();
         std::fs::write(dest.join("same"), b"ambient").unwrap();
         std::fs::hard_link(dest.join("same"), dest.join("sibling")).unwrap();
-        let mut bytes = Vec::new();
-        append_posix_member(&mut bytes, "same", b'0', b"archive", "", 0o755);
-        finish(&mut bytes);
+        let bytes = single_posix_member_archive("same", b'0', b"archive", "", 0o755);
 
         extract(bytes, &dest).await.unwrap();
         assert_eq!(std::fs::read(dest.join("same")).unwrap(), b"archive");
@@ -1676,53 +1671,29 @@ mod tests {
 
         let ambient_directory_dest = temp.path().join("ambient-directory");
         std::fs::create_dir_all(ambient_directory_dest.join("same")).unwrap();
-        let mut ambient_directory = Vec::new();
-        append_posix_member(&mut ambient_directory, "same", b'5', b"", "", 0o755);
-        finish(&mut ambient_directory);
+        let ambient_directory = single_posix_member_archive("same", b'5', b"", "", 0o755);
         extract(ambient_directory, &ambient_directory_dest)
             .await
             .unwrap();
         assert!(ambient_directory_dest.join("same").is_dir());
 
-        let symbolic_link_dest = temp.path().join("symbolic-link");
-        let mut symbolic_link = Vec::new();
-        append_posix_member(&mut symbolic_link, "same", b'2', b"", "missing", 0o644);
-        append_posix_member(&mut symbolic_link, "same", b'0', b"file", "", 0o644);
-        finish(&mut symbolic_link);
-        assert!(matches!(
-            extract(symbolic_link, &symbolic_link_dest)
-                .await
-                .unwrap_err(),
-            DecodeError::PathCollision { .. }
-        ));
-        assert!(!symbolic_link_dest.join("same").exists());
+        for (case, link_path, file_path) in [
+            ("symbolic-link", "same", "same"),
+            ("symbolic-link-parent", "parent", "parent/file"),
+        ] {
+            let dest = temp.path().join(case);
+            let mut bytes = Vec::new();
+            append_posix_member(&mut bytes, link_path, b'2', b"", "missing", 0o644);
+            append_posix_member(&mut bytes, file_path, b'0', b"file", "", 0o644);
+            finish(&mut bytes);
 
-        let symbolic_link_parent_dest = temp.path().join("symbolic-link-parent");
-        let mut symbolic_link_parent = Vec::new();
-        append_posix_member(
-            &mut symbolic_link_parent,
-            "parent",
-            b'2',
-            b"",
-            "missing",
-            0o644,
-        );
-        append_posix_member(
-            &mut symbolic_link_parent,
-            "parent/file",
-            b'0',
-            b"file",
-            "",
-            0o644,
-        );
-        finish(&mut symbolic_link_parent);
-        assert!(matches!(
-            extract(symbolic_link_parent, &symbolic_link_parent_dest)
-                .await
-                .unwrap_err(),
-            DecodeError::PathCollision { .. }
-        ));
-        assert!(!symbolic_link_parent_dest.join("parent").exists());
+            let error = extract(bytes, &dest).await.unwrap_err();
+            assert!(
+                matches!(&error, DecodeError::PathCollision { .. }),
+                "{case}: {error:?}"
+            );
+            assert!(!dest.join(link_path).exists(), "{case}");
+        }
     }
 
     #[cfg(unix)]
@@ -1734,9 +1705,7 @@ mod tests {
         std::fs::create_dir_all(&dest).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         symlink(&outside, dest.join("parent")).unwrap();
-        let mut bytes = Vec::new();
-        append_posix_member(&mut bytes, "parent/file", b'0', b"bad", "", 0o644);
-        finish(&mut bytes);
+        let bytes = single_posix_member_archive("parent/file", b'0', b"bad", "", 0o644);
 
         assert!(matches!(
             extract(bytes, &dest).await.unwrap_err(),
@@ -1754,9 +1723,7 @@ mod tests {
         std::fs::create_dir(&dest).unwrap();
         std::fs::write(&outside, b"keep").unwrap();
         symlink(&outside, dest.join("same")).unwrap();
-        let mut bytes = Vec::new();
-        append_posix_member(&mut bytes, "same", b'0', b"bad", "", 0o644);
-        finish(&mut bytes);
+        let bytes = single_posix_member_archive("same", b'0', b"bad", "", 0o644);
 
         assert!(matches!(
             extract(bytes, &dest).await.unwrap_err(),
@@ -1778,9 +1745,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dest.join("two")).unwrap(), "ok");
 
         let dangling_dest = temp.path().join("dangling");
-        let mut dangling = Vec::new();
-        append_posix_member(&mut dangling, "link", b'2', b"", "missing", 0o644);
-        finish(&mut dangling);
+        let dangling = single_posix_member_archive("link", b'2', b"", "missing", 0o644);
         extract(dangling, &dangling_dest).await.unwrap();
         assert_eq!(
             std::fs::read_link(dangling_dest.join("link")).unwrap(),
@@ -1804,43 +1769,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_dangling_symlinks_reject_missing_targets() {
+    async fn strict_dangling_symlink_policy_distinguishes_missing_targets_and_root() {
         let temp = tempdir().unwrap();
-        let dest = temp.path().join("out");
-        let mut bytes = Vec::new();
-        append_posix_member(&mut bytes, "link", b'2', b"", "missing", 0o644);
-        finish(&mut bytes);
-        assert!(matches!(
-            extract_with_policy(
+        for (case, target, allowed) in [("missing", "missing", false), ("root", ".", true)] {
+            let dest = temp.path().join(case);
+            let bytes = single_posix_member_archive("link", b'2', b"", target, 0o644);
+            let result = extract_with_policy(
                 bytes,
                 &dest,
-                DecodePolicy::default().allow_dangling_symlinks(false)
+                DecodePolicy::default().allow_dangling_symlinks(false),
             )
-            .await
-            .unwrap_err(),
-            DecodeError::InvalidLink { .. }
-        ));
-        assert!(!dest.join("link").exists());
-    }
-
-    #[tokio::test]
-    async fn strict_dangling_symlinks_allow_the_extraction_root() {
-        let temp = tempdir().unwrap();
-        let dest = temp.path().join("out");
-        let mut bytes = Vec::new();
-        append_posix_member(&mut bytes, "link", b'2', b"", ".", 0o644);
-        finish(&mut bytes);
-        extract_with_policy(
-            bytes,
-            &dest,
-            DecodePolicy::default().allow_dangling_symlinks(false),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            std::fs::read_link(dest.join("link")).unwrap(),
-            Path::new(".")
-        );
+            .await;
+            if allowed {
+                result.unwrap();
+                assert_eq!(
+                    std::fs::read_link(dest.join("link")).unwrap(),
+                    Path::new(target),
+                    "{case}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(DecodeError::InvalidLink { .. })),
+                    "{case}"
+                );
+                assert!(!dest.join("link").exists(), "{case}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -1859,43 +1813,39 @@ mod tests {
     #[tokio::test]
     async fn rejects_symbolic_link_cycles_and_root_escapes() {
         let temp = tempdir().unwrap();
-        let cycle_dest = temp.path().join("cycle");
-        let mut cycle = Vec::new();
-        append_posix_member(&mut cycle, "a", b'2', b"", "b", 0o644);
-        append_posix_member(&mut cycle, "b", b'2', b"", "a", 0o644);
-        finish(&mut cycle);
-        assert!(matches!(
-            extract(cycle, &cycle_dest).await.unwrap_err(),
-            DecodeError::InvalidLink { .. }
-        ));
-        assert!(!cycle_dest.join("a").exists());
-        assert!(!cycle_dest.join("b").exists());
+        for (case, first_target, second_target, expected) in [
+            (
+                "cycle",
+                "b",
+                "a",
+                (|error| matches!(error, DecodeError::InvalidLink { .. })) as DecodeErrorMatcher,
+            ),
+            ("growing-cycle", "b/x", "a/y", |error| {
+                matches!(
+                    error,
+                    DecodeError::InvalidLink {
+                        reason: "symbolic-link target expansion limit exceeded",
+                        ..
+                    }
+                )
+            }),
+        ] {
+            let dest = temp.path().join(case);
+            let mut bytes = Vec::new();
+            append_posix_member(&mut bytes, "a", b'2', b"", first_target, 0o644);
+            append_posix_member(&mut bytes, "b", b'2', b"", second_target, 0o644);
+            finish(&mut bytes);
 
-        let growing_cycle_dest = temp.path().join("growing-cycle");
-        let mut growing_cycle = Vec::new();
-        append_posix_member(&mut growing_cycle, "a", b'2', b"", "b/x", 0o644);
-        append_posix_member(&mut growing_cycle, "b", b'2', b"", "a/y", 0o644);
-        finish(&mut growing_cycle);
-        assert!(matches!(
-            extract(growing_cycle, &growing_cycle_dest)
-                .await
-                .unwrap_err(),
-            DecodeError::InvalidLink {
-                reason: "symbolic-link target expansion limit exceeded",
-                ..
-            }
-        ));
-        assert!(!growing_cycle_dest.join("a").exists());
-        assert!(!growing_cycle_dest.join("b").exists());
+            let error = extract(bytes, &dest).await.unwrap_err();
+            assert!(expected(&error), "{case}: {error:?}");
+            assert!(!dest.join("a").exists(), "{case}");
+            assert!(!dest.join("b").exists(), "{case}");
+        }
 
         let escape_dest = temp.path().join("escape");
-        let mut escape = Vec::new();
-        append_posix_member(&mut escape, "link", b'2', b"", "../outside", 0o644);
-        finish(&mut escape);
-        assert!(matches!(
-            extract(escape, &escape_dest).await.unwrap_err(),
-            DecodeError::UnsafePath { .. }
-        ));
+        let escape = single_posix_member_archive("link", b'2', b"", "../outside", 0o644);
+        let error = extract(escape, &escape_dest).await.unwrap_err();
+        assert!(matches!(error, DecodeError::UnsafePath { .. }));
         assert!(!escape_dest.join("link").exists());
     }
 
@@ -1912,12 +1862,10 @@ mod tests {
         assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"new");
         assert_eq!(std::fs::read(dest.join("b")).unwrap(), b"new");
 
+        let unresolved = single_posix_member_archive("b", b'1', b"", "a", 0o644);
         let forward_dest = temp.path().join("forward");
-        let mut forward = Vec::new();
-        append_posix_member(&mut forward, "b", b'1', b"", "a", 0o644);
-        finish(&mut forward);
         assert!(matches!(
-            extract_with_policy(forward, &forward_dest, policy)
+            extract_with_policy(unresolved.clone(), &forward_dest, policy)
                 .await
                 .unwrap_err(),
             DecodeError::InvalidLink { .. }
@@ -1926,11 +1874,8 @@ mod tests {
         let ambient_dest = temp.path().join("ambient");
         std::fs::create_dir(&ambient_dest).unwrap();
         std::fs::write(ambient_dest.join("a"), b"ambient").unwrap();
-        let mut ambient = Vec::new();
-        append_posix_member(&mut ambient, "b", b'1', b"", "a", 0o644);
-        finish(&mut ambient);
         assert!(matches!(
-            extract_with_policy(ambient, &ambient_dest, policy)
+            extract_with_policy(unresolved, &ambient_dest, policy)
                 .await
                 .unwrap_err(),
             DecodeError::InvalidLink { .. }
@@ -1997,9 +1942,7 @@ mod tests {
         assert!(!symlink_dest.join("link").exists());
 
         let hard_link_dest = temp.path().join("hard-link");
-        let mut hard_link = Vec::new();
-        append_posix_member(&mut hard_link, "link", b'1', b"", "missing", 0o644);
-        finish(&mut hard_link);
+        let hard_link = single_posix_member_archive("link", b'1', b"", "missing", 0o644);
         assert!(matches!(
             extract(hard_link, &hard_link_dest).await.unwrap_err(),
             DecodeError::PolicyViolation {
@@ -2141,13 +2084,14 @@ mod tests {
         let mut local = record("path", "wrong");
         local.extend_from_slice(&record("path", "actual"));
 
+        let mut bytes = Vec::new();
+        append_pax(&mut bytes, b'x', &local);
+        append_posix_member(&mut bytes, "raw", b'0', b"contents", "", 0o644);
+        finish(&mut bytes);
+
         let rejected_dest = temp.path().join("rejected");
-        let mut rejected = Vec::new();
-        append_pax(&mut rejected, b'x', &local);
-        append_posix_member(&mut rejected, "raw", b'0', b"contents", "", 0o644);
-        finish(&mut rejected);
         assert!(matches!(
-            extract(rejected, &rejected_dest).await.unwrap_err(),
+            extract(bytes.clone(), &rejected_dest).await.unwrap_err(),
             DecodeError::PolicyViolation {
                 position: 0,
                 violation: DecodePolicyViolation::DuplicatePaxRecord { keyword },
@@ -2156,12 +2100,8 @@ mod tests {
         assert!(!rejected_dest.join("actual").exists());
 
         let permitted_dest = temp.path().join("permitted");
-        let mut permitted = Vec::new();
-        append_pax(&mut permitted, b'x', &local);
-        append_posix_member(&mut permitted, "raw", b'0', b"contents", "", 0o644);
-        finish(&mut permitted);
         extract_with_policy(
-            permitted,
+            bytes,
             &permitted_dest,
             DecodePolicy::default()
                 .pax_policy(PaxDecodePolicy::default().allow_duplicate_pax_records(true)),
@@ -2240,8 +2180,13 @@ mod tests {
     #[tokio::test]
     async fn rejects_member_specific_global_pax_records_when_global_extensions_are_allowed() {
         let temp = tempdir().unwrap();
-        for (keyword, value) in [("path", "file"), ("linkpath", "target"), ("size", "0")] {
-            let dest = temp.path().join(keyword);
+        for (case, keyword, value) in [
+            ("path", "path", "file"),
+            ("linkpath", "linkpath", "target"),
+            ("size", "size", "0"),
+            ("deleted-path", "path", ""),
+        ] {
+            let dest = temp.path().join(case);
             let mut bytes = Vec::new();
             append_pax(&mut bytes, b'g', &record(keyword, value));
             finish(&mut bytes);
@@ -2263,92 +2208,84 @@ mod tests {
                 } if found == keyword
             ));
         }
-
-        let deleted_dest = temp.path().join("deleted");
-        let mut deleted = Vec::new();
-        append_pax(&mut deleted, b'g', &record("path", ""));
-        finish(&mut deleted);
-        assert!(matches!(
-            extract_with_policy(
-                deleted,
-                &deleted_dest,
-                DecodePolicy::default()
-                    .pax_policy(PaxDecodePolicy::default().allow_global_pax_extensions(true))
-            )
-            .await
-            .unwrap_err(),
-            DecodeError::PolicyViolation {
-                position: 0,
-                violation: DecodePolicyViolation::GlobalPaxMemberMetadata { keyword: "path" },
-            }
-        ));
     }
 
     #[tokio::test]
     async fn rejects_invalid_extension_text_and_preserves_partial_outputs() {
         let temp = tempdir().unwrap();
-        let deleted_dest = temp.path().join("deleted");
+
         let mut deleted = Vec::new();
         append_pax(&mut deleted, b'x', &record("path", ""));
         append_posix_member(&mut deleted, "raw", b'0', b"", "", 0o644);
         finish(&mut deleted);
-        assert!(matches!(
-            extract(deleted, &deleted_dest).await.unwrap_err(),
-            DecodeError::Framing(FrameError {
-                inner: FrameErrorInner::DeletedPaxMetadata { keyword: "path" },
-                ..
-            })
-        ));
 
-        let binary_dest = temp.path().join("binary");
         let mut binary_path = record("hdrcharset", "BINARY");
         binary_path.extend_from_slice(&raw_record("path", &[0xff]));
         let mut binary = Vec::new();
         append_pax(&mut binary, b'x', &binary_path);
         append_posix_member(&mut binary, "raw", b'0', b"", "", 0o644);
         finish(&mut binary);
-        assert!(matches!(
-            extract(binary, &binary_dest).await.unwrap_err(),
-            DecodeError::InvalidUtf8 { field: "path", .. }
-        ));
 
-        let gnu_dest = temp.path().join("gnu");
         let mut malformed_gnu = Vec::new();
         append_gnu_member(&mut malformed_gnu, "longname", b'L', b"no-nul", "", 0o644);
         append_gnu_member(&mut malformed_gnu, "raw", b'0', b"", "", 0o644);
         finish(&mut malformed_gnu);
-        assert!(matches!(
-            extract(malformed_gnu, &gnu_dest).await.unwrap_err(),
-            DecodeError::Framing(FrameError {
-                inner: FrameErrorInner::InvalidGnuMetadata { .. },
-                ..
-            })
-        ));
 
-        let utf8_dest = temp.path().join("utf8");
         let mut invalid_utf8 = header(POSIX_IDENTITY, "name", b'0', 0, "", 0o644);
         invalid_utf8[NAME_RANGE.start] = 0xff;
         set_checksum(&mut invalid_utf8);
         let mut invalid_utf8_archive = invalid_utf8.to_vec();
         finish(&mut invalid_utf8_archive);
-        assert!(matches!(
-            extract(invalid_utf8_archive, &utf8_dest).await.unwrap_err(),
-            DecodeError::InvalidUtf8 { .. }
-        ));
 
-        let mode_dest = temp.path().join("mode");
         let mut invalid_mode = header(POSIX_IDENTITY, "mode", b'0', 0, "", 0o644);
         invalid_mode[MODE_RANGE].copy_from_slice(b"0000080\0");
         set_checksum(&mut invalid_mode);
         let mut invalid_mode_archive = invalid_mode.to_vec();
         finish(&mut invalid_mode_archive);
-        assert!(matches!(
-            extract(invalid_mode_archive, &mode_dest).await.unwrap_err(),
-            DecodeError::Framing(FrameError {
-                inner: FrameErrorInner::InvalidMode { .. },
-                ..
-            })
-        ));
+
+        for (case, bytes, expected) in [
+            (
+                "deleted",
+                deleted,
+                (|error| {
+                    matches!(
+                        error,
+                        DecodeError::Framing(FrameError {
+                            inner: FrameErrorInner::DeletedPaxMetadata { keyword: "path" },
+                            ..
+                        })
+                    )
+                }) as DecodeErrorMatcher,
+            ),
+            ("binary", binary, |error| {
+                matches!(error, DecodeError::InvalidUtf8 { field: "path", .. })
+            }),
+            ("gnu", malformed_gnu, |error| {
+                matches!(
+                    error,
+                    DecodeError::Framing(FrameError {
+                        inner: FrameErrorInner::InvalidGnuMetadata { .. },
+                        ..
+                    })
+                )
+            }),
+            ("utf8", invalid_utf8_archive, |error| {
+                matches!(error, DecodeError::InvalidUtf8 { .. })
+            }),
+            ("mode", invalid_mode_archive, |error| {
+                matches!(
+                    error,
+                    DecodeError::Framing(FrameError {
+                        inner: FrameErrorInner::InvalidMode { .. },
+                        ..
+                    })
+                )
+            }),
+        ] {
+            let dest = temp.path().join(case);
+            let error = extract(bytes, &dest).await.unwrap_err();
+            assert!(expected(&error), "{case}: {error:?}");
+        }
 
         let partial_dest = temp.path().join("partial");
         let mut partial = Vec::new();
@@ -2357,10 +2294,8 @@ mod tests {
         invalid[IDENTITY_RANGE.start] = b'!';
         set_checksum(&mut invalid);
         append_block(&mut partial, &invalid);
-        assert!(matches!(
-            extract(partial, &partial_dest).await.unwrap_err(),
-            DecodeError::Framing(_)
-        ));
+        let error = extract(partial, &partial_dest).await.unwrap_err();
+        assert!(matches!(error, DecodeError::Framing(_)));
         assert_eq!(
             std::fs::read_to_string(partial_dest.join("created")).unwrap(),
             "kept"

@@ -497,18 +497,7 @@ fn parse_integer(value: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn encoded_record(keyword: &str, value: &str) -> Vec<u8> {
-        let suffix = format!(" {keyword}={value}\n");
-        let mut len = suffix.len() + 1;
-        loop {
-            let encoded = format!("{len}{suffix}");
-            if encoded.len() == len {
-                return encoded.into_bytes();
-            }
-            len = encoded.len();
-        }
-    }
+    use crate::test_support::record;
 
     fn encoded_raw_record(keyword: &[u8], value: &[u8]) -> Vec<u8> {
         let mut suffix = Vec::new();
@@ -584,7 +573,7 @@ mod tests {
 
     #[test]
     fn parses_typed_standard_reserved_and_vendor_records() {
-        let mut payload = encoded_record("atime", "12.034");
+        let mut payload = record("atime", "12.034");
         for (keyword, value) in [
             ("charset", "BINARY"),
             ("comment", "a=b"),
@@ -602,7 +591,7 @@ mod tests {
             ("uname", "user"),
             ("ACME.attribute", "custom"),
         ] {
-            payload.extend_from_slice(&encoded_record(keyword, value));
+            payload.extend_from_slice(&record(keyword, value));
         }
 
         let Ok(records) = parse_records(0, &payload, HdrCharset::Utf8) else {
@@ -667,7 +656,7 @@ mod tests {
 
     #[test]
     fn parses_deleted_ctime_compatibility_extension() {
-        let Ok(records) = parse_records(0, &encoded_record("ctime", ""), HdrCharset::Utf8) else {
+        let Ok(records) = parse_records(0, &record("ctime", ""), HdrCharset::Utf8) else {
             panic!("ctime deletion should parse");
         };
         assert_eq!(records, vec![PaxRecord::Ctime(PaxValue::Deleted)]);
@@ -770,16 +759,21 @@ mod tests {
             ]
         );
 
-        let supported = encoded_record("hdrcharset", UTF8_HDRCHARSET);
-        assert!(parse_records(0, &supported, HdrCharset::Utf8).is_ok());
+        for (case, payload) in [
+            (
+                "supported hdrcharset",
+                record("hdrcharset", UTF8_HDRCHARSET),
+            ),
+            ("deleted hdrcharset", record("hdrcharset", "")),
+            ("member data charset", record("charset", "BINARY")),
+        ] {
+            assert!(
+                parse_records(0, &payload, HdrCharset::Utf8).is_ok(),
+                "{case}"
+            );
+        }
 
-        let deleted = encoded_record("hdrcharset", "");
-        assert!(parse_records(0, &deleted, HdrCharset::Utf8).is_ok());
-
-        let member_data_charset = encoded_record("charset", "BINARY");
-        assert!(parse_records(0, &member_data_charset, HdrCharset::Utf8).is_ok());
-
-        let mut binary_values = encoded_record("hdrcharset", BINARY_HDRCHARSET);
+        let mut binary_values = record("hdrcharset", BINARY_HDRCHARSET);
         for (keyword, value) in [
             (b"gname".as_slice(), [0xfc]),
             (b"linkpath".as_slice(), [0xfd]),
@@ -812,7 +806,7 @@ mod tests {
                 0xfe
             ])))]
         );
-        let mut reset_to_utf8 = encoded_record("hdrcharset", "");
+        let mut reset_to_utf8 = record("hdrcharset", "");
         reset_to_utf8.extend_from_slice(&encoded_raw_record(b"path", &[0xfd]));
         assert!(matches!(
             parse_records(0, &reset_to_utf8, HdrCharset::Binary),
@@ -821,7 +815,7 @@ mod tests {
                 ..
             })
         ));
-        let mut binary_comment = encoded_record("hdrcharset", BINARY_HDRCHARSET);
+        let mut binary_comment = record("hdrcharset", BINARY_HDRCHARSET);
         binary_comment.extend_from_slice(&encoded_raw_record(b"comment", &[0xff]));
         assert!(matches!(
             parse_records(0, &binary_comment, HdrCharset::Utf8),
@@ -832,10 +826,10 @@ mod tests {
         ));
 
         let unsupported_value = "ISO-IR 8859 1 1998";
-        let mut overridden_unsupported = encoded_record("hdrcharset", unsupported_value);
-        overridden_unsupported.extend_from_slice(&encoded_record("hdrcharset", UTF8_HDRCHARSET));
+        let mut overridden_unsupported = record("hdrcharset", unsupported_value);
+        overridden_unsupported.extend_from_slice(&record("hdrcharset", UTF8_HDRCHARSET));
         for unsupported in [
-            encoded_record("hdrcharset", unsupported_value),
+            record("hdrcharset", unsupported_value),
             overridden_unsupported,
         ] {
             assert!(matches!(

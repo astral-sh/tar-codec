@@ -158,7 +158,7 @@ fn source_archive_path(source: &Path) -> Result<String, TraversalError> {
             path: source.to_path_buf(),
         });
     };
-    normalize_archive_path(Path::new(name))
+    Ok(validate_traversal_archive_path(Path::new(name))?.to_owned())
 }
 
 fn stream_directory_entries_blocking(
@@ -261,10 +261,6 @@ fn traversal_entry(
         archive_path,
         kind,
     })
-}
-
-fn normalize_archive_path(path: &Path) -> Result<String, TraversalError> {
-    Ok(validate_traversal_archive_path(path)?.to_owned())
 }
 
 fn join_normalized_archive_path(

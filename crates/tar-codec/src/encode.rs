@@ -644,6 +644,18 @@ mod tests {
         }
     }
 
+    async fn encode_source_directory(source: &Path) -> Vec<u8> {
+        let mut encoder = Encoder::new(Vec::new());
+        encoder.add_directory(source).await.unwrap();
+        encoder.finish().await.unwrap()
+    }
+
+    async fn extract_archive(bytes: Vec<u8>, dest: &Path) -> Result<(), DecodeError> {
+        Archive::new(VecReader::new(bytes))
+            .extract(dest, DecodePolicy::default())
+            .await
+    }
+
     #[tokio::test]
     async fn adds_manual_files_as_local_pax_members_and_round_trips() {
         let mut encoder = Encoder::new(Vec::new());
@@ -673,10 +685,7 @@ mod tests {
 
         let temp = tempdir().unwrap();
         let dest = temp.path().join("out");
-        Archive::new(VecReader::new(bytes))
-            .extract(&dest, DecodePolicy::default())
-            .await
-            .unwrap();
+        extract_archive(bytes, &dest).await.unwrap();
         assert_eq!(std::fs::read(dest.join("bin/tool")).unwrap(), b"run");
         assert_eq!(std::fs::read(dest.join("README")).unwrap(), b"hello");
         #[cfg(unix)]
@@ -705,18 +714,15 @@ mod tests {
     #[tokio::test]
     async fn rejects_invalid_manual_paths_and_collisions_without_poisoning() {
         let mut encoder = Encoder::new(Vec::new());
-        assert!(matches!(
-            encoder
-                .add_entry("/absolute", b"", EntryMetadata::default())
-                .await,
-            Err(EncodeError::InvalidArchivePath { .. })
-        ));
-        assert!(matches!(
-            encoder
-                .add_entry("C:/ambiguous", b"", EntryMetadata::default())
-                .await,
-            Err(EncodeError::InvalidArchivePath { .. })
-        ));
+        for path in ["/absolute", "C:/ambiguous"] {
+            assert!(
+                matches!(
+                    encoder.add_entry(path, b"", EntryMetadata::default()).await,
+                    Err(EncodeError::InvalidArchivePath { .. })
+                ),
+                "{path}"
+            );
+        }
         encoder
             .add_entry("dir/file", b"first", EntryMetadata::default())
             .await
@@ -725,18 +731,20 @@ mod tests {
             encoder.entries.get("dir"),
             Some(ArchivedEntry::Directory { explicit: false })
         ));
-        assert!(matches!(
-            encoder
-                .add_entry("dir/file", b"second", EntryMetadata::default())
-                .await,
-            Err(EncodeError::PathCollision { .. })
-        ));
-        assert!(matches!(
-            encoder
-                .add_entry("dir/file/child", b"", EntryMetadata::default())
-                .await,
-            Err(EncodeError::PathCollision { .. })
-        ));
+        for (path, data) in [
+            ("dir/file", b"second".as_slice()),
+            ("dir/file/child", b"".as_slice()),
+        ] {
+            assert!(
+                matches!(
+                    encoder
+                        .add_entry(path, data, EntryMetadata::default())
+                        .await,
+                    Err(EncodeError::PathCollision { .. })
+                ),
+                "{path}"
+            );
+        }
         encoder
             .add_entry("dir/other", b"ok", EntryMetadata::default())
             .await
@@ -781,9 +789,7 @@ mod tests {
                 .unwrap();
         }
 
-        let mut encoder = Encoder::new(Vec::new());
-        encoder.add_directory(&source).await.unwrap();
-        let bytes = encoder.finish().await.unwrap();
+        let bytes = encode_source_directory(&source).await;
         let mut reader = TarReader::new(VecReader::new(bytes.clone()));
         let mut paths = Vec::new();
         while let Some(frame) = reader.next_frame().await.unwrap() {
@@ -804,10 +810,7 @@ mod tests {
         assert_eq!(reader.format(), Some(ArchiveFormat::Pax));
 
         let dest = temp.path().join("out");
-        Archive::new(VecReader::new(bytes))
-            .extract(&dest, DecodePolicy::default())
-            .await
-            .unwrap();
+        extract_archive(bytes, &dest).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(dest.join("tree/sub/file")).unwrap(),
             "nested"
@@ -828,51 +831,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recursively_streams_files_larger_than_the_buffered_threshold() {
-        let temp = tempdir().unwrap();
-        let source = temp.path().join("tree");
-        std::fs::create_dir(&source).unwrap();
-        let contents = vec![b'x'; SOURCE_FILE_CHUNK_BYTES + 17];
-        std::fs::write(source.join("large"), &contents).unwrap();
+    async fn recursively_encodes_streamed_and_mixed_source_files() {
+        for (case, files) in [
+            (
+                "streamed",
+                vec![("large", vec![b'x'; SOURCE_FILE_CHUNK_BYTES + 17])],
+            ),
+            (
+                "mixed",
+                vec![
+                    ("a-small", b"first".to_vec()),
+                    ("m-large", vec![b'x'; SOURCE_FILE_CHUNK_BYTES + 17]),
+                    ("z-small", b"last".to_vec()),
+                ],
+            ),
+        ] {
+            let temp = tempdir().unwrap();
+            let source = temp.path().join("tree");
+            std::fs::create_dir(&source).unwrap();
+            for (name, contents) in &files {
+                std::fs::write(source.join(name), contents).unwrap();
+            }
 
-        let mut encoder = Encoder::new(Vec::new());
-        encoder.add_directory(&source).await.unwrap();
-        let bytes = encoder.finish().await.unwrap();
-        let dest = temp.path().join("out");
-        Archive::new(VecReader::new(bytes))
-            .extract(&dest, DecodePolicy::default())
-            .await
-            .unwrap();
-        assert_eq!(std::fs::read(dest.join("tree/large")).unwrap(), contents);
-    }
-
-    #[tokio::test]
-    async fn recursively_combines_buffered_and_streamed_source_files() {
-        let temp = tempdir().unwrap();
-        let source = temp.path().join("tree");
-        std::fs::create_dir(&source).unwrap();
-        let large = vec![b'x'; SOURCE_FILE_CHUNK_BYTES + 17];
-        std::fs::write(source.join("a-small"), "first").unwrap();
-        std::fs::write(source.join("m-large"), &large).unwrap();
-        std::fs::write(source.join("z-small"), "last").unwrap();
-
-        let mut encoder = Encoder::new(Vec::new());
-        encoder.add_directory(&source).await.unwrap();
-        let bytes = encoder.finish().await.unwrap();
-        let dest = temp.path().join("out");
-        Archive::new(VecReader::new(bytes))
-            .extract(&dest, DecodePolicy::default())
-            .await
-            .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dest.join("tree/a-small")).unwrap(),
-            "first"
-        );
-        assert_eq!(std::fs::read(dest.join("tree/m-large")).unwrap(), large);
-        assert_eq!(
-            std::fs::read_to_string(dest.join("tree/z-small")).unwrap(),
-            "last"
-        );
+            let bytes = encode_source_directory(&source).await;
+            let dest = temp.path().join("out");
+            extract_archive(bytes, &dest).await.unwrap();
+            for (name, contents) in files {
+                assert_eq!(
+                    std::fs::read(dest.join("tree").join(name)).unwrap(),
+                    contents,
+                    "{case}"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -908,14 +899,9 @@ mod tests {
         symlink("sub", source.join("directory")).unwrap();
         symlink("directory/file", source.join("file")).unwrap();
 
-        let mut encoder = Encoder::new(Vec::new());
-        encoder.add_directory(&source).await.unwrap();
-        let bytes = encoder.finish().await.unwrap();
+        let bytes = encode_source_directory(&source).await;
         let dest = temp.path().join("out");
-        Archive::new(VecReader::new(bytes))
-            .extract(&dest, DecodePolicy::default())
-            .await
-            .unwrap();
+        extract_archive(bytes, &dest).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(dest.join("safe/file")).unwrap(),
             "contents"
@@ -924,13 +910,9 @@ mod tests {
         let source = temp.path().join("escape");
         std::fs::create_dir(&source).unwrap();
         symlink("../../outside", source.join("link")).unwrap();
-        let mut encoder = Encoder::new(Vec::new());
-        encoder.add_directory(&source).await.unwrap();
-        let bytes = encoder.finish().await.unwrap();
+        let bytes = encode_source_directory(&source).await;
         assert!(matches!(
-            Archive::new(VecReader::new(bytes))
-                .extract(&temp.path().join("escape-out"), DecodePolicy::default())
-                .await,
+            extract_archive(bytes, &temp.path().join("escape-out")).await,
             Err(DecodeError::UnsafePath {
                 context: "symbolic-link target",
                 ..
@@ -940,14 +922,9 @@ mod tests {
         let source = temp.path().join("dangling");
         std::fs::create_dir(&source).unwrap();
         symlink("missing", source.join("link")).unwrap();
-        let mut encoder = Encoder::new(Vec::new());
-        encoder.add_directory(&source).await.unwrap();
-        let bytes = encoder.finish().await.unwrap();
+        let bytes = encode_source_directory(&source).await;
         let dest = temp.path().join("dangling-out");
-        Archive::new(VecReader::new(bytes))
-            .extract(&dest, DecodePolicy::default())
-            .await
-            .unwrap();
+        extract_archive(bytes, &dest).await.unwrap();
         assert_eq!(
             std::fs::read_link(dest.join("dangling/link")).unwrap(),
             Path::new("missing")
@@ -956,13 +933,9 @@ mod tests {
         let source = temp.path().join("cycle");
         std::fs::create_dir(&source).unwrap();
         symlink("link", source.join("link")).unwrap();
-        let mut encoder = Encoder::new(Vec::new());
-        encoder.add_directory(&source).await.unwrap();
-        let bytes = encoder.finish().await.unwrap();
+        let bytes = encode_source_directory(&source).await;
         assert!(matches!(
-            Archive::new(VecReader::new(bytes))
-                .extract(&temp.path().join("cycle-out"), DecodePolicy::default())
-                .await,
+            extract_archive(bytes, &temp.path().join("cycle-out")).await,
             Err(DecodeError::InvalidLink { .. })
         ));
     }
@@ -978,9 +951,7 @@ mod tests {
         std::fs::write(source.join("one"), "contents").unwrap();
         std::fs::hard_link(source.join("one"), source.join("two")).unwrap();
 
-        let mut encoder = Encoder::new(Vec::new());
-        encoder.add_directory(&source).await.unwrap();
-        let bytes = encoder.finish().await.unwrap();
+        let bytes = encode_source_directory(&source).await;
         let mut reader = TarReader::new(VecReader::new(bytes));
         let mut regular = 0;
         while let Some(frame) = reader.next_frame().await.unwrap() {

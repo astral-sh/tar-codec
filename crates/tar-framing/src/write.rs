@@ -631,13 +631,14 @@ mod tests {
 
     #[test]
     fn returns_payload_padding_and_contiguous_end_marker_bytes() {
-        assert_eq!(payload_padding(0), b"");
-        assert_eq!(payload_padding(BLOCK_SIZE as u64), b"");
-        assert_eq!(payload_padding(1), &[0; BLOCK_SIZE - 1]);
-        assert_eq!(
-            payload_padding((BLOCK_SIZE + 7) as u64),
-            &[0; BLOCK_SIZE - 7]
-        );
+        for (size, expected) in [
+            (0, &[] as &[u8]),
+            (BLOCK_SIZE as u64, &[]),
+            (1, &[0; BLOCK_SIZE - 1]),
+            ((BLOCK_SIZE + 7) as u64, &[0; BLOCK_SIZE - 7]),
+        ] {
+            assert_eq!(payload_padding(size), expected, "{size}");
+        }
 
         let marker = end_marker().into_iter().flatten().collect::<Vec<_>>();
         assert_eq!(end_marker_bytes(), marker);
@@ -682,32 +683,35 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_or_inconsistent_members() {
-        let member = PaxMember {
-            path: "file",
-            kind: MemberKind::HardLink,
-            size: 0,
-            link_path: None,
-            executable: false,
-        };
-        assert_eq!(
-            frame_pax_member(0, member),
-            Err(FramingWriteError::UnsupportedMemberKind {
-                kind: MemberKind::HardLink
-            })
-        );
-        assert!(matches!(
-            frame_pax_member(
-                0,
+        for (member, expected) in [
+            (
+                PaxMember {
+                    path: "file",
+                    kind: MemberKind::HardLink,
+                    size: 0,
+                    link_path: None,
+                    executable: false,
+                },
+                FramingWriteError::UnsupportedMemberKind {
+                    kind: MemberKind::HardLink,
+                },
+            ),
+            (
                 PaxMember {
                     path: "link",
                     kind: MemberKind::SymbolicLink,
                     size: 1,
                     link_path: Some("file"),
                     executable: false,
-                }
+                },
+                FramingWriteError::InvalidMemberSize {
+                    kind: MemberKind::SymbolicLink,
+                    size: 1,
+                },
             ),
-            Err(FramingWriteError::InvalidMemberSize { .. })
-        ));
+        ] {
+            assert_eq!(frame_pax_member(0, member), Err(expected));
+        }
     }
 
     #[test]

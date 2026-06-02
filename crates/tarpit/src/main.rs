@@ -355,33 +355,28 @@ mod tests {
     const POSIX_IDENTITY: &[u8; 8] = b"ustar\x0000";
 
     #[tokio::test]
-    async fn extracts_plain_tar_archive() {
-        let temp = tempdir().unwrap();
-        let archive = temp.path().join("archive.tar");
-        let destination = temp.path().join("out");
-        fs::write(&archive, archive_with_file("file", b"contents")).unwrap();
-
-        extract_archive(&archive, &destination).await.unwrap();
-
-        assert_eq!(fs::read(destination.join("file")).unwrap(), b"contents");
-    }
-
-    #[tokio::test]
-    async fn extracts_gzip_tar_archive() {
-        let temp = tempdir().unwrap();
-        let archive = temp.path().join("archive.tar.gz");
-        let destination = temp.path().join("out");
+    async fn extracts_plain_and_gzip_tar_archives() {
+        let plain = archive_with_file("file", b"contents");
         let mut encoder = GzipEncoder::new(Vec::new());
-        encoder
-            .write_all(&archive_with_file("file", b"contents"))
-            .await
-            .unwrap();
+        encoder.write_all(&plain).await.unwrap();
         encoder.shutdown().await.unwrap();
-        fs::write(&archive, encoder.into_inner()).unwrap();
+        for (case, name, bytes) in [
+            ("plain", "archive.tar", plain),
+            ("gzip", "archive.tar.gz", encoder.into_inner()),
+        ] {
+            let temp = tempdir().unwrap();
+            let archive = temp.path().join(name);
+            let destination = temp.path().join("out");
+            fs::write(&archive, bytes).unwrap();
 
-        extract_archive(&archive, &destination).await.unwrap();
+            extract_archive(&archive, &destination).await.unwrap();
 
-        assert_eq!(fs::read(destination.join("file")).unwrap(), b"contents");
+            assert_eq!(
+                fs::read(destination.join("file")).unwrap(),
+                b"contents",
+                "{case}"
+            );
+        }
     }
 
     #[tokio::test]

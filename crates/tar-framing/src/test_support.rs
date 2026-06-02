@@ -8,7 +8,7 @@ use std::{
 use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::{
-    BLOCK_SIZE, Block,
+    BLOCK_SIZE, Block, FrameError,
     header::{
         CHECKSUM_RANGE, GNU_IDENTITY, IDENTITY_RANGE, POSIX_IDENTITY, SIZE_RANGE, TYPEFLAG_OFFSET,
     },
@@ -126,5 +126,15 @@ pub(crate) fn ready<F: Future>(future: F) -> F::Output {
     match future.as_mut().poll(&mut context) {
         Poll::Ready(value) => value,
         Poll::Pending => panic!("test reader is never pending"),
+    }
+}
+
+pub(crate) fn ready_ok<F, T>(future: F) -> T
+where
+    F: Future<Output = Result<T, FrameError>>,
+{
+    match ready(future) {
+        Ok(value) => value,
+        Err(error) => panic!("test future returned error: {error:?}"),
     }
 }

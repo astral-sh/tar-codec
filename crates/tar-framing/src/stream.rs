@@ -1019,6 +1019,74 @@ mod tests {
         &last_error(frames).inner
     }
 
+    #[derive(Clone, Copy)]
+    enum ExpectedHeaderError {
+        InvalidIdentity,
+        InvalidChecksum,
+        InvalidSize,
+        UnsupportedTypeflag(u8),
+    }
+
+    impl ExpectedHeaderError {
+        fn matches(self, error: &FrameErrorInner) -> bool {
+            match (self, error) {
+                (Self::InvalidIdentity, FrameErrorInner::InvalidIdentity { .. })
+                | (Self::InvalidChecksum, FrameErrorInner::InvalidChecksum { .. })
+                | (Self::InvalidSize, FrameErrorInner::InvalidSize { .. }) => true,
+                (
+                    Self::UnsupportedTypeflag(typeflag),
+                    FrameErrorInner::UnsupportedTypeflag { typeflag: found },
+                ) => typeflag == *found,
+                _ => false,
+            }
+        }
+    }
+
+    fn invalid_header_cases() -> Vec<(&'static str, Block, ExpectedHeaderError)> {
+        let mut bad_magic = header(b'0', 0);
+        bad_magic[IDENTITY_RANGE.start] = b'g';
+        let mut bad_version = header(b'0', 0);
+        bad_version[IDENTITY_RANGE.end - 2..IDENTITY_RANGE.end].copy_from_slice(b"  ");
+        let mut bad_checksum = header(b'0', 0);
+        bad_checksum[0] = b'X';
+        let mut bad_octal_size = header(b'0', 0);
+        bad_octal_size[SIZE_RANGE].copy_from_slice(b"00000000008\0");
+        set_checksum(&mut bad_octal_size);
+        let mut bad_base256_size = header(b'0', 0);
+        bad_base256_size[SIZE_RANGE.start] = 0x80;
+        set_checksum(&mut bad_base256_size);
+
+        vec![
+            ("magic", bad_magic, ExpectedHeaderError::InvalidIdentity),
+            ("version", bad_version, ExpectedHeaderError::InvalidIdentity),
+            (
+                "checksum",
+                bad_checksum,
+                ExpectedHeaderError::InvalidChecksum,
+            ),
+            (
+                "octal size",
+                bad_octal_size,
+                ExpectedHeaderError::InvalidSize,
+            ),
+            (
+                "base256 size",
+                bad_base256_size,
+                ExpectedHeaderError::InvalidSize,
+            ),
+            (
+                "POSIX typeflag",
+                header(b'X', 0),
+                ExpectedHeaderError::UnsupportedTypeflag(b'X'),
+            ),
+            (
+                "GNU typeflag",
+                header(b'L', 0),
+                ExpectedHeaderError::UnsupportedTypeflag(b'L'),
+            ),
+        ]
+    }
+
     #[test]
     fn frames_bare_member_across_fragmented_reads() {
         let mut bytes = Vec::new();
@@ -1238,30 +1306,21 @@ mod tests {
 
     #[test]
     fn rejects_deleted_size_when_member_payload_cannot_be_framed() {
-        let local = record("size", "");
-        let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'x', local.len() as u64));
-        append_payload(&mut bytes, &local);
-        append_block(&mut bytes, &header(b'0', 0));
+        let records = record("size", "");
+        for typeflag in [b'x', b'g'] {
+            let mut bytes = Vec::new();
+            append_block(&mut bytes, &header(typeflag, records.len() as u64));
+            append_payload(&mut bytes, &records);
+            append_block(&mut bytes, &header(b'0', 0));
 
-        assert!(matches!(
-            last_error_inner(&collect(bytes, BLOCK_SIZE)),
-            FrameErrorInner::DeletedPaxMetadata { keyword: "size" }
-        ));
-    }
-
-    #[test]
-    fn rejects_global_size_deletion_when_member_payload_cannot_be_framed() {
-        let global = record("size", "");
-        let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'g', global.len() as u64));
-        append_payload(&mut bytes, &global);
-        append_block(&mut bytes, &header(b'0', 0));
-
-        assert!(matches!(
-            last_error_inner(&collect(bytes, BLOCK_SIZE)),
-            FrameErrorInner::DeletedPaxMetadata { keyword: "size" }
-        ));
+            assert!(
+                matches!(
+                    last_error_inner(&collect(bytes, BLOCK_SIZE)),
+                    FrameErrorInner::DeletedPaxMetadata { keyword: "size" }
+                ),
+                "{typeflag:?}"
+            );
+        }
     }
 
     #[test]
@@ -1387,107 +1446,26 @@ mod tests {
 
     #[test]
     fn rejects_header_format_and_type_errors() {
-        let mut bad_magic = header(b'0', 0);
-        bad_magic[IDENTITY_RANGE.start] = b'g';
-        assert!(matches!(
-            last_error_inner(&collect(bad_magic.to_vec(), BLOCK_SIZE)),
-            FrameErrorInner::InvalidIdentity { .. }
-        ));
-
-        let mut bad_version = header(b'0', 0);
-        bad_version[IDENTITY_RANGE.end - 2..IDENTITY_RANGE.end].copy_from_slice(b"  ");
-        assert!(matches!(
-            last_error_inner(&collect(bad_version.to_vec(), BLOCK_SIZE)),
-            FrameErrorInner::InvalidIdentity { .. }
-        ));
-
-        let mut bad_checksum = header(b'0', 0);
-        bad_checksum[0] = b'X';
-        assert!(matches!(
-            last_error_inner(&collect(bad_checksum.to_vec(), BLOCK_SIZE)),
-            FrameErrorInner::InvalidChecksum { .. }
-        ));
-
-        let mut bad_size = header(b'0', 0);
-        bad_size[SIZE_RANGE].copy_from_slice(b"00000000008\0");
-        set_checksum(&mut bad_size);
-        assert!(matches!(
-            last_error_inner(&collect(bad_size.to_vec(), BLOCK_SIZE)),
-            FrameErrorInner::InvalidSize { .. }
-        ));
-
-        let mut base256_size = header(b'0', 0);
-        base256_size[SIZE_RANGE.start] = 0x80;
-        set_checksum(&mut base256_size);
-        assert!(matches!(
-            last_error_inner(&collect(base256_size.to_vec(), BLOCK_SIZE)),
-            FrameErrorInner::InvalidSize { .. }
-        ));
-
-        assert!(matches!(
-            last_error_inner(&collect(header(b'X', 0).to_vec(), BLOCK_SIZE)),
-            FrameErrorInner::UnsupportedTypeflag { typeflag: b'X' }
-        ));
-        assert!(matches!(
-            last_error_inner(&collect(header(b'L', 0).to_vec(), BLOCK_SIZE)),
-            FrameErrorInner::UnsupportedTypeflag { typeflag: b'L' }
-        ));
+        for (case, block, expected) in invalid_header_cases() {
+            let frames = collect(block.to_vec(), BLOCK_SIZE);
+            let error = last_error_inner(&frames);
+            assert!(expected.matches(error), "{case}: {error:?}");
+        }
     }
 
     #[test]
     fn direct_conversion_errors_preserve_later_header_positions() {
         let position = BLOCK_SIZE as u64;
 
-        let mut bad_identity = header(b'0', 0);
-        bad_identity[IDENTITY_RANGE.start] = b'!';
-        let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'0', 0));
-        append_block(&mut bytes, &bad_identity);
-        assert!(matches!(
-            last_error(&collect(bytes, BLOCK_SIZE)),
-            FrameError {
-                position: found,
-                inner: FrameErrorInner::InvalidIdentity { .. },
-            } if *found == position
-        ));
-
-        let mut bad_checksum = header(b'0', 0);
-        bad_checksum[0] = b'X';
-        let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'0', 0));
-        append_block(&mut bytes, &bad_checksum);
-        assert!(matches!(
-            last_error(&collect(bytes, BLOCK_SIZE)),
-            FrameError {
-                position: found,
-                inner: FrameErrorInner::InvalidChecksum { .. },
-            } if *found == position
-        ));
-
-        let mut bad_size = header(b'0', 0);
-        bad_size[SIZE_RANGE].copy_from_slice(b"00000000008\0");
-        set_checksum(&mut bad_size);
-        let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'0', 0));
-        append_block(&mut bytes, &bad_size);
-        assert!(matches!(
-            last_error(&collect(bytes, BLOCK_SIZE)),
-            FrameError {
-                position: found,
-                inner: FrameErrorInner::InvalidSize { .. },
-            } if *found == position
-        ));
-
-        let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'0', 0));
-        append_block(&mut bytes, &header(b'X', 0));
-        assert!(matches!(
-            last_error(&collect(bytes, BLOCK_SIZE)),
-            FrameError {
-                position: found,
-                inner: FrameErrorInner::UnsupportedTypeflag { typeflag: b'X' },
-            } if *found == position
-        ));
+        for (case, block, expected) in invalid_header_cases() {
+            let mut bytes = Vec::new();
+            append_block(&mut bytes, &header(b'0', 0));
+            append_block(&mut bytes, &block);
+            let frames = collect(bytes, BLOCK_SIZE);
+            let error = last_error(&frames);
+            assert_eq!(error.position, position, "{case}");
+            assert!(expected.matches(&error.inner), "{case}: {error:?}");
+        }
     }
 
     #[test]
@@ -1579,26 +1557,25 @@ mod tests {
         let mut duplicate = Vec::new();
         append_block(&mut duplicate, &gnu_header(b'L', 0));
         append_block(&mut duplicate, &gnu_header(b'L', 0));
-        assert!(matches!(
-            last_error_inner(&collect(duplicate, BLOCK_SIZE)),
-            FrameErrorInner::UnexpectedOrder { .. }
-        ));
-
         let mut long_link_for_regular = Vec::new();
         append_block(&mut long_link_for_regular, &gnu_header(b'K', 0));
         append_block(&mut long_link_for_regular, &gnu_header(b'0', 0));
-        assert!(matches!(
-            last_error_inner(&collect(long_link_for_regular, BLOCK_SIZE)),
-            FrameErrorInner::UnexpectedOrder { .. }
-        ));
-
         let mut dangling = Vec::new();
         append_block(&mut dangling, &gnu_header(b'L', 0));
         append_terminator(&mut dangling);
-        assert!(matches!(
-            last_error_inner(&collect(dangling, BLOCK_SIZE)),
-            FrameErrorInner::UnexpectedOrder { .. }
-        ));
+        for (case, bytes) in [
+            ("duplicate", duplicate),
+            ("long-link-for-regular", long_link_for_regular),
+            ("dangling", dangling),
+        ] {
+            assert!(
+                matches!(
+                    last_error_inner(&collect(bytes, BLOCK_SIZE)),
+                    FrameErrorInner::UnexpectedOrder { .. }
+                ),
+                "{case}"
+            );
+        }
 
         assert!(matches!(
             last_error_inner(&collect(gnu_header(b'S', 0).to_vec(), BLOCK_SIZE)),
@@ -1649,14 +1626,15 @@ mod tests {
             }
         ));
 
-        assert!(matches!(
-            last_error_inner(&collect(gnu_header(b'x', 0).to_vec(), BLOCK_SIZE)),
-            FrameErrorInner::UnsupportedTypeflag { typeflag: b'x' }
-        ));
-        assert!(matches!(
-            last_error_inner(&collect(gnu_header(b'g', 0).to_vec(), BLOCK_SIZE)),
-            FrameErrorInner::UnsupportedTypeflag { typeflag: b'g' }
-        ));
+        for typeflag in [b'x', b'g'] {
+            assert!(
+                matches!(
+                    last_error_inner(&collect(gnu_header(typeflag, 0).to_vec(), BLOCK_SIZE)),
+                    FrameErrorInner::UnsupportedTypeflag { typeflag: found } if *found == typeflag
+                ),
+                "{typeflag:?}"
+            );
+        }
 
         let mut empty = Vec::new();
         append_terminator(&mut empty);
