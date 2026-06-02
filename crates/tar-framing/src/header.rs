@@ -14,6 +14,14 @@ pub(crate) const PREFIX_RANGE: std::ops::Range<usize> = 345..500;
 pub(crate) const POSIX_IDENTITY: &[u8; 8] = b"ustar\x0000";
 pub(crate) const GNU_IDENTITY: &[u8; 8] = b"ustar  \0";
 
+/// A tar header block (pax, ustar, or GNU) is exactly 512 bytes,
+/// so the logical maximum checksum is `255*512 = 130,560`. However,
+/// the checksum field *itself* is treated as 8 ASCII spaces when
+/// computing the checksum, so the actual maximum is
+/// `(504*255)+(8*32) = 128,776`.
+const MAX_CHECKSUM: u64 = (504 * 255) + (8 * 32);
+const _: () = assert!(MAX_CHECKSUM < 0o777777);
+
 // Pax framing constructs two headers per member. Keeping this fixed-size
 // reduction inline lets LLVM lower each call to a compact vectorized sum.
 #[inline(always)]
@@ -31,7 +39,17 @@ pub(crate) fn checksum(block: &Block) -> u64 {
 #[inline(always)]
 pub(crate) fn encode_checksum(block: &mut Block) {
     let value = checksum(block);
-    // Six octal digits can represent every possible block checksum.
+
+    // Observe:
+    // 1. We know statically that our computed checksum is no more than MAX_CHECKSUM
+    // 2. We know that MAX_CHECKSUM is less than 0o777777 (262143)
+    //
+    // Therefore, we know that all possible checksums fit within 6 octal digits,
+    // and therefore we can always safely include two padding bytes.
+    //
+    // NOTE: the use of `\0 ` as the suffix is not specified by pax, but appears
+    // to be a convention across tar encoders.
+    debug_assert!(value <= MAX_CHECKSUM);
     let _ = encode_octal_with_suffix(&mut block[CHECKSUM_RANGE], value, b"\0 ");
 }
 
@@ -114,28 +132,24 @@ mod tests {
     }
 
     #[test]
-    fn encodes_checksum_with_the_standard_terminator() {
-        let mut block = [0; crate::BLOCK_SIZE];
-        block[0] = b'x';
-        let value = checksum(&block);
-        encode_checksum(&mut block);
-        assert_eq!(parse_octal(&block[CHECKSUM_RANGE]), Some(value));
-        assert_eq!(&block[CHECKSUM_RANGE.end - 2..CHECKSUM_RANGE.end], b"\0 ");
-    }
+    fn encodes_known_checksums() {
+        let zero_block = [0; crate::BLOCK_SIZE];
+        let mut x_typeflag_block = zero_block;
+        x_typeflag_block[TYPEFLAG_OFFSET] = b'x';
+        x_typeflag_block[CHECKSUM_RANGE].fill(0xff);
+        let maximum_block = [0xff; crate::BLOCK_SIZE];
 
-    #[test]
-    fn checksum_treats_its_field_as_spaces() {
-        let mut block = [0xff; crate::BLOCK_SIZE];
-        block[CHECKSUM_RANGE].fill(0);
-
-        let expected = (crate::BLOCK_SIZE - CHECKSUM_RANGE.len()) as u64 * u64::from(u8::MAX)
-            + CHECKSUM_RANGE.len() as u64 * u64::from(b' ');
-        assert_eq!(checksum(&block), expected);
-
-        block[CHECKSUM_RANGE].fill(0xff);
-        assert_eq!(checksum(&block), expected);
-
-        encode_checksum(&mut block);
-        assert_eq!(parse_octal(&block[CHECKSUM_RANGE]), Some(expected));
+        for (name, mut block, expected) in [
+            ("zero block", zero_block, b"000400\0 "),
+            (
+                "x typeflag with junk checksum bytes",
+                x_typeflag_block,
+                b"000570\0 ",
+            ),
+            ("maximum block", maximum_block, b"373410\0 "),
+        ] {
+            encode_checksum(&mut block);
+            assert_eq!(&block[CHECKSUM_RANGE], expected, "{name}");
+        }
     }
 }
