@@ -7,9 +7,9 @@
 use crate::{
     BLOCK_SIZE, Block, MemberKind,
     header::{
-        CHECKSUM_RANGE, GID_RANGE, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE, MTIME_RANGE,
-        NAME_RANGE, POSIX_IDENTITY, PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, UID_RANGE,
-        encode_checksum_value, encode_octal,
+        GID_RANGE, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE, MTIME_RANGE, NAME_RANGE,
+        POSIX_IDENTITY, PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, UID_RANGE, encode_checksum,
+        encode_octal,
     },
 };
 
@@ -71,7 +71,7 @@ pub enum FramingWriteError {
         /// The unpadded local pax payload size.
         size: u64,
     },
-    /// An internal length or checksum computation exceeded its framing range.
+    /// An internal length computation exceeded its framing range.
     #[error("arithmetic overflow while constructing {context}")]
     ArithmeticOverflow {
         /// The failed framing computation.
@@ -148,7 +148,6 @@ pub fn frame_pax_member_into(
     for (keyword, value, len) in records.into_iter().flatten() {
         append_record_with_len(buffer, keyword, value, len);
     }
-    buffer.resize(BLOCK_SIZE + padded_payload_len, 0);
     buffer.resize(framing_len, 0);
     let (extended_header, rest) = buffer.split_at_mut(BLOCK_SIZE);
     let (_, member_header) = rest.split_at_mut(padded_payload_len);
@@ -274,13 +273,10 @@ fn build_header_into(
             })?;
     block[NAME_RANGE.start..NAME_RANGE.start + name.len()].copy_from_slice(name);
     block[PREFIX_RANGE.start..PREFIX_RANGE.start + prefix.len()].copy_from_slice(prefix);
-    let encoded_link_path = if link_path.len() <= LINK_NAME_RANGE.len() {
+    if link_path.len() <= LINK_NAME_RANGE.len() {
         block[LINK_NAME_RANGE.start..LINK_NAME_RANGE.start + link_path.len()]
             .copy_from_slice(link_path);
-        link_path
-    } else {
-        &[]
-    };
+    }
     if !encode_octal(&mut block[MODE_RANGE], mode)
         || !encode_octal(&mut block[UID_RANGE], 0)
         || !encode_octal(&mut block[GID_RANGE], 0)
@@ -291,22 +287,7 @@ fn build_header_into(
     }
     block[TYPEFLAG_OFFSET] = typeflag;
     block[IDENTITY_RANGE].copy_from_slice(POSIX_IDENTITY);
-    let checksum = byte_sum(name)
-        + byte_sum(prefix)
-        + byte_sum(encoded_link_path)
-        + byte_sum(&block[MODE_RANGE])
-        + byte_sum(&block[UID_RANGE])
-        + byte_sum(&block[GID_RANGE])
-        + byte_sum(&block[SIZE_RANGE])
-        + byte_sum(&block[MTIME_RANGE])
-        + u64::from(typeflag)
-        + byte_sum(POSIX_IDENTITY)
-        + CHECKSUM_RANGE.len() as u64 * u64::from(b' ');
-    if !encode_checksum_value(block, checksum) {
-        return Err(FramingWriteError::ArithmeticOverflow {
-            context: "ustar checksum",
-        });
-    }
+    encode_checksum(block);
     Ok(())
 }
 
@@ -372,10 +353,6 @@ fn decimal_u64(mut value: u64, buffer: &mut [u8; MAX_DECIMAL_U64_BYTES]) -> &[u8
 fn append_decimal_usize(output: &mut Vec<u8>, value: usize) {
     let mut buffer = [0; MAX_DECIMAL_U64_BYTES];
     output.extend_from_slice(decimal_u64(value as u64, &mut buffer));
-}
-
-fn byte_sum(bytes: &[u8]) -> u64 {
-    bytes.iter().map(|byte| u64::from(*byte)).sum()
 }
 
 #[cfg(test)]

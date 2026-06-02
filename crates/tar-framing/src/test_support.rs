@@ -10,8 +10,8 @@ use tokio::io::{AsyncRead, ReadBuf};
 use crate::{
     BLOCK_SIZE, Block, FrameError,
     header::{
-        GNU_IDENTITY, IDENTITY_RANGE, POSIX_IDENTITY, SIZE_RANGE, TYPEFLAG_OFFSET, checksum,
-        encode_checksum_value, encode_octal,
+        GNU_IDENTITY, IDENTITY_RANGE, POSIX_IDENTITY, SIZE_RANGE, TYPEFLAG_OFFSET, encode_checksum,
+        encode_octal,
     },
 };
 
@@ -53,7 +53,7 @@ impl AsyncRead for ChunkedReader {
 }
 
 pub(crate) fn set_checksum(block: &mut Block) {
-    assert!(encode_checksum_value(block, checksum(block)));
+    encode_checksum(block);
 }
 
 pub(crate) fn header(typeflag: u8, size: u64) -> Block {
