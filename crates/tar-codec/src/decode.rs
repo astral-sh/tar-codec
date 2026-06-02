@@ -1043,14 +1043,15 @@ fn open_or_replace_file(
     path: &Path,
     executable: bool,
 ) -> Result<cap_std::fs::File, FileOperationError> {
-    match create_new_file(dir, path, executable) {
-        Ok(file) => Ok(file),
-        Err(create_error) if create_error.kind() == io::ErrorKind::AlreadyExists => {
+    let file = match create_new_file(dir, path) {
+        Ok(file) => file,
+        Err(create_error) => {
+            // Windows may report an existing directory as permission denied.
             match dir.symlink_metadata(path) {
                 Ok(metadata) if metadata.is_file() => {
                     dir.remove_file(path)
                         .map_err(|source| file_operation_error("remove file", source))?;
-                    create_new_file(dir, path, executable)
+                    create_new_file(dir, path)
                         .map_err(|source| file_operation_error("create file", source))
                 }
                 Ok(_) => Err(FileOperationError::Collision),
@@ -1059,17 +1060,17 @@ fn open_or_replace_file(
                 }
                 Err(source) => Err(file_operation_error("inspect", source)),
             }
-        }
-        Err(source) => Err(file_operation_error("create file", source)),
-    }
+        }?,
+    };
+    add_executable(&file, executable)
+        .map_err(|source| file_operation_error("create file", source))?;
+    Ok(file)
 }
 
-fn create_new_file(dir: &Dir, path: &Path, executable: bool) -> io::Result<cap_std::fs::File> {
+fn create_new_file(dir: &Dir, path: &Path) -> io::Result<cap_std::fs::File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
-    let file = dir.open_with(path, &options)?;
-    add_executable(&file, executable)?;
-    Ok(file)
+    dir.open_with(path, &options)
 }
 
 fn file_operation_error(operation: &'static str, source: io::Error) -> FileOperationError {

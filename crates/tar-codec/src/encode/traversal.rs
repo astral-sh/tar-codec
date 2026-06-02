@@ -233,15 +233,10 @@ fn traversal_entry(
             path: path.to_path_buf(),
             reason: "source entry is outside recursive root",
         })?;
-    let Some(relative) = relative.to_str() else {
-        return Err(TraversalError::NonUtf8SourcePath {
-            path: path.to_path_buf(),
-        });
-    };
-    let archive_path = if relative.is_empty() {
+    let archive_path = if relative.as_os_str().is_empty() {
         archive_path.to_owned()
     } else {
-        join_normalized_archive_path(archive_path, relative)?
+        join_normalized_archive_path(archive_path, relative, path)?
     };
     let kind = if file_type.is_dir() {
         TraversalKind::Directory
@@ -274,12 +269,19 @@ fn normalize_archive_path(path: &Path) -> Result<String, TraversalError> {
 
 fn join_normalized_archive_path(
     archive_path: &str,
-    relative: &str,
+    relative: &Path,
+    source_path: &Path,
 ) -> Result<String, TraversalError> {
-    let mut joined = String::with_capacity(archive_path.len() + 1 + relative.len());
-    joined.push_str(archive_path);
-    joined.push('/');
-    joined.push_str(relative);
+    let mut joined = archive_path.to_owned();
+    for component in relative {
+        let Some(component) = component.to_str() else {
+            return Err(TraversalError::NonUtf8SourcePath {
+                path: source_path.to_path_buf(),
+            });
+        };
+        joined.push('/');
+        joined.push_str(component);
+    }
     validate_traversal_archive_path(Path::new(&joined))?;
     Ok(joined)
 }
@@ -304,13 +306,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn joins_normalized_archive_paths_without_weakening_validation() {
+    fn joins_native_relative_paths_with_archive_separators() {
+        let relative = Path::new("nested").join("file");
         assert_eq!(
-            join_normalized_archive_path("tree", "nested/file").unwrap(),
+            join_normalized_archive_path("tree", &relative, &relative).unwrap(),
             "tree/nested/file"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_backslashes_in_source_path_components() {
+        let relative = Path::new("nested\\file");
         assert!(matches!(
-            join_normalized_archive_path("tree", "nested\\file"),
+            join_normalized_archive_path("tree", relative, relative),
             Err(TraversalError::InvalidArchivePath { .. })
         ));
     }
