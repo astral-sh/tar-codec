@@ -14,8 +14,6 @@ use std::{
     sync::Arc,
 };
 
-#[cfg(windows)]
-use cap_std::fs::FileTypeExt;
 use cap_std::{
     ambient_authority,
     fs::{Dir, OpenOptions},

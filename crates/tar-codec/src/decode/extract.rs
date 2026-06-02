@@ -538,8 +538,9 @@ fn remove_non_directory(
     metadata: &cap_std::fs::Metadata,
 ) -> io::Result<()> {
     #[cfg(windows)]
-    if metadata.file_type().is_symlink_dir() {
-        return dir.remove_dir(path);
+    if metadata.file_type().is_symlink() {
+        // Stable Windows does not expose whether a symlink is file- or directory-shaped.
+        return dir.remove_file(path).or_else(|_| dir.remove_dir(path));
     }
     #[cfg(not(windows))]
     let _ = metadata;
@@ -582,7 +583,11 @@ fn create_symlink(dir: &Dir, contents: &Path, path: &Path, kind: TerminalKind) -
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::os::unix::fs::symlink as symlink_file;
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink as symlink_dir};
+    #[cfg(windows)]
+    use std::os::windows::fs::{symlink_dir, symlink_file};
 
     use super::*;
     use crate::test_support::ChunkedReader;
@@ -1319,7 +1324,7 @@ mod tests {
         assert_eq!(std::fs::read(dest.join("alias")).unwrap(), b"target");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn replaces_preexisting_symlink_parents_without_following_them() {
         let temp = tempdir().unwrap();
@@ -1327,7 +1332,7 @@ mod tests {
         let outside = temp.path().join("outside");
         std::fs::create_dir_all(&dest).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
-        symlink(&outside, dest.join("parent")).unwrap();
+        symlink_dir(&outside, dest.join("parent")).unwrap();
         let bytes = single_posix_member_archive("parent/file", b'0', b"good", "", 0o644);
 
         extract(bytes, &dest).await.unwrap();
@@ -1335,7 +1340,7 @@ mod tests {
         assert!(!outside.join("file").exists());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn replaces_preexisting_final_symlinks_instead_of_following_them() {
         let temp = tempdir().unwrap();
@@ -1343,7 +1348,7 @@ mod tests {
         let outside = temp.path().join("outside");
         std::fs::create_dir(&dest).unwrap();
         std::fs::write(&outside, b"keep").unwrap();
-        symlink(&outside, dest.join("same")).unwrap();
+        symlink_file(&outside, dest.join("same")).unwrap();
         let bytes = single_posix_member_archive("same", b'0', b"bad", "", 0o644);
 
         extract(bytes, &dest).await.unwrap();
