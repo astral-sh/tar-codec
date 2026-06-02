@@ -559,20 +559,31 @@ fn frame_description(frame: &Frame) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::AsyncRead;
+
     use super::*;
     use crate::{
         BLOCK_SIZE, FrameError, FrameErrorInner, PaxRecord, PaxValue,
         header::{LINK_NAME_RANGE, MODE_RANGE, NAME_RANGE, PREFIX_RANGE, TYPEFLAG_OFFSET},
         stream::DataOwner,
         test_support::{
-            ChunkedReader, append_block, append_payload, append_terminator, data, gnu_header,
-            header, ready, ready_ok, record, set_checksum,
+            ChunkedReader, append_block, append_gnu, append_payload, append_posix,
+            append_terminator, gnu_header, header, ready, ready_ok, record, set_checksum,
         },
     };
 
     fn set_field(block: &mut Block, range: std::ops::Range<usize>, value: &[u8]) {
         block[range.clone()].fill(0);
         block[range.start..range.start + value.len()].copy_from_slice(value);
+    }
+
+    async fn next_member<R: AsyncRead + Unpin>(
+        reader: &mut TarReader<R>,
+    ) -> Result<MemberFrame<'_, R>, FrameError> {
+        let Some(LogicalFrame::Member(member)) = reader.next_frame().await? else {
+            panic!("expected logical member");
+        };
+        Ok(member)
     }
 
     #[test]
@@ -589,9 +600,7 @@ mod tests {
             append_block(&mut bytes, &ustar_header);
             append_terminator(&mut bytes);
             let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
-            let Some(LogicalFrame::Member(member)) = reader.next_frame().await? else {
-                panic!("expected ustar member");
-            };
+            let member = next_member(&mut reader).await?;
             assert_eq!(member.header.format, ArchiveFormat::Pax);
             assert_eq!(member.header.header_path().as_ref(), b"dir/file");
             assert_eq!(member.header.link_name(), b"target");
@@ -614,9 +623,7 @@ mod tests {
             append_block(&mut bytes, &gnu_header);
             append_terminator(&mut bytes);
             let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
-            let Some(LogicalFrame::Member(member)) = reader.next_frame().await? else {
-                panic!("expected GNU member");
-            };
+            let member = next_member(&mut reader).await?;
             assert_eq!(member.header.format, ArchiveFormat::Gnu);
             assert_eq!(member.header.header_path().as_ref(), b"name");
             assert_eq!(member.header.mode()?, 0o755);
@@ -631,10 +638,8 @@ mod tests {
         let mut local = record("path", "local");
         local.extend_from_slice(&record("linkpath", ""));
         let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'g', global.len() as u64));
-        append_payload(&mut bytes, &global);
-        append_block(&mut bytes, &header(b'x', local.len() as u64));
-        append_payload(&mut bytes, &local);
+        append_posix(&mut bytes, b'g', &global);
+        append_posix(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'2', 0));
         append_block(&mut bytes, &header(b'2', 0));
         append_terminator(&mut bytes);
@@ -646,9 +651,7 @@ mod tests {
                 Some(LogicalFrame::GlobalPax(_))
             ));
             {
-                let Some(LogicalFrame::Member(member)) = reader.next_frame().await? else {
-                    panic!("expected local pax member");
-                };
+                let member = next_member(&mut reader).await?;
                 assert_eq!(member.effective_path()?.as_ref(), b"local");
                 assert!(matches!(
                     member.effective_link_path(),
@@ -660,9 +663,7 @@ mod tests {
                     })
                 ));
             }
-            let Some(LogicalFrame::Member(member)) = reader.next_frame().await? else {
-                panic!("expected global pax member");
-            };
+            let member = next_member(&mut reader).await?;
             assert_eq!(member.effective_path()?.as_ref(), b"global");
             assert_eq!(member.effective_link_path()?.as_ref(), b"global-link");
             Ok(())
@@ -673,17 +674,15 @@ mod tests {
     fn resolves_and_validates_gnu_metadata_lazily() {
         let mut bytes = Vec::new();
         append_block(&mut bytes, &gnu_header(b'L', 5));
-        append_block(&mut bytes, &data(b"name\0"));
+        append_payload(&mut bytes, b"name\0");
         append_block(&mut bytes, &gnu_header(b'K', 5));
-        append_block(&mut bytes, &data(b"link\0"));
+        append_payload(&mut bytes, b"link\0");
         append_block(&mut bytes, &gnu_header(b'2', 0));
         append_terminator(&mut bytes);
 
         ready_ok(async {
             let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
-            let Some(LogicalFrame::Member(member)) = reader.next_frame().await? else {
-                panic!("expected GNU member");
-            };
+            let member = next_member(&mut reader).await?;
             assert_eq!(member.effective_path()?.as_ref(), b"name");
             assert_eq!(member.effective_link_path()?.as_ref(), b"link");
             Ok(())
@@ -694,15 +693,12 @@ mod tests {
             (b'K', b"link\0bad".as_slice(), GnuKind::LongLink),
         ] {
             let mut bytes = Vec::new();
-            append_block(&mut bytes, &gnu_header(typeflag, payload.len() as u64));
-            append_payload(&mut bytes, payload);
+            append_gnu(&mut bytes, typeflag, payload);
             append_block(&mut bytes, &gnu_header(b'2', 0));
             append_terminator(&mut bytes);
             let result: Result<(), FrameError> = ready(async {
                 let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
-                let Some(LogicalFrame::Member(member)) = reader.next_frame().await? else {
-                    panic!("expected GNU member before metadata interpretation");
-                };
+                let member = next_member(&mut reader).await?;
                 match kind {
                     GnuKind::LongName => member.effective_path().map(|_| ()),
                     GnuKind::LongLink => member.effective_link_path().map(|_| ()),
@@ -728,9 +724,7 @@ mod tests {
             append_block(&mut bytes, &header);
             append_terminator(&mut bytes);
             let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
-            let Some(LogicalFrame::Member(member)) = reader.next_frame().await? else {
-                panic!("expected member before mode interpretation");
-            };
+            let member = next_member(&mut reader).await?;
             member.header.mode().map(|_| ())
         });
         assert!(matches!(
@@ -748,13 +742,11 @@ mod tests {
         let mut local = record("path", "renamed");
         local.extend_from_slice(&record("size", "513"));
         let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'g', global.len() as u64));
-        append_payload(&mut bytes, &global);
-        append_block(&mut bytes, &header(b'x', local.len() as u64));
-        append_payload(&mut bytes, &local);
+        append_posix(&mut bytes, b'g', &global);
+        append_posix(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'0', 1));
-        append_block(&mut bytes, &data(&[b'a'; BLOCK_SIZE]));
-        append_block(&mut bytes, &data(b"b"));
+        append_payload(&mut bytes, &[b'a'; BLOCK_SIZE]);
+        append_payload(&mut bytes, b"b");
         append_terminator(&mut bytes);
 
         ready_ok(async {
@@ -769,9 +761,7 @@ mod tests {
             );
 
             {
-                let Some(LogicalFrame::Member(mut member)) = reader.next_frame().await? else {
-                    panic!("expected logical member");
-                };
+                let mut member = next_member(&mut reader).await?;
                 assert_eq!(member.header.effective_size, 513);
                 let MemberExtensions::Pax {
                     local_position: Some(local_position),
@@ -806,15 +796,12 @@ mod tests {
             .map(|index| u8::try_from(index % 251).unwrap())
             .collect::<Vec<_>>();
         let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'0', payload.len() as u64));
-        append_payload(&mut bytes, &payload);
+        append_posix(&mut bytes, b'0', &payload);
         append_terminator(&mut bytes);
 
         ready_ok(async {
             let mut reader = TarReader::new(ChunkedReader::new(bytes, 17));
-            let Some(LogicalFrame::Member(mut member)) = reader.next_frame().await? else {
-                panic!("expected logical member");
-            };
+            let mut member = next_member(&mut reader).await?;
             let mut chunk = Vec::with_capacity(BLOCK_SIZE * 2);
             assert!(
                 member
@@ -856,7 +843,7 @@ mod tests {
         ] {
             let mut bytes = Vec::new();
             append_block(&mut bytes, &header(b'0', (BLOCK_SIZE + 1) as u64));
-            append_block(&mut bytes, &data(b"payload"));
+            append_payload(&mut bytes, b"payload");
             if let Some(trailing_byte) = trailing_byte {
                 bytes.push(trailing_byte);
             }
@@ -897,17 +884,15 @@ mod tests {
     fn groups_gnu_metadata_with_its_member() {
         let mut bytes = Vec::new();
         append_block(&mut bytes, &gnu_header(b'L', 5));
-        append_block(&mut bytes, &data(b"name\0"));
+        append_payload(&mut bytes, b"name\0");
         append_block(&mut bytes, &gnu_header(b'K', 5));
-        append_block(&mut bytes, &data(b"link\0"));
+        append_payload(&mut bytes, b"link\0");
         append_block(&mut bytes, &gnu_header(b'2', 0));
         append_terminator(&mut bytes);
 
         ready_ok(async {
             let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
-            let Some(LogicalFrame::Member(mut member)) = reader.next_frame().await? else {
-                panic!("expected GNU member");
-            };
+            let mut member = next_member(&mut reader).await?;
             let MemberExtensions::Gnu {
                 long_name: Some(long_name),
                 long_link: Some(long_link),
@@ -930,18 +915,14 @@ mod tests {
         long_link.push(0);
 
         let mut bytes = Vec::new();
-        append_block(&mut bytes, &gnu_header(b'L', long_name.len() as u64));
-        append_payload(&mut bytes, &long_name);
-        append_block(&mut bytes, &gnu_header(b'K', long_link.len() as u64));
-        append_payload(&mut bytes, &long_link);
+        append_gnu(&mut bytes, b'L', &long_name);
+        append_gnu(&mut bytes, b'K', &long_link);
         append_block(&mut bytes, &gnu_header(b'2', 0));
         append_terminator(&mut bytes);
 
         ready_ok(async {
             let mut reader = TarReader::new(ChunkedReader::new(bytes, 19));
-            let Some(LogicalFrame::Member(member)) = reader.next_frame().await? else {
-                panic!("expected GNU member");
-            };
+            let member = next_member(&mut reader).await?;
             let MemberExtensions::Gnu {
                 long_name: Some(name_metadata),
                 long_link: Some(link_metadata),
@@ -997,22 +978,17 @@ mod tests {
         for payload_len in [BLOCK_SIZE + 1, PAYLOAD_DRAIN_CHUNK_BYTES + 7] {
             let payload = vec![b'a'; payload_len];
             let mut bytes = Vec::new();
-            append_block(&mut bytes, &header(b'0', payload.len() as u64));
-            append_payload(&mut bytes, &payload);
+            append_posix(&mut bytes, b'0', &payload);
             append_block(&mut bytes, &header(b'0', 0));
             append_terminator(&mut bytes);
 
             ready_ok(async {
                 let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
                 {
-                    let Some(LogicalFrame::Member(member)) = reader.next_frame().await? else {
-                        panic!("expected first member");
-                    };
+                    let member = next_member(&mut reader).await?;
                     member.payload.skip().await?;
                 }
-                let Some(LogicalFrame::Member(member)) = reader.next_frame().await? else {
-                    panic!("expected second member");
-                };
+                let member = next_member(&mut reader).await?;
                 assert_eq!(member.header.payload_size, 0);
                 drop(member);
                 assert!(reader.next_frame().await?.is_none());
@@ -1022,14 +998,12 @@ mod tests {
 
         let mut auto_bytes = Vec::new();
         append_block(&mut auto_bytes, &header(b'0', 1));
-        append_block(&mut auto_bytes, &data(b"a"));
+        append_payload(&mut auto_bytes, b"a");
         append_block(&mut auto_bytes, &header(b'0', 0));
         append_terminator(&mut auto_bytes);
         ready_ok(async {
             let mut reader = TarReader::new(ChunkedReader::new(auto_bytes, BLOCK_SIZE));
-            let Some(LogicalFrame::Member(first)) = reader.next_frame().await? else {
-                panic!("expected first member");
-            };
+            let first = next_member(&mut reader).await?;
             drop(first);
             assert!(matches!(
                 reader.next_frame().await?,

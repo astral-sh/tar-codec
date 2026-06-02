@@ -1030,29 +1030,33 @@ mod tests {
         task::{Context, Poll},
     };
 
-    use tokio_stream::Stream;
+    use tokio_stream::{Stream, StreamExt};
 
     use super::*;
     use crate::{
         ArchiveFormat, FrameError, FrameErrorInner, HdrCharset, PaxString, PaxValue,
         test_support::{
-            ChunkedReader, append_block, append_payload, append_terminator, data,
-            gnu_base256_header, gnu_header, header, record, set_checksum,
+            ChunkedReader, append_block, append_gnu, append_payload, append_posix,
+            append_terminator, gnu_base256_header, gnu_header, header, ready, record, set_checksum,
         },
     };
 
     fn collect(bytes: Vec<u8>, max_chunk: usize) -> Vec<Result<Frame, FrameError>> {
-        let mut stream = TarStream::new(ChunkedReader::new(bytes, max_chunk));
-        let waker = std::task::Waker::noop();
-        let mut cx = Context::from_waker(waker);
-        let mut frames = Vec::new();
-        loop {
-            match Pin::new(&mut stream).poll_next(&mut cx) {
-                Poll::Ready(Some(frame)) => frames.push(frame),
-                Poll::Ready(None) => return frames,
-                Poll::Pending => panic!("test reader is never pending"),
-            }
-        }
+        ready(TarStream::new(ChunkedReader::new(bytes, max_chunk)).collect())
+    }
+
+    fn header_frame(frames: &[Result<Frame, FrameError>], index: usize) -> &HeaderFrame {
+        let Ok(Frame::Header(frame)) = &frames[index] else {
+            panic!("expected header frame");
+        };
+        frame
+    }
+
+    fn data_frame(frames: &[Result<Frame, FrameError>], index: usize) -> &DataFrame {
+        let Ok(Frame::Data(frame)) = &frames[index] else {
+            panic!("expected data frame");
+        };
+        frame
     }
 
     fn last_error(frames: &[Result<Frame, FrameError>]) -> &FrameError {
@@ -1139,27 +1143,21 @@ mod tests {
     fn frames_bare_member_across_fragmented_reads() {
         let mut bytes = Vec::new();
         append_block(&mut bytes, &header(b'0', 513));
-        append_block(&mut bytes, &data(&[b'a'; BLOCK_SIZE]));
-        append_block(&mut bytes, &data(b"b"));
+        append_payload(&mut bytes, &[b'a'; BLOCK_SIZE]);
+        append_payload(&mut bytes, b"b");
         append_terminator(&mut bytes);
 
         let frames = collect(bytes, 7);
         assert_eq!(frames.len(), 3);
-        let Frame::Header(header) = frames[0].as_ref().unwrap() else {
-            panic!("expected member header");
-        };
+        let header = header_frame(&frames, 0);
         assert_eq!(header.kind, MemberKind::Regular);
         assert_eq!(header.declared_size, 513);
         assert_eq!(header.effective_size, 513);
         assert_eq!(header.payload_size, 513);
         assert!(header.global_pax_records.is_empty());
         assert!(header.local_pax_records.is_empty());
-        let Frame::Data(first) = frames[1].as_ref().unwrap() else {
-            panic!("expected first data frame");
-        };
-        let Frame::Data(last) = frames[2].as_ref().unwrap() else {
-            panic!("expected second data frame");
-        };
+        let first = data_frame(&frames, 1);
+        let last = data_frame(&frames, 2);
         assert_eq!(first.len, BLOCK_SIZE);
         assert_eq!(last.len, 1);
         assert_eq!(last.owner, DataOwner::Member);
@@ -1174,11 +1172,10 @@ mod tests {
         assert!(payload.len() > BLOCK_SIZE);
 
         let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'x', payload.len() as u64));
-        append_payload(&mut bytes, &payload);
+        append_posix(&mut bytes, b'x', &payload);
         append_block(&mut bytes, &header(b'0', 1));
-        append_block(&mut bytes, &data(&[b'a'; BLOCK_SIZE]));
-        append_block(&mut bytes, &data(b"b"));
+        append_payload(&mut bytes, &[b'a'; BLOCK_SIZE]);
+        append_payload(&mut bytes, b"b");
         append_terminator(&mut bytes);
 
         let frames = collect(bytes, 19);
@@ -1188,14 +1185,10 @@ mod tests {
         };
         assert_eq!(pax.kind, PaxKind::Local);
         assert_eq!(pax.payload_size, payload.len() as u64);
-        let Frame::Data(first_pax_data) = frames[1].as_ref().unwrap() else {
-            panic!("expected first pax data frame");
-        };
+        let first_pax_data = data_frame(&frames, 1);
         assert_eq!(first_pax_data.owner, DataOwner::Pax(PaxKind::Local));
         assert!(first_pax_data.completed_pax_records.is_none());
-        let Frame::Data(final_pax_data) = frames[2].as_ref().unwrap() else {
-            panic!("expected final pax data frame");
-        };
+        let final_pax_data = data_frame(&frames, 2);
         assert_eq!(final_pax_data.owner, DataOwner::Pax(PaxKind::Local));
         assert_eq!(
             final_pax_data
@@ -1204,9 +1197,7 @@ mod tests {
                 .and_then(|records| records.last()),
             Some(&PaxRecord::Size(PaxValue::Value(513)))
         );
-        let Frame::Header(header) = frames[3].as_ref().unwrap() else {
-            panic!("expected overridden member header");
-        };
+        let header = header_frame(&frames, 3);
         assert_eq!(header.declared_size, 1);
         assert_eq!(header.effective_size, 513);
         assert_eq!(header.payload_size, 513);
@@ -1215,9 +1206,7 @@ mod tests {
             header.local_pax_records[1],
             PaxRecord::Size(PaxValue::Value(513))
         );
-        let Frame::Data(last) = frames[5].as_ref().unwrap() else {
-            panic!("expected final member data");
-        };
+        let last = data_frame(&frames, 5);
         assert_eq!(last.len, 1);
     }
 
@@ -1232,18 +1221,14 @@ mod tests {
         deletion.extend_from_slice(&record("size", ""));
 
         let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'g', initial_global.len() as u64));
-        append_payload(&mut bytes, &initial_global);
-        append_block(&mut bytes, &header(b'g', replacement_global.len() as u64));
-        append_payload(&mut bytes, &replacement_global);
+        append_posix(&mut bytes, b'g', &initial_global);
+        append_posix(&mut bytes, b'g', &replacement_global);
         append_block(&mut bytes, &header(b'0', 1));
-        append_block(&mut bytes, &data(b"ab"));
-        append_block(&mut bytes, &header(b'x', local.len() as u64));
-        append_payload(&mut bytes, &local);
+        append_payload(&mut bytes, b"ab");
+        append_posix(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'0', 1));
-        append_block(&mut bytes, &data(b"abc"));
-        append_block(&mut bytes, &header(b'g', deletion.len() as u64));
-        append_payload(&mut bytes, &deletion);
+        append_payload(&mut bytes, b"abc");
+        append_posix(&mut bytes, b'g', &deletion);
         append_block(&mut bytes, &header(b'5', 1));
         append_terminator(&mut bytes);
 
@@ -1317,16 +1302,13 @@ mod tests {
         let mut local = record("size", "");
         local.extend_from_slice(&record("size", "2"));
         let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'x', local.len() as u64));
-        append_payload(&mut bytes, &local);
+        append_posix(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'0', 1));
-        append_block(&mut bytes, &data(b"ab"));
+        append_payload(&mut bytes, b"ab");
         append_terminator(&mut bytes);
 
         let frames = collect(bytes, BLOCK_SIZE);
-        let Frame::Header(header) = frames[2].as_ref().unwrap() else {
-            panic!("expected member header");
-        };
+        let header = header_frame(&frames, 2);
         assert_eq!(header.effective_size, 2);
         assert_eq!(
             header.local_pax_records[0],
@@ -1339,10 +1321,8 @@ mod tests {
         let global = record("size", "7");
         let local = record("size", "");
         let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'g', global.len() as u64));
-        append_payload(&mut bytes, &global);
-        append_block(&mut bytes, &header(b'x', local.len() as u64));
-        append_payload(&mut bytes, &local);
+        append_posix(&mut bytes, b'g', &global);
+        append_posix(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'5', 3));
         append_terminator(&mut bytes);
 
@@ -1357,8 +1337,7 @@ mod tests {
         let records = record("size", "");
         for typeflag in [b'x', b'g'] {
             let mut bytes = Vec::new();
-            append_block(&mut bytes, &header(typeflag, records.len() as u64));
-            append_payload(&mut bytes, &records);
+            append_posix(&mut bytes, typeflag, &records);
             append_block(&mut bytes, &header(b'0', 0));
 
             assert!(
@@ -1376,18 +1355,14 @@ mod tests {
         let global = record("size", "");
         let local = record("size", "2");
         let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'g', global.len() as u64));
-        append_payload(&mut bytes, &global);
-        append_block(&mut bytes, &header(b'x', local.len() as u64));
-        append_payload(&mut bytes, &local);
+        append_posix(&mut bytes, b'g', &global);
+        append_posix(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'0', 1));
-        append_block(&mut bytes, &data(b"ab"));
+        append_payload(&mut bytes, b"ab");
         append_terminator(&mut bytes);
 
         let frames = collect(bytes, BLOCK_SIZE);
-        let Frame::Header(header) = frames[4].as_ref().unwrap() else {
-            panic!("expected member header");
-        };
+        let header = header_frame(&frames, 4);
         assert_eq!(header.effective_size, 2);
         assert_eq!(
             header.global_pax_records[0],
@@ -1403,18 +1378,14 @@ mod tests {
     fn accepts_pax_linkdata() {
         let mut bytes = Vec::new();
         append_block(&mut bytes, &header(b'1', 3));
-        append_block(&mut bytes, &data(b"abc"));
+        append_payload(&mut bytes, b"abc");
         append_terminator(&mut bytes);
 
         let frames = collect(bytes, BLOCK_SIZE);
-        let Frame::Header(header) = frames[0].as_ref().unwrap() else {
-            panic!("expected hard-link header");
-        };
+        let header = header_frame(&frames, 0);
         assert_eq!(header.kind, MemberKind::HardLink);
         assert_eq!(header.payload_size, 3);
-        let Frame::Data(data) = frames[1].as_ref().unwrap() else {
-            panic!("expected link data");
-        };
+        let data = data_frame(&frames, 1);
         assert_eq!(data.len, 3);
     }
 
@@ -1434,8 +1405,7 @@ mod tests {
     fn zero_filled_block_inside_pax_payload_is_data() {
         let payload = record("comment", &"\0".repeat(BLOCK_SIZE * 3));
         let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'x', payload.len() as u64));
-        append_payload(&mut bytes, &payload);
+        append_posix(&mut bytes, b'x', &payload);
         append_block(&mut bytes, &header(b'0', 0));
         append_terminator(&mut bytes);
 
@@ -1454,10 +1424,9 @@ mod tests {
     fn frames_gnu_long_metadata_and_base256_payloads() {
         let mut bytes = Vec::new();
         append_block(&mut bytes, &gnu_base256_header(b'L', 513));
-        append_block(&mut bytes, &data(&[b'n'; BLOCK_SIZE]));
-        append_block(&mut bytes, &data(b"\0"));
-        append_block(&mut bytes, &gnu_header(b'K', 5));
-        append_block(&mut bytes, &data(b"link\0"));
+        append_payload(&mut bytes, &[b'n'; BLOCK_SIZE]);
+        append_payload(&mut bytes, b"\0");
+        append_gnu(&mut bytes, b'K', b"link\0");
         append_block(&mut bytes, &gnu_header(b'2', 0));
         append_terminator(&mut bytes);
 
@@ -1471,9 +1440,7 @@ mod tests {
                 ..
             })
         ));
-        let Frame::Data(final_name) = frames[2].as_ref().unwrap() else {
-            panic!("expected long-name payload");
-        };
+        let final_name = data_frame(&frames, 2);
         assert_eq!(final_name.owner, DataOwner::Gnu(GnuKind::LongName));
         assert_eq!(final_name.len, 1);
         assert!(final_name.completed_pax_records.is_none());
@@ -1484,9 +1451,7 @@ mod tests {
                 ..
             })
         ));
-        let Frame::Header(header) = frames[5].as_ref().unwrap() else {
-            panic!("expected GNU member header");
-        };
+        let header = header_frame(&frames, 5);
         assert_eq!(header.kind, MemberKind::SymbolicLink);
         assert!(header.global_pax_records.is_empty());
         assert!(header.local_pax_records.is_empty());
@@ -1525,8 +1490,7 @@ mod tests {
 
         let valid = record("path", "name");
         let mut consecutive = Vec::new();
-        append_block(&mut consecutive, &header(b'x', valid.len() as u64));
-        append_payload(&mut consecutive, &valid);
+        append_posix(&mut consecutive, b'x', &valid);
         append_block(&mut consecutive, &header(b'x', valid.len() as u64));
         assert!(matches!(
             last_error_inner(&collect(consecutive, BLOCK_SIZE)),
@@ -1534,8 +1498,7 @@ mod tests {
         ));
 
         let mut missing_member = Vec::new();
-        append_block(&mut missing_member, &header(b'x', valid.len() as u64));
-        append_payload(&mut missing_member, &valid);
+        append_posix(&mut missing_member, b'x', &valid);
         assert!(matches!(
             last_error_inner(&collect(missing_member, BLOCK_SIZE)),
             FrameErrorInner::UnexpectedEof { .. }
@@ -1547,8 +1510,7 @@ mod tests {
         let invalid = record("size", "bad");
         let mut bytes = Vec::new();
         append_block(&mut bytes, &header(b'0', 0));
-        append_block(&mut bytes, &header(b'x', invalid.len() as u64));
-        append_payload(&mut bytes, &invalid);
+        append_posix(&mut bytes, b'x', &invalid);
 
         let frames = collect(bytes, BLOCK_SIZE);
         assert!(matches!(
@@ -1566,16 +1528,12 @@ mod tests {
         global.extend_from_slice(&record("path", "global"));
         let local = record("path", "local");
         let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'g', global.len() as u64));
-        append_payload(&mut bytes, &global);
-        append_block(&mut bytes, &header(b'x', local.len() as u64));
-        append_payload(&mut bytes, &local);
+        append_posix(&mut bytes, b'g', &global);
+        append_posix(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'0', 0));
         append_terminator(&mut bytes);
         let frames = collect(bytes, BLOCK_SIZE);
-        let Frame::Header(member_header) = frames[4].as_ref().unwrap() else {
-            panic!("expected member header");
-        };
+        let member_header = header_frame(&frames, 4);
         assert_eq!(
             member_header.global_pax_records,
             [
@@ -1592,8 +1550,7 @@ mod tests {
 
         let records = record("hdrcharset", "ISO-IR 8859 1 1998");
         let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'x', records.len() as u64));
-        append_payload(&mut bytes, &records);
+        append_posix(&mut bytes, b'x', &records);
         assert!(matches!(
             last_error_inner(&collect(bytes, BLOCK_SIZE)),
             FrameErrorInner::UnsupportedPaxCharset { value } if value == "ISO-IR 8859 1 1998"
@@ -1715,7 +1672,7 @@ mod tests {
 
         let mut pax_payload_truncated = Vec::new();
         append_block(&mut pax_payload_truncated, &header(b'x', 513));
-        append_block(&mut pax_payload_truncated, &data(b"11 path=x\n"));
+        append_payload(&mut pax_payload_truncated, b"11 path=x\n");
         assert!(matches!(
             last_error_inner(&collect(pax_payload_truncated, BLOCK_SIZE)),
             FrameErrorInner::TruncatedPayload {

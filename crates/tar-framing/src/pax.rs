@@ -487,25 +487,20 @@ fn parse_integer(value: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::record;
+    use crate::test_support::{raw_record, record};
 
-    fn encoded_raw_record(keyword: &[u8], value: &[u8]) -> Vec<u8> {
-        let mut suffix = Vec::new();
-        suffix.push(b' ');
-        suffix.extend_from_slice(keyword);
-        suffix.push(b'=');
-        suffix.extend_from_slice(value);
-        suffix.push(b'\n');
-        let mut len = suffix.len() + 1;
-        loop {
-            let prefix = len.to_string();
-            let actual = prefix.len() + suffix.len();
-            if actual == len {
-                let mut record = prefix.into_bytes();
-                record.extend_from_slice(&suffix);
-                return record;
-            }
-            len = actual;
+    fn vendor(name: &str, value: &str) -> PaxRecord {
+        PaxRecord::Vendor {
+            vendor: "ACME".to_owned(),
+            name: name.to_owned(),
+            value: PaxValue::Value(value.to_owned()),
+        }
+    }
+
+    fn security(value: &str) -> PaxRecord {
+        PaxRecord::Security {
+            name: "label".to_owned(),
+            value: PaxValue::Value(value.to_owned()),
         }
     }
 
@@ -563,8 +558,8 @@ mod tests {
 
     #[test]
     fn parses_typed_standard_reserved_and_vendor_records() {
-        let mut payload = record("atime", "12.034");
-        for (keyword, value) in [
+        let fields = [
+            ("atime", "12.034"),
             ("charset", "BINARY"),
             ("comment", "a=b"),
             ("ctime", "17.500"),
@@ -580,7 +575,9 @@ mod tests {
             ("uid", "8"),
             ("uname", "user"),
             ("ACME.attribute", "custom"),
-        ] {
+        ];
+        let mut payload = Vec::new();
+        for (keyword, value) in fields {
             payload.extend_from_slice(&record(keyword, value));
         }
 
@@ -604,43 +601,18 @@ mod tests {
                     name: "deadline".to_owned(),
                     value: PaxValue::Value("soon".to_owned()),
                 },
-                PaxRecord::Security {
-                    name: "label".to_owned(),
-                    value: PaxValue::Value("secure".to_owned()),
-                },
+                security("secure"),
                 PaxRecord::Size(PaxValue::Value(0)),
                 PaxRecord::Uid(PaxValue::Value(8)),
                 PaxRecord::Uname(PaxValue::Value(PaxString::Utf8("user".to_owned()))),
-                PaxRecord::Vendor {
-                    vendor: "ACME".to_owned(),
-                    name: "attribute".to_owned(),
-                    value: PaxValue::Value("custom".to_owned()),
-                },
+                vendor("attribute", "custom"),
             ]
         );
-        assert_eq!(
+        assert!(
             records
                 .iter()
-                .map(|record| record.keyword().into_owned())
-                .collect::<Vec<_>>(),
-            [
-                "atime",
-                "charset",
-                "comment",
-                "ctime",
-                "gid",
-                "gname",
-                "hdrcharset",
-                "linkpath",
-                "mtime",
-                "path",
-                "realtime.deadline",
-                "security.label",
-                "size",
-                "uid",
-                "uname",
-                "ACME.attribute",
-            ]
+                .zip(fields)
+                .all(|(record, (keyword, _))| record.keyword() == keyword)
         );
     }
 
@@ -669,7 +641,7 @@ mod tests {
             ));
         }
 
-        let invalid_utf8 = encoded_raw_record(b"path", &[0xff]);
+        let invalid_utf8 = raw_record(b"path", &[0xff]);
         assert!(matches!(
             parse_records(23, &invalid_utf8, HdrCharset::Utf8),
             Err(FrameError {
@@ -700,52 +672,17 @@ mod tests {
     #[test]
     fn applies_namespaced_globals_and_accepts_supported_hdrcharset_records() {
         let mut active = vec![
-            PaxRecord::Vendor {
-                vendor: "ACME".to_owned(),
-                name: "first".to_owned(),
-                value: PaxValue::Value("old".to_owned()),
-            },
-            PaxRecord::Vendor {
-                vendor: "ACME".to_owned(),
-                name: "second".to_owned(),
-                value: PaxValue::Value("kept".to_owned()),
-            },
-            PaxRecord::Security {
-                name: "label".to_owned(),
-                value: PaxValue::Value("old".to_owned()),
-            },
+            vendor("first", "old"),
+            vendor("second", "kept"),
+            security("old"),
         ];
-        apply_global(
-            &mut active,
-            vec![
-                PaxRecord::Vendor {
-                    vendor: "ACME".to_owned(),
-                    name: "first".to_owned(),
-                    value: PaxValue::Value("new".to_owned()),
-                },
-                PaxRecord::Security {
-                    name: "label".to_owned(),
-                    value: PaxValue::Value("new".to_owned()),
-                },
-            ],
-        );
+        apply_global(&mut active, vec![vendor("first", "new"), security("new")]);
         assert_eq!(
             active,
             [
-                PaxRecord::Vendor {
-                    vendor: "ACME".to_owned(),
-                    name: "second".to_owned(),
-                    value: PaxValue::Value("kept".to_owned()),
-                },
-                PaxRecord::Vendor {
-                    vendor: "ACME".to_owned(),
-                    name: "first".to_owned(),
-                    value: PaxValue::Value("new".to_owned()),
-                },
-                PaxRecord::Security {
-                    name: "label".to_owned(),
-                    value: PaxValue::Value("new".to_owned()),
-                },
+                vendor("second", "kept"),
+                vendor("first", "new"),
+                security("new"),
             ]
         );
 
@@ -770,7 +707,7 @@ mod tests {
             (b"path".as_slice(), [0xfe]),
             (b"uname".as_slice(), [0xff]),
         ] {
-            binary_values.extend_from_slice(&encoded_raw_record(keyword, &value));
+            binary_values.extend_from_slice(&raw_record(keyword, &value));
         }
         let Ok(binary_records) = parse_records(0, &binary_values, HdrCharset::Utf8) else {
             panic!("binary records should parse");
@@ -785,7 +722,7 @@ mod tests {
                 PaxRecord::Uname(PaxValue::Value(PaxString::Binary(vec![0xff]))),
             ]
         );
-        let inherited_binary_path = encoded_raw_record(b"path", &[0xfe]);
+        let inherited_binary_path = raw_record(b"path", &[0xfe]);
         let Ok(inherited_records) = parse_records(0, &inherited_binary_path, HdrCharset::Binary)
         else {
             panic!("inherited binary records should parse");
@@ -797,7 +734,7 @@ mod tests {
             ])))]
         );
         let mut reset_to_utf8 = record("hdrcharset", "");
-        reset_to_utf8.extend_from_slice(&encoded_raw_record(b"path", &[0xfd]));
+        reset_to_utf8.extend_from_slice(&raw_record(b"path", &[0xfd]));
         assert!(matches!(
             parse_records(0, &reset_to_utf8, HdrCharset::Binary),
             Err(FrameError {
@@ -806,7 +743,7 @@ mod tests {
             })
         ));
         let mut binary_comment = record("hdrcharset", BINARY_HDRCHARSET);
-        binary_comment.extend_from_slice(&encoded_raw_record(b"comment", &[0xff]));
+        binary_comment.extend_from_slice(&raw_record(b"comment", &[0xff]));
         assert!(matches!(
             parse_records(0, &binary_comment, HdrCharset::Utf8),
             Err(FrameError {

@@ -94,17 +94,22 @@ pub fn frame_pax_member_into(
 
     let mut size_buffer = [0; MAX_DECIMAL_U64_BYTES];
     let size = decimal_u64(member.size, &mut size_buffer);
-    let path_record_len = record_len("path", member.path.as_bytes())?;
-    let size_record_len = record_len("size", size)?;
-    let link_path_record_len = member
-        .link_path
-        .map(|link_path| record_len("linkpath", link_path.as_bytes()))
-        .transpose()?;
-    let payload_len = path_record_len
-        .checked_add(size_record_len)
-        .and_then(|len| {
-            link_path_record_len.map_or(Some(len), |link_len| len.checked_add(link_len))
-        })
+    let link_path = member.link_path.map(str::as_bytes);
+    let records = [
+        Some((
+            "path",
+            member.path.as_bytes(),
+            record_len("path", member.path.as_bytes())?,
+        )),
+        Some(("size", size, record_len("size", size)?)),
+        link_path
+            .map(|value| record_len("linkpath", value).map(|len| ("linkpath", value, len)))
+            .transpose()?,
+    ];
+    let payload_len = records
+        .iter()
+        .flatten()
+        .try_fold(0_usize, |total, (_, _, len)| total.checked_add(*len))
         .ok_or(FramingWriteError::ArithmeticOverflow {
             context: "pax payload length",
         })?;
@@ -115,14 +120,10 @@ pub fn frame_pax_member_into(
     let padded_payload_len = padded_payload_len(payload_len)?;
 
     let mut extended_name_buffer = [0; MAX_SEQUENCE_NAME_BYTES];
-    let extended_name = prefixed_decimal_name(b"PaxHeaders/", sequence, &mut extended_name_buffer)?;
+    let extended_name = prefixed_decimal_name(b"PaxHeaders/", sequence, &mut extended_name_buffer);
     let mut fallback_name_buffer = [0; MAX_SEQUENCE_NAME_BYTES];
-    let fallback_name = prefixed_decimal_name(b"PaxEntries/", sequence, &mut fallback_name_buffer)?;
-    let member_name = if split_ustar_path(member.path.as_bytes()).is_some() {
-        member.path.as_bytes()
-    } else {
-        fallback_name
-    };
+    let fallback_name = prefixed_decimal_name(b"PaxEntries/", sequence, &mut fallback_name_buffer);
+    let member_path = split_ustar_path(member.path.as_bytes()).unwrap_or((&[], fallback_name));
     let fallback_size = if fits_octal(SIZE_RANGE.len(), member.size) {
         member.size
     } else {
@@ -136,21 +137,16 @@ pub fn frame_pax_member_into(
             return Err(FramingWriteError::UnsupportedMemberKind { kind: member.kind });
         }
     };
-    let framing_len = BLOCK_SIZE
-        .checked_add(padded_payload_len)
-        .and_then(|len| len.checked_add(BLOCK_SIZE))
-        .ok_or(FramingWriteError::ArithmeticOverflow {
+    let framing_len = padded_payload_len.checked_add(BLOCK_SIZE * 2).ok_or(
+        FramingWriteError::ArithmeticOverflow {
             context: "pax framing length",
-        })?;
+        },
+    )?;
     buffer.clear();
     buffer.reserve(framing_len);
     buffer.resize(BLOCK_SIZE, 0);
-    append_record_with_len(buffer, "path", member.path.as_bytes(), path_record_len);
-    append_record_with_len(buffer, "size", size, size_record_len);
-    if let Some(link_path) = member.link_path
-        && let Some(record_len) = link_path_record_len
-    {
-        append_record_with_len(buffer, "linkpath", link_path.as_bytes(), record_len);
+    for (keyword, value, len) in records.into_iter().flatten() {
+        append_record_with_len(buffer, keyword, value, len);
     }
     buffer.resize(BLOCK_SIZE + padded_payload_len, 0);
     buffer.resize(framing_len, 0);
@@ -158,7 +154,7 @@ pub fn frame_pax_member_into(
     let (_, member_header) = rest.split_at_mut(padded_payload_len);
     build_header_into(
         extended_header,
-        extended_name,
+        (&[], extended_name),
         0o644,
         payload_size,
         b'x',
@@ -166,7 +162,7 @@ pub fn frame_pax_member_into(
     )?;
     build_header_into(
         member_header,
-        member_name,
+        member_path,
         mode,
         fallback_size,
         typeflag,
@@ -232,21 +228,16 @@ fn validate_text(field: &'static str, value: &str) -> Result<(), FramingWriteErr
 }
 
 fn record_len(keyword: &'static str, value: &[u8]) -> Result<usize, FramingWriteError> {
-    let suffix_len = 1_usize
-        .checked_add(keyword.len())
-        .and_then(|len| len.checked_add(1))
-        .and_then(|len| len.checked_add(value.len()))
-        .and_then(|len| len.checked_add(1))
+    let suffix_len = keyword
+        .len()
+        .checked_add(value.len())
+        .and_then(|len| len.checked_add(3))
         .ok_or(FramingWriteError::ArithmeticOverflow {
             context: "pax record length",
         })?;
-    let mut len = suffix_len
-        .checked_add(1)
-        .ok_or(FramingWriteError::ArithmeticOverflow {
-            context: "pax record length",
-        })?;
+    let mut len = suffix_len;
     loop {
-        let actual = decimal_len(len).checked_add(suffix_len).ok_or(
+        let actual = (len.ilog10() as usize + 1).checked_add(suffix_len).ok_or(
             FramingWriteError::ArithmeticOverflow {
                 context: "pax record length",
             },
@@ -269,7 +260,7 @@ fn append_record_with_len(payload: &mut Vec<u8>, keyword: &'static str, value: &
 
 fn build_header_into(
     block: &mut [u8],
-    path: &[u8],
+    (prefix, name): (&[u8], &[u8]),
     mode: u64,
     size: u64,
     typeflag: u8,
@@ -281,9 +272,6 @@ fn build_header_into(
             .map_err(|_| FramingWriteError::ArithmeticOverflow {
                 context: "ustar header block length",
             })?;
-    let (prefix, name) = split_ustar_path(path).ok_or(FramingWriteError::ArithmeticOverflow {
-        context: "ustar fallback path",
-    })?;
     block[NAME_RANGE.start..NAME_RANGE.start + name.len()].copy_from_slice(name);
     block[PREFIX_RANGE.start..PREFIX_RANGE.start + prefix.len()].copy_from_slice(prefix);
     let encoded_link_path = if link_path.len() <= LINK_NAME_RANGE.len() {
@@ -350,39 +338,23 @@ fn split_ustar_path(path: &[u8]) -> Option<(&[u8], &[u8])> {
 }
 
 fn padded_payload_len(len: usize) -> Result<usize, FramingWriteError> {
-    let remainder = len % BLOCK_SIZE;
-    if remainder == 0 {
-        Ok(len)
-    } else {
-        len.checked_add(BLOCK_SIZE - remainder)
-            .ok_or(FramingWriteError::ArithmeticOverflow {
-                context: "padded pax payload length",
-            })
-    }
+    len.checked_next_multiple_of(BLOCK_SIZE)
+        .ok_or(FramingWriteError::ArithmeticOverflow {
+            context: "padded pax payload length",
+        })
 }
 
 fn prefixed_decimal_name<'a>(
-    prefix: &[u8],
+    prefix: &[u8; b"PaxHeaders/".len()],
     value: u64,
-    buffer: &'a mut [u8],
-) -> Result<&'a [u8], FramingWriteError> {
+    buffer: &'a mut [u8; MAX_SEQUENCE_NAME_BYTES],
+) -> &'a [u8] {
     let mut digits_buffer = [0; MAX_DECIMAL_U64_BYTES];
     let digits = decimal_u64(value, &mut digits_buffer);
-    let len =
-        prefix
-            .len()
-            .checked_add(digits.len())
-            .ok_or(FramingWriteError::ArithmeticOverflow {
-                context: "pax fallback name length",
-            })?;
-    let Some(name) = buffer.get_mut(..len) else {
-        return Err(FramingWriteError::ArithmeticOverflow {
-            context: "pax fallback name length",
-        });
-    };
-    name[..prefix.len()].copy_from_slice(prefix);
-    name[prefix.len()..].copy_from_slice(digits);
-    Ok(name)
+    let len = prefix.len() + digits.len();
+    buffer[..prefix.len()].copy_from_slice(prefix);
+    buffer[prefix.len()..len].copy_from_slice(digits);
+    &buffer[..len]
 }
 
 fn decimal_u64(mut value: u64, buffer: &mut [u8; MAX_DECIMAL_U64_BYTES]) -> &[u8] {
@@ -397,27 +369,9 @@ fn decimal_u64(mut value: u64, buffer: &mut [u8; MAX_DECIMAL_U64_BYTES]) -> &[u8
     }
 }
 
-fn decimal_len(mut value: usize) -> usize {
-    let mut len = 1;
-    while value >= 10 {
-        value /= 10;
-        len += 1;
-    }
-    len
-}
-
-fn append_decimal_usize(output: &mut Vec<u8>, mut value: usize) {
-    let mut buffer = [0; std::mem::size_of::<usize>() * 3];
-    let mut start = buffer.len();
-    loop {
-        start -= 1;
-        buffer[start] = b'0' + (value % 10) as u8;
-        value /= 10;
-        if value == 0 {
-            output.extend_from_slice(&buffer[start..]);
-            return;
-        }
-    }
+fn append_decimal_usize(output: &mut Vec<u8>, value: usize) {
+    let mut buffer = [0; MAX_DECIMAL_U64_BYTES];
+    output.extend_from_slice(decimal_u64(value as u64, &mut buffer));
 }
 
 fn byte_sum(bytes: &[u8]) -> u64 {
@@ -436,6 +390,22 @@ mod tests {
         test_support::{ChunkedReader, ready},
     };
 
+    fn pax_member<'a>(
+        path: &'a str,
+        kind: MemberKind,
+        size: u64,
+        link_path: Option<&'a str>,
+        executable: bool,
+    ) -> PaxMember<'a> {
+        PaxMember {
+            path,
+            kind,
+            size,
+            link_path,
+            executable,
+        }
+    }
+
     fn frame_archive(
         sequence: u64,
         member: PaxMember<'_>,
@@ -452,27 +422,15 @@ mod tests {
     #[test]
     fn frames_regular_directory_and_symbolic_link_members() {
         let members = [
-            PaxMember {
-                path: "bin/tool",
-                kind: MemberKind::Regular,
-                size: 3,
-                link_path: None,
-                executable: true,
-            },
-            PaxMember {
-                path: "bin",
-                kind: MemberKind::Directory,
-                size: 0,
-                link_path: None,
-                executable: false,
-            },
-            PaxMember {
-                path: "alias",
-                kind: MemberKind::SymbolicLink,
-                size: 0,
-                link_path: Some("bin/tool"),
-                executable: false,
-            },
+            pax_member("bin/tool", MemberKind::Regular, 3, None, true),
+            pax_member("bin", MemberKind::Directory, 0, None, false),
+            pax_member(
+                "alias",
+                MemberKind::SymbolicLink,
+                0,
+                Some("bin/tool"),
+                false,
+            ),
         ];
         for (sequence, member) in members.into_iter().enumerate() {
             let payload: &[u8] = if member.kind == MemberKind::Regular {
@@ -507,13 +465,7 @@ mod tests {
 
     #[test]
     fn frames_members_into_a_reusable_buffer() {
-        let member = PaxMember {
-            path: "bin/tool",
-            kind: MemberKind::Regular,
-            size: 3,
-            link_path: None,
-            executable: true,
-        };
+        let member = pax_member("bin/tool", MemberKind::Regular, 3, None, true);
         let mut bytes = Vec::with_capacity(BLOCK_SIZE * 3);
         bytes.extend_from_slice(b"stale bytes");
         frame_pax_member_into(7, member, &mut bytes).expect("valid member");
@@ -550,13 +502,7 @@ mod tests {
     fn uses_generated_fallbacks_for_long_paths_and_links() {
         let path = format!("{}/{}", "a".repeat(156), "b".repeat(101));
         let link_path = "c".repeat(101);
-        let member = PaxMember {
-            path: &path,
-            kind: MemberKind::SymbolicLink,
-            size: 0,
-            link_path: Some(&link_path),
-            executable: false,
-        };
+        let member = pax_member(&path, MemberKind::SymbolicLink, 0, Some(&link_path), false);
         let mut bytes = Vec::new();
         frame_pax_member_into(7, member, &mut bytes).expect("valid member");
         let member_header = &bytes[bytes.len() - BLOCK_SIZE..];
@@ -582,25 +528,13 @@ mod tests {
     fn rejects_unsupported_or_inconsistent_members() {
         for (member, expected) in [
             (
-                PaxMember {
-                    path: "file",
-                    kind: MemberKind::HardLink,
-                    size: 0,
-                    link_path: None,
-                    executable: false,
-                },
+                pax_member("file", MemberKind::HardLink, 0, None, false),
                 FramingWriteError::UnsupportedMemberKind {
                     kind: MemberKind::HardLink,
                 },
             ),
             (
-                PaxMember {
-                    path: "link",
-                    kind: MemberKind::SymbolicLink,
-                    size: 1,
-                    link_path: Some("file"),
-                    executable: false,
-                },
+                pax_member("link", MemberKind::SymbolicLink, 1, Some("file"), false),
                 FramingWriteError::InvalidMemberSize {
                     kind: MemberKind::SymbolicLink,
                     size: 1,
@@ -619,13 +553,7 @@ mod tests {
         let mut bytes = Vec::new();
         frame_pax_member_into(
             0,
-            PaxMember {
-                path: "large",
-                kind: MemberKind::Regular,
-                size: u64::MAX,
-                link_path: None,
-                executable: false,
-            },
+            pax_member("large", MemberKind::Regular, u64::MAX, None, false),
             &mut bytes,
         )
         .expect("pax size can represent u64 values");

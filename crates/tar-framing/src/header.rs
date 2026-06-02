@@ -28,33 +28,23 @@ pub(crate) fn checksum(block: &Block) -> u64 {
         .sum()
 }
 
-#[cfg(test)]
-pub(crate) fn encode_checksum(block: &mut Block) -> bool {
-    block[CHECKSUM_RANGE].fill(b' ');
-    let value = block.iter().map(|byte| u64::from(*byte)).sum();
-    encode_checksum_value(block, value)
-}
-
 pub(crate) fn encode_checksum_value(block: &mut Block, value: u64) -> bool {
-    let field = &mut block[CHECKSUM_RANGE];
-    let Some(width) = field.len().checked_sub(2) else {
-        return false;
-    };
-    field.fill(b'0');
-    field[width] = 0;
-    field[width + 1] = b' ';
-    encode_octal_digits(&mut field[..width], value)
+    encode_octal_with_suffix(&mut block[CHECKSUM_RANGE], value, b"\0 ")
 }
 
 pub(crate) fn encode_octal(field: &mut [u8], value: u64) -> bool {
-    let Some(width) = field.len().checked_sub(1) else {
+    encode_octal_with_suffix(field, value, b"\0")
+}
+
+fn encode_octal_with_suffix(field: &mut [u8], value: u64, suffix: &[u8]) -> bool {
+    let Some(width) = field.len().checked_sub(suffix.len()) else {
         return false;
     };
     if width == 0 {
         return false;
     }
-    field.fill(b'0');
-    field[width] = 0;
+    field[..width].fill(b'0');
+    field[width..].copy_from_slice(suffix);
     encode_octal_digits(&mut field[..width], value)
 }
 
@@ -111,7 +101,8 @@ mod tests {
     fn encodes_checksum_with_the_standard_terminator() {
         let mut block = [0; crate::BLOCK_SIZE];
         block[0] = b'x';
-        assert!(encode_checksum(&mut block));
+        let value = checksum(&block);
+        assert!(encode_checksum_value(&mut block, value));
         assert_eq!(parse_octal(&block[CHECKSUM_RANGE]), Some(checksum(&block)));
         assert_eq!(&block[CHECKSUM_RANGE.end - 2..CHECKSUM_RANGE.end], b"\0 ");
     }
