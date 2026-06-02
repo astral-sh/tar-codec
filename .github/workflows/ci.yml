@@ -2,6 +2,11 @@ name: CI
 
 on:
   pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - labeled
   push:
     branches:
       - main
@@ -30,6 +35,7 @@ jobs:
 
   bench:
     name: Bench
+    if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-benchmarks')
     runs-on: ubuntu-latest
 
     steps:
