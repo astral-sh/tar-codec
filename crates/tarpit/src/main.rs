@@ -6,7 +6,7 @@ use std::{
 
 use async_compression::tokio::bufread::GzipDecoder;
 use clap::{Parser, Subcommand};
-use tar_codec::decode::{Archive, ExtractError, ExtractPolicy};
+use tar_codec::decode::{Archive, DecodeError, DecodePolicy};
 use tar_framing::{
     ArchiveFormat, FrameError, GnuKind, HdrCharset, MemberKind, PaxKind, PaxRecord, PaxString,
     PaxValue,
@@ -51,7 +51,7 @@ enum CliError {
         source: io::Error,
     },
     #[error(transparent)]
-    Extract(#[from] ExtractError),
+    Extract(#[from] DecodeError),
     #[error(transparent)]
     Framing(#[from] FrameError),
     #[error("failed to write frame dump: {0}")]
@@ -115,9 +115,9 @@ async fn open_archive(archive: &Path) -> Result<File, CliError> {
 async fn extract_reader<R: AsyncRead + Unpin>(
     reader: R,
     destination: &Path,
-) -> Result<(), ExtractError> {
+) -> Result<(), DecodeError> {
     Archive::new(reader)
-        .extract(destination, ExtractPolicy::default())
+        .extract(destination, DecodePolicy::default())
         .await
 }
 
@@ -393,7 +393,7 @@ mod tests {
 
         assert!(matches!(
             extract_archive(&archive, &destination).await.unwrap_err(),
-            CliError::Extract(ExtractError::Framing(_))
+            CliError::Extract(DecodeError::Framing(_))
         ));
     }
 

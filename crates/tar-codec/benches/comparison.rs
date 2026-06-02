@@ -10,7 +10,7 @@ use std::{
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tar_codec::{
-    decode::{Archive, ExtractPolicy},
+    decode::{Archive, DecodePolicy},
     encode::{Encoder, EntryMetadata},
 };
 use tempfile::{TempDir, tempdir};
@@ -411,7 +411,7 @@ fn bench_extract(criterion: &mut Criterion, runtime: &Runtime, fixtures: &[Fixtu
                             let destination = temp.path().join("out");
                             async move {
                                 Archive::new(input.bytes.as_slice())
-                                    .extract(destination, ExtractPolicy::default())
+                                    .extract(destination, DecodePolicy::default())
                                     .await
                                     .expect("tar-codec should extract fixture archive");
                             }

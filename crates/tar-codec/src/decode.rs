@@ -49,12 +49,12 @@ impl<R> Archive<R> {
 /// either supported framing family, while rejecting hard links, global pax
 /// member metadata, vendor-namespaced pax records, and repeated keywords.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ExtractPolicy {
+pub struct DecodePolicy {
     allow_symlinks: bool,
     allow_dangling_symlinks: bool,
     allow_hard_links: bool,
     allow_gnu: bool,
-    pax_policy: PaxExtractPolicy,
+    pax_policy: PaxDecodePolicy,
 }
 
 /// Controls which otherwise valid pax features extraction may accept.
@@ -62,14 +62,14 @@ pub struct ExtractPolicy {
 /// The default permits global pax extension headers while rejecting global
 /// per-member metadata, vendor-namespaced records, and duplicate records.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PaxExtractPolicy {
+pub struct PaxDecodePolicy {
     allow_global_pax_extensions: bool,
     allow_pax_vendor_extensions: bool,
     allow_duplicate_pax_records: bool,
     allow_global_pax_member_metadata: bool,
 }
 
-impl Default for PaxExtractPolicy {
+impl Default for PaxDecodePolicy {
     fn default() -> Self {
         Self {
             allow_global_pax_extensions: true,
@@ -80,19 +80,19 @@ impl Default for PaxExtractPolicy {
     }
 }
 
-impl Default for ExtractPolicy {
+impl Default for DecodePolicy {
     fn default() -> Self {
         Self {
             allow_symlinks: true,
             allow_dangling_symlinks: true,
             allow_hard_links: false,
             allow_gnu: true,
-            pax_policy: PaxExtractPolicy::default(),
+            pax_policy: PaxDecodePolicy::default(),
         }
     }
 }
 
-impl ExtractPolicy {
+impl DecodePolicy {
     /// Configures whether symbolic-link members may be extracted.
     pub fn allow_symlinks(mut self, allow: bool) -> Self {
         self.allow_symlinks = allow;
@@ -124,29 +124,27 @@ impl ExtractPolicy {
     }
 
     /// Configures the accepted pax feature subset.
-    pub fn pax_policy(mut self, policy: PaxExtractPolicy) -> Self {
+    pub fn pax_policy(mut self, policy: PaxDecodePolicy) -> Self {
         self.pax_policy = policy;
         self
     }
 
-    fn check_format(&self, position: u64, format: ArchiveFormat) -> Result<(), ExtractError> {
+    fn check_format(&self, position: u64, format: ArchiveFormat) -> Result<(), DecodeError> {
         if format == ArchiveFormat::Gnu && !self.allow_gnu {
             return Err(policy_violation(
                 position,
-                ExtractPolicyViolation::GnuArchive,
+                DecodePolicyViolation::GnuArchive,
             ));
         }
         Ok(())
     }
 
-    fn check_member_kind(&self, position: u64, kind: MemberKind) -> Result<(), ExtractError> {
+    fn check_member_kind(&self, position: u64, kind: MemberKind) -> Result<(), DecodeError> {
         let violation = match kind {
             MemberKind::SymbolicLink if !self.allow_symlinks => {
-                Some(ExtractPolicyViolation::SymbolicLink)
+                Some(DecodePolicyViolation::SymbolicLink)
             }
-            MemberKind::HardLink if !self.allow_hard_links => {
-                Some(ExtractPolicyViolation::HardLink)
-            }
+            MemberKind::HardLink if !self.allow_hard_links => Some(DecodePolicyViolation::HardLink),
             _ => None,
         };
         if let Some(violation) = violation {
@@ -156,7 +154,7 @@ impl ExtractPolicy {
     }
 }
 
-impl PaxExtractPolicy {
+impl PaxDecodePolicy {
     /// Configures whether global pax extension headers may be accepted.
     ///
     /// When enabled, [`Self::allow_global_pax_member_metadata`] separately
@@ -191,11 +189,11 @@ impl PaxExtractPolicy {
         self
     }
 
-    fn check_global_pax_extension(&self, position: u64) -> Result<(), ExtractError> {
+    fn check_global_pax_extension(&self, position: u64) -> Result<(), DecodeError> {
         if !self.allow_global_pax_extensions {
             return Err(policy_violation(
                 position,
-                ExtractPolicyViolation::GlobalPaxExtension,
+                DecodePolicyViolation::GlobalPaxExtension,
             ));
         }
         Ok(())
@@ -206,13 +204,13 @@ impl PaxExtractPolicy {
         position: u64,
         kind: PaxKind,
         records: &[PaxRecord],
-    ) -> Result<(), ExtractError> {
+    ) -> Result<(), DecodeError> {
         if !self.allow_pax_vendor_extensions {
             for record in records {
                 if let PaxRecord::Vendor { vendor, name, .. } = record {
                     return Err(policy_violation(
                         position,
-                        ExtractPolicyViolation::PaxVendorExtension {
+                        DecodePolicyViolation::PaxVendorExtension {
                             vendor: vendor.clone(),
                             name: name.clone(),
                         },
@@ -232,7 +230,7 @@ impl PaxExtractPolicy {
                 if let Some(keyword) = keyword {
                     return Err(policy_violation(
                         position,
-                        ExtractPolicyViolation::GlobalPaxMemberMetadata { keyword },
+                        DecodePolicyViolation::GlobalPaxMemberMetadata { keyword },
                     ));
                 }
             }
@@ -245,7 +243,7 @@ impl PaxExtractPolicy {
                 if !keywords.insert(keyword.clone()) {
                     return Err(policy_violation(
                         position,
-                        ExtractPolicyViolation::DuplicatePaxRecord { keyword },
+                        DecodePolicyViolation::DuplicatePaxRecord { keyword },
                     ));
                 }
             }
@@ -266,8 +264,8 @@ impl<R: AsyncRead + Unpin> Archive<R> {
     pub async fn extract<P: AsRef<Path>>(
         mut self,
         dest: P,
-        policy: ExtractPolicy,
-    ) -> Result<(), ExtractError> {
+        policy: DecodePolicy,
+    ) -> Result<(), DecodeError> {
         let mut root = ExtractionRoot::open(dest.as_ref()).await?;
         let mut payload_chunk = Vec::new();
         while let Some(frame) = self.reader.next_frame().await? {
@@ -308,7 +306,7 @@ impl<R: AsyncRead + Unpin> Archive<R> {
                                 .next_chunk(&mut payload_chunk, EXTRACTION_CHUNK_BYTES)
                                 .await?
                         {
-                            return Err(ExtractError::InvalidFrameSequence {
+                            return Err(DecodeError::InvalidFrameSequence {
                                 reason: "buffered member payload ended before its decoded size",
                             });
                         }
@@ -335,9 +333,9 @@ impl<R: AsyncRead + Unpin> Archive<R> {
     }
 }
 
-/// A valid archive feature rejected by the selected [`ExtractPolicy`].
+/// A valid archive feature rejected by the selected [`DecodePolicy`].
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
-pub enum ExtractPolicyViolation {
+pub enum DecodePolicyViolation {
     /// A symbolic-link member appeared when links are forbidden.
     #[error("symbolic-link members are not allowed")]
     SymbolicLink,
@@ -374,7 +372,7 @@ pub enum ExtractPolicyViolation {
 
 /// An error produced while decoding or securely extracting an archive.
 #[derive(Debug, Error)]
-pub enum ExtractError {
+pub enum DecodeError {
     /// The underlying tar stream is not structurally valid.
     #[error(transparent)]
     Framing(#[from] FrameError),
@@ -452,12 +450,12 @@ pub enum ExtractError {
         /// Source header position for the rejected feature.
         position: u64,
         /// The selected policy rule that rejected the feature.
-        violation: ExtractPolicyViolation,
+        violation: DecodePolicyViolation,
     },
 }
 
-fn policy_violation(position: u64, violation: ExtractPolicyViolation) -> ExtractError {
-    ExtractError::PolicyViolation {
+fn policy_violation(position: u64, violation: DecodePolicyViolation) -> DecodeError {
+    DecodeError::PolicyViolation {
         position,
         violation,
     }
@@ -488,7 +486,7 @@ fn member_format_position(header: &MemberHeader, extensions: &MemberExtensions) 
     }
 }
 
-fn decode_member<R>(frame: &MemberFrame<'_, R>) -> Result<DecodedMember, ExtractError> {
+fn decode_member<R>(frame: &MemberFrame<'_, R>) -> Result<DecodedMember, DecodeError> {
     let header = &frame.header;
     let mode = header.mode()?;
     let executable = mode & 0o111 != 0;
@@ -522,20 +520,20 @@ fn resolved_text(
     position: u64,
     keyword: &'static str,
     value: Cow<'_, [u8]>,
-) -> Result<String, ExtractError> {
+) -> Result<String, DecodeError> {
     std::str::from_utf8(value.as_ref())
         .map(str::to_owned)
-        .map_err(|_| ExtractError::InvalidUtf8 {
+        .map_err(|_| DecodeError::InvalidUtf8 {
             position,
             field: keyword,
         })
 }
 
-fn normalize_member_path(position: u64, value: &str) -> Result<PathBuf, ExtractError> {
+fn normalize_member_path(position: u64, value: &str) -> Result<PathBuf, DecodeError> {
     normalize_path(position, "member path", value, &[])
 }
 
-fn normalize_hard_link_target(position: u64, value: &str) -> Result<PathBuf, ExtractError> {
+fn normalize_hard_link_target(position: u64, value: &str) -> Result<PathBuf, DecodeError> {
     normalize_path(position, "hard-link target", value, &[])
 }
 
@@ -543,7 +541,7 @@ fn normalize_symlink_target(
     position: u64,
     path: &Path,
     value: &str,
-) -> Result<PathBuf, ExtractError> {
+) -> Result<PathBuf, DecodeError> {
     let base = path.parent().map(path_components).unwrap_or_default();
     normalize_path(position, "symbolic-link target", value, &base)
 }
@@ -553,7 +551,7 @@ fn normalize_path(
     context: &'static str,
     value: &str,
     base: &[String],
-) -> Result<PathBuf, ExtractError> {
+) -> Result<PathBuf, DecodeError> {
     if value.contains('\0') {
         return unsafe_path(position, context, value, "contains a NUL byte");
     }
@@ -591,8 +589,8 @@ fn unsafe_path<T>(
     context: &'static str,
     value: &str,
     reason: &'static str,
-) -> Result<T, ExtractError> {
-    Err(ExtractError::UnsafePath {
+) -> Result<T, DecodeError> {
+    Err(DecodeError::UnsafePath {
         position,
         context,
         value: value.to_owned(),
@@ -631,7 +629,7 @@ struct ExtractionRoot {
 }
 
 impl ExtractionRoot {
-    async fn open(dest: &Path) -> Result<Self, ExtractError> {
+    async fn open(dest: &Path) -> Result<Self, DecodeError> {
         let dest = dest.to_owned();
         let path = dest.clone();
         let dir = tokio::task::spawn_blocking(move || {
@@ -664,7 +662,7 @@ impl ExtractionRoot {
     async fn start_member(
         &mut self,
         member: DecodedMember,
-    ) -> Result<Option<ActiveWriter>, ExtractError> {
+    ) -> Result<Option<ActiveWriter>, DecodeError> {
         if member.path.as_os_str().is_empty() {
             return if member.kind == MemberKind::Directory {
                 Ok(None)
@@ -689,7 +687,7 @@ impl ExtractionRoot {
             }
             MemberKind::HardLink => self.create_hard_link(member).await,
             MemberKind::CharacterDevice | MemberKind::BlockDevice | MemberKind::Fifo => {
-                Err(ExtractError::UnsupportedMember {
+                Err(DecodeError::UnsupportedMember {
                     position: member.position,
                     path: member.path,
                     kind: member.kind,
@@ -701,7 +699,7 @@ impl ExtractionRoot {
     async fn create_file(
         &mut self,
         member: DecodedMember,
-    ) -> Result<Option<ActiveWriter>, ExtractError> {
+    ) -> Result<Option<ActiveWriter>, DecodeError> {
         let std_file = self
             .create_or_replace_file(&member.path, member.executable)
             .await?;
@@ -713,13 +711,13 @@ impl ExtractionRoot {
         &mut self,
         member: DecodedMember,
         buffer: Vec<u8>,
-    ) -> (Vec<u8>, Result<(), ExtractError>) {
+    ) -> (Vec<u8>, Result<(), DecodeError>) {
         let payload_size = match u64::try_from(buffer.len()) {
             Ok(payload_size) => payload_size,
             Err(_) => {
                 return (
                     buffer,
-                    Err(ExtractError::InvalidFrameSequence {
+                    Err(DecodeError::InvalidFrameSequence {
                         reason: "buffered payload length cannot be represented",
                     }),
                 );
@@ -728,7 +726,7 @@ impl ExtractionRoot {
         if payload_size != member.payload_size {
             return (
                 buffer,
-                Err(ExtractError::InvalidFrameSequence {
+                Err(DecodeError::InvalidFrameSequence {
                     reason: "buffered payload length did not match the decoded member size",
                 }),
             );
@@ -742,15 +740,15 @@ impl ExtractionRoot {
         (buffer, result)
     }
 
-    async fn create_directory(&mut self, member: DecodedMember) -> Result<(), ExtractError> {
+    async fn create_directory(&mut self, member: DecodedMember) -> Result<(), DecodeError> {
         self.ensure_parents(&member.path).await?;
         if self.pending_symlinks.contains_key(&member.path) {
-            return Err(ExtractError::PathCollision { path: member.path });
+            return Err(DecodeError::PathCollision { path: member.path });
         }
         if !self.verified_directories.contains(&member.path) {
             match self.symlink_metadata(&member.path).await? {
                 Some(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-                Some(_) => return Err(ExtractError::PathCollision { path: member.path }),
+                Some(_) => return Err(DecodeError::PathCollision { path: member.path }),
                 None => self.create_dir(&member.path).await?,
             }
             self.verified_directories.insert(member.path.clone());
@@ -759,7 +757,7 @@ impl ExtractionRoot {
         Ok(())
     }
 
-    async fn reserve_symlink(&mut self, member: DecodedMember) -> Result<(), ExtractError> {
+    async fn reserve_symlink(&mut self, member: DecodedMember) -> Result<(), DecodeError> {
         let target_text = required_link_target(&member)?;
         let target = normalize_symlink_target(member.position, &member.path, &target_text)?;
         self.ensure_new_path(&member.path).await?;
@@ -780,11 +778,11 @@ impl ExtractionRoot {
     async fn create_hard_link(
         &mut self,
         member: DecodedMember,
-    ) -> Result<Option<ActiveWriter>, ExtractError> {
+    ) -> Result<Option<ActiveWriter>, DecodeError> {
         let target_text = required_link_target(&member)?;
         let target = normalize_hard_link_target(member.position, &target_text)?;
         if !self.extracted_files.contains(&target) {
-            return Err(ExtractError::InvalidLink {
+            return Err(DecodeError::InvalidLink {
                 position: member.position,
                 path: member.path,
                 target: target_text,
@@ -801,20 +799,20 @@ impl ExtractionRoot {
         Ok(active_writer(member, std_file))
     }
 
-    async fn install_symlinks(&self, allow_dangling_symlinks: bool) -> Result<(), ExtractError> {
+    async fn install_symlinks(&self, allow_dangling_symlinks: bool) -> Result<(), DecodeError> {
         let mut terminal_kinds = Vec::with_capacity(self.symlink_paths.len());
         for path in &self.symlink_paths {
             let link = self.pending_symlinks.get(path).expect("tracked symlink");
-            let kind = self.resolve_terminal(&link.target).map_err(|reason| {
-                ExtractError::InvalidLink {
-                    position: link.position,
-                    path: path.clone(),
-                    target: link.target_text.clone(),
-                    reason,
-                }
-            })?;
+            let kind =
+                self.resolve_terminal(&link.target)
+                    .map_err(|reason| DecodeError::InvalidLink {
+                        position: link.position,
+                        path: path.clone(),
+                        target: link.target_text.clone(),
+                        reason,
+                    })?;
             if kind == TerminalKind::Dangling && !allow_dangling_symlinks {
-                return Err(ExtractError::InvalidLink {
+                return Err(DecodeError::InvalidLink {
                     position: link.position,
                     path: path.clone(),
                     target: link.target_text.clone(),
@@ -872,7 +870,7 @@ impl ExtractionRoot {
         &mut self,
         path: &Path,
         executable: bool,
-    ) -> Result<std::fs::File, ExtractError> {
+    ) -> Result<std::fs::File, DecodeError> {
         self.prepare_file_path(path).await?;
         let relative = path.to_owned();
         let error_path = relative.clone();
@@ -888,7 +886,7 @@ impl ExtractionRoot {
         path: &Path,
         executable: bool,
         buffer: Vec<u8>,
-    ) -> (Vec<u8>, Result<(), ExtractError>) {
+    ) -> (Vec<u8>, Result<(), DecodeError>) {
         let relative = path.to_owned();
         let error_path = relative.clone();
         let dir = Arc::clone(&self.dir);
@@ -903,27 +901,27 @@ impl ExtractionRoot {
         .await
     }
 
-    async fn prepare_file_path(&mut self, path: &Path) -> Result<(), ExtractError> {
+    async fn prepare_file_path(&mut self, path: &Path) -> Result<(), DecodeError> {
         self.ensure_parents(path).await?;
         if self.pending_symlinks.contains_key(path) {
-            return Err(ExtractError::PathCollision {
+            return Err(DecodeError::PathCollision {
                 path: path.to_owned(),
             });
         }
         Ok(())
     }
 
-    async fn ensure_new_path(&mut self, path: &Path) -> Result<(), ExtractError> {
+    async fn ensure_new_path(&mut self, path: &Path) -> Result<(), DecodeError> {
         self.ensure_parents(path).await?;
         if self.pending_symlinks.contains_key(path) {
-            return Err(ExtractError::PathCollision {
+            return Err(DecodeError::PathCollision {
                 path: path.to_owned(),
             });
         }
         self.reject_existing(path).await
     }
 
-    async fn ensure_parents(&mut self, path: &Path) -> Result<(), ExtractError> {
+    async fn ensure_parents(&mut self, path: &Path) -> Result<(), DecodeError> {
         let Some(parent) = path.parent() else {
             return Ok(());
         };
@@ -931,7 +929,7 @@ impl ExtractionRoot {
         for component in parent.components() {
             current.push(component.as_os_str());
             if self.pending_symlinks.contains_key(&current) {
-                return Err(ExtractError::PathCollision {
+                return Err(DecodeError::PathCollision {
                     path: current.clone(),
                 });
             }
@@ -943,7 +941,7 @@ impl ExtractionRoot {
                     self.verified_directories.insert(current.clone());
                 }
                 Some(_) => {
-                    return Err(ExtractError::PathCollision {
+                    return Err(DecodeError::PathCollision {
                         path: current.clone(),
                     });
                 }
@@ -957,9 +955,9 @@ impl ExtractionRoot {
         Ok(())
     }
 
-    async fn reject_existing(&self, path: &Path) -> Result<(), ExtractError> {
+    async fn reject_existing(&self, path: &Path) -> Result<(), DecodeError> {
         if self.symlink_metadata(path).await?.is_some() {
-            Err(ExtractError::PathCollision {
+            Err(DecodeError::PathCollision {
                 path: path.to_owned(),
             })
         } else {
@@ -970,7 +968,7 @@ impl ExtractionRoot {
     async fn symlink_metadata(
         &self,
         path: &Path,
-    ) -> Result<Option<cap_std::fs::Metadata>, ExtractError> {
+    ) -> Result<Option<cap_std::fs::Metadata>, DecodeError> {
         let relative = path.to_owned();
         let error_path = relative.clone();
         let dir = Arc::clone(&self.dir);
@@ -981,7 +979,7 @@ impl ExtractionRoot {
         }
     }
 
-    async fn create_dir(&self, path: &Path) -> Result<(), ExtractError> {
+    async fn create_dir(&self, path: &Path) -> Result<(), DecodeError> {
         let relative = path.to_owned();
         let error_path = relative.clone();
         let dir = Arc::clone(&self.dir);
@@ -990,7 +988,7 @@ impl ExtractionRoot {
             .map_err(|source| filesystem("create directory", error_path, source))
     }
 
-    async fn truncate_file(&self, path: &Path) -> Result<std::fs::File, ExtractError> {
+    async fn truncate_file(&self, path: &Path) -> Result<std::fs::File, DecodeError> {
         let relative = path.to_owned();
         let error_path = relative.clone();
         let dir = Arc::clone(&self.dir);
@@ -1004,7 +1002,7 @@ impl ExtractionRoot {
         .map_err(|source| filesystem("truncate file", error_path, source))
     }
 
-    async fn hard_link(&self, target: &Path, path: &Path) -> Result<(), ExtractError> {
+    async fn hard_link(&self, target: &Path, path: &Path) -> Result<(), DecodeError> {
         let target = target.to_owned();
         let path = path.to_owned();
         let error_path = path.clone();
@@ -1019,7 +1017,7 @@ impl ExtractionRoot {
         path: &Path,
         contents: &Path,
         kind: TerminalKind,
-    ) -> Result<(), ExtractError> {
+    ) -> Result<(), DecodeError> {
         let path = path.to_owned();
         let error_path = path.clone();
         let contents = contents.to_owned();
@@ -1043,14 +1041,15 @@ fn open_or_replace_file(
     path: &Path,
     executable: bool,
 ) -> Result<cap_std::fs::File, FileOperationError> {
-    match create_new_file(dir, path, executable) {
-        Ok(file) => Ok(file),
-        Err(create_error) if create_error.kind() == io::ErrorKind::AlreadyExists => {
+    let file = match create_new_file(dir, path) {
+        Ok(file) => file,
+        Err(create_error) => {
+            // Windows may report an existing directory as permission denied.
             match dir.symlink_metadata(path) {
                 Ok(metadata) if metadata.is_file() => {
                     dir.remove_file(path)
                         .map_err(|source| file_operation_error("remove file", source))?;
-                    create_new_file(dir, path, executable)
+                    create_new_file(dir, path)
                         .map_err(|source| file_operation_error("create file", source))
                 }
                 Ok(_) => Err(FileOperationError::Collision),
@@ -1059,34 +1058,34 @@ fn open_or_replace_file(
                 }
                 Err(source) => Err(file_operation_error("inspect", source)),
             }
-        }
-        Err(source) => Err(file_operation_error("create file", source)),
-    }
+        }?,
+    };
+    add_executable(&file, executable)
+        .map_err(|source| file_operation_error("create file", source))?;
+    Ok(file)
 }
 
-fn create_new_file(dir: &Dir, path: &Path, executable: bool) -> io::Result<cap_std::fs::File> {
+fn create_new_file(dir: &Dir, path: &Path) -> io::Result<cap_std::fs::File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
-    let file = dir.open_with(path, &options)?;
-    add_executable(&file, executable)?;
-    Ok(file)
+    dir.open_with(path, &options)
 }
 
 fn file_operation_error(operation: &'static str, source: io::Error) -> FileOperationError {
     FileOperationError::Filesystem { operation, source }
 }
 
-fn map_file_operation_error(path: PathBuf, error: FileOperationError) -> ExtractError {
+fn map_file_operation_error(path: PathBuf, error: FileOperationError) -> DecodeError {
     match error {
-        FileOperationError::Collision => ExtractError::PathCollision { path },
+        FileOperationError::Collision => DecodeError::PathCollision { path },
         FileOperationError::Filesystem { operation, source } => filesystem(operation, path, source),
     }
 }
 
-fn required_link_target(member: &DecodedMember) -> Result<String, ExtractError> {
+fn required_link_target(member: &DecodedMember) -> Result<String, DecodeError> {
     match member.link_target.clone() {
         Some(target) if !target.is_empty() => Ok(target),
-        _ => Err(ExtractError::InvalidLink {
+        _ => Err(DecodeError::InvalidLink {
             position: member.position,
             path: member.path.clone(),
             target: String::new(),
@@ -1095,8 +1094,8 @@ fn required_link_target(member: &DecodedMember) -> Result<String, ExtractError> 
     }
 }
 
-fn filesystem(operation: &'static str, path: PathBuf, source: io::Error) -> ExtractError {
-    ExtractError::Filesystem {
+fn filesystem(operation: &'static str, path: PathBuf, source: io::Error) -> DecodeError {
+    DecodeError::Filesystem {
         operation,
         path,
         source,
@@ -1110,12 +1109,12 @@ struct ActiveWriter {
 }
 
 impl ActiveWriter {
-    async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), ExtractError> {
-        let len = u64::try_from(chunk.len()).map_err(|_| ExtractError::InvalidFrameSequence {
+    async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), DecodeError> {
+        let len = u64::try_from(chunk.len()).map_err(|_| DecodeError::InvalidFrameSequence {
             reason: "payload chunk length cannot be represented",
         })?;
         if len > self.remaining {
-            return Err(ExtractError::InvalidFrameSequence {
+            return Err(DecodeError::InvalidFrameSequence {
                 reason: "member payload exceeded the decoded member size",
             });
         }
@@ -1381,15 +1380,15 @@ mod tests {
         append_block(bytes, &[0; BLOCK_SIZE]);
     }
 
-    async fn extract(bytes: Vec<u8>, dest: &Path) -> Result<(), ExtractError> {
-        extract_with_policy(bytes, dest, ExtractPolicy::default()).await
+    async fn extract(bytes: Vec<u8>, dest: &Path) -> Result<(), DecodeError> {
+        extract_with_policy(bytes, dest, DecodePolicy::default()).await
     }
 
     async fn extract_with_policy(
         bytes: Vec<u8>,
         dest: &Path,
-        policy: ExtractPolicy,
-    ) -> Result<(), ExtractError> {
+        policy: DecodePolicy,
+    ) -> Result<(), DecodeError> {
         Archive::new(ChunkedReader::new(bytes))
             .extract(dest, policy)
             .await
@@ -1484,7 +1483,7 @@ mod tests {
         for value in ["C:", "C:/escape", "nested/C:/escape"] {
             assert!(matches!(
                 normalize_member_path(0, value),
-                Err(ExtractError::UnsafePath {
+                Err(DecodeError::UnsafePath {
                     reason: "contains a platform path prefix",
                     ..
                 })
@@ -1511,8 +1510,8 @@ mod tests {
         extract_with_policy(
             bytes,
             &dest,
-            ExtractPolicy::default().pax_policy(
-                PaxExtractPolicy::default()
+            DecodePolicy::default().pax_policy(
+                PaxDecodePolicy::default()
                     .allow_global_pax_extensions(true)
                     .allow_global_pax_member_metadata(true),
             ),
@@ -1585,9 +1584,9 @@ mod tests {
             finish(&mut bytes);
             let error = extract(bytes, &dest).await.unwrap_err();
             match expected {
-                "unsafe" => assert!(matches!(error, ExtractError::UnsafePath { .. })),
-                "collision" => assert!(matches!(error, ExtractError::PathCollision { .. })),
-                "unsupported" => assert!(matches!(error, ExtractError::UnsupportedMember { .. })),
+                "unsafe" => assert!(matches!(error, DecodeError::UnsafePath { .. })),
+                "collision" => assert!(matches!(error, DecodeError::PathCollision { .. })),
+                "unsupported" => assert!(matches!(error, DecodeError::UnsupportedMember { .. })),
                 _ => unreachable!(),
             }
         }
@@ -1657,7 +1656,7 @@ mod tests {
         finish(&mut directory);
         assert!(matches!(
             extract(directory, &directory_dest).await.unwrap_err(),
-            ExtractError::PathCollision { .. }
+            DecodeError::PathCollision { .. }
         ));
         assert!(directory_dest.join("same").is_dir());
 
@@ -1690,7 +1689,7 @@ mod tests {
             extract(symbolic_link, &symbolic_link_dest)
                 .await
                 .unwrap_err(),
-            ExtractError::PathCollision { .. }
+            DecodeError::PathCollision { .. }
         ));
         assert!(!symbolic_link_dest.join("same").exists());
 
@@ -1717,7 +1716,7 @@ mod tests {
             extract(symbolic_link_parent, &symbolic_link_parent_dest)
                 .await
                 .unwrap_err(),
-            ExtractError::PathCollision { .. }
+            DecodeError::PathCollision { .. }
         ));
         assert!(!symbolic_link_parent_dest.join("parent").exists());
     }
@@ -1737,7 +1736,7 @@ mod tests {
 
         assert!(matches!(
             extract(bytes, &dest).await.unwrap_err(),
-            ExtractError::PathCollision { .. }
+            DecodeError::PathCollision { .. }
         ));
         assert!(!outside.join("file").exists());
     }
@@ -1757,7 +1756,7 @@ mod tests {
 
         assert!(matches!(
             extract(bytes, &dest).await.unwrap_err(),
-            ExtractError::PathCollision { .. }
+            DecodeError::PathCollision { .. }
         ));
         assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
     }
@@ -1811,11 +1810,11 @@ mod tests {
             extract_with_policy(
                 bytes,
                 &dest,
-                ExtractPolicy::default().allow_dangling_symlinks(false)
+                DecodePolicy::default().allow_dangling_symlinks(false)
             )
             .await
             .unwrap_err(),
-            ExtractError::InvalidLink { .. }
+            DecodeError::InvalidLink { .. }
         ));
         assert!(!dest.join("link").exists());
     }
@@ -1830,7 +1829,7 @@ mod tests {
         extract_with_policy(
             bytes,
             &dest,
-            ExtractPolicy::default().allow_dangling_symlinks(false),
+            DecodePolicy::default().allow_dangling_symlinks(false),
         )
         .await
         .unwrap();
@@ -1863,7 +1862,7 @@ mod tests {
         finish(&mut cycle);
         assert!(matches!(
             extract(cycle, &cycle_dest).await.unwrap_err(),
-            ExtractError::InvalidLink { .. }
+            DecodeError::InvalidLink { .. }
         ));
         assert!(!cycle_dest.join("a").exists());
         assert!(!cycle_dest.join("b").exists());
@@ -1877,7 +1876,7 @@ mod tests {
             extract(growing_cycle, &growing_cycle_dest)
                 .await
                 .unwrap_err(),
-            ExtractError::InvalidLink {
+            DecodeError::InvalidLink {
                 reason: "symbolic-link target expansion limit exceeded",
                 ..
             }
@@ -1891,7 +1890,7 @@ mod tests {
         finish(&mut escape);
         assert!(matches!(
             extract(escape, &escape_dest).await.unwrap_err(),
-            ExtractError::UnsafePath { .. }
+            DecodeError::UnsafePath { .. }
         ));
         assert!(!escape_dest.join("link").exists());
     }
@@ -1900,7 +1899,7 @@ mod tests {
     async fn extracts_prior_target_hard_links_with_linkdata_and_differing_modes() {
         let temp = tempdir().unwrap();
         let dest = temp.path().join("out");
-        let policy = ExtractPolicy::default().allow_hard_links(true);
+        let policy = DecodePolicy::default().allow_hard_links(true);
         let mut bytes = Vec::new();
         append_posix_member(&mut bytes, "a", b'0', b"old", "", 0o644);
         append_posix_member(&mut bytes, "b", b'1', b"new", "a", 0o644);
@@ -1917,7 +1916,7 @@ mod tests {
             extract_with_policy(forward, &forward_dest, policy)
                 .await
                 .unwrap_err(),
-            ExtractError::InvalidLink { .. }
+            DecodeError::InvalidLink { .. }
         ));
 
         let ambient_dest = temp.path().join("ambient");
@@ -1930,7 +1929,7 @@ mod tests {
             extract_with_policy(ambient, &ambient_dest, policy)
                 .await
                 .unwrap_err(),
-            ExtractError::InvalidLink { .. }
+            DecodeError::InvalidLink { .. }
         ));
         assert_eq!(std::fs::read(ambient_dest.join("a")).unwrap(), b"ambient");
         assert!(!ambient_dest.join("b").exists());
@@ -1978,13 +1977,13 @@ mod tests {
             extract_with_policy(
                 symlink,
                 &symlink_dest,
-                ExtractPolicy::default().allow_symlinks(false)
+                DecodePolicy::default().allow_symlinks(false)
             )
             .await
             .unwrap_err(),
-            ExtractError::PolicyViolation {
+            DecodeError::PolicyViolation {
                 position: 1024,
-                violation: ExtractPolicyViolation::SymbolicLink,
+                violation: DecodePolicyViolation::SymbolicLink,
             }
         ));
         assert_eq!(
@@ -1999,9 +1998,9 @@ mod tests {
         finish(&mut hard_link);
         assert!(matches!(
             extract(hard_link, &hard_link_dest).await.unwrap_err(),
-            ExtractError::PolicyViolation {
+            DecodeError::PolicyViolation {
                 position: 0,
-                violation: ExtractPolicyViolation::HardLink,
+                violation: DecodePolicyViolation::HardLink,
             }
         ));
         assert!(!hard_link_dest.join("link").exists());
@@ -2017,12 +2016,12 @@ mod tests {
         finish(&mut bytes);
 
         assert!(matches!(
-            extract_with_policy(bytes, &dest, ExtractPolicy::default().allow_gnu(false))
+            extract_with_policy(bytes, &dest, DecodePolicy::default().allow_gnu(false))
                 .await
                 .unwrap_err(),
-            ExtractError::PolicyViolation {
+            DecodeError::PolicyViolation {
                 position: 0,
-                violation: ExtractPolicyViolation::GnuArchive,
+                violation: DecodePolicyViolation::GnuArchive,
             }
         ));
         assert!(!dest.join("renamed").exists());
@@ -2030,13 +2029,9 @@ mod tests {
         let empty_dest = temp.path().join("empty");
         let mut empty = Vec::new();
         finish(&mut empty);
-        extract_with_policy(
-            empty,
-            &empty_dest,
-            ExtractPolicy::default().allow_gnu(false),
-        )
-        .await
-        .unwrap();
+        extract_with_policy(empty, &empty_dest, DecodePolicy::default().allow_gnu(false))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2073,15 +2068,15 @@ mod tests {
                 extract_with_policy(
                     bytes,
                     &dest,
-                    ExtractPolicy::default().pax_policy(
-                        PaxExtractPolicy::default().allow_global_pax_extensions(typeflag == b'g')
+                    DecodePolicy::default().pax_policy(
+                        PaxDecodePolicy::default().allow_global_pax_extensions(typeflag == b'g')
                     )
                 )
                 .await
                 .unwrap_err(),
-                ExtractError::PolicyViolation {
+                DecodeError::PolicyViolation {
                     position: 0,
-                    violation: ExtractPolicyViolation::PaxVendorExtension {
+                    violation: DecodePolicyViolation::PaxVendorExtension {
                         vendor,
                         name
                     },
@@ -2102,14 +2097,14 @@ mod tests {
             extract_with_policy(
                 partial,
                 &partial_dest,
-                ExtractPolicy::default()
-                    .pax_policy(PaxExtractPolicy::default().allow_global_pax_extensions(true))
+                DecodePolicy::default()
+                    .pax_policy(PaxDecodePolicy::default().allow_global_pax_extensions(true))
             )
             .await
             .unwrap_err(),
-            ExtractError::PolicyViolation {
+            DecodeError::PolicyViolation {
                 position: 1024,
-                violation: ExtractPolicyViolation::PaxVendorExtension { .. },
+                violation: DecodePolicyViolation::PaxVendorExtension { .. },
             }
         ));
         assert_eq!(
@@ -2125,8 +2120,8 @@ mod tests {
         extract_with_policy(
             permitted,
             &permitted_dest,
-            ExtractPolicy::default()
-                .pax_policy(PaxExtractPolicy::default().allow_pax_vendor_extensions(true)),
+            DecodePolicy::default()
+                .pax_policy(PaxDecodePolicy::default().allow_pax_vendor_extensions(true)),
         )
         .await
         .unwrap();
@@ -2149,9 +2144,9 @@ mod tests {
         finish(&mut rejected);
         assert!(matches!(
             extract(rejected, &rejected_dest).await.unwrap_err(),
-            ExtractError::PolicyViolation {
+            DecodeError::PolicyViolation {
                 position: 0,
-                violation: ExtractPolicyViolation::DuplicatePaxRecord { keyword },
+                violation: DecodePolicyViolation::DuplicatePaxRecord { keyword },
             } if keyword == "path"
         ));
         assert!(!rejected_dest.join("actual").exists());
@@ -2164,8 +2159,8 @@ mod tests {
         extract_with_policy(
             permitted,
             &permitted_dest,
-            ExtractPolicy::default()
-                .pax_policy(PaxExtractPolicy::default().allow_duplicate_pax_records(true)),
+            DecodePolicy::default()
+                .pax_policy(PaxDecodePolicy::default().allow_duplicate_pax_records(true)),
         )
         .await
         .unwrap();
@@ -2187,14 +2182,14 @@ mod tests {
             extract_with_policy(
                 rejected,
                 &rejected_dest,
-                ExtractPolicy::default()
-                    .pax_policy(PaxExtractPolicy::default().allow_global_pax_extensions(false))
+                DecodePolicy::default()
+                    .pax_policy(PaxDecodePolicy::default().allow_global_pax_extensions(false))
             )
             .await
             .unwrap_err(),
-            ExtractError::PolicyViolation {
+            DecodeError::PolicyViolation {
                 position: 0,
-                violation: ExtractPolicyViolation::GlobalPaxExtension,
+                violation: DecodePolicyViolation::GlobalPaxExtension,
             }
         ));
 
@@ -2223,8 +2218,8 @@ mod tests {
         extract_with_policy(
             bytes,
             &dest,
-            ExtractPolicy::default().pax_policy(
-                PaxExtractPolicy::default()
+            DecodePolicy::default().pax_policy(
+                PaxDecodePolicy::default()
                     .allow_global_pax_extensions(true)
                     .allow_global_pax_member_metadata(true),
             ),
@@ -2251,14 +2246,14 @@ mod tests {
                 extract_with_policy(
                     bytes,
                     &dest,
-                    ExtractPolicy::default()
-                        .pax_policy(PaxExtractPolicy::default().allow_global_pax_extensions(true))
+                    DecodePolicy::default()
+                        .pax_policy(PaxDecodePolicy::default().allow_global_pax_extensions(true))
                 )
                 .await
                 .unwrap_err(),
-                ExtractError::PolicyViolation {
+                DecodeError::PolicyViolation {
                     position: 0,
-                    violation: ExtractPolicyViolation::GlobalPaxMemberMetadata {
+                    violation: DecodePolicyViolation::GlobalPaxMemberMetadata {
                         keyword: found,
                     },
                 } if found == keyword
@@ -2273,14 +2268,14 @@ mod tests {
             extract_with_policy(
                 deleted,
                 &deleted_dest,
-                ExtractPolicy::default()
-                    .pax_policy(PaxExtractPolicy::default().allow_global_pax_extensions(true))
+                DecodePolicy::default()
+                    .pax_policy(PaxDecodePolicy::default().allow_global_pax_extensions(true))
             )
             .await
             .unwrap_err(),
-            ExtractError::PolicyViolation {
+            DecodeError::PolicyViolation {
                 position: 0,
-                violation: ExtractPolicyViolation::GlobalPaxMemberMetadata { keyword: "path" },
+                violation: DecodePolicyViolation::GlobalPaxMemberMetadata { keyword: "path" },
             }
         ));
     }
@@ -2295,7 +2290,7 @@ mod tests {
         finish(&mut deleted);
         assert!(matches!(
             extract(deleted, &deleted_dest).await.unwrap_err(),
-            ExtractError::Framing(FrameError {
+            DecodeError::Framing(FrameError {
                 inner: FrameErrorInner::DeletedPaxMetadata { keyword: "path" },
                 ..
             })
@@ -2310,7 +2305,7 @@ mod tests {
         finish(&mut binary);
         assert!(matches!(
             extract(binary, &binary_dest).await.unwrap_err(),
-            ExtractError::InvalidUtf8 { field: "path", .. }
+            DecodeError::InvalidUtf8 { field: "path", .. }
         ));
 
         let gnu_dest = temp.path().join("gnu");
@@ -2320,7 +2315,7 @@ mod tests {
         finish(&mut malformed_gnu);
         assert!(matches!(
             extract(malformed_gnu, &gnu_dest).await.unwrap_err(),
-            ExtractError::Framing(FrameError {
+            DecodeError::Framing(FrameError {
                 inner: FrameErrorInner::InvalidGnuMetadata { .. },
                 ..
             })
@@ -2334,7 +2329,7 @@ mod tests {
         finish(&mut invalid_utf8_archive);
         assert!(matches!(
             extract(invalid_utf8_archive, &utf8_dest).await.unwrap_err(),
-            ExtractError::InvalidUtf8 { .. }
+            DecodeError::InvalidUtf8 { .. }
         ));
 
         let mode_dest = temp.path().join("mode");
@@ -2345,7 +2340,7 @@ mod tests {
         finish(&mut invalid_mode_archive);
         assert!(matches!(
             extract(invalid_mode_archive, &mode_dest).await.unwrap_err(),
-            ExtractError::Framing(FrameError {
+            DecodeError::Framing(FrameError {
                 inner: FrameErrorInner::InvalidMode { .. },
                 ..
             })
@@ -2360,7 +2355,7 @@ mod tests {
         append_block(&mut partial, &invalid);
         assert!(matches!(
             extract(partial, &partial_dest).await.unwrap_err(),
-            ExtractError::Framing(_)
+            DecodeError::Framing(_)
         ));
         assert_eq!(
             std::fs::read_to_string(partial_dest.join("created")).unwrap(),

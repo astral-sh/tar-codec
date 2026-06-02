@@ -1,6 +1,6 @@
 # tar-codec
 
-tar-codec is a small, contrained tar encoder and decoder for Rust.
+tar-codec is a small, fast, constrained tar encoder and decoder for Rust.
 
 Goals:
 

@@ -1,7 +1,7 @@
 use std::{fs, path::Path};
 
 use tar_codec::{
-    decode::{Archive, ExtractPolicy},
+    decode::{Archive, DecodePolicy},
     encode::{Encoder, EntryMetadata},
 };
 use tempfile::tempdir;
@@ -85,7 +85,7 @@ async fn assert_tar_codec_extracts(archive: &[u8]) {
     let temp = tempdir().expect("temporary extraction directory should be created");
     let destination = temp.path().join("out");
     Archive::new(archive)
-        .extract(&destination, ExtractPolicy::default())
+        .extract(&destination, DecodePolicy::default())
         .await
         .expect("tar-codec should extract archive");
     assert_contents(&destination);

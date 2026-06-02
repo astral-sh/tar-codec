@@ -601,7 +601,7 @@ mod tests {
     use tokio_stream::StreamExt;
 
     use super::{traversal::DIRECTORY_TRAVERSAL_BATCH_ENTRIES, *};
-    use crate::decode::{Archive, ExtractError, ExtractPolicy};
+    use crate::decode::{Archive, DecodeError, DecodePolicy};
 
     struct VecReader {
         bytes: Vec<u8>,
@@ -685,7 +685,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let dest = temp.path().join("out");
         Archive::new(VecReader::new(bytes))
-            .extract(&dest, ExtractPolicy::default())
+            .extract(&dest, DecodePolicy::default())
             .await
             .unwrap();
         assert_eq!(std::fs::read(dest.join("bin/tool")).unwrap(), b"run");
@@ -816,7 +816,7 @@ mod tests {
 
         let dest = temp.path().join("out");
         Archive::new(VecReader::new(bytes))
-            .extract(&dest, ExtractPolicy::default())
+            .extract(&dest, DecodePolicy::default())
             .await
             .unwrap();
         assert_eq!(
@@ -851,7 +851,7 @@ mod tests {
         let bytes = encoder.finish().await.unwrap();
         let dest = temp.path().join("out");
         Archive::new(VecReader::new(bytes))
-            .extract(&dest, ExtractPolicy::default())
+            .extract(&dest, DecodePolicy::default())
             .await
             .unwrap();
         assert_eq!(std::fs::read(dest.join("tree/large")).unwrap(), contents);
@@ -872,7 +872,7 @@ mod tests {
         let bytes = encoder.finish().await.unwrap();
         let dest = temp.path().join("out");
         Archive::new(VecReader::new(bytes))
-            .extract(&dest, ExtractPolicy::default())
+            .extract(&dest, DecodePolicy::default())
             .await
             .unwrap();
         assert_eq!(
@@ -924,7 +924,7 @@ mod tests {
         let bytes = encoder.finish().await.unwrap();
         let dest = temp.path().join("out");
         Archive::new(VecReader::new(bytes))
-            .extract(&dest, ExtractPolicy::default())
+            .extract(&dest, DecodePolicy::default())
             .await
             .unwrap();
         assert_eq!(
@@ -940,9 +940,9 @@ mod tests {
         let bytes = encoder.finish().await.unwrap();
         assert!(matches!(
             Archive::new(VecReader::new(bytes))
-                .extract(&temp.path().join("escape-out"), ExtractPolicy::default())
+                .extract(&temp.path().join("escape-out"), DecodePolicy::default())
                 .await,
-            Err(ExtractError::UnsafePath {
+            Err(DecodeError::UnsafePath {
                 context: "symbolic-link target",
                 ..
             })
@@ -956,7 +956,7 @@ mod tests {
         let bytes = encoder.finish().await.unwrap();
         let dest = temp.path().join("dangling-out");
         Archive::new(VecReader::new(bytes))
-            .extract(&dest, ExtractPolicy::default())
+            .extract(&dest, DecodePolicy::default())
             .await
             .unwrap();
         assert_eq!(
@@ -972,9 +972,9 @@ mod tests {
         let bytes = encoder.finish().await.unwrap();
         assert!(matches!(
             Archive::new(VecReader::new(bytes))
-                .extract(&temp.path().join("cycle-out"), ExtractPolicy::default())
+                .extract(&temp.path().join("cycle-out"), DecodePolicy::default())
                 .await,
-            Err(ExtractError::InvalidLink { .. })
+            Err(DecodeError::InvalidLink { .. })
         ));
     }
 

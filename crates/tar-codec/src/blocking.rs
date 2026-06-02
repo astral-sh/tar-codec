@@ -1,5 +1,29 @@
+//! Helpers for synchronous work that owns reusable payload buffers.
+//!
+//! Encoding and extraction use synchronous [`std::fs`] and [`cap_std::fs`]
+//! operations in otherwise asynchronous APIs. Those operations run through
+//! [`tokio::task::spawn_blocking`] so filesystem latency does not occupy a
+//! Tokio async worker thread.
+//!
+//! Some of that work also reads or writes payload bytes using a buffer reused
+//! across archive members. A blocking task requires owned `'static` state, so
+//! callers cannot borrow their buffer into the task. This module centralizes
+//! moving the buffer into the task and returning it with the operation result,
+//! preserving its allocation after both success and ordinary operation errors.
+
 use tokio::task::JoinError;
 
+/// Runs one synchronous operation on Tokio's blocking pool and returns its buffer.
+///
+/// `buffer` is moved into the `'static` closure required by
+/// [`tokio::task::spawn_blocking`], then returned alongside the operation
+/// result. The helper does not clear or otherwise reset the buffer, allowing
+/// each operation to decide which contents should remain available to its
+/// caller.
+///
+/// If the blocking task cannot be joined, its moved buffer cannot be
+/// recovered. In that case, this returns a new empty buffer and converts the
+/// [`JoinError`] into `E`.
 pub(crate) async fn with_reusable_buffer<T, E, F>(
     mut buffer: Vec<u8>,
     operation: F,
