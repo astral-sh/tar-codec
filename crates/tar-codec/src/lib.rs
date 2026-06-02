@@ -4,6 +4,8 @@
 //! Deterministic pure-pax encoding is available through [`encode`].
 
 mod blocking;
+#[cfg(test)]
+mod test_support;
 
 pub mod decode;
 pub mod encode;

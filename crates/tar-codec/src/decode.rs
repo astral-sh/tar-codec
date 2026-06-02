@@ -20,7 +20,8 @@ use cap_std::{
 };
 use tar_framing::{
     ArchiveFormat, FrameError, MemberKind, PaxKind, PaxRecord,
-    logical::{LogicalFrame, MemberExtensions, MemberFrame, MemberHeader, TarReader},
+    logical::{LogicalFrame, MemberExtensions, MemberFrame, TarReader},
+    stream::HeaderFrame,
 };
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWriteExt};
@@ -287,13 +288,13 @@ impl<R: AsyncRead + Unpin> Archive<R> {
                     )?;
                     policy.check_member_kind(frame.header.position, frame.header.kind)?;
                     if let MemberExtensions::Pax {
-                        local: Some(local), ..
+                        local_position: Some(position),
                     } = &frame.extensions
                     {
                         policy.pax_policy.check_pax_records(
-                            local.position,
+                            *position,
                             PaxKind::Local,
-                            &local.records,
+                            &frame.header.local_pax_records,
                         )?;
                     }
                     let member = decode_member(&frame)?;
@@ -471,7 +472,7 @@ struct DecodedMember {
     payload_size: u64,
 }
 
-fn member_format_position(header: &MemberHeader, extensions: &MemberExtensions) -> u64 {
+fn member_format_position(header: &HeaderFrame, extensions: &MemberExtensions) -> u64 {
     match extensions {
         MemberExtensions::Pax { .. } => header.position,
         MemberExtensions::Gnu {
@@ -1206,18 +1207,13 @@ fn create_symlink(dir: &Dir, contents: &Path, path: &Path, kind: TerminalKind) -
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        pin::Pin,
-        task::{Context, Poll},
-    };
-
     #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
     use super::*;
+    use crate::test_support::ChunkedReader;
     use tar_framing::{BLOCK_SIZE, Block, FrameErrorInner};
     use tempfile::tempdir;
-    use tokio::io::ReadBuf;
 
     const NAME_RANGE: std::ops::Range<usize> = 0..100;
     const MODE_RANGE: std::ops::Range<usize> = 100..108;
@@ -1228,37 +1224,6 @@ mod tests {
     const IDENTITY_RANGE: std::ops::Range<usize> = 257..265;
     const POSIX_IDENTITY: &[u8; 8] = b"ustar\x0000";
     const GNU_IDENTITY: &[u8; 8] = b"ustar  \0";
-
-    struct ChunkedReader {
-        bytes: Vec<u8>,
-        offset: usize,
-    }
-
-    impl ChunkedReader {
-        fn new(bytes: Vec<u8>) -> Self {
-            Self { bytes, offset: 0 }
-        }
-    }
-
-    impl AsyncRead for ChunkedReader {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buffer: &mut ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
-            if self.offset == self.bytes.len() {
-                return Poll::Ready(Ok(()));
-            }
-            let len = buffer
-                .remaining()
-                .min(23)
-                .min(self.bytes.len() - self.offset);
-            let end = self.offset + len;
-            buffer.put_slice(&self.bytes[self.offset..end]);
-            self.offset = end;
-            Poll::Ready(Ok(()))
-        }
-    }
 
     fn header(
         identity: &[u8; 8],
@@ -1291,15 +1256,7 @@ mod tests {
     }
 
     fn record(keyword: &str, value: &str) -> Vec<u8> {
-        let suffix = format!(" {keyword}={value}\n");
-        let mut len = suffix.len() + 1;
-        loop {
-            let value = format!("{len}{suffix}");
-            if value.len() == len {
-                return value.into_bytes();
-            }
-            len = value.len();
-        }
+        raw_record(keyword, value.as_bytes())
     }
 
     fn raw_record(keyword: &str, value: &[u8]) -> Vec<u8> {
@@ -1324,11 +1281,8 @@ mod tests {
     }
 
     fn append_payload(bytes: &mut Vec<u8>, payload: &[u8]) {
-        for chunk in payload.chunks(BLOCK_SIZE) {
-            let mut block = [0; BLOCK_SIZE];
-            block[..chunk.len()].copy_from_slice(chunk);
-            append_block(bytes, &block);
-        }
+        bytes.extend_from_slice(payload);
+        bytes.resize(bytes.len().next_multiple_of(BLOCK_SIZE), 0);
     }
 
     fn append_posix_member(
@@ -1380,8 +1334,7 @@ mod tests {
     }
 
     fn finish(bytes: &mut Vec<u8>) {
-        append_block(bytes, &[0; BLOCK_SIZE]);
-        append_block(bytes, &[0; BLOCK_SIZE]);
+        bytes.resize(bytes.len() + 2 * BLOCK_SIZE, 0);
     }
 
     fn single_posix_member_archive(
@@ -1408,7 +1361,7 @@ mod tests {
         dest: &Path,
         policy: DecodePolicy,
     ) -> Result<(), DecodeError> {
-        Archive::new(ChunkedReader::new(bytes))
+        Archive::new(ChunkedReader::new(bytes, 23))
             .extract(dest, policy)
             .await
     }

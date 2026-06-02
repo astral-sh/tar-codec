@@ -33,17 +33,6 @@ pub struct PaxMember<'a> {
     pub executable: bool,
 }
 
-/// Deterministic framing blocks for one pax archive member.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PaxMemberBlocks {
-    /// The local pax `x` header block.
-    pub extended_header: Block,
-    /// The padded local pax payload blocks.
-    pub extended_payload: Vec<Block>,
-    /// The ordinary POSIX-ustar member header block.
-    pub member_header: Block,
-}
-
 /// A failure while constructing strict pax framing blocks.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum FramingWriteError {
@@ -88,50 +77,6 @@ pub enum FramingWriteError {
         /// The failed framing computation.
         context: &'static str,
     },
-}
-
-/// Builds one local pax header and its following ordinary member header.
-///
-/// The local extended header always carries `path` and `size`. Symbolic links
-/// additionally carry `linkpath`. The ordinary member header contains
-/// deterministic POSIX-ustar fallback values for readers that ignore pax.
-pub fn frame_pax_member(
-    sequence: u64,
-    member: PaxMember<'_>,
-) -> Result<PaxMemberBlocks, FramingWriteError> {
-    let mut bytes = Vec::new();
-    frame_pax_member_into(sequence, member, &mut bytes)?;
-    let member_header_start =
-        bytes
-            .len()
-            .checked_sub(BLOCK_SIZE)
-            .ok_or(FramingWriteError::ArithmeticOverflow {
-                context: "pax framing block length",
-            })?;
-    let extended_header = block_from_slice(bytes.get(..BLOCK_SIZE).ok_or(
-        FramingWriteError::ArithmeticOverflow {
-            context: "pax framing block length",
-        },
-    )?)?;
-    let extended_payload = bytes
-        .get(BLOCK_SIZE..member_header_start)
-        .ok_or(FramingWriteError::ArithmeticOverflow {
-            context: "pax framing block length",
-        })?
-        .chunks_exact(BLOCK_SIZE)
-        .map(block_from_slice)
-        .collect::<Result<Vec<_>, _>>()?;
-    let member_header = block_from_slice(bytes.get(member_header_start..).ok_or(
-        FramingWriteError::ArithmeticOverflow {
-            context: "pax framing block length",
-        },
-    )?)?;
-
-    Ok(PaxMemberBlocks {
-        extended_header,
-        extended_payload,
-        member_header,
-    })
 }
 
 /// Writes one local pax header and its ordinary member header into `buffer`.
@@ -228,11 +173,6 @@ pub fn frame_pax_member_into(
         member.link_path.unwrap_or_default().as_bytes(),
     )?;
     Ok(())
-}
-
-/// Returns the required two-block POSIX end-of-archive marker.
-pub fn end_marker() -> [Block; 2] {
-    [ZERO_BLOCK; 2]
 }
 
 /// Returns the required two-block POSIX end-of-archive marker as contiguous bytes.
@@ -480,14 +420,6 @@ fn append_decimal_usize(output: &mut Vec<u8>, mut value: usize) {
     }
 }
 
-fn block_from_slice(bytes: &[u8]) -> Result<Block, FramingWriteError> {
-    bytes
-        .try_into()
-        .map_err(|_| FramingWriteError::ArithmeticOverflow {
-            context: "pax framing block length",
-        })
-}
-
 fn byte_sum(bytes: &[u8]) -> u64 {
     bytes.iter().map(|byte| u64::from(*byte)).sum()
 }
@@ -504,27 +436,17 @@ mod tests {
         test_support::{ChunkedReader, ready},
     };
 
-    fn flatten_framing(blocks: PaxMemberBlocks) -> Vec<u8> {
+    fn frame_archive(
+        sequence: u64,
+        member: PaxMember<'_>,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, FramingWriteError> {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&blocks.extended_header);
-        for block in blocks.extended_payload {
-            bytes.extend_from_slice(&block);
-        }
-        bytes.extend_from_slice(&blocks.member_header);
-        bytes
-    }
-
-    fn flatten(blocks: PaxMemberBlocks, payload: &[u8]) -> Vec<u8> {
-        let mut bytes = flatten_framing(blocks);
-        for chunk in payload.chunks(BLOCK_SIZE) {
-            let mut block = [0; BLOCK_SIZE];
-            block[..chunk.len()].copy_from_slice(chunk);
-            bytes.extend_from_slice(&block);
-        }
-        for block in end_marker() {
-            bytes.extend_from_slice(&block);
-        }
-        bytes
+        frame_pax_member_into(sequence, member, &mut bytes)?;
+        bytes.extend_from_slice(payload);
+        bytes.extend_from_slice(payload_padding(member.size));
+        bytes.extend_from_slice(end_marker_bytes());
+        Ok(bytes)
     }
 
     #[test]
@@ -558,10 +480,7 @@ mod tests {
             } else {
                 b""
             };
-            let bytes = flatten(
-                frame_pax_member(sequence as u64, member).expect("valid member"),
-                payload,
-            );
+            let bytes = frame_archive(sequence as u64, member, payload).expect("valid member");
             let frames = ready(TarStream::new(ChunkedReader::new(bytes, 19)).collect::<Vec<_>>());
             assert!(matches!(
                 &frames[0],
@@ -607,26 +526,9 @@ mod tests {
 
         bytes.extend_from_slice(b"run");
         bytes.resize(bytes.len() + BLOCK_SIZE - 3, 0);
-        for block in end_marker() {
-            bytes.extend_from_slice(&block);
-        }
+        bytes.extend_from_slice(end_marker_bytes());
         let frames = ready(TarStream::new(ChunkedReader::new(bytes, 19)).collect::<Vec<_>>());
         assert!(frames.iter().all(Result::is_ok));
-    }
-
-    #[test]
-    fn frames_directly_into_the_same_bytes_as_the_block_wrapper() {
-        let member = PaxMember {
-            path: "bin/tool",
-            kind: MemberKind::Regular,
-            size: 3,
-            link_path: None,
-            executable: true,
-        };
-        let expected = flatten_framing(frame_pax_member(7, member).expect("valid member"));
-        let mut bytes = Vec::new();
-        frame_pax_member_into(7, member, &mut bytes).expect("valid member");
-        assert_eq!(bytes, expected);
     }
 
     #[test]
@@ -640,36 +542,31 @@ mod tests {
             assert_eq!(payload_padding(size), expected, "{size}");
         }
 
-        let marker = end_marker().into_iter().flatten().collect::<Vec<_>>();
-        assert_eq!(end_marker_bytes(), marker);
+        assert_eq!(end_marker_bytes().len(), BLOCK_SIZE * 2);
+        assert!(end_marker_bytes().iter().all(|byte| *byte == 0));
     }
 
     #[test]
     fn uses_generated_fallbacks_for_long_paths_and_links() {
         let path = format!("{}/{}", "a".repeat(156), "b".repeat(101));
         let link_path = "c".repeat(101);
-        let blocks = frame_pax_member(
-            7,
-            PaxMember {
-                path: &path,
-                kind: MemberKind::SymbolicLink,
-                size: 0,
-                link_path: Some(&link_path),
-                executable: false,
-            },
-        )
-        .expect("valid member");
+        let member = PaxMember {
+            path: &path,
+            kind: MemberKind::SymbolicLink,
+            size: 0,
+            link_path: Some(&link_path),
+            executable: false,
+        };
+        let mut bytes = Vec::new();
+        frame_pax_member_into(7, member, &mut bytes).expect("valid member");
+        let member_header = &bytes[bytes.len() - BLOCK_SIZE..];
         assert_eq!(
-            &blocks.member_header[NAME_RANGE.start..NAME_RANGE.start + 12],
+            &member_header[NAME_RANGE.start..NAME_RANGE.start + 12],
             b"PaxEntries/7"
         );
-        assert!(
-            blocks.member_header[LINK_NAME_RANGE]
-                .iter()
-                .all(|byte| *byte == 0)
-        );
+        assert!(member_header[LINK_NAME_RANGE].iter().all(|byte| *byte == 0));
 
-        let bytes = flatten(blocks, b"");
+        bytes.extend_from_slice(end_marker_bytes());
         let frames = ready(TarStream::new(ChunkedReader::new(bytes, 23)).collect::<Vec<_>>());
         let header = frames
             .iter()
@@ -710,13 +607,17 @@ mod tests {
                 },
             ),
         ] {
-            assert_eq!(frame_pax_member(0, member), Err(expected));
+            assert_eq!(
+                frame_pax_member_into(0, member, &mut Vec::new()),
+                Err(expected)
+            );
         }
     }
 
     #[test]
     fn uses_zero_ustar_fallback_for_oversized_regular_payloads() {
-        let blocks = frame_pax_member(
+        let mut bytes = Vec::new();
+        frame_pax_member_into(
             0,
             PaxMember {
                 path: "large",
@@ -725,8 +626,12 @@ mod tests {
                 link_path: None,
                 executable: false,
             },
+            &mut bytes,
         )
         .expect("pax size can represent u64 values");
-        assert_eq!(parse_octal(&blocks.member_header[SIZE_RANGE]), Some(0));
+        assert_eq!(
+            parse_octal(&bytes[bytes.len() - BLOCK_SIZE..][SIZE_RANGE]),
+            Some(0)
+        );
     }
 }

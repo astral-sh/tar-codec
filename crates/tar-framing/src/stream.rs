@@ -4,6 +4,7 @@
 //! tar block and preserves each source block verbatim.
 
 use std::{
+    borrow::Cow,
     future::poll_fn,
     pin::Pin,
     task::{Context, Poll},
@@ -16,8 +17,8 @@ use crate::{
     ArchiveFormat, BLOCK_SIZE, Block, FrameError, FrameErrorInner, GnuKind, MemberKind, PaxKind,
     PaxRecord, PaxValue,
     header::{
-        CHECKSUM_RANGE, GNU_IDENTITY, IDENTITY_RANGE, POSIX_IDENTITY, SIZE_RANGE, TYPEFLAG_OFFSET,
-        checksum, parse_octal,
+        CHECKSUM_RANGE, GNU_IDENTITY, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE, NAME_RANGE,
+        POSIX_IDENTITY, PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, checksum, parse_octal,
     },
     pax::{
         apply_global as apply_global_pax_records, hdrcharset as pax_hdrcharset,
@@ -73,6 +74,8 @@ pub struct HeaderFrame {
     pub position: u64,
     /// The lossless header block bytes.
     pub block: Block,
+    /// The selected archive family of this member header.
+    pub format: ArchiveFormat,
     /// The member type identified by the header.
     pub kind: MemberKind,
     /// The size encoded directly in the member header field.
@@ -85,6 +88,41 @@ pub struct HeaderFrame {
     pub global_pax_records: Vec<PaxRecord>,
     /// Parsed local pax records that apply to this member, in input order.
     pub local_pax_records: Vec<PaxRecord>,
+}
+
+impl HeaderFrame {
+    /// Decodes the ordinary header's numeric mode according to its archive family.
+    pub fn mode(&self) -> Result<u64, FrameError> {
+        let bytes: [u8; 8] = self.block[MODE_RANGE]
+            .try_into()
+            .expect("fixed header range");
+        parse_number(self.format, &bytes).ok_or_else(|| {
+            FrameError::at(self.position, FrameErrorInner::InvalidMode { found: bytes })
+        })
+    }
+
+    pub(crate) fn header_path(&self) -> Cow<'_, [u8]> {
+        let name = trim_nul(&self.block[NAME_RANGE]);
+        if self.format == ArchiveFormat::Gnu {
+            return Cow::Borrowed(name);
+        }
+        let prefix = trim_nul(&self.block[PREFIX_RANGE]);
+        if prefix.is_empty() {
+            Cow::Borrowed(name)
+        } else if name.is_empty() {
+            Cow::Borrowed(prefix)
+        } else {
+            let mut path = Vec::with_capacity(prefix.len() + 1 + name.len());
+            path.extend_from_slice(prefix);
+            path.push(b'/');
+            path.extend_from_slice(name);
+            Cow::Owned(path)
+        }
+    }
+
+    pub(crate) fn link_name(&self) -> &[u8] {
+        trim_nul(&self.block[LINK_NAME_RANGE])
+    }
 }
 
 /// The payload entry to which a data block belongs.
@@ -704,6 +742,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         Ok(Frame::Header(HeaderFrame {
             position,
             block,
+            format: ArchiveFormat::Pax,
             kind,
             declared_size: parsed.size,
             effective_size,
@@ -772,6 +811,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         Ok(Frame::Header(HeaderFrame {
             position,
             block,
+            format: ArchiveFormat::Gnu,
             kind,
             declared_size: parsed.size,
             effective_size: parsed.size,
@@ -832,6 +872,14 @@ trait TryFromFramed<T>: Sized {
 
 fn is_zero_block(block: &Block) -> bool {
     block.iter().all(|byte| *byte == 0)
+}
+
+fn trim_nul(bytes: &[u8]) -> &[u8] {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    &bytes[..end]
 }
 
 fn member_payload_state(remaining: u64) -> State {

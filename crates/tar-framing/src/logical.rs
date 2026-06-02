@@ -9,10 +9,9 @@ use tokio::io::AsyncRead;
 use tokio_stream::StreamExt;
 
 use crate::{
-    ArchiveFormat, Block, FrameError, FrameErrorInner, GnuKind, MemberKind, PaxKind, PaxRecord,
-    PaxString, PaxValue,
-    header::{LINK_NAME_RANGE, MODE_RANGE, NAME_RANGE, PREFIX_RANGE},
-    stream::{DataOwner, Frame, GnuFrame, PaxFrame, TarStream, parse_number},
+    ArchiveFormat, Block, FrameError, FrameErrorInner, GnuKind, PaxKind, PaxRecord, PaxString,
+    PaxValue,
+    stream::{DataOwner, Frame, GnuFrame, HeaderFrame, PaxFrame, TarStream},
 };
 
 const PAYLOAD_DRAIN_CHUNK_BYTES: usize = 1024 * 1024;
@@ -35,89 +34,13 @@ pub struct GnuMetadata {
     pub payload: Vec<u8>,
 }
 
-/// An ordinary member header in a logical archive item.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MemberHeader {
-    /// The absolute byte position of this header block in the source stream.
-    pub position: u64,
-    /// The lossless member header block bytes.
-    pub block: Block,
-    /// The selected archive family of this member header.
-    pub format: ArchiveFormat,
-    /// The member type identified by the header.
-    pub kind: MemberKind,
-    /// The size encoded directly in the member header field.
-    pub declared_size: u64,
-    /// The size after applying applicable pax `size` records.
-    pub effective_size: u64,
-    /// The meaningful payload size belonging to this member.
-    pub payload_size: u64,
-}
-
-impl MemberHeader {
-    /// Returns the ordinary header's member-name bytes, trimmed at the first NUL.
-    pub fn name(&self) -> &[u8] {
-        trim_nul(&self.block[NAME_RANGE])
-    }
-
-    /// Returns the ordinary header's prefix bytes, trimmed at the first NUL.
-    pub fn prefix(&self) -> &[u8] {
-        trim_nul(&self.block[PREFIX_RANGE])
-    }
-
-    /// Returns the ordinary member path before extension metadata is applied.
-    ///
-    /// For ustar headers, this is the concatenation of the prefix and name fields.
-    /// For GNU headers, this is just the name field.
-    ///
-    /// **IMPORTANT**: This path is **not** guaranteed to be meaningful, valid, or
-    /// correct in the presence of pax or GNU metadata. Some tar encoders will place
-    /// a sentinel value in these fields. Unless you're writing a forensic tar
-    /// inspector, you probably want [`MemberFrame::effective_path`] instead.
-    pub fn header_path(&self) -> Cow<'_, [u8]> {
-        let name = self.name();
-        if self.format == ArchiveFormat::Gnu {
-            return Cow::Borrowed(name);
-        }
-        let prefix = self.prefix();
-        if prefix.is_empty() {
-            Cow::Borrowed(name)
-        } else if name.is_empty() {
-            Cow::Borrowed(prefix)
-        } else {
-            let mut path = Vec::with_capacity(prefix.len() + 1 + name.len());
-            path.extend_from_slice(prefix);
-            path.push(b'/');
-            path.extend_from_slice(name);
-            Cow::Owned(path)
-        }
-    }
-
-    /// Returns the ordinary header's link-name bytes, trimmed at the first NUL.
-    pub fn link_name(&self) -> &[u8] {
-        trim_nul(&self.block[LINK_NAME_RANGE])
-    }
-
-    /// Decodes the ordinary header's numeric mode according to its archive family.
-    pub fn mode(&self) -> Result<u64, FrameError> {
-        let bytes: [u8; 8] = self.block[MODE_RANGE]
-            .try_into()
-            .expect("fixed header range");
-        parse_number(self.format, &bytes).ok_or_else(|| {
-            FrameError::at(self.position, FrameErrorInner::InvalidMode { found: bytes })
-        })
-    }
-}
-
 /// Extension metadata attached to one ordinary archive member.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MemberExtensions {
     /// pax state applicable to an ordinary ustar member.
     Pax {
-        /// Effective global records active for this member.
-        global_records: Vec<PaxRecord>,
-        /// Local pax metadata applying only to this member.
-        local: Option<PaxMetadata>,
+        /// Source position of the local pax header applying to this member.
+        local_position: Option<u64>,
     },
     /// GNU metadata applying to an ordinary GNU member.
     Gnu {
@@ -158,7 +81,7 @@ pub enum LogicalFrame<'a, R> {
 /// An ordinary archive member and its streaming payload cursor.
 pub struct MemberFrame<'a, R> {
     /// The ordinary member header.
-    pub header: MemberHeader,
+    pub header: HeaderFrame,
     /// Extension metadata applying to this member.
     pub extensions: MemberExtensions,
     /// A cursor over the member payload bytes.
@@ -172,13 +95,10 @@ impl<R> MemberFrame<'_, R> {
     /// ordinary-header fallback required to identify this member.
     pub fn effective_path(&self) -> Result<Cow<'_, [u8]>, FrameError> {
         match &self.extensions {
-            MemberExtensions::Pax {
-                global_records,
-                local,
-            } => resolve_pax_text(
+            MemberExtensions::Pax { .. } => resolve_pax_text(
                 self.header.position,
-                global_records,
-                local.as_ref(),
+                &self.header.global_pax_records,
+                &self.header.local_pax_records,
                 "path",
                 self.header.header_path(),
                 path_value,
@@ -199,13 +119,10 @@ impl<R> MemberFrame<'_, R> {
     /// ordinary-header fallback required to identify a link target.
     pub fn effective_link_path(&self) -> Result<Cow<'_, [u8]>, FrameError> {
         match &self.extensions {
-            MemberExtensions::Pax {
-                global_records,
-                local,
-            } => resolve_pax_text(
+            MemberExtensions::Pax { .. } => resolve_pax_text(
                 self.header.position,
-                global_records,
-                local.as_ref(),
+                &self.header.global_pax_records,
+                &self.header.local_pax_records,
                 "linkpath",
                 Cow::Borrowed(self.header.link_name()),
                 link_path_value,
@@ -246,11 +163,6 @@ impl<R> TarReader<R> {
             drain_buffer: Vec::new(),
         }
     }
-
-    /// Returns the selected archive family after the first header is read.
-    pub fn format(&self) -> Option<ArchiveFormat> {
-        self.stream.format()
-    }
 }
 
 impl<R: AsyncRead + Unpin> TarReader<R> {
@@ -261,7 +173,7 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
     pub async fn next_frame(&mut self) -> Result<Option<LogicalFrame<'_, R>>, FrameError> {
         self.drain_payload().await?;
 
-        let mut local_pax = None;
+        let mut local_pax_position = None;
         let mut long_name = None;
         let mut long_link = None;
         loop {
@@ -276,7 +188,7 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
                         PaxKind::Global => {
                             return Ok(Some(LogicalFrame::GlobalPax(metadata)));
                         }
-                        PaxKind::Local => local_pax = Some(metadata),
+                        PaxKind::Local => local_pax_position = Some(metadata.position),
                     }
                 }
                 Frame::Gnu(frame) => {
@@ -288,31 +200,14 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
                     }
                 }
                 Frame::Header(header) => {
-                    let format = self.stream.format().ok_or_else(|| {
-                        self.unexpected_logical_frame(
-                            header.position,
-                            "selected archive format for an ordinary member header",
-                            "ordinary member header without a format",
-                        )
-                    })?;
-                    let extensions = match format {
+                    let extensions = match header.format {
                         ArchiveFormat::Pax => MemberExtensions::Pax {
-                            global_records: header.global_pax_records.clone(),
-                            local: local_pax,
+                            local_position: local_pax_position,
                         },
                         ArchiveFormat::Gnu => MemberExtensions::Gnu {
                             long_name,
                             long_link,
                         },
-                    };
-                    let header = MemberHeader {
-                        position: header.position,
-                        block: header.block,
-                        format,
-                        kind: header.kind,
-                        declared_size: header.declared_size,
-                        effective_size: header.effective_size,
-                        payload_size: header.payload_size,
                     };
                     self.payload_remaining = header.payload_size;
                     return Ok(Some(LogicalFrame::Member(MemberFrame {
@@ -557,13 +452,15 @@ impl<R: AsyncRead + Unpin> MemberPayload<'_, R> {
 fn resolve_pax_text<'a>(
     position: u64,
     global_records: &'a [PaxRecord],
-    local: Option<&'a PaxMetadata>,
+    local_records: &'a [PaxRecord],
     keyword: &'static str,
     header_value: Cow<'a, [u8]>,
     select: fn(&PaxRecord) -> Option<&PaxValue<PaxString>>,
 ) -> Result<Cow<'a, [u8]>, FrameError> {
-    let value = local
-        .and_then(|local| local.records.iter().rev().find_map(select))
+    let value = local_records
+        .iter()
+        .rev()
+        .find_map(select)
         .or_else(|| global_records.iter().rev().find_map(select));
     if let Some(value) = value {
         return pax_value(position, keyword, value);
@@ -595,7 +492,8 @@ fn pax_value<'a>(
     value: &'a PaxValue<PaxString>,
 ) -> Result<Cow<'a, [u8]>, FrameError> {
     match value {
-        PaxValue::Value(value) => Ok(Cow::Borrowed(value.as_bytes())),
+        PaxValue::Value(PaxString::Utf8(value)) => Ok(Cow::Borrowed(value.as_bytes())),
+        PaxValue::Value(PaxString::Binary(value)) => Ok(Cow::Borrowed(value)),
         // A pax value that has been explicitly deleted does *not*
         // result in a fallthrough to the corresponding ustar header value:
         //
@@ -641,14 +539,6 @@ fn parse_gnu_metadata(metadata: &GnuMetadata, kind: GnuKind) -> Result<&[u8], Fr
     Ok(&metadata.payload[..terminator])
 }
 
-fn trim_nul(bytes: &[u8]) -> &[u8] {
-    let end = bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(bytes.len());
-    &bytes[..end]
-}
-
 fn frame_position(frame: &Frame) -> u64 {
     match frame {
         Frame::Pax(frame) => frame.position,
@@ -672,7 +562,7 @@ mod tests {
     use super::*;
     use crate::{
         BLOCK_SIZE, FrameError, FrameErrorInner, PaxRecord, PaxValue,
-        header::TYPEFLAG_OFFSET,
+        header::{LINK_NAME_RANGE, MODE_RANGE, NAME_RANGE, PREFIX_RANGE, TYPEFLAG_OFFSET},
         stream::DataOwner,
         test_support::{
             ChunkedReader, append_block, append_payload, append_terminator, data, gnu_header,
@@ -703,8 +593,6 @@ mod tests {
                 panic!("expected ustar member");
             };
             assert_eq!(member.header.format, ArchiveFormat::Pax);
-            assert_eq!(member.header.name(), b"file");
-            assert_eq!(member.header.prefix(), b"dir");
             assert_eq!(member.header.header_path().as_ref(), b"dir/file");
             assert_eq!(member.header.link_name(), b"target");
             assert_eq!(member.header.mode()?, 0o755);
@@ -886,15 +774,15 @@ mod tests {
                 };
                 assert_eq!(member.header.effective_size, 513);
                 let MemberExtensions::Pax {
-                    global_records,
-                    local: Some(local_header),
+                    local_position: Some(local_position),
                 } = &member.extensions
                 else {
                     panic!("expected local pax member metadata");
                 };
-                assert_eq!(global_records, &global_header.records);
+                assert_eq!(*local_position, (BLOCK_SIZE * 2) as u64);
+                assert_eq!(member.header.global_pax_records, global_header.records);
                 assert_eq!(
-                    local_header.records.last(),
+                    member.header.local_pax_records.last(),
                     Some(&PaxRecord::Size(PaxValue::Value(513)))
                 );
                 let Some(first) = member.payload.next_block().await? else {
@@ -1078,7 +966,6 @@ mod tests {
         ready_ok(async {
             let mut reader = TarReader::new(ChunkedReader::new(empty, BLOCK_SIZE));
             assert!(reader.next_frame().await?.is_none());
-            assert_eq!(reader.format(), None);
             Ok(())
         });
 

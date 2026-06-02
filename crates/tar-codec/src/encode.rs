@@ -581,47 +581,18 @@ mod tests {
     };
 
     use tar_framing::{
-        ArchiveFormat, PaxKind,
+        PaxKind,
         logical::{LogicalFrame, TarReader},
         stream::{Frame, TarStream},
     };
     use tempfile::tempdir;
-    use tokio::io::{AsyncRead, ReadBuf};
     use tokio_stream::StreamExt;
 
     use super::{traversal::DIRECTORY_TRAVERSAL_BATCH_ENTRIES, *};
-    use crate::decode::{Archive, DecodeError, DecodePolicy};
-
-    struct VecReader {
-        bytes: Vec<u8>,
-        position: usize,
-    }
-
-    impl VecReader {
-        fn new(bytes: Vec<u8>) -> Self {
-            Self { bytes, position: 0 }
-        }
-    }
-
-    impl AsyncRead for VecReader {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            _context: &mut Context<'_>,
-            buffer: &mut ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
-            if self.position == self.bytes.len() {
-                return Poll::Ready(Ok(()));
-            }
-            let len = buffer
-                .remaining()
-                .min(17)
-                .min(self.bytes.len() - self.position);
-            let end = self.position + len;
-            buffer.put_slice(&self.bytes[self.position..end]);
-            self.position = end;
-            Poll::Ready(Ok(()))
-        }
-    }
+    use crate::{
+        decode::{Archive, DecodeError, DecodePolicy},
+        test_support::ChunkedReader,
+    };
 
     #[derive(Default)]
     struct FailingWriter;
@@ -651,7 +622,7 @@ mod tests {
     }
 
     async fn extract_archive(bytes: Vec<u8>, dest: &Path) -> Result<(), DecodeError> {
-        Archive::new(VecReader::new(bytes))
+        Archive::new(ChunkedReader::new(bytes, 17))
             .extract(dest, DecodePolicy::default())
             .await
     }
@@ -673,7 +644,7 @@ mod tests {
             .unwrap();
         let bytes = encoder.finish().await.unwrap();
 
-        let frames = TarStream::new(VecReader::new(bytes.clone()))
+        let frames = TarStream::new(ChunkedReader::new(bytes.clone(), 17))
             .collect::<Vec<_>>()
             .await;
         assert!(frames.iter().all(|frame| {
@@ -790,7 +761,7 @@ mod tests {
         }
 
         let bytes = encode_source_directory(&source).await;
-        let mut reader = TarReader::new(VecReader::new(bytes.clone()));
+        let mut reader = TarReader::new(ChunkedReader::new(bytes.clone(), 17));
         let mut paths = Vec::new();
         while let Some(frame) = reader.next_frame().await.unwrap() {
             match frame {
@@ -807,7 +778,6 @@ mod tests {
             paths,
             ["tree", "tree/a", "tree/sub", "tree/sub/file", "tree/z"]
         );
-        assert_eq!(reader.format(), Some(ArchiveFormat::Pax));
 
         let dest = temp.path().join("out");
         extract_archive(bytes, &dest).await.unwrap();
@@ -952,7 +922,7 @@ mod tests {
         std::fs::hard_link(source.join("one"), source.join("two")).unwrap();
 
         let bytes = encode_source_directory(&source).await;
-        let mut reader = TarReader::new(VecReader::new(bytes));
+        let mut reader = TarReader::new(ChunkedReader::new(bytes, 17));
         let mut regular = 0;
         while let Some(frame) = reader.next_frame().await.unwrap() {
             if let LogicalFrame::Member(member) = frame {

@@ -35,16 +35,6 @@ pub enum PaxString {
     Binary(Vec<u8>),
 }
 
-impl PaxString {
-    /// Returns the value's source bytes without interpreting its encoding.
-    pub fn as_bytes(&self) -> &[u8] {
-        match self {
-            Self::Utf8(value) => value.as_bytes(),
-            Self::Binary(value) => value,
-        }
-    }
-}
-
 /// A parsed pax value, including an explicit deletion tombstone.
 ///
 /// Deletion tombstones are needed because pax has special semantics for
