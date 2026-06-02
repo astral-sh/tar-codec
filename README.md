@@ -21,8 +21,8 @@ the machine and filesystem, and are lower-is-better.
 
 | Recursive encoding | `tar-codec` | `tar` | `astral-tokio-tar` |
 | --- | ---: | ---: | ---: |
-| large: 1 x 16 MiB | 0.93 ms | 1.07 ms | 12.28 ms |
-| many-small: 1,024 x 1 KiB | 29.4 ms | 21.6 ms | 55.8 ms |
+| large: 1 x 16 MiB | 0.93 ms | 1.03 ms | 12.69 ms |
+| many-small: 1,024 x 1 KiB | 26.8 ms | 21.7 ms | 59.2 ms |
 
 | Extraction | `tar-codec` | `tar` | `astral-tokio-tar` |
 | --- | ---: | ---: | ---: |
@@ -36,7 +36,7 @@ The synchronous `tar` crate still leads the many-small filesystem workloads.
 The many-small extraction figures are especially filesystem-sensitive and
 noisy.
 Recursive encoding policies are not identical: `tar-codec` emits pure pax
-archives and validates the complete tree before writing, while the comparison
+archives and streams a deterministic sorted traversal, while the comparison
 builders emit conventional headers.
 
 ## Benchmarking
@@ -50,8 +50,10 @@ cargo bench -p tar-codec --bench comparison
 The benchmarks compare `tar-codec` against `tar` and `astral-tokio-tar` for
 uncompressed encoding and extraction. Encoder output formats intentionally
 differ: `tar-codec` emits pure pax archives, while the comparison builders emit
-conventional headers. `tar-codec` also validates the complete recursive tree
-before writing it.
+conventional headers. `tar-codec` validates recursive entries incrementally,
+preserves UTF-8 source symbolic-link targets without applying extraction
+policy, and may return an error after writing partial output if a late source
+entry is invalid.
 
 `encode_entries_framing` measures in-memory entry framing and bookkeeping with a
 sink that does not read payload bytes, so it reports entries per second.
