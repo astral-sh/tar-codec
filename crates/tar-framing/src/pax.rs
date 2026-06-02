@@ -287,29 +287,18 @@ fn parse_record(
     hdrcharset: HdrCharset,
 ) -> Result<PaxRecord, FrameError> {
     match keyword {
-        "atime" => {
-            parse_time(position, "atime", parse_utf8(position, value)?).map(PaxRecord::Atime)
-        }
+        "atime" => parse_time(position, "atime", value).map(PaxRecord::Atime),
         "charset" => parse_text(position, value).map(PaxRecord::Charset),
         "comment" => parse_text(position, value).map(PaxRecord::Comment),
-        "ctime" => {
-            parse_time(position, "ctime", parse_utf8(position, value)?).map(PaxRecord::Ctime)
-        }
-        "gid" => {
-            parse_record_integer(position, "gid", parse_utf8(position, value)?).map(PaxRecord::Gid)
-        }
+        "ctime" => parse_time(position, "ctime", value).map(PaxRecord::Ctime),
+        "gid" => parse_record_integer(position, "gid", value).map(PaxRecord::Gid),
         "gname" => parse_pax_string(position, value, hdrcharset).map(PaxRecord::Gname),
         "hdrcharset" => parse_hdrcharset(position, value).map(PaxRecord::HdrCharset),
         "linkpath" => parse_pax_string(position, value, hdrcharset).map(PaxRecord::LinkPath),
-        "mtime" => {
-            parse_time(position, "mtime", parse_utf8(position, value)?).map(PaxRecord::Mtime)
-        }
+        "mtime" => parse_time(position, "mtime", value).map(PaxRecord::Mtime),
         "path" => parse_pax_string(position, value, hdrcharset).map(PaxRecord::Path),
-        "size" => parse_record_integer(position, "size", parse_utf8(position, value)?)
-            .map(PaxRecord::Size),
-        "uid" => {
-            parse_record_integer(position, "uid", parse_utf8(position, value)?).map(PaxRecord::Uid)
-        }
+        "size" => parse_record_integer(position, "size", value).map(PaxRecord::Size),
+        "uid" => parse_record_integer(position, "uid", value).map(PaxRecord::Uid),
         "uname" => parse_pax_string(position, value, hdrcharset).map(PaxRecord::Uname),
         _ => parse_namespaced_record(position, keyword, value),
     }
@@ -414,8 +403,9 @@ fn parse_utf8(position: u64, value: &[u8]) -> Result<&str, FrameError> {
 fn parse_record_integer(
     position: u64,
     keyword: &'static str,
-    value: &str,
+    value: &[u8],
 ) -> Result<PaxValue<u64>, FrameError> {
+    let value = parse_utf8(position, value)?;
     if value.is_empty() {
         return Ok(PaxValue::Deleted);
     }
@@ -434,8 +424,9 @@ fn parse_record_integer(
 fn parse_time(
     position: u64,
     keyword: &'static str,
-    value: &str,
+    value: &[u8],
 ) -> Result<PaxValue<u64>, FrameError> {
+    let value = parse_utf8(position, value)?;
     if value.is_empty() {
         return Ok(PaxValue::Deleted);
     }
@@ -558,22 +549,22 @@ mod tests {
     #[test]
     fn parses_strict_numeric_and_timestamp_values() {
         assert!(matches!(
-            parse_record_integer(0, "uid", "12"),
+            parse_record_integer(0, "uid", b"12"),
             Ok(PaxValue::Value(12))
         ));
         assert!(matches!(
-            parse_record_integer(0, "uid", ""),
+            parse_record_integer(0, "uid", b""),
             Ok(PaxValue::Deleted)
         ));
         assert!(matches!(
-            parse_time(0, "mtime", "12.034"),
+            parse_time(0, "mtime", b"12.034"),
             Ok(PaxValue::Value(12))
         ));
-        assert!(matches!(parse_time(0, "mtime", ""), Ok(PaxValue::Deleted)));
+        assert!(matches!(parse_time(0, "mtime", b""), Ok(PaxValue::Deleted)));
 
         for value in ["+1", "-1", "12x", "18446744073709551616"] {
             assert!(matches!(
-                parse_record_integer(7, "gid", value),
+                parse_record_integer(7, "gid", value.as_bytes()),
                 Err(FrameError {
                     position: 7,
                     inner: FrameErrorInner::InvalidPaxInteger { .. },
@@ -582,7 +573,7 @@ mod tests {
         }
         for value in ["+1", "-1", "1.", "1.nanosecond", "18446744073709551616"] {
             assert!(matches!(
-                parse_time(11, "atime", value),
+                parse_time(11, "atime", value.as_bytes()),
                 Err(FrameError {
                     position: 11,
                     inner: FrameErrorInner::InvalidPaxTime { .. },

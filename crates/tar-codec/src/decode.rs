@@ -25,7 +25,7 @@ use tar_framing::{
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWriteExt};
 
-use crate::blocking::with_reusable_buffer;
+use crate::{blocking::with_reusable_buffer, has_windows_prefix};
 
 const EXTRACTION_CHUNK_BYTES: usize = 1024 * 1024;
 
@@ -579,11 +579,6 @@ fn normalize_path(
     Ok(components.iter().collect())
 }
 
-fn has_windows_prefix(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
-}
-
 fn unsafe_path<T>(
     position: u64,
     context: &'static str,
@@ -742,9 +737,7 @@ impl ExtractionRoot {
 
     async fn create_directory(&mut self, member: DecodedMember) -> Result<(), DecodeError> {
         self.ensure_parents(&member.path).await?;
-        if self.pending_symlinks.contains_key(&member.path) {
-            return Err(DecodeError::PathCollision { path: member.path });
-        }
+        self.reject_pending_symlink(&member.path)?;
         if !self.verified_directories.contains(&member.path) {
             match self.symlink_metadata(&member.path).await? {
                 Some(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
@@ -872,13 +865,14 @@ impl ExtractionRoot {
         executable: bool,
     ) -> Result<std::fs::File, DecodeError> {
         self.prepare_file_path(path).await?;
-        let relative = path.to_owned();
-        let error_path = relative.clone();
-        let dir = Arc::clone(&self.dir);
-        tokio::task::spawn_blocking(move || open_or_replace_file(&dir, &relative, executable))
-            .await?
+        let (path, result) = self
+            .run_path_operation(path, move |dir, path| {
+                open_or_replace_file(dir, path, executable)
+            })
+            .await?;
+        result
             .map(cap_std::fs::File::into_std)
-            .map_err(|error| map_file_operation_error(error_path, error))
+            .map_err(|error| map_file_operation_error(path, error))
     }
 
     async fn create_or_replace_buffered_file(
@@ -903,21 +897,12 @@ impl ExtractionRoot {
 
     async fn prepare_file_path(&mut self, path: &Path) -> Result<(), DecodeError> {
         self.ensure_parents(path).await?;
-        if self.pending_symlinks.contains_key(path) {
-            return Err(DecodeError::PathCollision {
-                path: path.to_owned(),
-            });
-        }
-        Ok(())
+        self.reject_pending_symlink(path)
     }
 
     async fn ensure_new_path(&mut self, path: &Path) -> Result<(), DecodeError> {
         self.ensure_parents(path).await?;
-        if self.pending_symlinks.contains_key(path) {
-            return Err(DecodeError::PathCollision {
-                path: path.to_owned(),
-            });
-        }
+        self.reject_pending_symlink(path)?;
         self.reject_existing(path).await
     }
 
@@ -928,11 +913,7 @@ impl ExtractionRoot {
         let mut current = PathBuf::new();
         for component in parent.components() {
             current.push(component.as_os_str());
-            if self.pending_symlinks.contains_key(&current) {
-                return Err(DecodeError::PathCollision {
-                    path: current.clone(),
-                });
-            }
+            self.reject_pending_symlink(&current)?;
             if self.verified_directories.contains(&current) {
                 continue;
             }
@@ -955,6 +936,16 @@ impl ExtractionRoot {
         Ok(())
     }
 
+    fn reject_pending_symlink(&self, path: &Path) -> Result<(), DecodeError> {
+        if self.pending_symlinks.contains_key(path) {
+            Err(DecodeError::PathCollision {
+                path: path.to_owned(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
     async fn reject_existing(&self, path: &Path) -> Result<(), DecodeError> {
         if self.symlink_metadata(path).await?.is_some() {
             Err(DecodeError::PathCollision {
@@ -969,47 +960,41 @@ impl ExtractionRoot {
         &self,
         path: &Path,
     ) -> Result<Option<cap_std::fs::Metadata>, DecodeError> {
-        let relative = path.to_owned();
-        let error_path = relative.clone();
-        let dir = Arc::clone(&self.dir);
-        match tokio::task::spawn_blocking(move || dir.symlink_metadata(relative)).await? {
+        let (path, result) = self
+            .run_path_operation(path, |dir, path| dir.symlink_metadata(path))
+            .await?;
+        match result {
             Ok(metadata) => Ok(Some(metadata)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(source) => Err(filesystem("inspect", error_path, source)),
+            Err(source) => Err(filesystem("inspect", path, source)),
         }
     }
 
     async fn create_dir(&self, path: &Path) -> Result<(), DecodeError> {
-        let relative = path.to_owned();
-        let error_path = relative.clone();
-        let dir = Arc::clone(&self.dir);
-        tokio::task::spawn_blocking(move || dir.create_dir(relative))
-            .await?
-            .map_err(|source| filesystem("create directory", error_path, source))
+        let (path, result) = self
+            .run_path_operation(path, |dir, path| dir.create_dir(path))
+            .await?;
+        result.map_err(|source| filesystem("create directory", path, source))
     }
 
     async fn truncate_file(&self, path: &Path) -> Result<std::fs::File, DecodeError> {
-        let relative = path.to_owned();
-        let error_path = relative.clone();
-        let dir = Arc::clone(&self.dir);
-        tokio::task::spawn_blocking(move || {
-            let mut options = OpenOptions::new();
-            options.write(true).truncate(true);
-            dir.open_with(relative, &options)
-                .map(cap_std::fs::File::into_std)
-        })
-        .await?
-        .map_err(|source| filesystem("truncate file", error_path, source))
+        let (path, result) = self
+            .run_path_operation(path, |dir, path| {
+                let mut options = OpenOptions::new();
+                options.write(true).truncate(true);
+                dir.open_with(path, &options)
+                    .map(cap_std::fs::File::into_std)
+            })
+            .await?;
+        result.map_err(|source| filesystem("truncate file", path, source))
     }
 
     async fn hard_link(&self, target: &Path, path: &Path) -> Result<(), DecodeError> {
         let target = target.to_owned();
-        let path = path.to_owned();
-        let error_path = path.clone();
-        let dir = Arc::clone(&self.dir);
-        tokio::task::spawn_blocking(move || dir.hard_link(target, &dir, path))
-            .await?
-            .map_err(|source| filesystem("create hard link", error_path, source))
+        let (path, result) = self
+            .run_path_operation(path, move |dir, path| dir.hard_link(target, dir, path))
+            .await?;
+        result.map_err(|source| filesystem("create hard link", path, source))
     }
 
     async fn install_symlink(
@@ -1018,13 +1003,32 @@ impl ExtractionRoot {
         contents: &Path,
         kind: TerminalKind,
     ) -> Result<(), DecodeError> {
-        let path = path.to_owned();
-        let error_path = path.clone();
         let contents = contents.to_owned();
+        let (path, result) = self
+            .run_path_operation(path, move |dir, path| {
+                create_symlink(dir, &contents, path, kind)
+            })
+            .await?;
+        result.map_err(|source| filesystem("create symbolic link", path, source))
+    }
+
+    async fn run_path_operation<T, E, F>(
+        &self,
+        path: &Path,
+        operation: F,
+    ) -> Result<(PathBuf, Result<T, E>), DecodeError>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce(&Dir, &Path) -> Result<T, E> + Send + 'static,
+    {
+        let path = path.to_owned();
         let dir = Arc::clone(&self.dir);
-        tokio::task::spawn_blocking(move || create_symlink(&dir, &contents, &path, kind))
-            .await?
-            .map_err(|source| filesystem("create symbolic link", error_path, source))
+        Ok(tokio::task::spawn_blocking(move || {
+            let result = operation(&dir, &path);
+            (path, result)
+        })
+        .await?)
     }
 }
 

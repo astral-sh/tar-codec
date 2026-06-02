@@ -24,7 +24,7 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use self::traversal::{TraversalEntry, TraversalKind, TraversalStream, stream_directory_entries};
-use crate::blocking::with_reusable_buffer;
+use crate::{blocking::with_reusable_buffer, has_windows_prefix};
 
 const SOURCE_FILE_CHUNK_BYTES: usize = 1024 * 1024;
 
@@ -196,24 +196,21 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
         let (returned_buffer, result) = prepare_source_file(&entry.source, reusable_buffer).await;
         *buffer = returned_buffer;
         let file = result?;
+        let (size, executable) = file.metadata();
         self.write_member(PaxMember {
             path: &entry.archive_path,
             kind: MemberKind::Regular,
-            size: file.size(),
+            size,
             link_path: None,
-            executable: file.executable(),
+            executable,
         })
         .await?;
         match file {
-            PreparedSourceFile::Buffered { size, .. } => {
+            PreparedSourceFile::Buffered { .. } => {
                 self.write_bytes(buffer).await?;
                 self.write_padding(size).await
             }
-            PreparedSourceFile::Streaming {
-                file,
-                size,
-                executable: _,
-            } => {
+            PreparedSourceFile::Streaming { file, .. } => {
                 let mut file = tokio::fs::File::from_std(file);
                 self.write_file_payload(&mut file, &entry.source, size, buffer)
                     .await?;
@@ -366,15 +363,12 @@ async fn prepare_source_file(
 }
 
 impl PreparedSourceFile {
-    fn size(&self) -> u64 {
+    fn metadata(&self) -> (u64, bool) {
         match self {
-            Self::Buffered { size, .. } | Self::Streaming { size, .. } => *size,
-        }
-    }
-
-    fn executable(&self) -> bool {
-        match self {
-            Self::Buffered { executable, .. } | Self::Streaming { executable, .. } => *executable,
+            Self::Buffered { size, executable }
+            | Self::Streaming {
+                size, executable, ..
+            } => (*size, *executable),
         }
     }
 }
@@ -557,11 +551,6 @@ fn validate_archive_path(path: &Path) -> Result<&str, &'static str> {
         return Err("path contains an empty, current, or parent component");
     }
     Ok(path)
-}
-
-fn has_windows_prefix(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 fn filesystem_error(operation: &'static str, path: &Path, source: io::Error) -> EncodeError {

@@ -336,11 +336,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                     },
                 )
             })?;
-        self.state = if remaining == 0 {
-            State::AwaitingHeader
-        } else {
-            State::ReadingMember { remaining }
-        };
+        self.state = member_payload_state(remaining);
         buffer.truncate(meaningful_len);
         Ok(meaningful_len)
     }
@@ -564,11 +560,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             State::ReadingMember { mut remaining } => {
                 let len = remaining.min(BLOCK_SIZE as u64) as usize;
                 remaining -= len as u64;
-                if remaining == 0 {
-                    self.state = State::AwaitingHeader;
-                } else {
-                    self.state = State::ReadingMember { remaining };
-                }
+                self.state = member_payload_state(remaining);
                 Ok(Some(Frame::Data(DataFrame {
                     position,
                     block,
@@ -708,13 +700,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 )),
             })?;
         let payload_size = posix_payload_size(position, kind, effective_size)?;
-        self.state = if payload_size == 0 {
-            State::AwaitingHeader
-        } else {
-            State::ReadingMember {
-                remaining: payload_size,
-            }
-        };
+        self.state = member_payload_state(payload_size);
         Ok(Frame::Header(HeaderFrame {
             position,
             block,
@@ -782,13 +768,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             ));
         }
         let payload_size = gnu_payload_size(position, kind, parsed.size)?;
-        self.state = if payload_size == 0 {
-            State::AwaitingHeader
-        } else {
-            State::ReadingMember {
-                remaining: payload_size,
-            }
-        };
+        self.state = member_payload_state(payload_size);
         Ok(Frame::Header(HeaderFrame {
             position,
             block,
@@ -852,6 +832,14 @@ trait TryFromFramed<T>: Sized {
 
 fn is_zero_block(block: &Block) -> bool {
     block.iter().all(|byte| *byte == 0)
+}
+
+fn member_payload_state(remaining: u64) -> State {
+    if remaining == 0 {
+        State::AwaitingHeader
+    } else {
+        State::ReadingMember { remaining }
+    }
 }
 
 fn completed_block_bytes(len: usize) -> usize {
