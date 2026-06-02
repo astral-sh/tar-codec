@@ -25,6 +25,8 @@ use tar_framing::{
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWriteExt};
 
+use crate::blocking::with_reusable_buffer;
+
 const EXTRACTION_CHUNK_BYTES: usize = 1024 * 1024;
 
 /// A one-pass reader for a validated pax or GNU tar archive.
@@ -885,27 +887,20 @@ impl ExtractionRoot {
         &self,
         path: &Path,
         executable: bool,
-        mut buffer: Vec<u8>,
+        buffer: Vec<u8>,
     ) -> (Vec<u8>, Result<(), ExtractError>) {
         let relative = path.to_owned();
         let error_path = relative.clone();
         let dir = Arc::clone(&self.dir);
-        match tokio::task::spawn_blocking(move || {
+        with_reusable_buffer(buffer, move |buffer| {
             let result = open_or_replace_file(&dir, &relative, executable).and_then(|mut file| {
-                file.write_all(&buffer)
+                file.write_all(buffer)
                     .map_err(|source| file_operation_error("write file", source))
             });
             buffer.clear();
-            (buffer, result)
+            result.map_err(|error| map_file_operation_error(error_path, error))
         })
         .await
-        {
-            Ok((buffer, result)) => (
-                buffer,
-                result.map_err(|error| map_file_operation_error(error_path, error)),
-            ),
-            Err(error) => (Vec::new(), Err(error.into())),
-        }
     }
 
     async fn prepare_file_path(&mut self, path: &Path) -> Result<(), ExtractError> {

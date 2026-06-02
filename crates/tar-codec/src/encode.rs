@@ -11,11 +11,15 @@ use std::{
 };
 
 use tar_framing::{
-    BLOCK_SIZE, MemberKind,
-    write::{FramingWriteError, PaxMember, end_marker, frame_pax_member_into},
+    MemberKind,
+    write::{
+        FramingWriteError, PaxMember, end_marker_bytes, frame_pax_member_into, payload_padding,
+    },
 };
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use crate::blocking::with_reusable_buffer;
 
 const SOURCE_FILE_CHUNK_BYTES: usize = 1024 * 1024;
 
@@ -123,9 +127,7 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
     /// Writes the required two-zero-block terminator and returns the writer.
     pub async fn finish(mut self) -> Result<W, EncodeError> {
         self.ensure_active()?;
-        for block in end_marker() {
-            self.write_bytes(&block).await?;
-        }
+        self.write_bytes(end_marker_bytes()).await?;
         Ok(self.writer)
     }
 
@@ -256,15 +258,9 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
     }
 
     async fn write_padding(&mut self, size: u64) -> Result<(), EncodeError> {
-        let remainder = size % BLOCK_SIZE as u64;
-        if remainder != 0 {
-            let padding = [0; BLOCK_SIZE];
-            let len = usize::try_from(BLOCK_SIZE as u64 - remainder).map_err(|_| {
-                EncodeError::ArithmeticOverflow {
-                    context: "payload padding size",
-                }
-            })?;
-            self.write_bytes(&padding[..len]).await?;
+        let padding = payload_padding(size);
+        if !padding.is_empty() {
+            self.write_bytes(padding).await?;
         }
         Ok(())
     }
@@ -295,38 +291,30 @@ async fn open_source_file(path: &Path, expected_size: u64) -> Result<tokio::fs::
 async fn read_small_source_file(
     path: &Path,
     expected_size: u64,
-    mut buffer: Vec<u8>,
+    buffer: Vec<u8>,
 ) -> (Vec<u8>, Result<(), EncodeError>) {
     let path = path.to_path_buf();
-    match tokio::task::spawn_blocking(move || {
-        let result = (|| {
-            let file = open_verified_source_file(&path, expected_size)?;
-            let read_limit =
-                expected_size
-                    .checked_add(1)
-                    .ok_or(EncodeError::ArithmeticOverflow {
-                        context: "buffered source file read limit",
-                    })?;
-            buffer.clear();
-            file.take(read_limit)
-                .read_to_end(&mut buffer)
-                .map_err(|source| filesystem_error("read source file", &path, source))?;
-            let actual_size =
-                u64::try_from(buffer.len()).map_err(|_| EncodeError::ArithmeticOverflow {
-                    context: "buffered source file payload size",
-                })?;
-            if actual_size != expected_size {
-                return Err(EncodeError::ChangedSourceFile { path });
-            }
-            Ok(())
-        })();
-        (buffer, result)
+    with_reusable_buffer(buffer, move |buffer| {
+        let file = open_verified_source_file(&path, expected_size)?;
+        let read_limit = expected_size
+            .checked_add(1)
+            .ok_or(EncodeError::ArithmeticOverflow {
+                context: "buffered source file read limit",
+            })?;
+        buffer.clear();
+        file.take(read_limit)
+            .read_to_end(buffer)
+            .map_err(|source| filesystem_error("read source file", &path, source))?;
+        let actual_size =
+            u64::try_from(buffer.len()).map_err(|_| EncodeError::ArithmeticOverflow {
+                context: "buffered source file payload size",
+            })?;
+        if actual_size != expected_size {
+            return Err(EncodeError::ChangedSourceFile { path });
+        }
+        Ok(())
     })
     .await
-    {
-        Ok(result) => result,
-        Err(error) => (Vec::new(), Err(error.into())),
-    }
 }
 
 fn open_verified_source_file(

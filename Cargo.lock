@@ -947,6 +947,7 @@ dependencies = [
 name = "tar-framing"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "thiserror",
  "tokio",
  "tokio-stream",

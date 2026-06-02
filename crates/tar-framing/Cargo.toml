@@ -13,3 +13,11 @@ license = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
+
+[[bench]]
+name = "framing"
+harness = false

@@ -15,6 +15,8 @@ use crate::{
 
 const MAX_DECIMAL_U64_BYTES: usize = 20;
 const MAX_SEQUENCE_NAME_BYTES: usize = b"PaxHeaders/".len() + MAX_DECIMAL_U64_BYTES;
+const ZERO_BLOCK: Block = [0; BLOCK_SIZE];
+const END_MARKER_BYTES: [u8; BLOCK_SIZE * 2] = [0; BLOCK_SIZE * 2];
 
 /// Metadata needed to frame one supported pax archive member.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -169,8 +171,6 @@ pub fn frame_pax_member_into(
 
     let mut extended_name_buffer = [0; MAX_SEQUENCE_NAME_BYTES];
     let extended_name = prefixed_decimal_name(b"PaxHeaders/", sequence, &mut extended_name_buffer)?;
-    let extended_header = build_header(extended_name, 0o644, payload_size, b'x', b"")?;
-
     let mut fallback_name_buffer = [0; MAX_SEQUENCE_NAME_BYTES];
     let fallback_name = prefixed_decimal_name(b"PaxEntries/", sequence, &mut fallback_name_buffer)?;
     let member_name = if split_ustar_path(member.path.as_bytes()).is_some() {
@@ -191,14 +191,6 @@ pub fn frame_pax_member_into(
             return Err(FramingWriteError::UnsupportedMemberKind { kind: member.kind });
         }
     };
-    let member_header = build_header(
-        member_name,
-        mode,
-        fallback_size,
-        typeflag,
-        member.link_path.unwrap_or_default().as_bytes(),
-    )?;
-
     let framing_len = BLOCK_SIZE
         .checked_add(padded_payload_len)
         .and_then(|len| len.checked_add(BLOCK_SIZE))
@@ -207,7 +199,7 @@ pub fn frame_pax_member_into(
         })?;
     buffer.clear();
     buffer.reserve(framing_len);
-    buffer.extend_from_slice(&extended_header);
+    buffer.resize(BLOCK_SIZE, 0);
     append_record_with_len(buffer, "path", member.path.as_bytes(), path_record_len);
     append_record_with_len(buffer, "size", size, size_record_len);
     if let Some(link_path) = member.link_path
@@ -216,13 +208,47 @@ pub fn frame_pax_member_into(
         append_record_with_len(buffer, "linkpath", link_path.as_bytes(), record_len);
     }
     buffer.resize(BLOCK_SIZE + padded_payload_len, 0);
-    buffer.extend_from_slice(&member_header);
+    buffer.resize(framing_len, 0);
+    let (extended_header, rest) = buffer.split_at_mut(BLOCK_SIZE);
+    let (_, member_header) = rest.split_at_mut(padded_payload_len);
+    build_header_into(
+        extended_header,
+        extended_name,
+        0o644,
+        payload_size,
+        b'x',
+        b"",
+    )?;
+    build_header_into(
+        member_header,
+        member_name,
+        mode,
+        fallback_size,
+        typeflag,
+        member.link_path.unwrap_or_default().as_bytes(),
+    )?;
     Ok(())
 }
 
 /// Returns the required two-block POSIX end-of-archive marker.
 pub fn end_marker() -> [Block; 2] {
-    [[0; BLOCK_SIZE], [0; BLOCK_SIZE]]
+    [ZERO_BLOCK; 2]
+}
+
+/// Returns the required two-block POSIX end-of-archive marker as contiguous bytes.
+pub fn end_marker_bytes() -> &'static [u8] {
+    &END_MARKER_BYTES
+}
+
+/// Returns the zero padding required after a payload of `size` meaningful bytes.
+pub fn payload_padding(size: u64) -> &'static [u8] {
+    let remainder = size % BLOCK_SIZE as u64;
+    if remainder == 0 {
+        &[]
+    } else {
+        let len = (BLOCK_SIZE as u64 - remainder) as usize;
+        &ZERO_BLOCK[..len]
+    }
 }
 
 fn validate_member(member: PaxMember<'_>) -> Result<(), FramingWriteError> {
@@ -301,14 +327,20 @@ fn append_record_with_len(payload: &mut Vec<u8>, keyword: &'static str, value: &
     payload.push(b'\n');
 }
 
-fn build_header(
+fn build_header_into(
+    block: &mut [u8],
     path: &[u8],
     mode: u64,
     size: u64,
     typeflag: u8,
     link_path: &[u8],
-) -> Result<Block, FramingWriteError> {
-    let mut block = [0; BLOCK_SIZE];
+) -> Result<(), FramingWriteError> {
+    let block: &mut Block =
+        block
+            .try_into()
+            .map_err(|_| FramingWriteError::ArithmeticOverflow {
+                context: "ustar header block length",
+            })?;
     let (prefix, name) = split_ustar_path(path).ok_or(FramingWriteError::ArithmeticOverflow {
         context: "ustar fallback path",
     })?;
@@ -342,12 +374,12 @@ fn build_header(
         + u64::from(typeflag)
         + byte_sum(POSIX_IDENTITY)
         + CHECKSUM_RANGE.len() as u64 * u64::from(b' ');
-    if !encode_checksum_value(&mut block, checksum) {
+    if !encode_checksum_value(block, checksum) {
         return Err(FramingWriteError::ArithmeticOverflow {
             context: "ustar checksum",
         });
     }
-    Ok(block)
+    Ok(())
 }
 
 fn fits_octal(field_len: usize, value: u64) -> bool {
@@ -472,13 +504,18 @@ mod tests {
         test_support::{ChunkedReader, ready},
     };
 
-    fn flatten(blocks: PaxMemberBlocks, payload: &[u8]) -> Vec<u8> {
+    fn flatten_framing(blocks: PaxMemberBlocks) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&blocks.extended_header);
         for block in blocks.extended_payload {
             bytes.extend_from_slice(&block);
         }
         bytes.extend_from_slice(&blocks.member_header);
+        bytes
+    }
+
+    fn flatten(blocks: PaxMemberBlocks, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = flatten_framing(blocks);
         for chunk in payload.chunks(BLOCK_SIZE) {
             let mut block = [0; BLOCK_SIZE];
             block[..chunk.len()].copy_from_slice(chunk);
@@ -575,6 +612,35 @@ mod tests {
         }
         let frames = ready(TarStream::new(ChunkedReader::new(bytes, 19)).collect::<Vec<_>>());
         assert!(frames.iter().all(Result::is_ok));
+    }
+
+    #[test]
+    fn frames_directly_into_the_same_bytes_as_the_block_wrapper() {
+        let member = PaxMember {
+            path: "bin/tool",
+            kind: MemberKind::Regular,
+            size: 3,
+            link_path: None,
+            executable: true,
+        };
+        let expected = flatten_framing(frame_pax_member(7, member).expect("valid member"));
+        let mut bytes = Vec::new();
+        frame_pax_member_into(7, member, &mut bytes).expect("valid member");
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn returns_payload_padding_and_contiguous_end_marker_bytes() {
+        assert_eq!(payload_padding(0), b"");
+        assert_eq!(payload_padding(BLOCK_SIZE as u64), b"");
+        assert_eq!(payload_padding(1), &[0; BLOCK_SIZE - 1]);
+        assert_eq!(
+            payload_padding((BLOCK_SIZE + 7) as u64),
+            &[0; BLOCK_SIZE - 7]
+        );
+
+        let marker = end_marker().into_iter().flatten().collect::<Vec<_>>();
+        assert_eq!(end_marker_bytes(), marker);
     }
 
     #[test]

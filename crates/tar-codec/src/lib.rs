@@ -3,5 +3,7 @@
 //! Decoding and secure extraction are currently available through [`decode`].
 //! Deterministic pure-pax encoding is available through [`encode`].
 
+mod blocking;
+
 pub mod decode;
 pub mod encode;
