@@ -8,9 +8,10 @@ use std::{
 use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::{
-    BLOCK_SIZE, Block,
+    BLOCK_SIZE, Block, FrameError,
     header::{
-        CHECKSUM_RANGE, GNU_IDENTITY, IDENTITY_RANGE, POSIX_IDENTITY, SIZE_RANGE, TYPEFLAG_OFFSET,
+        GNU_IDENTITY, IDENTITY_RANGE, POSIX_IDENTITY, SIZE_RANGE, TYPEFLAG_OFFSET, encode_checksum,
+        encode_octal,
     },
 };
 
@@ -52,17 +53,13 @@ impl AsyncRead for ChunkedReader {
 }
 
 pub(crate) fn set_checksum(block: &mut Block) {
-    block[CHECKSUM_RANGE].fill(b' ');
-    let checksum: u64 = block.iter().map(|byte| u64::from(*byte)).sum();
-    let encoded = format!("{checksum:06o}\0 ");
-    block[CHECKSUM_RANGE].copy_from_slice(encoded.as_bytes());
+    encode_checksum(block);
 }
 
 pub(crate) fn header(typeflag: u8, size: u64) -> Block {
     let mut block = [0; BLOCK_SIZE];
     block[..4].copy_from_slice(b"file");
-    let encoded_size = format!("{size:011o}\0");
-    block[SIZE_RANGE].copy_from_slice(encoded_size.as_bytes());
+    assert!(encode_octal(&mut block[SIZE_RANGE], size));
     block[TYPEFLAG_OFFSET] = typeflag;
     block[IDENTITY_RANGE].copy_from_slice(POSIX_IDENTITY);
     set_checksum(&mut block);
@@ -86,21 +83,20 @@ pub(crate) fn gnu_base256_header(typeflag: u8, size: u64) -> Block {
     block
 }
 
-pub(crate) fn data(value: &[u8]) -> Block {
-    let mut block = [0; BLOCK_SIZE];
-    block[..value.len()].copy_from_slice(value);
-    block
+pub(crate) fn record(keyword: &str, value: &str) -> Vec<u8> {
+    raw_record(keyword.as_bytes(), value.as_bytes())
 }
 
-pub(crate) fn record(keyword: &str, value: &str) -> Vec<u8> {
-    let suffix = format!(" {keyword}={value}\n");
+pub(crate) fn raw_record(keyword: &[u8], value: &[u8]) -> Vec<u8> {
+    let suffix = [b" ".as_slice(), keyword, b"=", value, b"\n"].concat();
     let mut len = suffix.len() + 1;
     loop {
-        let encoded = format!("{len}{suffix}");
-        if encoded.len() == len {
-            return encoded.into_bytes();
+        let mut record = len.to_string().into_bytes();
+        record.extend_from_slice(&suffix);
+        if record.len() == len {
+            return record;
         }
-        len = encoded.len();
+        len = record.len();
     }
 }
 
@@ -109,14 +105,22 @@ pub(crate) fn append_block(bytes: &mut Vec<u8>, block: &Block) {
 }
 
 pub(crate) fn append_payload(bytes: &mut Vec<u8>, payload: &[u8]) {
-    for chunk in payload.chunks(BLOCK_SIZE) {
-        append_block(bytes, &data(chunk));
-    }
+    bytes.extend_from_slice(payload);
+    bytes.resize(bytes.len().next_multiple_of(BLOCK_SIZE), 0);
+}
+
+pub(crate) fn append_posix(bytes: &mut Vec<u8>, typeflag: u8, payload: &[u8]) {
+    append_block(bytes, &header(typeflag, payload.len() as u64));
+    append_payload(bytes, payload);
+}
+
+pub(crate) fn append_gnu(bytes: &mut Vec<u8>, typeflag: u8, payload: &[u8]) {
+    append_block(bytes, &gnu_header(typeflag, payload.len() as u64));
+    append_payload(bytes, payload);
 }
 
 pub(crate) fn append_terminator(bytes: &mut Vec<u8>) {
-    append_block(bytes, &[0; BLOCK_SIZE]);
-    append_block(bytes, &[0; BLOCK_SIZE]);
+    bytes.resize(bytes.len() + 2 * BLOCK_SIZE, 0);
 }
 
 pub(crate) fn ready<F: Future>(future: F) -> F::Output {
@@ -126,5 +130,15 @@ pub(crate) fn ready<F: Future>(future: F) -> F::Output {
     match future.as_mut().poll(&mut context) {
         Poll::Ready(value) => value,
         Poll::Pending => panic!("test reader is never pending"),
+    }
+}
+
+pub(crate) fn ready_ok<F, T>(future: F) -> T
+where
+    F: Future<Output = Result<T, FrameError>>,
+{
+    match ready(future) {
+        Ok(value) => value,
+        Err(error) => panic!("test future returned error: {error:?}"),
     }
 }

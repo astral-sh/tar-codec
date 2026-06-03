@@ -4,7 +4,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use tar_framing::{
     BLOCK_SIZE, MemberKind,
     logical::{LogicalFrame, TarReader},
-    write::{PaxMember, end_marker, frame_pax_member_into},
+    write::{PaxMember, end_marker_bytes, frame_pax_member_into},
 };
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
@@ -141,9 +141,7 @@ fn archive(entries: &[Entry]) -> Vec<u8> {
         archive.extend_from_slice(&entry.data);
         append_padding(&mut archive, entry.data.len());
     }
-    for block in end_marker() {
-        archive.extend_from_slice(&block);
-    }
+    archive.extend_from_slice(end_marker_bytes());
     archive
 }
 

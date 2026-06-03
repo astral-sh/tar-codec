@@ -4,6 +4,7 @@
 //! tar block and preserves each source block verbatim.
 
 use std::{
+    borrow::Cow,
     future::poll_fn,
     pin::Pin,
     task::{Context, Poll},
@@ -16,8 +17,8 @@ use crate::{
     ArchiveFormat, BLOCK_SIZE, Block, FrameError, FrameErrorInner, GnuKind, MemberKind, PaxKind,
     PaxRecord, PaxValue,
     header::{
-        CHECKSUM_RANGE, GNU_IDENTITY, IDENTITY_RANGE, POSIX_IDENTITY, SIZE_RANGE, TYPEFLAG_OFFSET,
-        checksum, parse_octal,
+        CHECKSUM_RANGE, GNU_IDENTITY, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE, NAME_RANGE,
+        POSIX_IDENTITY, PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, checksum, parse_octal,
     },
     pax::{
         apply_global as apply_global_pax_records, hdrcharset as pax_hdrcharset,
@@ -73,6 +74,8 @@ pub struct HeaderFrame {
     pub position: u64,
     /// The lossless header block bytes.
     pub block: Block,
+    /// The selected archive family of this member header.
+    pub format: ArchiveFormat,
     /// The member type identified by the header.
     pub kind: MemberKind,
     /// The size encoded directly in the member header field.
@@ -85,6 +88,41 @@ pub struct HeaderFrame {
     pub global_pax_records: Vec<PaxRecord>,
     /// Parsed local pax records that apply to this member, in input order.
     pub local_pax_records: Vec<PaxRecord>,
+}
+
+impl HeaderFrame {
+    /// Decodes the ordinary header's numeric mode according to its archive family.
+    pub fn mode(&self) -> Result<u64, FrameError> {
+        let bytes: [u8; 8] = self.block[MODE_RANGE]
+            .try_into()
+            .expect("fixed header range");
+        parse_number(self.format, &bytes).ok_or_else(|| {
+            FrameError::at(self.position, FrameErrorInner::InvalidMode { found: bytes })
+        })
+    }
+
+    pub(crate) fn header_path(&self) -> Cow<'_, [u8]> {
+        let name = trim_nul(&self.block[NAME_RANGE]);
+        if self.format == ArchiveFormat::Gnu {
+            return Cow::Borrowed(name);
+        }
+        let prefix = trim_nul(&self.block[PREFIX_RANGE]);
+        if prefix.is_empty() {
+            Cow::Borrowed(name)
+        } else if name.is_empty() {
+            Cow::Borrowed(prefix)
+        } else {
+            let mut path = Vec::with_capacity(prefix.len() + 1 + name.len());
+            path.extend_from_slice(prefix);
+            path.push(b'/');
+            path.extend_from_slice(name);
+            Cow::Owned(path)
+        }
+    }
+
+    pub(crate) fn link_name(&self) -> &[u8] {
+        trim_nul(&self.block[LINK_NAME_RANGE])
+    }
 }
 
 /// The payload entry to which a data block belongs.
@@ -207,63 +245,42 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             State::ReadingMember { remaining } => *remaining,
             _ => {
                 self.state = State::Failed;
-                return Err(FrameError::at(
+                return Err(FrameError::unexpected_order(
                     self.position,
-                    FrameErrorInner::UnexpectedOrder {
-                        expected: "ordinary member payload",
-                        found: "parser state without member payload",
-                    },
+                    "ordinary member payload",
+                    "parser state without member payload",
                 ));
             }
         };
         if self.block_len != 0 {
             self.state = State::Failed;
-            return Err(FrameError::at(
+            return Err(FrameError::unexpected_order(
                 self.position,
-                FrameErrorInner::UnexpectedOrder {
-                    expected: "aligned ordinary member payload",
-                    found: "partially buffered physical block",
-                },
+                "aligned ordinary member payload",
+                "partially buffered physical block",
             ));
         }
 
         let target_blocks = target_len.max(BLOCK_SIZE).div_ceil(BLOCK_SIZE);
         let target_blocks = u64::try_from(target_blocks).map_err(|_| {
-            FrameError::at(
-                self.position,
-                FrameErrorInner::ArithmeticOverflow {
-                    context: "member payload chunk block count",
-                },
-            )
+            FrameError::arithmetic_overflow(self.position, "member payload chunk block count")
         })?;
         let remaining_blocks = remaining.div_ceil(BLOCK_SIZE as u64);
         let physical_len = target_blocks
             .min(remaining_blocks)
             .checked_mul(BLOCK_SIZE as u64)
             .ok_or_else(|| {
-                FrameError::at(
+                FrameError::arithmetic_overflow(
                     self.position,
-                    FrameErrorInner::ArithmeticOverflow {
-                        context: "member payload chunk physical length",
-                    },
+                    "member payload chunk physical length",
                 )
             })?;
         let meaningful_len = remaining.min(physical_len);
         let physical_len = usize::try_from(physical_len).map_err(|_| {
-            FrameError::at(
-                self.position,
-                FrameErrorInner::ArithmeticOverflow {
-                    context: "member payload chunk physical length",
-                },
-            )
+            FrameError::arithmetic_overflow(self.position, "member payload chunk physical length")
         })?;
         let meaningful_len = usize::try_from(meaningful_len).map_err(|_| {
-            FrameError::at(
-                self.position,
-                FrameErrorInner::ArithmeticOverflow {
-                    context: "member payload chunk meaningful length",
-                },
-            )
+            FrameError::arithmetic_overflow(self.position, "member payload chunk meaningful length")
         })?;
 
         buffer.resize(physical_len, 0);
@@ -284,8 +301,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 Err(source) => {
                     self.state = State::Failed;
                     let error_position = checked_position(start_position, filled)?;
-                    self.position =
-                        checked_position(start_position, completed_block_bytes(filled))?;
+                    self.position = checked_position(start_position, filled - filled % BLOCK_SIZE)?;
                     return Err(FrameError::at(
                         error_position,
                         FrameErrorInner::Io { source },
@@ -304,19 +320,15 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                     ));
                 }
                 let completed_len = u64::try_from(completed_len).map_err(|_| {
-                    FrameError::at(
+                    FrameError::arithmetic_overflow(
                         self.position,
-                        FrameErrorInner::ArithmeticOverflow {
-                            context: "completed member payload chunk length",
-                        },
+                        "completed member payload chunk length",
                     )
                 })?;
-                return Err(FrameError::at(
+                return Err(FrameError::truncated_payload(
                     self.position,
-                    FrameErrorInner::TruncatedPayload {
-                        owner: DataOwner::Member,
-                        remaining: remaining - remaining.min(completed_len),
-                    },
+                    DataOwner::Member,
+                    remaining - remaining.min(completed_len),
                 ));
             }
             filled += read;
@@ -329,18 +341,9 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             .checked_sub(meaningful_len as u64)
             .ok_or_else(|| {
                 self.state = State::Failed;
-                FrameError::at(
-                    start_position,
-                    FrameErrorInner::ArithmeticOverflow {
-                        context: "remaining member payload length",
-                    },
-                )
+                FrameError::arithmetic_overflow(start_position, "remaining member payload length")
             })?;
-        self.state = if remaining == 0 {
-            State::AwaitingHeader
-        } else {
-            State::ReadingMember { remaining }
-        };
+        self.state = member_payload_state(remaining);
         buffer.truncate(meaningful_len);
         Ok(meaningful_len)
     }
@@ -381,68 +384,42 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         self.position = self
             .position
             .checked_add(BLOCK_SIZE as u64)
-            .ok_or_else(|| {
-                FrameError::at(
-                    position,
-                    FrameErrorInner::ArithmeticOverflow {
-                        context: "stream position",
-                    },
-                )
-            })?;
+            .ok_or_else(|| FrameError::arithmetic_overflow(position, "stream position"))?;
         self.block_len = 0;
         let block = std::mem::replace(&mut self.block, [0; BLOCK_SIZE]);
         Poll::Ready(Ok(Some((position, block))))
     }
 
     fn handle_eof(&mut self) -> FrameError {
-        match &self.state {
-            State::AwaitingHeader | State::AwaitingSecondZero => {
-                FrameError::at(self.position, FrameErrorInner::MissingEndMarker)
-            }
+        let inner = match &self.state {
+            State::AwaitingHeader | State::AwaitingSecondZero => FrameErrorInner::MissingEndMarker,
             State::ReadingPax {
                 kind, remaining, ..
-            } => FrameError::at(
-                self.position,
-                FrameErrorInner::TruncatedPayload {
-                    owner: DataOwner::Pax(*kind),
-                    remaining: *remaining,
-                },
-            ),
-            State::AwaitingUstarHeader { .. } => FrameError::at(
-                self.position,
-                FrameErrorInner::UnexpectedEof {
-                    expected: "ordinary ustar member header after a local pax header",
-                },
-            ),
+            } => FrameErrorInner::TruncatedPayload {
+                owner: DataOwner::Pax(*kind),
+                remaining: *remaining,
+            },
+            State::AwaitingUstarHeader { .. } => FrameErrorInner::UnexpectedEof {
+                expected: "ordinary ustar member header after a local pax header",
+            },
             State::ReadingGnu {
                 kind, remaining, ..
-            } => FrameError::at(
-                self.position,
-                FrameErrorInner::TruncatedPayload {
-                    owner: DataOwner::Gnu(*kind),
-                    remaining: *remaining,
-                },
-            ),
-            State::AwaitingGnuMember { .. } => FrameError::at(
-                self.position,
-                FrameErrorInner::UnexpectedEof {
-                    expected: "ordinary GNU member header after a GNU metadata extension",
-                },
-            ),
-            State::ReadingMember { remaining } => FrameError::at(
-                self.position,
-                FrameErrorInner::TruncatedPayload {
-                    owner: DataOwner::Member,
-                    remaining: *remaining,
-                },
-            ),
-            State::Complete | State::Failed => FrameError::at(
-                self.position,
-                FrameErrorInner::UnexpectedEof {
-                    expected: "no further input",
-                },
-            ),
-        }
+            } => FrameErrorInner::TruncatedPayload {
+                owner: DataOwner::Gnu(*kind),
+                remaining: *remaining,
+            },
+            State::AwaitingGnuMember { .. } => FrameErrorInner::UnexpectedEof {
+                expected: "ordinary GNU member header after a GNU metadata extension",
+            },
+            State::ReadingMember { remaining } => FrameErrorInner::TruncatedPayload {
+                owner: DataOwner::Member,
+                remaining: *remaining,
+            },
+            State::Complete | State::Failed => FrameErrorInner::UnexpectedEof {
+                expected: "no further input",
+            },
+        };
+        FrameError::at(self.position, inner)
     }
 
     fn process_block(&mut self, position: u64, block: Block) -> Result<Option<Frame>, FrameError> {
@@ -502,22 +479,18 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             }
             State::AwaitingUstarHeader { records } => {
                 if is_zero_block(&block) {
-                    return Err(FrameError::at(
+                    return Err(FrameError::unexpected_order(
                         position,
-                        FrameErrorInner::UnexpectedOrder {
-                            expected: "ordinary ustar member header after a local pax header",
-                            found: "end-of-archive marker",
-                        },
+                        "ordinary ustar member header after a local pax header",
+                        "end-of-archive marker",
                     ));
                 }
                 let parsed = self.parse_format_checked_header(position, &block)?;
                 if matches!(parsed.typeflag, b'x' | b'g') {
-                    return Err(FrameError::at(
+                    return Err(FrameError::unexpected_order(
                         position,
-                        FrameErrorInner::UnexpectedOrder {
-                            expected: "ordinary ustar member header after a local pax header",
-                            found: "another pax extended header",
-                        },
+                        "ordinary ustar member header after a local pax header",
+                        "another pax extended header",
                     ));
                 }
                 self.process_ustar_header(position, block, parsed, records)
@@ -549,12 +522,10 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             }
             State::AwaitingGnuMember { pending } => {
                 if is_zero_block(&block) {
-                    return Err(FrameError::at(
+                    return Err(FrameError::unexpected_order(
                         position,
-                        FrameErrorInner::UnexpectedOrder {
-                            expected: "ordinary GNU member header after a GNU metadata extension",
-                            found: "end-of-archive marker",
-                        },
+                        "ordinary GNU member header after a GNU metadata extension",
+                        "end-of-archive marker",
                     ));
                 }
                 let parsed = self.parse_format_checked_header(position, &block)?;
@@ -564,11 +535,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             State::ReadingMember { mut remaining } => {
                 let len = remaining.min(BLOCK_SIZE as u64) as usize;
                 remaining -= len as u64;
-                if remaining == 0 {
-                    self.state = State::AwaitingHeader;
-                } else {
-                    self.state = State::ReadingMember { remaining };
-                }
+                self.state = member_payload_state(remaining);
                 Ok(Some(Frame::Data(DataFrame {
                     position,
                     block,
@@ -588,10 +555,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 self.state = State::Complete;
                 Ok(None)
             }
-            State::Failed => {
-                self.state = State::Failed;
-                Ok(None)
-            }
+            State::Failed => Ok(None),
         }
     }
 
@@ -664,11 +628,9 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         kind: PaxKind,
     ) -> Result<Frame, FrameError> {
         if payload_size == 0 {
-            return Err(FrameError::at(
+            return Err(FrameError::invalid_pax_records(
                 position,
-                FrameErrorInner::InvalidPaxRecords {
-                    reason: "extended header payload contains no records",
-                },
+                "extended header payload contains no records",
             ));
         }
         self.state = State::ReadingPax {
@@ -702,22 +664,14 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             .or_else(|| pax_size(&self.global_pax_records))
             .map_or(Ok(parsed.size), |size| match size {
                 PaxValue::Value(size) => Ok(*size),
-                PaxValue::Deleted => Err(FrameError::at(
-                    position,
-                    FrameErrorInner::DeletedPaxMetadata { keyword: "size" },
-                )),
+                PaxValue::Deleted => Err(FrameError::deleted_pax_metadata(position, "size")),
             })?;
         let payload_size = posix_payload_size(position, kind, effective_size)?;
-        self.state = if payload_size == 0 {
-            State::AwaitingHeader
-        } else {
-            State::ReadingMember {
-                remaining: payload_size,
-            }
-        };
+        self.state = member_payload_state(payload_size);
         Ok(Frame::Header(HeaderFrame {
             position,
             block,
+            format: ArchiveFormat::Pax,
             kind,
             declared_size: parsed.size,
             effective_size,
@@ -745,12 +699,10 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 GnuKind::LongLink => &mut pending.long_link,
             };
             if *already_seen {
-                return Err(FrameError::at(
+                return Err(FrameError::unexpected_order(
                     position,
-                    FrameErrorInner::UnexpectedOrder {
-                        expected: "ordinary GNU member header or the other GNU metadata extension",
-                        found: "duplicate GNU metadata extension",
-                    },
+                    "ordinary GNU member header or the other GNU metadata extension",
+                    "duplicate GNU metadata extension",
                 ));
             }
             *already_seen = true;
@@ -773,25 +725,18 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
 
         let kind = MemberKind::try_from_framed(position, parsed.typeflag)?;
         if pending.long_link && !matches!(kind, MemberKind::HardLink | MemberKind::SymbolicLink) {
-            return Err(FrameError::at(
+            return Err(FrameError::unexpected_order(
                 position,
-                FrameErrorInner::UnexpectedOrder {
-                    expected: "hard-link or symbolic-link member after GNU long-link extension",
-                    found: "non-link ordinary member",
-                },
+                "hard-link or symbolic-link member after GNU long-link extension",
+                "non-link ordinary member",
             ));
         }
         let payload_size = gnu_payload_size(position, kind, parsed.size)?;
-        self.state = if payload_size == 0 {
-            State::AwaitingHeader
-        } else {
-            State::ReadingMember {
-                remaining: payload_size,
-            }
-        };
+        self.state = member_payload_state(payload_size);
         Ok(Frame::Header(HeaderFrame {
             position,
             block,
+            format: ArchiveFormat::Gnu,
             kind,
             declared_size: parsed.size,
             effective_size: parsed.size,
@@ -854,27 +799,28 @@ fn is_zero_block(block: &Block) -> bool {
     block.iter().all(|byte| *byte == 0)
 }
 
-fn completed_block_bytes(len: usize) -> usize {
-    len - len % BLOCK_SIZE
+fn trim_nul(bytes: &[u8]) -> &[u8] {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    &bytes[..end]
+}
+
+fn member_payload_state(remaining: u64) -> State {
+    if remaining == 0 {
+        State::AwaitingHeader
+    } else {
+        State::ReadingMember { remaining }
+    }
 }
 
 fn checked_position(position: u64, len: usize) -> Result<u64, FrameError> {
-    let len = u64::try_from(len).map_err(|_| {
-        FrameError::at(
-            position,
-            FrameErrorInner::ArithmeticOverflow {
-                context: "stream position",
-            },
-        )
-    })?;
-    position.checked_add(len).ok_or_else(|| {
-        FrameError::at(
-            position,
-            FrameErrorInner::ArithmeticOverflow {
-                context: "stream position",
-            },
-        )
-    })
+    let len = u64::try_from(len)
+        .map_err(|_| FrameError::arithmetic_overflow(position, "stream position"))?;
+    position
+        .checked_add(len)
+        .ok_or_else(|| FrameError::arithmetic_overflow(position, "stream position"))
 }
 
 impl TryFromFramed<&Block> for ParsedHeader {
@@ -957,10 +903,7 @@ fn posix_payload_size(position: u64, kind: MemberKind, size: u64) -> Result<u64,
         MemberKind::Regular | MemberKind::HardLink | MemberKind::Contiguous => Ok(size),
         MemberKind::SymbolicLink => {
             if size != 0 {
-                return Err(FrameError::at(
-                    position,
-                    FrameErrorInner::InvalidMemberSize { kind, size },
-                ));
+                return Err(FrameError::invalid_member_size(position, kind, size));
             }
             Ok(0)
         }
@@ -974,10 +917,9 @@ fn posix_payload_size(position: u64, kind: MemberKind, size: u64) -> Result<u64,
 fn gnu_payload_size(position: u64, kind: MemberKind, size: u64) -> Result<u64, FrameError> {
     match kind {
         MemberKind::Regular | MemberKind::Contiguous => Ok(size),
-        MemberKind::HardLink | MemberKind::SymbolicLink if size != 0 => Err(FrameError::at(
-            position,
-            FrameErrorInner::InvalidMemberSize { kind, size },
-        )),
+        MemberKind::HardLink | MemberKind::SymbolicLink if size != 0 => {
+            Err(FrameError::invalid_member_size(position, kind, size))
+        }
         MemberKind::HardLink
         | MemberKind::SymbolicLink
         | MemberKind::CharacterDevice
@@ -994,29 +936,33 @@ mod tests {
         task::{Context, Poll},
     };
 
-    use tokio_stream::Stream;
+    use tokio_stream::{Stream, StreamExt};
 
     use super::*;
     use crate::{
         ArchiveFormat, FrameError, FrameErrorInner, HdrCharset, PaxString, PaxValue,
         test_support::{
-            ChunkedReader, append_block, append_payload, append_terminator, data,
-            gnu_base256_header, gnu_header, header, record, set_checksum,
+            ChunkedReader, append_block, append_gnu, append_payload, append_posix,
+            append_terminator, gnu_base256_header, gnu_header, header, ready, record, set_checksum,
         },
     };
 
     fn collect(bytes: Vec<u8>, max_chunk: usize) -> Vec<Result<Frame, FrameError>> {
-        let mut stream = TarStream::new(ChunkedReader::new(bytes, max_chunk));
-        let waker = std::task::Waker::noop();
-        let mut cx = Context::from_waker(waker);
-        let mut frames = Vec::new();
-        loop {
-            match Pin::new(&mut stream).poll_next(&mut cx) {
-                Poll::Ready(Some(frame)) => frames.push(frame),
-                Poll::Ready(None) => return frames,
-                Poll::Pending => panic!("test reader is never pending"),
-            }
-        }
+        ready(TarStream::new(ChunkedReader::new(bytes, max_chunk)).collect())
+    }
+
+    fn header_frame(frames: &[Result<Frame, FrameError>], index: usize) -> &HeaderFrame {
+        let Ok(Frame::Header(frame)) = &frames[index] else {
+            panic!("expected header frame");
+        };
+        frame
+    }
+
+    fn data_frame(frames: &[Result<Frame, FrameError>], index: usize) -> &DataFrame {
+        let Ok(Frame::Data(frame)) = &frames[index] else {
+            panic!("expected data frame");
+        };
+        frame
     }
 
     fn last_error(frames: &[Result<Frame, FrameError>]) -> &FrameError {
@@ -1031,31 +977,93 @@ mod tests {
         &last_error(frames).inner
     }
 
+    #[derive(Clone, Copy)]
+    enum ExpectedHeaderError {
+        InvalidIdentity,
+        InvalidChecksum,
+        InvalidSize,
+        UnsupportedTypeflag(u8),
+    }
+
+    impl ExpectedHeaderError {
+        fn matches(self, error: &FrameErrorInner) -> bool {
+            match (self, error) {
+                (Self::InvalidIdentity, FrameErrorInner::InvalidIdentity { .. })
+                | (Self::InvalidChecksum, FrameErrorInner::InvalidChecksum { .. })
+                | (Self::InvalidSize, FrameErrorInner::InvalidSize { .. }) => true,
+                (
+                    Self::UnsupportedTypeflag(typeflag),
+                    FrameErrorInner::UnsupportedTypeflag { typeflag: found },
+                ) => typeflag == *found,
+                _ => false,
+            }
+        }
+    }
+
+    fn invalid_header_cases() -> Vec<(&'static str, Block, ExpectedHeaderError)> {
+        let mut bad_magic = header(b'0', 0);
+        bad_magic[IDENTITY_RANGE.start] = b'g';
+        let mut bad_version = header(b'0', 0);
+        bad_version[IDENTITY_RANGE.end - 2..IDENTITY_RANGE.end].copy_from_slice(b"  ");
+        let mut bad_checksum = header(b'0', 0);
+        bad_checksum[0] = b'X';
+        let mut bad_octal_size = header(b'0', 0);
+        bad_octal_size[SIZE_RANGE].copy_from_slice(b"00000000008\0");
+        set_checksum(&mut bad_octal_size);
+        let mut bad_base256_size = header(b'0', 0);
+        bad_base256_size[SIZE_RANGE.start] = 0x80;
+        set_checksum(&mut bad_base256_size);
+
+        vec![
+            ("magic", bad_magic, ExpectedHeaderError::InvalidIdentity),
+            ("version", bad_version, ExpectedHeaderError::InvalidIdentity),
+            (
+                "checksum",
+                bad_checksum,
+                ExpectedHeaderError::InvalidChecksum,
+            ),
+            (
+                "octal size",
+                bad_octal_size,
+                ExpectedHeaderError::InvalidSize,
+            ),
+            (
+                "base256 size",
+                bad_base256_size,
+                ExpectedHeaderError::InvalidSize,
+            ),
+            (
+                "POSIX typeflag",
+                header(b'X', 0),
+                ExpectedHeaderError::UnsupportedTypeflag(b'X'),
+            ),
+            (
+                "GNU typeflag",
+                header(b'L', 0),
+                ExpectedHeaderError::UnsupportedTypeflag(b'L'),
+            ),
+        ]
+    }
+
     #[test]
     fn frames_bare_member_across_fragmented_reads() {
         let mut bytes = Vec::new();
         append_block(&mut bytes, &header(b'0', 513));
-        append_block(&mut bytes, &data(&[b'a'; BLOCK_SIZE]));
-        append_block(&mut bytes, &data(b"b"));
+        append_payload(&mut bytes, &[b'a'; BLOCK_SIZE]);
+        append_payload(&mut bytes, b"b");
         append_terminator(&mut bytes);
 
         let frames = collect(bytes, 7);
         assert_eq!(frames.len(), 3);
-        let Frame::Header(header) = frames[0].as_ref().unwrap() else {
-            panic!("expected member header");
-        };
+        let header = header_frame(&frames, 0);
         assert_eq!(header.kind, MemberKind::Regular);
         assert_eq!(header.declared_size, 513);
         assert_eq!(header.effective_size, 513);
         assert_eq!(header.payload_size, 513);
         assert!(header.global_pax_records.is_empty());
         assert!(header.local_pax_records.is_empty());
-        let Frame::Data(first) = frames[1].as_ref().unwrap() else {
-            panic!("expected first data frame");
-        };
-        let Frame::Data(last) = frames[2].as_ref().unwrap() else {
-            panic!("expected second data frame");
-        };
+        let first = data_frame(&frames, 1);
+        let last = data_frame(&frames, 2);
         assert_eq!(first.len, BLOCK_SIZE);
         assert_eq!(last.len, 1);
         assert_eq!(last.owner, DataOwner::Member);
@@ -1070,11 +1078,10 @@ mod tests {
         assert!(payload.len() > BLOCK_SIZE);
 
         let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'x', payload.len() as u64));
-        append_payload(&mut bytes, &payload);
+        append_posix(&mut bytes, b'x', &payload);
         append_block(&mut bytes, &header(b'0', 1));
-        append_block(&mut bytes, &data(&[b'a'; BLOCK_SIZE]));
-        append_block(&mut bytes, &data(b"b"));
+        append_payload(&mut bytes, &[b'a'; BLOCK_SIZE]);
+        append_payload(&mut bytes, b"b");
         append_terminator(&mut bytes);
 
         let frames = collect(bytes, 19);
@@ -1084,14 +1091,10 @@ mod tests {
         };
         assert_eq!(pax.kind, PaxKind::Local);
         assert_eq!(pax.payload_size, payload.len() as u64);
-        let Frame::Data(first_pax_data) = frames[1].as_ref().unwrap() else {
-            panic!("expected first pax data frame");
-        };
+        let first_pax_data = data_frame(&frames, 1);
         assert_eq!(first_pax_data.owner, DataOwner::Pax(PaxKind::Local));
         assert!(first_pax_data.completed_pax_records.is_none());
-        let Frame::Data(final_pax_data) = frames[2].as_ref().unwrap() else {
-            panic!("expected final pax data frame");
-        };
+        let final_pax_data = data_frame(&frames, 2);
         assert_eq!(final_pax_data.owner, DataOwner::Pax(PaxKind::Local));
         assert_eq!(
             final_pax_data
@@ -1100,9 +1103,7 @@ mod tests {
                 .and_then(|records| records.last()),
             Some(&PaxRecord::Size(PaxValue::Value(513)))
         );
-        let Frame::Header(header) = frames[3].as_ref().unwrap() else {
-            panic!("expected overridden member header");
-        };
+        let header = header_frame(&frames, 3);
         assert_eq!(header.declared_size, 1);
         assert_eq!(header.effective_size, 513);
         assert_eq!(header.payload_size, 513);
@@ -1111,9 +1112,7 @@ mod tests {
             header.local_pax_records[1],
             PaxRecord::Size(PaxValue::Value(513))
         );
-        let Frame::Data(last) = frames[5].as_ref().unwrap() else {
-            panic!("expected final member data");
-        };
+        let last = data_frame(&frames, 5);
         assert_eq!(last.len, 1);
     }
 
@@ -1128,18 +1127,14 @@ mod tests {
         deletion.extend_from_slice(&record("size", ""));
 
         let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'g', initial_global.len() as u64));
-        append_payload(&mut bytes, &initial_global);
-        append_block(&mut bytes, &header(b'g', replacement_global.len() as u64));
-        append_payload(&mut bytes, &replacement_global);
+        append_posix(&mut bytes, b'g', &initial_global);
+        append_posix(&mut bytes, b'g', &replacement_global);
         append_block(&mut bytes, &header(b'0', 1));
-        append_block(&mut bytes, &data(b"ab"));
-        append_block(&mut bytes, &header(b'x', local.len() as u64));
-        append_payload(&mut bytes, &local);
+        append_payload(&mut bytes, b"ab");
+        append_posix(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'0', 1));
-        append_block(&mut bytes, &data(b"abc"));
-        append_block(&mut bytes, &header(b'g', deletion.len() as u64));
-        append_payload(&mut bytes, &deletion);
+        append_payload(&mut bytes, b"abc");
+        append_posix(&mut bytes, b'g', &deletion);
         append_block(&mut bytes, &header(b'5', 1));
         append_terminator(&mut bytes);
 
@@ -1213,16 +1208,13 @@ mod tests {
         let mut local = record("size", "");
         local.extend_from_slice(&record("size", "2"));
         let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'x', local.len() as u64));
-        append_payload(&mut bytes, &local);
+        append_posix(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'0', 1));
-        append_block(&mut bytes, &data(b"ab"));
+        append_payload(&mut bytes, b"ab");
         append_terminator(&mut bytes);
 
         let frames = collect(bytes, BLOCK_SIZE);
-        let Frame::Header(header) = frames[2].as_ref().unwrap() else {
-            panic!("expected member header");
-        };
+        let header = header_frame(&frames, 2);
         assert_eq!(header.effective_size, 2);
         assert_eq!(
             header.local_pax_records[0],
@@ -1235,10 +1227,8 @@ mod tests {
         let global = record("size", "7");
         let local = record("size", "");
         let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'g', global.len() as u64));
-        append_payload(&mut bytes, &global);
-        append_block(&mut bytes, &header(b'x', local.len() as u64));
-        append_payload(&mut bytes, &local);
+        append_posix(&mut bytes, b'g', &global);
+        append_posix(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'5', 3));
         append_terminator(&mut bytes);
 
@@ -1250,30 +1240,20 @@ mod tests {
 
     #[test]
     fn rejects_deleted_size_when_member_payload_cannot_be_framed() {
-        let local = record("size", "");
-        let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'x', local.len() as u64));
-        append_payload(&mut bytes, &local);
-        append_block(&mut bytes, &header(b'0', 0));
+        let records = record("size", "");
+        for typeflag in [b'x', b'g'] {
+            let mut bytes = Vec::new();
+            append_posix(&mut bytes, typeflag, &records);
+            append_block(&mut bytes, &header(b'0', 0));
 
-        assert!(matches!(
-            last_error_inner(&collect(bytes, BLOCK_SIZE)),
-            FrameErrorInner::DeletedPaxMetadata { keyword: "size" }
-        ));
-    }
-
-    #[test]
-    fn rejects_global_size_deletion_when_member_payload_cannot_be_framed() {
-        let global = record("size", "");
-        let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'g', global.len() as u64));
-        append_payload(&mut bytes, &global);
-        append_block(&mut bytes, &header(b'0', 0));
-
-        assert!(matches!(
-            last_error_inner(&collect(bytes, BLOCK_SIZE)),
-            FrameErrorInner::DeletedPaxMetadata { keyword: "size" }
-        ));
+            assert!(
+                matches!(
+                    last_error_inner(&collect(bytes, BLOCK_SIZE)),
+                    FrameErrorInner::DeletedPaxMetadata { keyword: "size" }
+                ),
+                "{typeflag:?}"
+            );
+        }
     }
 
     #[test]
@@ -1281,18 +1261,14 @@ mod tests {
         let global = record("size", "");
         let local = record("size", "2");
         let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'g', global.len() as u64));
-        append_payload(&mut bytes, &global);
-        append_block(&mut bytes, &header(b'x', local.len() as u64));
-        append_payload(&mut bytes, &local);
+        append_posix(&mut bytes, b'g', &global);
+        append_posix(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'0', 1));
-        append_block(&mut bytes, &data(b"ab"));
+        append_payload(&mut bytes, b"ab");
         append_terminator(&mut bytes);
 
         let frames = collect(bytes, BLOCK_SIZE);
-        let Frame::Header(header) = frames[4].as_ref().unwrap() else {
-            panic!("expected member header");
-        };
+        let header = header_frame(&frames, 4);
         assert_eq!(header.effective_size, 2);
         assert_eq!(
             header.global_pax_records[0],
@@ -1308,18 +1284,14 @@ mod tests {
     fn accepts_pax_linkdata() {
         let mut bytes = Vec::new();
         append_block(&mut bytes, &header(b'1', 3));
-        append_block(&mut bytes, &data(b"abc"));
+        append_payload(&mut bytes, b"abc");
         append_terminator(&mut bytes);
 
         let frames = collect(bytes, BLOCK_SIZE);
-        let Frame::Header(header) = frames[0].as_ref().unwrap() else {
-            panic!("expected hard-link header");
-        };
+        let header = header_frame(&frames, 0);
         assert_eq!(header.kind, MemberKind::HardLink);
         assert_eq!(header.payload_size, 3);
-        let Frame::Data(data) = frames[1].as_ref().unwrap() else {
-            panic!("expected link data");
-        };
+        let data = data_frame(&frames, 1);
         assert_eq!(data.len, 3);
     }
 
@@ -1339,8 +1311,7 @@ mod tests {
     fn zero_filled_block_inside_pax_payload_is_data() {
         let payload = record("comment", &"\0".repeat(BLOCK_SIZE * 3));
         let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'x', payload.len() as u64));
-        append_payload(&mut bytes, &payload);
+        append_posix(&mut bytes, b'x', &payload);
         append_block(&mut bytes, &header(b'0', 0));
         append_terminator(&mut bytes);
 
@@ -1359,10 +1330,9 @@ mod tests {
     fn frames_gnu_long_metadata_and_base256_payloads() {
         let mut bytes = Vec::new();
         append_block(&mut bytes, &gnu_base256_header(b'L', 513));
-        append_block(&mut bytes, &data(&[b'n'; BLOCK_SIZE]));
-        append_block(&mut bytes, &data(b"\0"));
-        append_block(&mut bytes, &gnu_header(b'K', 5));
-        append_block(&mut bytes, &data(b"link\0"));
+        append_payload(&mut bytes, &[b'n'; BLOCK_SIZE]);
+        append_payload(&mut bytes, b"\0");
+        append_gnu(&mut bytes, b'K', b"link\0");
         append_block(&mut bytes, &gnu_header(b'2', 0));
         append_terminator(&mut bytes);
 
@@ -1376,9 +1346,7 @@ mod tests {
                 ..
             })
         ));
-        let Frame::Data(final_name) = frames[2].as_ref().unwrap() else {
-            panic!("expected long-name payload");
-        };
+        let final_name = data_frame(&frames, 2);
         assert_eq!(final_name.owner, DataOwner::Gnu(GnuKind::LongName));
         assert_eq!(final_name.len, 1);
         assert!(final_name.completed_pax_records.is_none());
@@ -1389,9 +1357,7 @@ mod tests {
                 ..
             })
         ));
-        let Frame::Header(header) = frames[5].as_ref().unwrap() else {
-            panic!("expected GNU member header");
-        };
+        let header = header_frame(&frames, 5);
         assert_eq!(header.kind, MemberKind::SymbolicLink);
         assert!(header.global_pax_records.is_empty());
         assert!(header.local_pax_records.is_empty());
@@ -1399,107 +1365,26 @@ mod tests {
 
     #[test]
     fn rejects_header_format_and_type_errors() {
-        let mut bad_magic = header(b'0', 0);
-        bad_magic[IDENTITY_RANGE.start] = b'g';
-        assert!(matches!(
-            last_error_inner(&collect(bad_magic.to_vec(), BLOCK_SIZE)),
-            FrameErrorInner::InvalidIdentity { .. }
-        ));
-
-        let mut bad_version = header(b'0', 0);
-        bad_version[IDENTITY_RANGE.end - 2..IDENTITY_RANGE.end].copy_from_slice(b"  ");
-        assert!(matches!(
-            last_error_inner(&collect(bad_version.to_vec(), BLOCK_SIZE)),
-            FrameErrorInner::InvalidIdentity { .. }
-        ));
-
-        let mut bad_checksum = header(b'0', 0);
-        bad_checksum[0] = b'X';
-        assert!(matches!(
-            last_error_inner(&collect(bad_checksum.to_vec(), BLOCK_SIZE)),
-            FrameErrorInner::InvalidChecksum { .. }
-        ));
-
-        let mut bad_size = header(b'0', 0);
-        bad_size[SIZE_RANGE].copy_from_slice(b"00000000008\0");
-        set_checksum(&mut bad_size);
-        assert!(matches!(
-            last_error_inner(&collect(bad_size.to_vec(), BLOCK_SIZE)),
-            FrameErrorInner::InvalidSize { .. }
-        ));
-
-        let mut base256_size = header(b'0', 0);
-        base256_size[SIZE_RANGE.start] = 0x80;
-        set_checksum(&mut base256_size);
-        assert!(matches!(
-            last_error_inner(&collect(base256_size.to_vec(), BLOCK_SIZE)),
-            FrameErrorInner::InvalidSize { .. }
-        ));
-
-        assert!(matches!(
-            last_error_inner(&collect(header(b'X', 0).to_vec(), BLOCK_SIZE)),
-            FrameErrorInner::UnsupportedTypeflag { typeflag: b'X' }
-        ));
-        assert!(matches!(
-            last_error_inner(&collect(header(b'L', 0).to_vec(), BLOCK_SIZE)),
-            FrameErrorInner::UnsupportedTypeflag { typeflag: b'L' }
-        ));
+        for (case, block, expected) in invalid_header_cases() {
+            let frames = collect(block.to_vec(), BLOCK_SIZE);
+            let error = last_error_inner(&frames);
+            assert!(expected.matches(error), "{case}: {error:?}");
+        }
     }
 
     #[test]
     fn direct_conversion_errors_preserve_later_header_positions() {
         let position = BLOCK_SIZE as u64;
 
-        let mut bad_identity = header(b'0', 0);
-        bad_identity[IDENTITY_RANGE.start] = b'!';
-        let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'0', 0));
-        append_block(&mut bytes, &bad_identity);
-        assert!(matches!(
-            last_error(&collect(bytes, BLOCK_SIZE)),
-            FrameError {
-                position: found,
-                inner: FrameErrorInner::InvalidIdentity { .. },
-            } if *found == position
-        ));
-
-        let mut bad_checksum = header(b'0', 0);
-        bad_checksum[0] = b'X';
-        let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'0', 0));
-        append_block(&mut bytes, &bad_checksum);
-        assert!(matches!(
-            last_error(&collect(bytes, BLOCK_SIZE)),
-            FrameError {
-                position: found,
-                inner: FrameErrorInner::InvalidChecksum { .. },
-            } if *found == position
-        ));
-
-        let mut bad_size = header(b'0', 0);
-        bad_size[SIZE_RANGE].copy_from_slice(b"00000000008\0");
-        set_checksum(&mut bad_size);
-        let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'0', 0));
-        append_block(&mut bytes, &bad_size);
-        assert!(matches!(
-            last_error(&collect(bytes, BLOCK_SIZE)),
-            FrameError {
-                position: found,
-                inner: FrameErrorInner::InvalidSize { .. },
-            } if *found == position
-        ));
-
-        let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'0', 0));
-        append_block(&mut bytes, &header(b'X', 0));
-        assert!(matches!(
-            last_error(&collect(bytes, BLOCK_SIZE)),
-            FrameError {
-                position: found,
-                inner: FrameErrorInner::UnsupportedTypeflag { typeflag: b'X' },
-            } if *found == position
-        ));
+        for (case, block, expected) in invalid_header_cases() {
+            let mut bytes = Vec::new();
+            append_block(&mut bytes, &header(b'0', 0));
+            append_block(&mut bytes, &block);
+            let frames = collect(bytes, BLOCK_SIZE);
+            let error = last_error(&frames);
+            assert_eq!(error.position, position, "{case}");
+            assert!(expected.matches(&error.inner), "{case}: {error:?}");
+        }
     }
 
     #[test]
@@ -1511,8 +1396,7 @@ mod tests {
 
         let valid = record("path", "name");
         let mut consecutive = Vec::new();
-        append_block(&mut consecutive, &header(b'x', valid.len() as u64));
-        append_payload(&mut consecutive, &valid);
+        append_posix(&mut consecutive, b'x', &valid);
         append_block(&mut consecutive, &header(b'x', valid.len() as u64));
         assert!(matches!(
             last_error_inner(&collect(consecutive, BLOCK_SIZE)),
@@ -1520,8 +1404,7 @@ mod tests {
         ));
 
         let mut missing_member = Vec::new();
-        append_block(&mut missing_member, &header(b'x', valid.len() as u64));
-        append_payload(&mut missing_member, &valid);
+        append_posix(&mut missing_member, b'x', &valid);
         assert!(matches!(
             last_error_inner(&collect(missing_member, BLOCK_SIZE)),
             FrameErrorInner::UnexpectedEof { .. }
@@ -1533,8 +1416,7 @@ mod tests {
         let invalid = record("size", "bad");
         let mut bytes = Vec::new();
         append_block(&mut bytes, &header(b'0', 0));
-        append_block(&mut bytes, &header(b'x', invalid.len() as u64));
-        append_payload(&mut bytes, &invalid);
+        append_posix(&mut bytes, b'x', &invalid);
 
         let frames = collect(bytes, BLOCK_SIZE);
         assert!(matches!(
@@ -1552,16 +1434,12 @@ mod tests {
         global.extend_from_slice(&record("path", "global"));
         let local = record("path", "local");
         let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'g', global.len() as u64));
-        append_payload(&mut bytes, &global);
-        append_block(&mut bytes, &header(b'x', local.len() as u64));
-        append_payload(&mut bytes, &local);
+        append_posix(&mut bytes, b'g', &global);
+        append_posix(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'0', 0));
         append_terminator(&mut bytes);
         let frames = collect(bytes, BLOCK_SIZE);
-        let Frame::Header(member_header) = frames[4].as_ref().unwrap() else {
-            panic!("expected member header");
-        };
+        let member_header = header_frame(&frames, 4);
         assert_eq!(
             member_header.global_pax_records,
             [
@@ -1578,8 +1456,7 @@ mod tests {
 
         let records = record("hdrcharset", "ISO-IR 8859 1 1998");
         let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'x', records.len() as u64));
-        append_payload(&mut bytes, &records);
+        append_posix(&mut bytes, b'x', &records);
         assert!(matches!(
             last_error_inner(&collect(bytes, BLOCK_SIZE)),
             FrameErrorInner::UnsupportedPaxCharset { value } if value == "ISO-IR 8859 1 1998"
@@ -1591,26 +1468,25 @@ mod tests {
         let mut duplicate = Vec::new();
         append_block(&mut duplicate, &gnu_header(b'L', 0));
         append_block(&mut duplicate, &gnu_header(b'L', 0));
-        assert!(matches!(
-            last_error_inner(&collect(duplicate, BLOCK_SIZE)),
-            FrameErrorInner::UnexpectedOrder { .. }
-        ));
-
         let mut long_link_for_regular = Vec::new();
         append_block(&mut long_link_for_regular, &gnu_header(b'K', 0));
         append_block(&mut long_link_for_regular, &gnu_header(b'0', 0));
-        assert!(matches!(
-            last_error_inner(&collect(long_link_for_regular, BLOCK_SIZE)),
-            FrameErrorInner::UnexpectedOrder { .. }
-        ));
-
         let mut dangling = Vec::new();
         append_block(&mut dangling, &gnu_header(b'L', 0));
         append_terminator(&mut dangling);
-        assert!(matches!(
-            last_error_inner(&collect(dangling, BLOCK_SIZE)),
-            FrameErrorInner::UnexpectedOrder { .. }
-        ));
+        for (case, bytes) in [
+            ("duplicate", duplicate),
+            ("long-link-for-regular", long_link_for_regular),
+            ("dangling", dangling),
+        ] {
+            assert!(
+                matches!(
+                    last_error_inner(&collect(bytes, BLOCK_SIZE)),
+                    FrameErrorInner::UnexpectedOrder { .. }
+                ),
+                "{case}"
+            );
+        }
 
         assert!(matches!(
             last_error_inner(&collect(gnu_header(b'S', 0).to_vec(), BLOCK_SIZE)),
@@ -1661,14 +1537,15 @@ mod tests {
             }
         ));
 
-        assert!(matches!(
-            last_error_inner(&collect(gnu_header(b'x', 0).to_vec(), BLOCK_SIZE)),
-            FrameErrorInner::UnsupportedTypeflag { typeflag: b'x' }
-        ));
-        assert!(matches!(
-            last_error_inner(&collect(gnu_header(b'g', 0).to_vec(), BLOCK_SIZE)),
-            FrameErrorInner::UnsupportedTypeflag { typeflag: b'g' }
-        ));
+        for typeflag in [b'x', b'g'] {
+            assert!(
+                matches!(
+                    last_error_inner(&collect(gnu_header(typeflag, 0).to_vec(), BLOCK_SIZE)),
+                    FrameErrorInner::UnsupportedTypeflag { typeflag: found } if *found == typeflag
+                ),
+                "{typeflag:?}"
+            );
+        }
 
         let mut empty = Vec::new();
         append_terminator(&mut empty);
@@ -1701,7 +1578,7 @@ mod tests {
 
         let mut pax_payload_truncated = Vec::new();
         append_block(&mut pax_payload_truncated, &header(b'x', 513));
-        append_block(&mut pax_payload_truncated, &data(b"11 path=x\n"));
+        append_payload(&mut pax_payload_truncated, b"11 path=x\n");
         assert!(matches!(
             last_error_inner(&collect(pax_payload_truncated, BLOCK_SIZE)),
             FrameErrorInner::TruncatedPayload {

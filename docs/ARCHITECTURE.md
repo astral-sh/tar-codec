@@ -37,17 +37,23 @@ filesystem-oriented pure-pax encoding.
 It owns:
 
 - applying UTF-8 extraction policy to effective member path and link bytes;
-- extraction policy, including `ExtractPolicy` and `PaxExtractPolicy`;
-- archive-path normalization and collision handling, including unconditional
-  regular-file replacement and reuse of real directories;
+- extraction policy, including `DecodePolicy` and `PaxDecodePolicy`;
+- archive-path normalization and policy-controlled last-entry-wins replacement,
+  including no-follow leaf removal, reuse of real directories, and rejection of
+  non-empty directory removal;
 - deferred symbolic-link installation, including bounded graph validation,
   policy-controlled dangling links, and unconditional rejection of escaping
-  targets; and
-- capability-relative creation of files, directories, and permitted links;
+  targets;
+- path-based creation beneath a validated destination root, under the contract
+  that callers do not concurrently mutate that destination;
 - recursive encoding traversal, source symlink preservation, and async writes.
 
 It relies on `tar-framing` for structural validity and effective payload
 sizing; it does not re-parse the tar wire format.
+
+The filesystem extraction implementation and its private support types are
+isolated in `decode/extract.rs`. The implementation logic is kept under a
+550-line budget; policy, path decoding, and error APIs remain in `decode.rs`.
 
 ## Placement Rule
 

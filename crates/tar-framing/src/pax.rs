@@ -35,16 +35,6 @@ pub enum PaxString {
     Binary(Vec<u8>),
 }
 
-impl PaxString {
-    /// Returns the value's source bytes without interpreting its encoding.
-    pub fn as_bytes(&self) -> &[u8] {
-        match self {
-            Self::Utf8(value) => value.as_bytes(),
-            Self::Binary(value) => value,
-        }
-    }
-}
-
 /// A parsed pax value, including an explicit deletion tombstone.
 ///
 /// Deletion tombstones are needed because pax has special semantics for
@@ -165,11 +155,9 @@ pub(super) fn parse_records(
     inherited_hdrcharset: HdrCharset,
 ) -> Result<Vec<PaxRecord>, FrameError> {
     if payload.is_empty() {
-        return Err(FrameError::at(
+        return Err(FrameError::invalid_pax_records(
             position,
-            FrameErrorInner::InvalidPaxRecords {
-                reason: "local extended header payload contains no records",
-            },
+            "local extended header payload contains no records",
         ));
     }
 
@@ -180,64 +168,40 @@ pub(super) fn parse_records(
             .iter()
             .position(|byte| *byte == b' ')
             .ok_or_else(|| {
-                FrameError::at(
-                    position,
-                    FrameErrorInner::InvalidPaxRecords {
-                        reason: "record is missing its length separator",
-                    },
-                )
+                FrameError::invalid_pax_records(position, "record is missing its length separator")
             })?
             + cursor;
         if length_end == cursor {
-            return Err(FrameError::at(
+            return Err(FrameError::invalid_pax_records(
                 position,
-                FrameErrorInner::InvalidPaxRecords {
-                    reason: "record length is empty",
-                },
+                "record length is empty",
             ));
         }
         let record_len = std::str::from_utf8(&payload[cursor..length_end])
             .ok()
             .and_then(parse_integer)
             .ok_or_else(|| {
-                FrameError::at(
+                FrameError::invalid_pax_records(
                     position,
-                    FrameErrorInner::InvalidPaxRecords {
-                        reason: "record length is not a valid decimal integer",
-                    },
+                    "record length is not a valid decimal integer",
                 )
             })?;
-        let record_len = usize::try_from(record_len).map_err(|_| {
-            FrameError::at(
-                position,
-                FrameErrorInner::ArithmeticOverflow {
-                    context: "pax record length",
-                },
-            )
-        })?;
-        let record_end = cursor.checked_add(record_len).ok_or_else(|| {
-            FrameError::at(
-                position,
-                FrameErrorInner::ArithmeticOverflow {
-                    context: "pax record end",
-                },
-            )
-        })?;
+        let record_len = usize::try_from(record_len)
+            .map_err(|_| FrameError::arithmetic_overflow(position, "pax record length"))?;
+        let record_end = cursor
+            .checked_add(record_len)
+            .ok_or_else(|| FrameError::arithmetic_overflow(position, "pax record end"))?;
         if record_end > payload.len() {
-            return Err(FrameError::at(
+            return Err(FrameError::invalid_pax_records(
                 position,
-                FrameErrorInner::InvalidPaxRecords {
-                    reason: "record length exceeds extended header payload",
-                },
+                "record length exceeds extended header payload",
             ));
         }
         let record = &payload[cursor..record_end];
         if record.last() != Some(&b'\n') {
-            return Err(FrameError::at(
+            return Err(FrameError::invalid_pax_records(
                 position,
-                FrameErrorInner::InvalidPaxRecords {
-                    reason: "record is not newline terminated",
-                },
+                "record is not newline terminated",
             ));
         }
         let content_start = length_end - cursor + 1;
@@ -245,20 +209,16 @@ pub(super) fn parse_records(
             .iter()
             .position(|byte| *byte == b'=')
             .ok_or_else(|| {
-                FrameError::at(
+                FrameError::invalid_pax_records(
                     position,
-                    FrameErrorInner::InvalidPaxRecords {
-                        reason: "record is missing its keyword/value separator",
-                    },
+                    "record is missing its keyword/value separator",
                 )
             })?
             + content_start;
         if equals == content_start {
-            return Err(FrameError::at(
+            return Err(FrameError::invalid_pax_records(
                 position,
-                FrameErrorInner::InvalidPaxRecords {
-                    reason: "record keyword is empty",
-                },
+                "record keyword is empty",
             ));
         }
         let keyword = std::str::from_utf8(&record[content_start..equals])
@@ -287,29 +247,18 @@ fn parse_record(
     hdrcharset: HdrCharset,
 ) -> Result<PaxRecord, FrameError> {
     match keyword {
-        "atime" => {
-            parse_time(position, "atime", parse_utf8(position, value)?).map(PaxRecord::Atime)
-        }
+        "atime" => parse_time(position, "atime", value).map(PaxRecord::Atime),
         "charset" => parse_text(position, value).map(PaxRecord::Charset),
         "comment" => parse_text(position, value).map(PaxRecord::Comment),
-        "ctime" => {
-            parse_time(position, "ctime", parse_utf8(position, value)?).map(PaxRecord::Ctime)
-        }
-        "gid" => {
-            parse_record_integer(position, "gid", parse_utf8(position, value)?).map(PaxRecord::Gid)
-        }
+        "ctime" => parse_time(position, "ctime", value).map(PaxRecord::Ctime),
+        "gid" => parse_record_integer(position, "gid", value).map(PaxRecord::Gid),
         "gname" => parse_pax_string(position, value, hdrcharset).map(PaxRecord::Gname),
         "hdrcharset" => parse_hdrcharset(position, value).map(PaxRecord::HdrCharset),
         "linkpath" => parse_pax_string(position, value, hdrcharset).map(PaxRecord::LinkPath),
-        "mtime" => {
-            parse_time(position, "mtime", parse_utf8(position, value)?).map(PaxRecord::Mtime)
-        }
+        "mtime" => parse_time(position, "mtime", value).map(PaxRecord::Mtime),
         "path" => parse_pax_string(position, value, hdrcharset).map(PaxRecord::Path),
-        "size" => parse_record_integer(position, "size", parse_utf8(position, value)?)
-            .map(PaxRecord::Size),
-        "uid" => {
-            parse_record_integer(position, "uid", parse_utf8(position, value)?).map(PaxRecord::Uid)
-        }
+        "size" => parse_record_integer(position, "size", value).map(PaxRecord::Size),
+        "uid" => parse_record_integer(position, "uid", value).map(PaxRecord::Uid),
         "uname" => parse_pax_string(position, value, hdrcharset).map(PaxRecord::Uname),
         _ => parse_namespaced_record(position, keyword, value),
     }
@@ -320,47 +269,43 @@ fn parse_namespaced_record(
     keyword: &str,
     value: &[u8],
 ) -> Result<PaxRecord, FrameError> {
-    if let Some(name) = keyword.strip_prefix("realtime.")
-        && !name.is_empty()
-    {
-        return Ok(PaxRecord::Realtime {
+    let invalid = || {
+        FrameError::at(
+            position,
+            FrameErrorInner::InvalidPaxKeyword {
+                keyword: keyword.to_owned(),
+            },
+        )
+    };
+    let (namespace, name) = match keyword.split_once('.') {
+        Some((namespace, name)) if !name.is_empty() => (namespace, name),
+        _ => return Err(invalid()),
+    };
+    match namespace {
+        "realtime" => Ok(PaxRecord::Realtime {
             name: name.to_owned(),
             value: parse_text(position, value)?,
-        });
-    }
-    if let Some(name) = keyword.strip_prefix("security.")
-        && !name.is_empty()
-    {
-        return Ok(PaxRecord::Security {
+        }),
+        "security" => Ok(PaxRecord::Security {
             name: name.to_owned(),
             value: parse_text(position, value)?,
-        });
+        }),
+        vendor if !vendor.is_empty() && vendor.bytes().all(|byte| byte.is_ascii_uppercase()) => {
+            Ok(PaxRecord::Vendor {
+                vendor: vendor.to_owned(),
+                name: name.to_owned(),
+                value: parse_text(position, value)?,
+            })
+        }
+        _ => Err(invalid()),
     }
-    if let Some((vendor, name)) = keyword.split_once('.')
-        && !vendor.is_empty()
-        && vendor.bytes().all(|byte| byte.is_ascii_uppercase())
-        && !name.is_empty()
-    {
-        return Ok(PaxRecord::Vendor {
-            vendor: vendor.to_owned(),
-            name: name.to_owned(),
-            value: parse_text(position, value)?,
-        });
-    }
-    Err(FrameError::at(
-        position,
-        FrameErrorInner::InvalidPaxKeyword {
-            keyword: keyword.to_owned(),
-        },
-    ))
 }
 
 fn parse_text(position: u64, value: &[u8]) -> Result<PaxValue<String>, FrameError> {
-    let value = parse_utf8(position, value)?;
-    match value.parse() {
-        Ok(value) => Ok(value),
-        Err(error) => match error {},
-    }
+    parse_utf8(position, value).map(|value| match value {
+        "" => PaxValue::Deleted,
+        value => PaxValue::Value(value.to_owned()),
+    })
 }
 
 /// Parse a pax "string". This is distinct from [`parse_text`] or the common
@@ -414,8 +359,9 @@ fn parse_utf8(position: u64, value: &[u8]) -> Result<&str, FrameError> {
 fn parse_record_integer(
     position: u64,
     keyword: &'static str,
-    value: &str,
+    value: &[u8],
 ) -> Result<PaxValue<u64>, FrameError> {
+    let value = parse_utf8(position, value)?;
     if value.is_empty() {
         return Ok(PaxValue::Deleted);
     }
@@ -434,8 +380,9 @@ fn parse_record_integer(
 fn parse_time(
     position: u64,
     keyword: &'static str,
-    value: &str,
+    value: &[u8],
 ) -> Result<PaxValue<u64>, FrameError> {
+    let value = parse_utf8(position, value)?;
     if value.is_empty() {
         return Ok(PaxValue::Deleted);
     }
@@ -465,23 +412,20 @@ fn parse_time(
 }
 
 pub(super) fn size(records: &[PaxRecord]) -> Option<&PaxValue<u64>> {
-    records
-        .iter()
-        .filter_map(|record| match record {
-            PaxRecord::Size(value) => Some(value),
-            _ => None,
-        })
-        .next_back()
+    records.iter().rev().find_map(|record| match record {
+        PaxRecord::Size(value) => Some(value),
+        _ => None,
+    })
 }
 
 pub(super) fn hdrcharset(records: &[PaxRecord]) -> HdrCharset {
     records
         .iter()
-        .filter_map(|record| match record {
+        .rev()
+        .find_map(|record| match record {
             PaxRecord::HdrCharset(value) => Some(value),
             _ => None,
         })
-        .next_back()
         .map_or(HdrCharset::Utf8, |value| match value {
             PaxValue::Value(value) => *value,
             PaxValue::Deleted => HdrCharset::Utf8,
@@ -506,36 +450,20 @@ fn parse_integer(value: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{raw_record, record};
 
-    fn encoded_record(keyword: &str, value: &str) -> Vec<u8> {
-        let suffix = format!(" {keyword}={value}\n");
-        let mut len = suffix.len() + 1;
-        loop {
-            let encoded = format!("{len}{suffix}");
-            if encoded.len() == len {
-                return encoded.into_bytes();
-            }
-            len = encoded.len();
+    fn vendor(name: &str, value: &str) -> PaxRecord {
+        PaxRecord::Vendor {
+            vendor: "ACME".to_owned(),
+            name: name.to_owned(),
+            value: PaxValue::Value(value.to_owned()),
         }
     }
 
-    fn encoded_raw_record(keyword: &[u8], value: &[u8]) -> Vec<u8> {
-        let mut suffix = Vec::new();
-        suffix.push(b' ');
-        suffix.extend_from_slice(keyword);
-        suffix.push(b'=');
-        suffix.extend_from_slice(value);
-        suffix.push(b'\n');
-        let mut len = suffix.len() + 1;
-        loop {
-            let prefix = len.to_string();
-            let actual = prefix.len() + suffix.len();
-            if actual == len {
-                let mut record = prefix.into_bytes();
-                record.extend_from_slice(&suffix);
-                return record;
-            }
-            len = actual;
+    fn security(value: &str) -> PaxRecord {
+        PaxRecord::Security {
+            name: "label".to_owned(),
+            value: PaxValue::Value(value.to_owned()),
         }
     }
 
@@ -558,22 +486,22 @@ mod tests {
     #[test]
     fn parses_strict_numeric_and_timestamp_values() {
         assert!(matches!(
-            parse_record_integer(0, "uid", "12"),
+            parse_record_integer(0, "uid", b"12"),
             Ok(PaxValue::Value(12))
         ));
         assert!(matches!(
-            parse_record_integer(0, "uid", ""),
+            parse_record_integer(0, "uid", b""),
             Ok(PaxValue::Deleted)
         ));
         assert!(matches!(
-            parse_time(0, "mtime", "12.034"),
+            parse_time(0, "mtime", b"12.034"),
             Ok(PaxValue::Value(12))
         ));
-        assert!(matches!(parse_time(0, "mtime", ""), Ok(PaxValue::Deleted)));
+        assert!(matches!(parse_time(0, "mtime", b""), Ok(PaxValue::Deleted)));
 
         for value in ["+1", "-1", "12x", "18446744073709551616"] {
             assert!(matches!(
-                parse_record_integer(7, "gid", value),
+                parse_record_integer(7, "gid", value.as_bytes()),
                 Err(FrameError {
                     position: 7,
                     inner: FrameErrorInner::InvalidPaxInteger { .. },
@@ -582,7 +510,7 @@ mod tests {
         }
         for value in ["+1", "-1", "1.", "1.nanosecond", "18446744073709551616"] {
             assert!(matches!(
-                parse_time(11, "atime", value),
+                parse_time(11, "atime", value.as_bytes()),
                 Err(FrameError {
                     position: 11,
                     inner: FrameErrorInner::InvalidPaxTime { .. },
@@ -593,8 +521,8 @@ mod tests {
 
     #[test]
     fn parses_typed_standard_reserved_and_vendor_records() {
-        let mut payload = encoded_record("atime", "12.034");
-        for (keyword, value) in [
+        let fields = [
+            ("atime", "12.034"),
             ("charset", "BINARY"),
             ("comment", "a=b"),
             ("ctime", "17.500"),
@@ -610,8 +538,10 @@ mod tests {
             ("uid", "8"),
             ("uname", "user"),
             ("ACME.attribute", "custom"),
-        ] {
-            payload.extend_from_slice(&encoded_record(keyword, value));
+        ];
+        let mut payload = Vec::new();
+        for (keyword, value) in fields {
+            payload.extend_from_slice(&record(keyword, value));
         }
 
         let Ok(records) = parse_records(0, &payload, HdrCharset::Utf8) else {
@@ -634,49 +564,24 @@ mod tests {
                     name: "deadline".to_owned(),
                     value: PaxValue::Value("soon".to_owned()),
                 },
-                PaxRecord::Security {
-                    name: "label".to_owned(),
-                    value: PaxValue::Value("secure".to_owned()),
-                },
+                security("secure"),
                 PaxRecord::Size(PaxValue::Value(0)),
                 PaxRecord::Uid(PaxValue::Value(8)),
                 PaxRecord::Uname(PaxValue::Value(PaxString::Utf8("user".to_owned()))),
-                PaxRecord::Vendor {
-                    vendor: "ACME".to_owned(),
-                    name: "attribute".to_owned(),
-                    value: PaxValue::Value("custom".to_owned()),
-                },
+                vendor("attribute", "custom"),
             ]
         );
-        assert_eq!(
+        assert!(
             records
                 .iter()
-                .map(|record| record.keyword().into_owned())
-                .collect::<Vec<_>>(),
-            [
-                "atime",
-                "charset",
-                "comment",
-                "ctime",
-                "gid",
-                "gname",
-                "hdrcharset",
-                "linkpath",
-                "mtime",
-                "path",
-                "realtime.deadline",
-                "security.label",
-                "size",
-                "uid",
-                "uname",
-                "ACME.attribute",
-            ]
+                .zip(fields)
+                .all(|(record, (keyword, _))| record.keyword() == keyword)
         );
     }
 
     #[test]
     fn parses_deleted_ctime_compatibility_extension() {
-        let Ok(records) = parse_records(0, &encoded_record("ctime", ""), HdrCharset::Utf8) else {
+        let Ok(records) = parse_records(0, &record("ctime", ""), HdrCharset::Utf8) else {
             panic!("ctime deletion should parse");
         };
         assert_eq!(records, vec![PaxRecord::Ctime(PaxValue::Deleted)]);
@@ -699,7 +604,7 @@ mod tests {
             ));
         }
 
-        let invalid_utf8 = encoded_raw_record(b"path", &[0xff]);
+        let invalid_utf8 = raw_record(b"path", &[0xff]);
         assert!(matches!(
             parse_records(23, &invalid_utf8, HdrCharset::Utf8),
             Err(FrameError {
@@ -730,72 +635,42 @@ mod tests {
     #[test]
     fn applies_namespaced_globals_and_accepts_supported_hdrcharset_records() {
         let mut active = vec![
-            PaxRecord::Vendor {
-                vendor: "ACME".to_owned(),
-                name: "first".to_owned(),
-                value: PaxValue::Value("old".to_owned()),
-            },
-            PaxRecord::Vendor {
-                vendor: "ACME".to_owned(),
-                name: "second".to_owned(),
-                value: PaxValue::Value("kept".to_owned()),
-            },
-            PaxRecord::Security {
-                name: "label".to_owned(),
-                value: PaxValue::Value("old".to_owned()),
-            },
+            vendor("first", "old"),
+            vendor("second", "kept"),
+            security("old"),
         ];
-        apply_global(
-            &mut active,
-            vec![
-                PaxRecord::Vendor {
-                    vendor: "ACME".to_owned(),
-                    name: "first".to_owned(),
-                    value: PaxValue::Value("new".to_owned()),
-                },
-                PaxRecord::Security {
-                    name: "label".to_owned(),
-                    value: PaxValue::Value("new".to_owned()),
-                },
-            ],
-        );
+        apply_global(&mut active, vec![vendor("first", "new"), security("new")]);
         assert_eq!(
             active,
             [
-                PaxRecord::Vendor {
-                    vendor: "ACME".to_owned(),
-                    name: "second".to_owned(),
-                    value: PaxValue::Value("kept".to_owned()),
-                },
-                PaxRecord::Vendor {
-                    vendor: "ACME".to_owned(),
-                    name: "first".to_owned(),
-                    value: PaxValue::Value("new".to_owned()),
-                },
-                PaxRecord::Security {
-                    name: "label".to_owned(),
-                    value: PaxValue::Value("new".to_owned()),
-                },
+                vendor("second", "kept"),
+                vendor("first", "new"),
+                security("new"),
             ]
         );
 
-        let supported = encoded_record("hdrcharset", UTF8_HDRCHARSET);
-        assert!(parse_records(0, &supported, HdrCharset::Utf8).is_ok());
+        for (case, payload) in [
+            (
+                "supported hdrcharset",
+                record("hdrcharset", UTF8_HDRCHARSET),
+            ),
+            ("deleted hdrcharset", record("hdrcharset", "")),
+            ("member data charset", record("charset", "BINARY")),
+        ] {
+            assert!(
+                parse_records(0, &payload, HdrCharset::Utf8).is_ok(),
+                "{case}"
+            );
+        }
 
-        let deleted = encoded_record("hdrcharset", "");
-        assert!(parse_records(0, &deleted, HdrCharset::Utf8).is_ok());
-
-        let member_data_charset = encoded_record("charset", "BINARY");
-        assert!(parse_records(0, &member_data_charset, HdrCharset::Utf8).is_ok());
-
-        let mut binary_values = encoded_record("hdrcharset", BINARY_HDRCHARSET);
+        let mut binary_values = record("hdrcharset", BINARY_HDRCHARSET);
         for (keyword, value) in [
             (b"gname".as_slice(), [0xfc]),
             (b"linkpath".as_slice(), [0xfd]),
             (b"path".as_slice(), [0xfe]),
             (b"uname".as_slice(), [0xff]),
         ] {
-            binary_values.extend_from_slice(&encoded_raw_record(keyword, &value));
+            binary_values.extend_from_slice(&raw_record(keyword, &value));
         }
         let Ok(binary_records) = parse_records(0, &binary_values, HdrCharset::Utf8) else {
             panic!("binary records should parse");
@@ -810,7 +685,7 @@ mod tests {
                 PaxRecord::Uname(PaxValue::Value(PaxString::Binary(vec![0xff]))),
             ]
         );
-        let inherited_binary_path = encoded_raw_record(b"path", &[0xfe]);
+        let inherited_binary_path = raw_record(b"path", &[0xfe]);
         let Ok(inherited_records) = parse_records(0, &inherited_binary_path, HdrCharset::Binary)
         else {
             panic!("inherited binary records should parse");
@@ -821,8 +696,8 @@ mod tests {
                 0xfe
             ])))]
         );
-        let mut reset_to_utf8 = encoded_record("hdrcharset", "");
-        reset_to_utf8.extend_from_slice(&encoded_raw_record(b"path", &[0xfd]));
+        let mut reset_to_utf8 = record("hdrcharset", "");
+        reset_to_utf8.extend_from_slice(&raw_record(b"path", &[0xfd]));
         assert!(matches!(
             parse_records(0, &reset_to_utf8, HdrCharset::Binary),
             Err(FrameError {
@@ -830,8 +705,8 @@ mod tests {
                 ..
             })
         ));
-        let mut binary_comment = encoded_record("hdrcharset", BINARY_HDRCHARSET);
-        binary_comment.extend_from_slice(&encoded_raw_record(b"comment", &[0xff]));
+        let mut binary_comment = record("hdrcharset", BINARY_HDRCHARSET);
+        binary_comment.extend_from_slice(&raw_record(b"comment", &[0xff]));
         assert!(matches!(
             parse_records(0, &binary_comment, HdrCharset::Utf8),
             Err(FrameError {
@@ -841,10 +716,10 @@ mod tests {
         ));
 
         let unsupported_value = "ISO-IR 8859 1 1998";
-        let mut overridden_unsupported = encoded_record("hdrcharset", unsupported_value);
-        overridden_unsupported.extend_from_slice(&encoded_record("hdrcharset", UTF8_HDRCHARSET));
+        let mut overridden_unsupported = record("hdrcharset", unsupported_value);
+        overridden_unsupported.extend_from_slice(&record("hdrcharset", UTF8_HDRCHARSET));
         for unsupported in [
-            encoded_record("hdrcharset", unsupported_value),
+            record("hdrcharset", unsupported_value),
             overridden_unsupported,
         ] {
             assert!(matches!(

@@ -11,7 +11,6 @@ license = { workspace = true }
 readme = { workspace = true }
 
 [dependencies]
-cap-std = { workspace = true }
 tar-framing = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync"] }

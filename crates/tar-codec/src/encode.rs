@@ -24,7 +24,7 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use self::traversal::{TraversalEntry, TraversalKind, TraversalStream, stream_directory_entries};
-use crate::blocking::with_reusable_buffer;
+use crate::{blocking::with_reusable_buffer, has_windows_prefix};
 
 const SOURCE_FILE_CHUNK_BYTES: usize = 1024 * 1024;
 
@@ -80,9 +80,8 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
         let path = normalize_archive_path(path.as_ref())?;
         let implicit_ancestors = preflight_regular_entry(&self.entries, &path)?;
         let data = data.as_ref();
-        let size = u64::try_from(data.len()).map_err(|_| EncodeError::ArithmeticOverflow {
-            context: "manual entry payload size",
-        })?;
+        let size = u64::try_from(data.len())
+            .map_err(|_| arithmetic_overflow("manual entry payload size"))?;
         self.write_member(PaxMember {
             path: &path,
             kind: MemberKind::Regular,
@@ -196,24 +195,21 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
         let (returned_buffer, result) = prepare_source_file(&entry.source, reusable_buffer).await;
         *buffer = returned_buffer;
         let file = result?;
+        let (size, executable) = file.metadata();
         self.write_member(PaxMember {
             path: &entry.archive_path,
             kind: MemberKind::Regular,
-            size: file.size(),
+            size,
             link_path: None,
-            executable: file.executable(),
+            executable,
         })
         .await?;
         match file {
-            PreparedSourceFile::Buffered { size, .. } => {
+            PreparedSourceFile::Buffered { .. } => {
                 self.write_bytes(buffer).await?;
                 self.write_padding(size).await
             }
-            PreparedSourceFile::Streaming {
-                file,
-                size,
-                executable: _,
-            } => {
+            PreparedSourceFile::Streaming { file, .. } => {
                 let mut file = tokio::fs::File::from_std(file);
                 self.write_file_payload(&mut file, &entry.source, size, buffer)
                     .await?;
@@ -230,12 +226,10 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
     }
 
     async fn write_member(&mut self, member: PaxMember<'_>) -> Result<(), EncodeError> {
-        let next_sequence =
-            self.sequence
-                .checked_add(1)
-                .ok_or(EncodeError::ArithmeticOverflow {
-                    context: "pax member sequence",
-                })?;
+        let next_sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| arithmetic_overflow("pax member sequence"))?;
         frame_pax_member_into(self.sequence, member, &mut self.framing_buffer)?;
         if let Err(source) = self.writer.write_all(&self.framing_buffer).await {
             self.poisoned = true;
@@ -252,20 +246,13 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
         size: u64,
         buffer: &mut Vec<u8>,
     ) -> Result<(), EncodeError> {
-        let chunk_len =
-            usize::try_from(size.min(SOURCE_FILE_CHUNK_BYTES as u64)).map_err(|_| {
-                EncodeError::ArithmeticOverflow {
-                    context: "source file read buffer size",
-                }
-            })?;
+        let chunk_len = usize::try_from(size.min(SOURCE_FILE_CHUNK_BYTES as u64))
+            .map_err(|_| arithmetic_overflow("source file read buffer size"))?;
         buffer.resize(chunk_len, 0);
         let mut remaining = size;
         while remaining != 0 {
-            let read_len = usize::try_from(remaining.min(buffer.len() as u64)).map_err(|_| {
-                EncodeError::ArithmeticOverflow {
-                    context: "source file read size",
-                }
-            })?;
+            let read_len = usize::try_from(remaining.min(buffer.len() as u64))
+                .map_err(|_| arithmetic_overflow("source file read size"))?;
             let len = file.read(&mut buffer[..read_len]).await.map_err(|source| {
                 EncodeError::Filesystem {
                     operation: "read source file",
@@ -274,9 +261,7 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
                 }
             })?;
             if len == 0 {
-                return Err(EncodeError::ChangedSourceFile {
-                    path: path.to_path_buf(),
-                });
+                return Err(changed_source_file(path.to_path_buf()));
             }
             self.write_bytes(&buffer[..len]).await?;
             remaining -= len as u64;
@@ -292,9 +277,7 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
             })?
             != 0
         {
-            return Err(EncodeError::ChangedSourceFile {
-                path: path.to_path_buf(),
-            });
+            return Err(changed_source_file(path.to_path_buf()));
         }
         Ok(())
     }
@@ -335,7 +318,7 @@ async fn prepare_source_file(
             .metadata()
             .map_err(|source| filesystem_error("inspect source file", &path, source))?;
         if !metadata.is_file() {
-            return Err(EncodeError::ChangedSourceFile { path });
+            return Err(changed_source_file(path));
         }
         let size = metadata.len();
         let executable = is_executable(&metadata);
@@ -346,19 +329,17 @@ async fn prepare_source_file(
                 executable,
             });
         }
-        let read_limit = size.checked_add(1).ok_or(EncodeError::ArithmeticOverflow {
-            context: "buffered source file read limit",
-        })?;
+        let read_limit = size
+            .checked_add(1)
+            .ok_or_else(|| arithmetic_overflow("buffered source file read limit"))?;
         buffer.clear();
         file.take(read_limit)
             .read_to_end(buffer)
             .map_err(|source| filesystem_error("read source file", &path, source))?;
-        let actual_size =
-            u64::try_from(buffer.len()).map_err(|_| EncodeError::ArithmeticOverflow {
-                context: "buffered source file payload size",
-            })?;
+        let actual_size = u64::try_from(buffer.len())
+            .map_err(|_| arithmetic_overflow("buffered source file payload size"))?;
         if actual_size != size {
-            return Err(EncodeError::ChangedSourceFile { path });
+            return Err(changed_source_file(path));
         }
         Ok(PreparedSourceFile::Buffered { size, executable })
     })
@@ -366,15 +347,12 @@ async fn prepare_source_file(
 }
 
 impl PreparedSourceFile {
-    fn size(&self) -> u64 {
+    fn metadata(&self) -> (u64, bool) {
         match self {
-            Self::Buffered { size, .. } | Self::Streaming { size, .. } => *size,
-        }
-    }
-
-    fn executable(&self) -> bool {
-        match self {
-            Self::Buffered { executable, .. } | Self::Streaming { executable, .. } => *executable,
+            Self::Buffered { size, executable }
+            | Self::Streaming {
+                size, executable, ..
+            } => (*size, *executable),
         }
     }
 }
@@ -475,9 +453,7 @@ fn reserve_entry(
         match entries.get(ancestor) {
             Some(ArchivedEntry::Directory { .. }) => {}
             Some(_) => {
-                return Err(EncodeError::PathCollision {
-                    path: ancestor.to_owned(),
-                });
+                return Err(path_collision(ancestor));
             }
             None => {
                 entries.insert(
@@ -492,9 +468,7 @@ fn reserve_entry(
             entries.insert(path.to_owned(), ArchivedEntry::Directory { explicit: true });
         }
         (Some(_), _) => {
-            return Err(EncodeError::PathCollision {
-                path: path.to_owned(),
-            });
+            return Err(path_collision(path));
         }
         (None, entry) => {
             entries.insert(path.to_owned(), entry);
@@ -513,17 +487,13 @@ fn preflight_regular_entry(
         match entries.get(ancestor) {
             Some(ArchivedEntry::Directory { .. }) => {}
             Some(_) => {
-                return Err(EncodeError::PathCollision {
-                    path: ancestor.to_owned(),
-                });
+                return Err(path_collision(ancestor));
             }
             None => implicit_ancestors.push(ancestor.to_owned()),
         }
     }
     if entries.contains_key(path) {
-        return Err(EncodeError::PathCollision {
-            path: path.to_owned(),
-        });
+        return Err(path_collision(path));
     }
     Ok(implicit_ancestors)
 }
@@ -559,16 +529,25 @@ fn validate_archive_path(path: &Path) -> Result<&str, &'static str> {
     Ok(path)
 }
 
-fn has_windows_prefix(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
-}
-
 fn filesystem_error(operation: &'static str, path: &Path, source: io::Error) -> EncodeError {
     EncodeError::Filesystem {
         operation,
         path: path.to_path_buf(),
         source,
+    }
+}
+
+fn arithmetic_overflow(context: &'static str) -> EncodeError {
+    EncodeError::ArithmeticOverflow { context }
+}
+
+fn changed_source_file(path: PathBuf) -> EncodeError {
+    EncodeError::ChangedSourceFile { path }
+}
+
+fn path_collision(path: &str) -> EncodeError {
+    EncodeError::PathCollision {
+        path: path.to_owned(),
     }
 }
 
@@ -592,47 +571,18 @@ mod tests {
     };
 
     use tar_framing::{
-        ArchiveFormat, PaxKind,
+        PaxKind,
         logical::{LogicalFrame, TarReader},
         stream::{Frame, TarStream},
     };
     use tempfile::tempdir;
-    use tokio::io::{AsyncRead, ReadBuf};
     use tokio_stream::StreamExt;
 
     use super::{traversal::DIRECTORY_TRAVERSAL_BATCH_ENTRIES, *};
-    use crate::decode::{Archive, DecodeError, DecodePolicy};
-
-    struct VecReader {
-        bytes: Vec<u8>,
-        position: usize,
-    }
-
-    impl VecReader {
-        fn new(bytes: Vec<u8>) -> Self {
-            Self { bytes, position: 0 }
-        }
-    }
-
-    impl AsyncRead for VecReader {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            _context: &mut Context<'_>,
-            buffer: &mut ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
-            if self.position == self.bytes.len() {
-                return Poll::Ready(Ok(()));
-            }
-            let len = buffer
-                .remaining()
-                .min(17)
-                .min(self.bytes.len() - self.position);
-            let end = self.position + len;
-            buffer.put_slice(&self.bytes[self.position..end]);
-            self.position = end;
-            Poll::Ready(Ok(()))
-        }
-    }
+    use crate::{
+        decode::{Archive, DecodeError, DecodePolicy},
+        test_support::ChunkedReader,
+    };
 
     #[derive(Default)]
     struct FailingWriter;
@@ -655,6 +605,18 @@ mod tests {
         }
     }
 
+    async fn encode_source_directory(source: &Path) -> Vec<u8> {
+        let mut encoder = Encoder::new(Vec::new());
+        encoder.add_directory(source).await.unwrap();
+        encoder.finish().await.unwrap()
+    }
+
+    async fn extract_archive(bytes: Vec<u8>, dest: &Path) -> Result<(), DecodeError> {
+        Archive::new(ChunkedReader::new(bytes, 17))
+            .extract(dest, DecodePolicy::default())
+            .await
+    }
+
     #[tokio::test]
     async fn adds_manual_files_as_local_pax_members_and_round_trips() {
         let mut encoder = Encoder::new(Vec::new());
@@ -672,7 +634,7 @@ mod tests {
             .unwrap();
         let bytes = encoder.finish().await.unwrap();
 
-        let frames = TarStream::new(VecReader::new(bytes.clone()))
+        let frames = TarStream::new(ChunkedReader::new(bytes.clone(), 17))
             .collect::<Vec<_>>()
             .await;
         assert!(frames.iter().all(|frame| {
@@ -684,10 +646,7 @@ mod tests {
 
         let temp = tempdir().unwrap();
         let dest = temp.path().join("out");
-        Archive::new(VecReader::new(bytes))
-            .extract(&dest, DecodePolicy::default())
-            .await
-            .unwrap();
+        extract_archive(bytes, &dest).await.unwrap();
         assert_eq!(std::fs::read(dest.join("bin/tool")).unwrap(), b"run");
         assert_eq!(std::fs::read(dest.join("README")).unwrap(), b"hello");
         #[cfg(unix)]
@@ -716,18 +675,15 @@ mod tests {
     #[tokio::test]
     async fn rejects_invalid_manual_paths_and_collisions_without_poisoning() {
         let mut encoder = Encoder::new(Vec::new());
-        assert!(matches!(
-            encoder
-                .add_entry("/absolute", b"", EntryMetadata::default())
-                .await,
-            Err(EncodeError::InvalidArchivePath { .. })
-        ));
-        assert!(matches!(
-            encoder
-                .add_entry("C:/ambiguous", b"", EntryMetadata::default())
-                .await,
-            Err(EncodeError::InvalidArchivePath { .. })
-        ));
+        for path in ["/absolute", "C:/ambiguous"] {
+            assert!(
+                matches!(
+                    encoder.add_entry(path, b"", EntryMetadata::default()).await,
+                    Err(EncodeError::InvalidArchivePath { .. })
+                ),
+                "{path}"
+            );
+        }
         encoder
             .add_entry("dir/file", b"first", EntryMetadata::default())
             .await
@@ -736,18 +692,20 @@ mod tests {
             encoder.entries.get("dir"),
             Some(ArchivedEntry::Directory { explicit: false })
         ));
-        assert!(matches!(
-            encoder
-                .add_entry("dir/file", b"second", EntryMetadata::default())
-                .await,
-            Err(EncodeError::PathCollision { .. })
-        ));
-        assert!(matches!(
-            encoder
-                .add_entry("dir/file/child", b"", EntryMetadata::default())
-                .await,
-            Err(EncodeError::PathCollision { .. })
-        ));
+        for (path, data) in [
+            ("dir/file", b"second".as_slice()),
+            ("dir/file/child", b"".as_slice()),
+        ] {
+            assert!(
+                matches!(
+                    encoder
+                        .add_entry(path, data, EntryMetadata::default())
+                        .await,
+                    Err(EncodeError::PathCollision { .. })
+                ),
+                "{path}"
+            );
+        }
         encoder
             .add_entry("dir/other", b"ok", EntryMetadata::default())
             .await
@@ -792,10 +750,8 @@ mod tests {
                 .unwrap();
         }
 
-        let mut encoder = Encoder::new(Vec::new());
-        encoder.add_directory(&source).await.unwrap();
-        let bytes = encoder.finish().await.unwrap();
-        let mut reader = TarReader::new(VecReader::new(bytes.clone()));
+        let bytes = encode_source_directory(&source).await;
+        let mut reader = TarReader::new(ChunkedReader::new(bytes.clone(), 17));
         let mut paths = Vec::new();
         while let Some(frame) = reader.next_frame().await.unwrap() {
             match frame {
@@ -812,13 +768,9 @@ mod tests {
             paths,
             ["tree", "tree/a", "tree/sub", "tree/sub/file", "tree/z"]
         );
-        assert_eq!(reader.format(), Some(ArchiveFormat::Pax));
 
         let dest = temp.path().join("out");
-        Archive::new(VecReader::new(bytes))
-            .extract(&dest, DecodePolicy::default())
-            .await
-            .unwrap();
+        extract_archive(bytes, &dest).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(dest.join("tree/sub/file")).unwrap(),
             "nested"
@@ -839,51 +791,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recursively_streams_files_larger_than_the_buffered_threshold() {
-        let temp = tempdir().unwrap();
-        let source = temp.path().join("tree");
-        std::fs::create_dir(&source).unwrap();
-        let contents = vec![b'x'; SOURCE_FILE_CHUNK_BYTES + 17];
-        std::fs::write(source.join("large"), &contents).unwrap();
+    async fn recursively_encodes_streamed_and_mixed_source_files() {
+        for (case, files) in [
+            (
+                "streamed",
+                vec![("large", vec![b'x'; SOURCE_FILE_CHUNK_BYTES + 17])],
+            ),
+            (
+                "mixed",
+                vec![
+                    ("a-small", b"first".to_vec()),
+                    ("m-large", vec![b'x'; SOURCE_FILE_CHUNK_BYTES + 17]),
+                    ("z-small", b"last".to_vec()),
+                ],
+            ),
+        ] {
+            let temp = tempdir().unwrap();
+            let source = temp.path().join("tree");
+            std::fs::create_dir(&source).unwrap();
+            for (name, contents) in &files {
+                std::fs::write(source.join(name), contents).unwrap();
+            }
 
-        let mut encoder = Encoder::new(Vec::new());
-        encoder.add_directory(&source).await.unwrap();
-        let bytes = encoder.finish().await.unwrap();
-        let dest = temp.path().join("out");
-        Archive::new(VecReader::new(bytes))
-            .extract(&dest, DecodePolicy::default())
-            .await
-            .unwrap();
-        assert_eq!(std::fs::read(dest.join("tree/large")).unwrap(), contents);
-    }
-
-    #[tokio::test]
-    async fn recursively_combines_buffered_and_streamed_source_files() {
-        let temp = tempdir().unwrap();
-        let source = temp.path().join("tree");
-        std::fs::create_dir(&source).unwrap();
-        let large = vec![b'x'; SOURCE_FILE_CHUNK_BYTES + 17];
-        std::fs::write(source.join("a-small"), "first").unwrap();
-        std::fs::write(source.join("m-large"), &large).unwrap();
-        std::fs::write(source.join("z-small"), "last").unwrap();
-
-        let mut encoder = Encoder::new(Vec::new());
-        encoder.add_directory(&source).await.unwrap();
-        let bytes = encoder.finish().await.unwrap();
-        let dest = temp.path().join("out");
-        Archive::new(VecReader::new(bytes))
-            .extract(&dest, DecodePolicy::default())
-            .await
-            .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dest.join("tree/a-small")).unwrap(),
-            "first"
-        );
-        assert_eq!(std::fs::read(dest.join("tree/m-large")).unwrap(), large);
-        assert_eq!(
-            std::fs::read_to_string(dest.join("tree/z-small")).unwrap(),
-            "last"
-        );
+            let bytes = encode_source_directory(&source).await;
+            let dest = temp.path().join("out");
+            extract_archive(bytes, &dest).await.unwrap();
+            for (name, contents) in files {
+                assert_eq!(
+                    std::fs::read(dest.join("tree").join(name)).unwrap(),
+                    contents,
+                    "{case}"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -919,14 +859,9 @@ mod tests {
         symlink("sub", source.join("directory")).unwrap();
         symlink("directory/file", source.join("file")).unwrap();
 
-        let mut encoder = Encoder::new(Vec::new());
-        encoder.add_directory(&source).await.unwrap();
-        let bytes = encoder.finish().await.unwrap();
+        let bytes = encode_source_directory(&source).await;
         let dest = temp.path().join("out");
-        Archive::new(VecReader::new(bytes))
-            .extract(&dest, DecodePolicy::default())
-            .await
-            .unwrap();
+        extract_archive(bytes, &dest).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(dest.join("safe/file")).unwrap(),
             "contents"
@@ -935,13 +870,9 @@ mod tests {
         let source = temp.path().join("escape");
         std::fs::create_dir(&source).unwrap();
         symlink("../../outside", source.join("link")).unwrap();
-        let mut encoder = Encoder::new(Vec::new());
-        encoder.add_directory(&source).await.unwrap();
-        let bytes = encoder.finish().await.unwrap();
+        let bytes = encode_source_directory(&source).await;
         assert!(matches!(
-            Archive::new(VecReader::new(bytes))
-                .extract(&temp.path().join("escape-out"), DecodePolicy::default())
-                .await,
+            extract_archive(bytes, &temp.path().join("escape-out")).await,
             Err(DecodeError::UnsafePath {
                 context: "symbolic-link target",
                 ..
@@ -951,14 +882,9 @@ mod tests {
         let source = temp.path().join("dangling");
         std::fs::create_dir(&source).unwrap();
         symlink("missing", source.join("link")).unwrap();
-        let mut encoder = Encoder::new(Vec::new());
-        encoder.add_directory(&source).await.unwrap();
-        let bytes = encoder.finish().await.unwrap();
+        let bytes = encode_source_directory(&source).await;
         let dest = temp.path().join("dangling-out");
-        Archive::new(VecReader::new(bytes))
-            .extract(&dest, DecodePolicy::default())
-            .await
-            .unwrap();
+        extract_archive(bytes, &dest).await.unwrap();
         assert_eq!(
             std::fs::read_link(dest.join("dangling/link")).unwrap(),
             Path::new("missing")
@@ -967,13 +893,9 @@ mod tests {
         let source = temp.path().join("cycle");
         std::fs::create_dir(&source).unwrap();
         symlink("link", source.join("link")).unwrap();
-        let mut encoder = Encoder::new(Vec::new());
-        encoder.add_directory(&source).await.unwrap();
-        let bytes = encoder.finish().await.unwrap();
+        let bytes = encode_source_directory(&source).await;
         assert!(matches!(
-            Archive::new(VecReader::new(bytes))
-                .extract(&temp.path().join("cycle-out"), DecodePolicy::default())
-                .await,
+            extract_archive(bytes, &temp.path().join("cycle-out")).await,
             Err(DecodeError::InvalidLink { .. })
         ));
     }
@@ -989,10 +911,8 @@ mod tests {
         std::fs::write(source.join("one"), "contents").unwrap();
         std::fs::hard_link(source.join("one"), source.join("two")).unwrap();
 
-        let mut encoder = Encoder::new(Vec::new());
-        encoder.add_directory(&source).await.unwrap();
-        let bytes = encoder.finish().await.unwrap();
-        let mut reader = TarReader::new(VecReader::new(bytes));
+        let bytes = encode_source_directory(&source).await;
+        let mut reader = TarReader::new(ChunkedReader::new(bytes, 17));
         let mut regular = 0;
         while let Some(frame) = reader.next_frame().await.unwrap() {
             if let LogicalFrame::Member(member) = frame {

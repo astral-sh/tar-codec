@@ -216,77 +216,50 @@ fn render_pax_records(
 ) -> io::Result<()> {
     for record in records {
         let keyword = record.keyword();
+        write!(output, "        {scope} pax: {}=", keyword.escape_default())?;
         match record {
             PaxRecord::Atime(value)
             | PaxRecord::Ctime(value)
             | PaxRecord::Gid(value)
             | PaxRecord::Mtime(value)
             | PaxRecord::Size(value)
-            | PaxRecord::Uid(value) => render_pax_integer(output, scope, &keyword, value)?,
+            | PaxRecord::Uid(value) => {
+                render_pax_value(output, value, |output, value| writeln!(output, "{value}"))?
+            }
             PaxRecord::Charset(value)
             | PaxRecord::Comment(value)
             | PaxRecord::Realtime { value, .. }
             | PaxRecord::Security { value, .. }
-            | PaxRecord::Vendor { value, .. } => render_pax_text(output, scope, &keyword, value)?,
+            | PaxRecord::Vendor { value, .. } => {
+                render_pax_value(output, value, |output, value| writeln!(output, "{value:?}"))?
+            }
             PaxRecord::Gname(value)
             | PaxRecord::LinkPath(value)
             | PaxRecord::Path(value)
-            | PaxRecord::Uname(value) => render_pax_string(output, scope, &keyword, value)?,
-            PaxRecord::HdrCharset(value) => render_pax_charset(output, scope, value)?,
+            | PaxRecord::Uname(value) => {
+                render_pax_value(output, value, |output, value| match value {
+                    PaxString::Utf8(value) => writeln!(output, "{value:?}"),
+                    PaxString::Binary(value) => writeln!(output, "binary({value:?})"),
+                })?
+            }
+            PaxRecord::HdrCharset(value) => {
+                render_pax_value(output, value, |output, value| match value {
+                    HdrCharset::Utf8 => writeln!(output, "{:?}", "ISO-IR 10646 2000 UTF-8"),
+                    HdrCharset::Binary => writeln!(output, "{:?}", "BINARY"),
+                })?
+            }
         }
     }
     Ok(())
 }
 
-fn render_pax_text(
-    output: &mut impl Write,
-    scope: &str,
-    keyword: &str,
-    value: &PaxValue<String>,
+fn render_pax_value<W: Write, T>(
+    output: &mut W,
+    value: &PaxValue<T>,
+    render_value: impl FnOnce(&mut W, &T) -> io::Result<()>,
 ) -> io::Result<()> {
-    write!(output, "        {scope} pax: {}=", keyword.escape_default())?;
     match value {
-        PaxValue::Value(value) => writeln!(output, "{value:?}"),
-        PaxValue::Deleted => writeln!(output, "<deleted>"),
-    }
-}
-
-fn render_pax_integer(
-    output: &mut impl Write,
-    scope: &str,
-    keyword: &str,
-    value: &PaxValue<u64>,
-) -> io::Result<()> {
-    write!(output, "        {scope} pax: {}=", keyword.escape_default())?;
-    match value {
-        PaxValue::Value(value) => writeln!(output, "{value}"),
-        PaxValue::Deleted => writeln!(output, "<deleted>"),
-    }
-}
-
-fn render_pax_string(
-    output: &mut impl Write,
-    scope: &str,
-    keyword: &str,
-    value: &PaxValue<PaxString>,
-) -> io::Result<()> {
-    write!(output, "        {scope} pax: {}=", keyword.escape_default())?;
-    match value {
-        PaxValue::Value(PaxString::Utf8(value)) => writeln!(output, "{value:?}"),
-        PaxValue::Value(PaxString::Binary(value)) => writeln!(output, "binary({value:?})"),
-        PaxValue::Deleted => writeln!(output, "<deleted>"),
-    }
-}
-
-fn render_pax_charset(
-    output: &mut impl Write,
-    scope: &str,
-    value: &PaxValue<HdrCharset>,
-) -> io::Result<()> {
-    write!(output, "        {scope} pax: hdrcharset=")?;
-    match value {
-        PaxValue::Value(HdrCharset::Utf8) => writeln!(output, "{:?}", "ISO-IR 10646 2000 UTF-8"),
-        PaxValue::Value(HdrCharset::Binary) => writeln!(output, "{:?}", "BINARY"),
+        PaxValue::Value(value) => render_value(output, value),
         PaxValue::Deleted => writeln!(output, "<deleted>"),
     }
 }
@@ -354,34 +327,55 @@ mod tests {
     const TYPEFLAG_OFFSET: usize = 156;
     const POSIX_IDENTITY: &[u8; 8] = b"ustar\x0000";
 
-    #[tokio::test]
-    async fn extracts_plain_tar_archive() {
-        let temp = tempdir().unwrap();
-        let archive = temp.path().join("archive.tar");
-        let destination = temp.path().join("out");
-        fs::write(&archive, archive_with_file("file", b"contents")).unwrap();
-
-        extract_archive(&archive, &destination).await.unwrap();
-
-        assert_eq!(fs::read(destination.join("file")).unwrap(), b"contents");
+    #[test]
+    fn renders_pax_value_categories_and_deletions() {
+        let records = [
+            PaxRecord::Uid(PaxValue::Value(7)),
+            PaxRecord::Comment(PaxValue::Value("note".to_owned())),
+            PaxRecord::Path(PaxValue::Value(PaxString::Utf8("file".to_owned()))),
+            PaxRecord::LinkPath(PaxValue::Value(PaxString::Binary(vec![0xff]))),
+            PaxRecord::HdrCharset(PaxValue::Value(HdrCharset::Binary)),
+            PaxRecord::Gid(PaxValue::Deleted),
+        ];
+        let mut output = Vec::new();
+        render_pax_records(&mut output, "local", &records).unwrap();
+        assert_eq!(
+            output,
+            concat!(
+                "        local pax: uid=7\n",
+                "        local pax: comment=\"note\"\n",
+                "        local pax: path=\"file\"\n",
+                "        local pax: linkpath=binary([255])\n",
+                "        local pax: hdrcharset=\"BINARY\"\n",
+                "        local pax: gid=<deleted>\n",
+            )
+            .as_bytes()
+        );
     }
 
     #[tokio::test]
-    async fn extracts_gzip_tar_archive() {
-        let temp = tempdir().unwrap();
-        let archive = temp.path().join("archive.tar.gz");
-        let destination = temp.path().join("out");
+    async fn extracts_plain_and_gzip_tar_archives() {
+        let plain = archive_with_file("file", b"contents");
         let mut encoder = GzipEncoder::new(Vec::new());
-        encoder
-            .write_all(&archive_with_file("file", b"contents"))
-            .await
-            .unwrap();
+        encoder.write_all(&plain).await.unwrap();
         encoder.shutdown().await.unwrap();
-        fs::write(&archive, encoder.into_inner()).unwrap();
+        for (case, name, bytes) in [
+            ("plain", "archive.tar", plain),
+            ("gzip", "archive.tar.gz", encoder.into_inner()),
+        ] {
+            let temp = tempdir().unwrap();
+            let archive = temp.path().join(name);
+            let destination = temp.path().join("out");
+            fs::write(&archive, bytes).unwrap();
 
-        extract_archive(&archive, &destination).await.unwrap();
+            extract_archive(&archive, &destination).await.unwrap();
 
-        assert_eq!(fs::read(destination.join("file")).unwrap(), b"contents");
+            assert_eq!(
+                fs::read(destination.join("file")).unwrap(),
+                b"contents",
+                "{case}"
+            );
+        }
     }
 
     #[tokio::test]
