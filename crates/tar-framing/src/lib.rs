@@ -61,12 +61,6 @@ pub enum MemberKind {
     /// A regular file (`'0'` or NUL).
     Regular,
     /// A hard link (`'1'`).
-    ///
-    /// The pax format permits hard-link data blocks, including those required
-    /// by its `linkdata` option, but carries no marker recording why a body was
-    /// included. Its physical size field may be nonzero, and an applicable pax
-    /// `size` record overrides that field. Consequently, every nonzero
-    /// effective pax hard-link size is framed as payload.
     HardLink,
     /// A symbolic link (`'2'`).
     SymbolicLink,

@@ -39,10 +39,7 @@ impl<R> Archive<R> {
 
 /// Controls which otherwise valid archive features extraction may accept.
 ///
-/// The default permits symbolic links, safe dangling symbolic links, either
-/// supported framing family, and replacement of existing destination entries,
-/// while rejecting hard links, global pax member metadata, vendor-namespaced
-/// pax records, and repeated keywords.
+/// See each allow API for its default.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DecodePolicy {
     allow_symlinks: bool,
@@ -55,11 +52,8 @@ pub struct DecodePolicy {
 
 /// Controls which otherwise valid pax features extraction may accept.
 ///
-/// The default permits global pax extension headers while rejecting global
-/// per-member metadata, vendor-namespaced records, and duplicate records.
-/// Policy checks inspect positioned extensions retained by the member's unified
-/// logical PAX state. Global headers are checked with the following ordinary
-/// member; trailing global headers are consumed and ignored by [`TarReader`].
+///
+/// See each allow API for its default.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PaxDecodePolicy {
     allow_global_pax_extensions: bool,
