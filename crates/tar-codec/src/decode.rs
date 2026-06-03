@@ -94,6 +94,8 @@ impl Default for DecodePolicy {
 
 impl DecodePolicy {
     /// Configures whether symbolic-link members may be extracted.
+    ///
+    /// Symlink extraction is **allowed by default**.
     pub fn allow_symlinks(mut self, allow: bool) -> Self {
         self.allow_symlinks = allow;
         self
@@ -101,6 +103,9 @@ impl DecodePolicy {
 
     /// Configures whether symbolic links may name safe targets other than
     /// entries created by this extraction or the extraction root.
+    ///
+    /// Dangling symlinks are **allowed by default** as they do not typically
+    /// pose a security risk.
     pub fn allow_dangling_symlinks(mut self, allow: bool) -> Self {
         self.allow_dangling_symlinks = allow;
         self
@@ -108,11 +113,12 @@ impl DecodePolicy {
 
     /// Configures whether hard-link members may be extracted.
     ///
-    /// The pax format permits hard-link bodies but carries no marker recording
-    /// why a body was included, so enabling hard links permits every nonzero
-    /// effective payload to update the contents of an earlier extracted file
-    /// through its shared inode. Hard-link headers with modes different from
-    /// their targets are accepted without changing the shared inode mode.
+    /// Hardlinks are **forbidden by default** because they're (1) not common,
+    /// (2) harder to extract in a cross-platform manner, and
+    /// (3) may be differential-prone dependending on the input.
+    ///
+    /// **IMPORTANT**: Only enable hard-link extraction if you fully
+    /// trust the archive you're extracting from.
     pub fn allow_hard_links(mut self, allow: bool) -> Self {
         self.allow_hard_links = allow;
         self
@@ -120,6 +126,8 @@ impl DecodePolicy {
 
     /// Configures whether archive members may replace existing destination
     /// entries.
+    ///
+    /// Overwrites during extraction are **allowed by default**.
     ///
     /// Replacement never follows symbolic links or recursively removes
     /// non-empty directories. Real directories are always reused, including
@@ -130,6 +138,11 @@ impl DecodePolicy {
     }
 
     /// Configures whether archives in the GNU framing family may be extracted.
+    ///
+    /// GNU tar archives are **allowed by default**.
+    ///
+    /// Users who wish to parse strictly pax-confirming tar archives may wish to
+    /// disable this setting.
     pub fn allow_gnu(mut self, allow: bool) -> Self {
         self.allow_gnu = allow;
         self
@@ -217,12 +230,19 @@ impl PaxDecodePolicy {
     /// controls whether global `path`, `linkpath`, and `size` records are
     /// accepted. Trailing global headers without a following ordinary member
     /// are consumed and ignored before policy checks.
+    ///
+    /// Global pax extension headers are **allowed by default**.
     pub fn allow_global_pax_extensions(mut self, allow: bool) -> Self {
         self.allow_global_pax_extensions = allow;
         self
     }
 
     /// Configures whether vendor-namespaced pax records may be accepted.
+    ///
+    /// When enabled, well-formed vendor-namespaced pax records will not cause
+    /// a decoding error.
+    ///
+    /// Vendor-namespaced pax records are **forbidden by default**.
     pub fn allow_pax_vendor_extensions(mut self, allow: bool) -> Self {
         self.allow_pax_vendor_extensions = allow;
         self
@@ -232,6 +252,8 @@ impl PaxDecodePolicy {
     ///
     /// When enabled, standard pax precedence applies and the last record for
     /// a repeated keyword takes effect.
+    ///
+    /// Duplicated pax records within a single header are **forbidden by default**.
     pub fn allow_duplicate_pax_records(mut self, allow: bool) -> Self {
         self.allow_duplicate_pax_records = allow;
         self
@@ -241,6 +263,9 @@ impl PaxDecodePolicy {
     ///
     /// When enabled, standard pax semantics permit global `path`, `linkpath`,
     /// and `size` records to apply to following members until overridden.
+    ///
+    /// Member metadata within global pax headers is **forbidden by default**,
+    /// as it is extremely differential-prone.
     pub fn allow_global_pax_member_metadata(mut self, allow: bool) -> Self {
         self.allow_global_pax_member_metadata = allow;
         self
