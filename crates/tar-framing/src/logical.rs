@@ -11,79 +11,12 @@ use tokio_stream::StreamExt;
 
 use crate::{
     ArchiveFormat, Block, FrameError, GnuKind, MemberKind, PaxKind, PaxRecord, PaxString, PaxValue,
-    pax::{SharedPaxRecords, effective_record},
     stream::{DataOwner, Frame, GnuFrame, HeaderFrame, PaxFrame, TarStream, parse_mode},
 };
 
+pub use crate::{PaxExtension, PaxState};
+
 const PAYLOAD_DRAIN_CHUNK_BYTES: usize = 1024 * 1024;
-
-/// One positioned parsed pax extended header.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PaxExtension {
-    /// The absolute byte position of the pax extension header block.
-    pub position: u64,
-    /// Whether this extension has local or global scope.
-    pub kind: PaxKind,
-    records: SharedPaxRecords,
-}
-
-impl PaxExtension {
-    /// Returns the parsed pax records in archive order.
-    pub fn records(&self) -> &[PaxRecord] {
-        &self.records
-    }
-}
-
-/// Unified pax metadata state applicable to one ordinary member.
-///
-/// Effective values apply local records over the active global state using
-/// standard last-record-wins and deletion semantics. [`Self::extensions`]
-/// retains the positioned extension headers newly encountered for this member.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PaxState {
-    global_records: Option<SharedPaxRecords>,
-    global_extensions: Vec<PaxExtension>,
-    local_extension: Option<PaxExtension>,
-}
-
-impl PaxState {
-    fn new(
-        global_records: Option<SharedPaxRecords>,
-        global_extensions: Vec<PaxExtension>,
-        local_extension: Option<PaxExtension>,
-    ) -> Self {
-        Self {
-            global_records,
-            global_extensions,
-            local_extension,
-        }
-    }
-
-    /// Returns positioned extensions newly encountered for this member.
-    ///
-    /// Global extensions are yielded in source order, followed by the optional
-    /// local extension.
-    pub fn extensions(&self) -> impl Iterator<Item = &PaxExtension> {
-        self.global_extensions
-            .iter()
-            .chain(self.local_extension.iter())
-    }
-
-    /// Returns the final applicable record for `keyword`, including deletions.
-    pub fn effective_record(&self, keyword: &str) -> Option<&PaxRecord> {
-        effective_record(self.local_records(), self.global_records(), keyword)
-    }
-
-    fn global_records(&self) -> &[PaxRecord] {
-        self.global_records.as_deref().map_or(&[], Vec::as_slice)
-    }
-
-    fn local_records(&self) -> &[PaxRecord] {
-        self.local_extension
-            .as_ref()
-            .map_or(&[], PaxExtension::records)
-    }
-}
 
 /// A GNU long-name or long-link value needed to interpret a member.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -141,7 +74,7 @@ impl Header<'_> {
     /// Returns the header's claimed path for its member.
     ///
     /// For ustar headers, this is the combination of the `name` and `prefix`
-    /// fields, i.e. `{name}/{prefix}`. For GNU headers, this is `name` alone.
+    /// fields, i.e. `{prefix}/{name}`. For GNU headers, this is `name` alone.
     ///
     /// **IMPORTANT**: This is **not** guaranteed to be the fully effective path
     /// for a member. Most users should call [`MemberFrame::effective_path`].
@@ -381,11 +314,7 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
             match next {
                 Frame::Data(data) if data.owner == DataOwner::Pax(kind) => {
                     if let Some(records) = data.into_completed_pax_records() {
-                        return Ok(PaxExtension {
-                            position,
-                            kind,
-                            records,
-                        });
+                        return Ok(PaxExtension::new(position, kind, records));
                     }
                 }
                 other => {
@@ -596,8 +525,6 @@ fn parse_gnu_metadata(metadata: &GnuMetadata, kind: GnuKind) -> Result<&[u8], Fr
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use tokio::io::AsyncRead;
 
     use super::*;
@@ -630,14 +557,6 @@ mod tests {
             Some(state)
         } else {
             None
-        }
-    }
-
-    fn pax_extension(position: u64, kind: PaxKind, records: Vec<PaxRecord>) -> PaxExtension {
-        PaxExtension {
-            position,
-            kind,
-            records: Arc::new(records),
         }
     }
 
@@ -847,13 +766,6 @@ mod tests {
                     state.effective_record("size"),
                     Some(&PaxRecord::Size(PaxValue::Value(513)))
                 );
-                assert!(Arc::ptr_eq(
-                    state
-                        .global_records
-                        .as_ref()
-                        .expect("global state should exist"),
-                    &extensions[0].records,
-                ));
                 let Some(first) = member.payload.next_block().await? else {
                     panic!("expected first member payload block");
                 };
@@ -870,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn attaches_new_global_pax_updates_and_copies_global_state_only_when_mutated() {
+    fn attaches_new_global_pax_updates_without_mutating_earlier_states() {
         let first = record("comment", "first");
         let second = record("gname", "second");
         let replacement = record("comment", "replacement");
@@ -885,7 +797,7 @@ mod tests {
 
         ready_ok(async {
             let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
-            let first_snapshot = {
+            let first_state = {
                 let member = next_member(&mut reader).await?;
                 let state = pax_state(&member).expect("expected pax member metadata");
                 let extensions = state.extensions().collect::<Vec<_>>();
@@ -896,21 +808,15 @@ mod tests {
                     state.effective_record("comment"),
                     Some(&PaxRecord::Comment(PaxValue::Value("first".to_owned())))
                 );
-                state
-                    .global_records
-                    .clone()
-                    .expect("global state should exist")
+                state.clone()
             };
             let member = next_member(&mut reader).await?;
             let state = pax_state(&member).expect("expected pax member metadata");
             assert_eq!(state.extensions().count(), 0);
-            assert!(Arc::ptr_eq(
-                &first_snapshot,
-                state
-                    .global_records
-                    .as_ref()
-                    .expect("global state should exist"),
-            ));
+            assert_eq!(
+                state.effective_record("comment"),
+                Some(&PaxRecord::Comment(PaxValue::Value("first".to_owned())))
+            );
             drop(member);
 
             let member = next_member(&mut reader).await?;
@@ -924,80 +830,12 @@ mod tests {
                     "replacement".to_owned()
                 )))
             );
-            assert!(!Arc::ptr_eq(
-                &first_snapshot,
-                state
-                    .global_records
-                    .as_ref()
-                    .expect("global state should exist"),
-            ));
             assert_eq!(
-                effective_record(&[], &first_snapshot, "comment"),
+                first_state.effective_record("comment"),
                 Some(&PaxRecord::Comment(PaxValue::Value("first".to_owned())))
             );
             Ok(())
         });
-    }
-
-    #[test]
-    fn resolves_effective_pax_records_with_standard_precedence() {
-        struct Case {
-            name: &'static str,
-            global: Vec<PaxRecord>,
-            local: Option<Vec<PaxRecord>>,
-            expected: Option<PaxRecord>,
-        }
-
-        for case in [
-            Case {
-                name: "missing",
-                global: Vec::new(),
-                local: None,
-                expected: None,
-            },
-            Case {
-                name: "global",
-                global: vec![PaxRecord::Comment(PaxValue::Value("global".to_owned()))],
-                local: None,
-                expected: Some(PaxRecord::Comment(PaxValue::Value("global".to_owned()))),
-            },
-            Case {
-                name: "local overrides global",
-                global: vec![PaxRecord::Comment(PaxValue::Value("global".to_owned()))],
-                local: Some(vec![PaxRecord::Comment(PaxValue::Value(
-                    "local".to_owned(),
-                ))]),
-                expected: Some(PaxRecord::Comment(PaxValue::Value("local".to_owned()))),
-            },
-            Case {
-                name: "last local duplicate wins",
-                global: Vec::new(),
-                local: Some(vec![
-                    PaxRecord::Comment(PaxValue::Value("first".to_owned())),
-                    PaxRecord::Comment(PaxValue::Value("last".to_owned())),
-                ]),
-                expected: Some(PaxRecord::Comment(PaxValue::Value("last".to_owned()))),
-            },
-            Case {
-                name: "local deletion suppresses global",
-                global: vec![PaxRecord::Comment(PaxValue::Value("global".to_owned()))],
-                local: Some(vec![PaxRecord::Comment(PaxValue::Deleted)]),
-                expected: Some(PaxRecord::Comment(PaxValue::Deleted)),
-            },
-        ] {
-            let state = PaxState::new(
-                (!case.global.is_empty()).then(|| Arc::new(case.global)),
-                Vec::new(),
-                case.local
-                    .map(|records| pax_extension(0, PaxKind::Local, records)),
-            );
-            assert_eq!(
-                state.effective_record("comment"),
-                case.expected.as_ref(),
-                "{}",
-                case.name
-            );
-        }
     }
 
     #[test]

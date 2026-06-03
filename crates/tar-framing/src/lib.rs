@@ -2,7 +2,7 @@
 //!
 //! This crate provides the lossless block-level [`stream`] framing API and
 //! the assembled member-level [`logical`] reader API. Logical PAX members use
-//! one unified [`logical::PaxState`] for effective values and positioned
+//! one unified [`PaxState`] for effective values and positioned
 //! extension history, while [`logical::Header`] borrows compact extracted
 //! ordinary-header metadata rather than retaining a lossless block.
 //!
@@ -21,7 +21,7 @@ mod test_support;
 pub mod write;
 
 pub use error::{FrameError, FrameErrorInner};
-pub use pax::{HdrCharset, PaxRecord, PaxString, PaxValue};
+pub use pax::{HdrCharset, PaxExtension, PaxRecord, PaxState, PaxString, PaxValue};
 
 /// The size of a logical tar record.
 pub const BLOCK_SIZE: usize = 512;
