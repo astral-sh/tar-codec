@@ -1,9 +1,11 @@
-use std::{borrow::Cow, str::FromStr};
+use std::{borrow::Cow, str::FromStr, sync::Arc};
 
 use super::{FrameError, FrameErrorInner};
 
 const UTF8_HDRCHARSET: &str = "ISO-IR 10646 2000 UTF-8";
 const BINARY_HDRCHARSET: &str = "BINARY";
+
+pub(crate) type SharedPaxRecords = Arc<Vec<PaxRecord>>;
 
 /// A character encoding for PAX pathname and user/group-name values.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -411,18 +413,27 @@ fn parse_time(
         .ok_or_else(invalid)
 }
 
-pub(super) fn size(records: &[PaxRecord]) -> Option<&PaxValue<u64>> {
-    records.iter().rev().find_map(|record| match record {
+pub(crate) fn effective_record<'a>(
+    local_records: &'a [PaxRecord],
+    global_records: &'a [PaxRecord],
+    keyword: &str,
+) -> Option<&'a PaxRecord> {
+    record(local_records, keyword).or_else(|| record(global_records, keyword))
+}
+
+pub(super) fn size<'a>(
+    local_records: &'a [PaxRecord],
+    global_records: &'a [PaxRecord],
+) -> Option<&'a PaxValue<u64>> {
+    effective_record(local_records, global_records, "size").and_then(|record| match record {
         PaxRecord::Size(value) => Some(value),
         _ => None,
     })
 }
 
 pub(super) fn hdrcharset(records: &[PaxRecord]) -> HdrCharset {
-    records
-        .iter()
-        .rev()
-        .find_map(|record| match record {
+    record(records, "hdrcharset")
+        .and_then(|record| match record {
             PaxRecord::HdrCharset(value) => Some(value),
             _ => None,
         })
@@ -432,12 +443,40 @@ pub(super) fn hdrcharset(records: &[PaxRecord]) -> HdrCharset {
         })
 }
 
-pub(super) fn apply_global(active: &mut Vec<PaxRecord>, records: Vec<PaxRecord>) {
+pub(super) fn apply_global(active: &mut Option<SharedPaxRecords>, records: &SharedPaxRecords) {
+    if let Some(active) = active {
+        apply_records(Arc::make_mut(active), records);
+    } else if records_have_unique_keywords(records) {
+        *active = Some(Arc::clone(records));
+    } else {
+        let mut effective = Vec::with_capacity(records.len());
+        apply_records(&mut effective, records);
+        *active = Some(Arc::new(effective));
+    }
+}
+
+fn record<'a>(records: &'a [PaxRecord], keyword: &str) -> Option<&'a PaxRecord> {
+    records
+        .iter()
+        .rev()
+        .find(|record| record.keyword() == keyword)
+}
+
+fn apply_records(active: &mut Vec<PaxRecord>, records: &[PaxRecord]) {
     for record in records {
         let keyword = record.keyword();
         active.retain(|existing| existing.keyword() != keyword);
-        active.push(record);
+        active.push(record.clone());
     }
+}
+
+fn records_have_unique_keywords(records: &[PaxRecord]) -> bool {
+    records.iter().enumerate().all(|(index, record)| {
+        let keyword = record.keyword();
+        records[..index]
+            .iter()
+            .all(|existing| existing.keyword() != keyword)
+    })
 }
 
 fn parse_integer(value: &str) -> Option<u64> {
@@ -634,19 +673,23 @@ mod tests {
 
     #[test]
     fn applies_namespaced_globals_and_accepts_supported_hdrcharset_records() {
-        let mut active = vec![
+        let mut active = Some(Arc::new(vec![
             vendor("first", "old"),
             vendor("second", "kept"),
             security("old"),
-        ];
-        apply_global(&mut active, vec![vendor("first", "new"), security("new")]);
+        ]));
+        let update = Arc::new(vec![vendor("first", "new"), security("new")]);
+        apply_global(&mut active, &update);
         assert_eq!(
-            active,
-            [
-                vendor("second", "kept"),
-                vendor("first", "new"),
-                security("new"),
-            ]
+            active.as_deref().map(Vec::as_slice),
+            Some(
+                [
+                    vendor("second", "kept"),
+                    vendor("first", "new"),
+                    security("new"),
+                ]
+                .as_slice()
+            )
         );
 
         for (case, payload) in [

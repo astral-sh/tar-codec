@@ -1,7 +1,9 @@
 //! Low level framing of tar streams.
 //!
 //! This crate provides the lossless block-level [`stream`] framing API and
-//! the assembled member-level [`logical`] reader API.
+//! the assembled member-level [`logical`] reader API. Logical PAX members use
+//! one unified [`logical::PaxState`] for effective values and positioned
+//! extension history.
 //!
 //! The stream is strict in the sense that it defines a state machine
 //! that enforces the pax (ustar superset) or GNU format rules

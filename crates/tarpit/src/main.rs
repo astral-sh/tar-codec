@@ -186,26 +186,30 @@ fn render_frame(output: &mut impl Write, index: usize, frame: &Frame) -> io::Res
             gnu_kind_name(frame.kind),
             frame.payload_size
         ),
-        Frame::Header(frame) => {
+        Frame::Header(frame) => writeln!(
+            output,
+            "    [{index}] @{} header {} declared={} effective={} payload={}",
+            frame.position,
+            member_kind_name(frame.kind),
+            frame.declared_size,
+            frame.effective_size,
+            frame.payload_size
+        ),
+        Frame::Data(frame) => {
             writeln!(
                 output,
-                "    [{index}] @{} header {} declared={} effective={} payload={}",
+                "    [{index}] @{} data owner={} len={}",
                 frame.position,
-                member_kind_name(frame.kind),
-                frame.declared_size,
-                frame.effective_size,
-                frame.payload_size
+                data_owner_name(frame.owner),
+                frame.len
             )?;
-            render_pax_records(output, "global", &frame.global_pax_records)?;
-            render_pax_records(output, "local", &frame.local_pax_records)
+            if let DataOwner::Pax(kind) = frame.owner
+                && let Some(records) = frame.completed_pax_records()
+            {
+                render_pax_records(output, pax_kind_name(kind), records)?;
+            }
+            Ok(())
         }
-        Frame::Data(frame) => writeln!(
-            output,
-            "    [{index}] @{} data owner={} len={}",
-            frame.position,
-            data_owner_name(frame.owner),
-            frame.len
-        ),
     }
 }
 
@@ -313,6 +317,7 @@ mod tests {
     use std::{fs, ops::Range};
 
     use async_compression::tokio::write::GzipEncoder;
+    use tar_framing::write::{PaxMember, end_marker_bytes, frame_pax_member_into};
     use tempfile::tempdir;
     use tokio::io::AsyncWriteExt;
 
@@ -351,6 +356,41 @@ mod tests {
             )
             .as_bytes()
         );
+    }
+
+    #[tokio::test]
+    async fn renders_pax_records_on_their_final_physical_payload_frame() {
+        let mut archive = Vec::new();
+        frame_pax_member_into(
+            0,
+            PaxMember {
+                path: "file",
+                kind: MemberKind::Regular,
+                size: 0,
+                link_path: None,
+                executable: false,
+            },
+            &mut archive,
+        )
+        .expect("member should frame");
+        archive.extend_from_slice(end_marker_bytes());
+
+        let mut output = Vec::new();
+        dump_frames(archive.as_slice(), "archive.tar", &mut output)
+            .await
+            .expect("archive should render");
+        let output = String::from_utf8(output).expect("frame output should be UTF-8");
+        let data = output
+            .find("data owner=pax(local)")
+            .expect("PAX data frame should be rendered");
+        let records = output[data..]
+            .find("        local pax: path=\"file\"")
+            .map(|offset| data + offset)
+            .expect("PAX records should be rendered");
+        let header = output
+            .find("header regular")
+            .expect("ordinary header should be rendered");
+        assert!(data < records && records < header);
     }
 
     #[tokio::test]

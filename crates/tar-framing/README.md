@@ -6,13 +6,13 @@ This is a dependency of `tar-codec`. Most users should not use this crate's APIs
 
 This crate provides two views over an asynchronous I/O source:
 
-- `stream::TarStream` emits physical 512-byte header and data frames for lossless inspection and debugging.
-- `logical::TarReader` emits ordinary members with newly encountered extension metadata attached, resolves byte-oriented member path/link metadata according to PAX/GNU precedence, and streams member payload blocks through a borrowing cursor.
+- `stream::TarStream` emits physical 512-byte header and data frames for lossless inspection and debugging. Parsed PAX records are available on the final physical PAX payload frame.
+- `logical::TarReader` emits ordinary members with extension metadata attached, resolves byte-oriented member path/link metadata according to PAX/GNU precedence, and streams member payload blocks through a borrowing cursor.
 
-For pax members, the attached metadata preserves each newly encountered
-global update and its source position, while the ordinary header carries the
-effective active global state. Use `TarStream` when standalone physical global
-headers must be inspected losslessly.
+For PAX members, one `PaxState` provides standards-consistent effective values
+while preserving each positioned global or local extension newly encountered
+for that member. Use `TarStream` when standalone physical extension headers
+must be inspected losslessly.
 
 It also provides `write` helpers for constructing deterministic POSIX-pax
 member blocks without performing I/O.
