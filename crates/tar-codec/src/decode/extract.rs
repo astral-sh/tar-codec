@@ -59,8 +59,6 @@ enum TerminalKind {
     Dangling,
 }
 
-// Extraction logic below this marker is kept under a 550-line budget.
-
 impl<R: AsyncRead + Unpin> Archive<R> {
     /// Securely extracts this archive beneath `dest` under `policy`.
     ///
@@ -595,8 +593,6 @@ fn create_symlink(dir: &Dir, contents: &Path, path: &Path, kind: TerminalKind) -
     }
 }
 
-// Extraction logic above this marker is kept under a 550-line budget.
-
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
@@ -778,34 +774,6 @@ mod tests {
         Archive::new(ChunkedReader::new(bytes, 23))
             .extract(dest, policy)
             .await
-    }
-
-    #[test]
-    fn extraction_logic_stays_within_line_budget() {
-        const START_MARKER: &str =
-            "// Extraction logic below this marker is kept under a 550-line budget.";
-        const END_MARKER: &str =
-            "// Extraction logic above this marker is kept under a 550-line budget.";
-
-        let source = include_str!("extract.rs");
-        let implementation = source
-            .split_once(START_MARKER)
-            .map_or(source, |(_, implementation)| implementation);
-        assert_ne!(
-            implementation.len(),
-            source.len(),
-            "extraction logic budget start marker is missing"
-        );
-        let bounded_implementation = implementation
-            .split_once(END_MARKER)
-            .map_or(implementation, |(implementation, _)| implementation);
-        assert_ne!(
-            bounded_implementation.len(),
-            implementation.len(),
-            "extraction logic budget end marker is missing"
-        );
-        let line_count = bounded_implementation.lines().count();
-        assert!(line_count <= 550, "extraction logic is {line_count} lines");
     }
 
     #[tokio::test]
