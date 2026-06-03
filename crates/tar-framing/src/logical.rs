@@ -60,9 +60,11 @@ pub struct Header<'a> {
     pub effective_size: u64,
     /// The number of payload bytes exposed through [`MemberPayload`].
     ///
-    /// For pax hard links, the physical size may be nonzero and an applicable
-    /// pax `size` record may override it. Every nonzero effective size is
-    /// treated as payload because the format carries no separate marker.
+    /// This can vary from both [`Header::declared_size`] and [`Header::effective_size`]
+    /// depending on [`Header::kind`]. For example, a dictory member is permitted
+    /// to declare a non-zero size in either the ustar or pax header, but ustar
+    /// explicitly says that no 'logical records' (i.e. payload) is emitted
+    /// for a directory.
     pub payload_size: u64,
     mode: [u8; 8],
     header_path: &'a [u8],

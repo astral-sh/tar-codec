@@ -26,6 +26,7 @@ pub use pax::{HdrCharset, PaxExtension, PaxRecord, PaxState, PaxString, PaxValue
 /// The size of a logical tar record.
 pub const BLOCK_SIZE: usize = 512;
 
+/// A single tar block.
 pub type Block = [u8; BLOCK_SIZE];
 
 /// An automatically detected, mutually exclusive tar archive family.
@@ -56,6 +57,8 @@ pub enum GnuKind {
 }
 
 /// A supported ordinary ustar member type.
+///
+/// These are shared across both pax and GNU tar streams.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemberKind {
     /// A regular file (`'0'` or NUL).

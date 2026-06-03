@@ -87,9 +87,12 @@ pub struct HeaderFrame {
     pub effective_size: u64,
     /// The number of payload bytes for which data frames will be emitted.
     ///
-    /// For pax hard links, the physical size may be nonzero and an applicable
-    /// pax `size` record may override it. Every nonzero effective size is
-    /// treated as payload because the format carries no separate marker.
+    /// This can vary from both [`HeaderFrame::declared_size`] and
+    /// [`HeaderFrame::effective_size`] depending on [`HeaderFrame::kind`].
+    /// For example, a dictory member is permitted
+    /// to declare a non-zero size in either the ustar or pax header, but ustar
+    /// explicitly says that no 'logical records' (i.e. payload) is emitted
+    /// for a directory.
     pub payload_size: u64,
 }
 
