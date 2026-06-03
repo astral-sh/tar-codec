@@ -415,12 +415,17 @@ mod tests {
                 .expect("member header");
             assert_eq!(header.kind, member.kind);
             assert_eq!(header.effective_size, member.size);
+            let records = frames
+                .iter()
+                .find_map(|frame| match frame {
+                    Ok(Frame::Data(data)) => data.completed_pax_records(),
+                    _ => None,
+                })
+                .expect("local pax records");
             assert!(
-                header
-                    .local_pax_records
-                    .contains(&PaxRecord::Path(PaxValue::Value(PaxString::Utf8(
-                        member.path.to_owned()
-                    ))))
+                records.contains(&PaxRecord::Path(PaxValue::Value(PaxString::Utf8(
+                    member.path.to_owned()
+                ))))
             );
         }
     }
@@ -476,14 +481,14 @@ mod tests {
 
         bytes.extend_from_slice(end_marker_bytes());
         let frames = ready(TarStream::new(ChunkedReader::new(bytes, 23)).collect::<Vec<_>>());
-        let header = frames
+        let records = frames
             .iter()
             .find_map(|frame| match frame {
-                Ok(Frame::Header(header)) => Some(header),
+                Ok(Frame::Data(data)) => data.completed_pax_records(),
                 _ => None,
             })
-            .expect("member header");
-        assert_eq!(header.local_pax_records.len(), 3);
+            .expect("local pax records");
+        assert_eq!(records.len(), 3);
     }
 
     #[test]

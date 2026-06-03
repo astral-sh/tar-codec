@@ -14,7 +14,7 @@ use std::{
 
 use tar_framing::{
     ArchiveFormat, FrameError, MemberKind, PaxKind, PaxRecord,
-    logical::{LogicalFrame, MemberExtensions, MemberFrame, TarReader},
+    logical::{MemberExtensions, MemberFrame, TarReader},
 };
 use thiserror::Error;
 use tokio::io::AsyncRead;
@@ -57,6 +57,9 @@ pub struct DecodePolicy {
 ///
 /// The default permits global pax extension headers while rejecting global
 /// per-member metadata, vendor-namespaced records, and duplicate records.
+/// Policy checks inspect positioned extensions retained by the member's unified
+/// logical PAX state. Global headers are checked with the following ordinary
+/// member; trailing global headers are consumed and ignored by [`TarReader`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PaxDecodePolicy {
     allow_global_pax_extensions: bool,
@@ -168,8 +171,16 @@ impl DecodePolicy {
     }
 
     fn check_member<R>(&self, frame: &MemberFrame<'_, R>) -> Result<(), DecodeError> {
+        if let MemberExtensions::Pax(state) = &frame.extensions {
+            for extension in state
+                .extensions()
+                .filter(|extension| extension.kind == PaxKind::Global)
+            {
+                self.check_global_pax(extension.position, extension.records())?;
+            }
+        }
         let format_position = match &frame.extensions {
-            MemberExtensions::Pax { .. } => frame.header.position,
+            MemberExtensions::Pax(_) => frame.header.position,
             MemberExtensions::Gnu {
                 long_name,
                 long_link,
@@ -182,15 +193,17 @@ impl DecodePolicy {
         };
         self.check_format(format_position, frame.header.format)?;
         self.check_member_kind(frame.header.position, frame.header.kind)?;
-        if let MemberExtensions::Pax {
-            local_position: Some(position),
-        } = &frame.extensions
-        {
-            self.pax_policy.check_pax_records(
-                *position,
-                PaxKind::Local,
-                &frame.header.local_pax_records,
-            )?;
+        if let MemberExtensions::Pax(state) = &frame.extensions {
+            for extension in state
+                .extensions()
+                .filter(|extension| extension.kind == PaxKind::Local)
+            {
+                self.pax_policy.check_pax_records(
+                    extension.position,
+                    PaxKind::Local,
+                    extension.records(),
+                )?;
+            }
         }
         Ok(())
     }
@@ -201,7 +214,8 @@ impl PaxDecodePolicy {
     ///
     /// When enabled, [`Self::allow_global_pax_member_metadata`] separately
     /// controls whether global `path`, `linkpath`, and `size` records are
-    /// accepted.
+    /// accepted. Trailing global headers without a following ordinary member
+    /// are consumed and ignored before policy checks.
     pub fn allow_global_pax_extensions(mut self, allow: bool) -> Self {
         self.allow_global_pax_extensions = allow;
         self

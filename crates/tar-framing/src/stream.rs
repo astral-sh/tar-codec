@@ -4,9 +4,9 @@
 //! tar block and preserves each source block verbatim.
 
 use std::{
-    borrow::Cow,
     future::poll_fn,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -21,7 +21,7 @@ use crate::{
         POSIX_IDENTITY, PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, checksum, parse_octal,
     },
     pax::{
-        apply_global as apply_global_pax_records, hdrcharset as pax_hdrcharset,
+        SharedPaxRecords, apply_global as apply_global_pax_records, hdrcharset as pax_hdrcharset,
         parse_records as parse_pax_records, size as pax_size,
     },
 };
@@ -67,7 +67,10 @@ pub struct GnuFrame {
     pub payload_size: u64,
 }
 
-/// An ordinary member header block in the selected archive family.
+/// An ordinary physical member header block in the selected archive family.
+///
+/// PAX records remain on their physical payload frames. Use
+/// [`crate::logical::TarReader`] for assembled member metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeaderFrame {
     /// The absolute byte position of this block in the source stream.
@@ -84,44 +87,35 @@ pub struct HeaderFrame {
     pub effective_size: u64,
     /// The number of payload bytes for which data frames will be emitted.
     pub payload_size: u64,
-    /// Effective global pax records active for this member, including deletions.
-    pub global_pax_records: Vec<PaxRecord>,
-    /// Parsed local pax records that apply to this member, in input order.
-    pub local_pax_records: Vec<PaxRecord>,
 }
 
 impl HeaderFrame {
-    /// Decodes the ordinary header's numeric mode according to its archive family.
-    pub fn mode(&self) -> Result<u64, FrameError> {
-        let bytes: [u8; 8] = self.block[MODE_RANGE]
-            .try_into()
-            .expect("fixed header range");
-        parse_number(self.format, &bytes).ok_or_else(|| {
-            FrameError::at(self.position, FrameErrorInner::InvalidMode { found: bytes })
-        })
-    }
-
-    pub(crate) fn header_path(&self) -> Cow<'_, [u8]> {
+    pub(crate) fn copy_header_path_into(&self, path: &mut Vec<u8>) {
+        path.clear();
         let name = trim_nul(&self.block[NAME_RANGE]);
         if self.format == ArchiveFormat::Gnu {
-            return Cow::Borrowed(name);
+            path.extend_from_slice(name);
+            return;
         }
         let prefix = trim_nul(&self.block[PREFIX_RANGE]);
-        if prefix.is_empty() {
-            Cow::Borrowed(name)
-        } else if name.is_empty() {
-            Cow::Borrowed(prefix)
-        } else {
-            let mut path = Vec::with_capacity(prefix.len() + 1 + name.len());
+        if !prefix.is_empty() {
             path.extend_from_slice(prefix);
-            path.push(b'/');
-            path.extend_from_slice(name);
-            Cow::Owned(path)
+            if !name.is_empty() {
+                path.push(b'/');
+            }
         }
+        path.extend_from_slice(name);
     }
 
-    pub(crate) fn link_name(&self) -> &[u8] {
-        trim_nul(&self.block[LINK_NAME_RANGE])
+    pub(crate) fn copy_link_name_into(&self, link_name: &mut Vec<u8>) {
+        link_name.clear();
+        link_name.extend_from_slice(trim_nul(&self.block[LINK_NAME_RANGE]));
+    }
+
+    pub(crate) fn mode_bytes(&self) -> [u8; 8] {
+        self.block[MODE_RANGE]
+            .try_into()
+            .expect("fixed header range")
     }
 }
 
@@ -154,7 +148,21 @@ pub struct DataFrame {
     ///
     /// This is `Some` only for the last data block belonging to a local or
     /// global pax header; other payload data carries `None`.
-    pub completed_pax_records: Option<Vec<PaxRecord>>,
+    completed_pax_records: Option<SharedPaxRecords>,
+}
+
+impl DataFrame {
+    /// Returns parsed records completed by this final pax payload block.
+    ///
+    /// This returns `Some` only for the last data block belonging to a local
+    /// or global pax header.
+    pub fn completed_pax_records(&self) -> Option<&[PaxRecord]> {
+        self.completed_pax_records.as_deref().map(Vec::as_slice)
+    }
+
+    pub(crate) fn into_completed_pax_records(self) -> Option<SharedPaxRecords> {
+        self.completed_pax_records
+    }
 }
 
 /// The parser phase required before the next physical frame can be emitted.
@@ -170,7 +178,7 @@ pub(super) enum State {
         payload: Vec<u8>,
     },
     /// A local pax header has completed; require its ordinary ustar header.
-    AwaitingUstarHeader { records: Vec<PaxRecord> },
+    AwaitingUstarHeader { records: SharedPaxRecords },
     /// Consume uninterpreted payload blocks for a GNU `L` or `K` extension.
     ReadingGnu {
         kind: GnuKind,
@@ -202,7 +210,7 @@ pub struct TarStream<R> {
     pub(super) block: Block,
     pub(super) block_len: usize,
     pub(super) format: Option<ArchiveFormat>,
-    pub(super) global_pax_records: Vec<PaxRecord>,
+    pub(super) global_pax_records: Option<SharedPaxRecords>,
     pub(super) state: State,
 }
 
@@ -215,7 +223,7 @@ impl<R> TarStream<R> {
             block: [0; BLOCK_SIZE],
             block_len: 0,
             format: None,
-            global_pax_records: Vec::new(),
+            global_pax_records: None,
             state: State::AwaitingHeader,
         }
     }
@@ -228,9 +236,54 @@ impl<R> TarStream<R> {
     pub(crate) fn position(&self) -> u64 {
         self.position
     }
+
+    pub(crate) fn global_pax_records(&self) -> Option<SharedPaxRecords> {
+        self.global_pax_records.clone()
+    }
 }
 
 impl<R: AsyncRead + Unpin> TarStream<R> {
+    /// Reads one ordinary-member payload block without constructing a [`Frame`].
+    ///
+    /// Returns the block's position, lossless bytes, and meaningful length.
+    pub(crate) async fn read_member_block(&mut self) -> Result<(u64, Block, usize), FrameError> {
+        let remaining = match &self.state {
+            State::ReadingMember { remaining } => *remaining,
+            _ => {
+                self.state = State::Failed;
+                return Err(FrameError::unexpected_order(
+                    self.position,
+                    "ordinary member payload",
+                    "parser state without member payload",
+                ));
+            }
+        };
+        if self.block_len != 0 {
+            self.state = State::Failed;
+            return Err(FrameError::unexpected_order(
+                self.position,
+                "aligned ordinary member payload",
+                "partially buffered physical block",
+            ));
+        }
+
+        let (position, block) = match poll_fn(|context| self.poll_read_block(context)).await {
+            Ok(Some(block)) => block,
+            Ok(None) => {
+                let error = self.handle_eof();
+                self.state = State::Failed;
+                return Err(error);
+            }
+            Err(error) => {
+                self.state = State::Failed;
+                return Err(error);
+            }
+        };
+        let meaningful_len = remaining.min(BLOCK_SIZE as u64) as usize;
+        self.state = member_payload_state(remaining - meaningful_len as u64);
+        Ok((position, block, meaningful_len))
+    }
+
     /// Reads aligned ordinary-member payload blocks directly into `buffer`.
     ///
     /// This internal path preserves exact physical-block completion checks
@@ -260,13 +313,12 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             ));
         }
 
-        let target_blocks = target_len.max(BLOCK_SIZE).div_ceil(BLOCK_SIZE);
-        let target_blocks = u64::try_from(target_blocks).map_err(|_| {
-            FrameError::arithmetic_overflow(self.position, "member payload chunk block count")
+        let target_len = u64::try_from(target_len.max(BLOCK_SIZE)).map_err(|_| {
+            FrameError::arithmetic_overflow(self.position, "member payload chunk target length")
         })?;
-        let remaining_blocks = remaining.div_ceil(BLOCK_SIZE as u64);
-        let physical_len = target_blocks
-            .min(remaining_blocks)
+        let physical_len = remaining
+            .min(target_len)
+            .div_ceil(BLOCK_SIZE as u64)
             .checked_mul(BLOCK_SIZE as u64)
             .ok_or_else(|| {
                 FrameError::arithmetic_overflow(
@@ -447,11 +499,15 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 payload.extend_from_slice(&block[..len]);
                 remaining -= len as u64;
                 let completed_pax_records = if remaining == 0 {
-                    let records = parse_pax_records(
+                    let global_records = self
+                        .global_pax_records
+                        .as_deref()
+                        .map_or(&[] as &[PaxRecord], Vec::as_slice);
+                    let records = Arc::new(parse_pax_records(
                         header_position,
                         &payload,
-                        pax_hdrcharset(&self.global_pax_records),
-                    )?;
+                        pax_hdrcharset(global_records),
+                    )?);
                     match kind {
                         PaxKind::Local => {
                             self.state = State::AwaitingUstarHeader {
@@ -459,7 +515,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                             };
                         }
                         PaxKind::Global => {
-                            apply_global_pax_records(&mut self.global_pax_records, records.clone());
+                            apply_global_pax_records(&mut self.global_pax_records, &records);
                             self.state = State::AwaitingHeader;
                         }
                     }
@@ -497,7 +553,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                         "another pax extended header",
                     ));
                 }
-                self.process_ustar_header(position, block, parsed, records)
+                self.process_ustar_header(position, block, parsed, Some(records))
                     .map(Some)
             }
             State::ReadingGnu {
@@ -616,7 +672,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         match parsed.typeflag {
             b'x' => self.process_pax_header(position, block, parsed.size, PaxKind::Local),
             b'g' => self.process_pax_header(position, block, parsed.size, PaxKind::Global),
-            _ => self.process_ustar_header(position, block, parsed, Vec::new()),
+            _ => self.process_ustar_header(position, block, parsed, None),
         }
     }
 
@@ -661,12 +717,18 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         position: u64,
         block: Block,
         parsed: ParsedHeader,
-        local_pax_records: Vec<PaxRecord>,
+        local_pax_records: Option<SharedPaxRecords>,
     ) -> Result<Frame, FrameError> {
         let kind = MemberKind::try_from_framed(position, parsed.typeflag)?;
-        let effective_size = pax_size(&local_pax_records)
-            .or_else(|| pax_size(&self.global_pax_records))
-            .map_or(Ok(parsed.size), |size| match size {
+        let local_records = local_pax_records
+            .as_deref()
+            .map_or(&[] as &[PaxRecord], Vec::as_slice);
+        let global_records = self
+            .global_pax_records
+            .as_deref()
+            .map_or(&[] as &[PaxRecord], Vec::as_slice);
+        let effective_size =
+            pax_size(local_records, global_records).map_or(Ok(parsed.size), |size| match size {
                 PaxValue::Value(size) => Ok(*size),
                 PaxValue::Deleted => Err(FrameError::deleted_pax_metadata(position, "size")),
             })?;
@@ -680,8 +742,6 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             declared_size: parsed.size,
             effective_size,
             payload_size,
-            global_pax_records: self.global_pax_records.clone(),
-            local_pax_records,
         }))
     }
 
@@ -745,8 +805,6 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             declared_size: parsed.size,
             effective_size: parsed.size,
             payload_size,
-            global_pax_records: Vec::new(),
-            local_pax_records: Vec::new(),
         }))
     }
 }
@@ -872,6 +930,15 @@ pub(crate) fn parse_number(format: ArchiveFormat, bytes: &[u8]) -> Option<u64> {
         ArchiveFormat::Pax => parse_octal(bytes),
         ArchiveFormat::Gnu => parse_gnu_number(bytes),
     }
+}
+
+pub(crate) fn parse_mode(
+    position: u64,
+    format: ArchiveFormat,
+    bytes: [u8; 8],
+) -> Result<u64, FrameError> {
+    parse_number(format, &bytes)
+        .ok_or_else(|| FrameError::at(position, FrameErrorInner::InvalidMode { found: bytes }))
 }
 
 fn parse_gnu_number(bytes: &[u8]) -> Option<u64> {
@@ -1064,15 +1131,13 @@ mod tests {
         assert_eq!(header.declared_size, 513);
         assert_eq!(header.effective_size, 513);
         assert_eq!(header.payload_size, 513);
-        assert!(header.global_pax_records.is_empty());
-        assert!(header.local_pax_records.is_empty());
         let first = data_frame(&frames, 1);
         let last = data_frame(&frames, 2);
         assert_eq!(first.len, BLOCK_SIZE);
         assert_eq!(last.len, 1);
         assert_eq!(last.owner, DataOwner::Member);
-        assert!(first.completed_pax_records.is_none());
-        assert!(last.completed_pax_records.is_none());
+        assert!(first.completed_pax_records().is_none());
+        assert!(last.completed_pax_records().is_none());
     }
 
     #[test]
@@ -1097,13 +1162,12 @@ mod tests {
         assert_eq!(pax.payload_size, payload.len() as u64);
         let first_pax_data = data_frame(&frames, 1);
         assert_eq!(first_pax_data.owner, DataOwner::Pax(PaxKind::Local));
-        assert!(first_pax_data.completed_pax_records.is_none());
+        assert!(first_pax_data.completed_pax_records().is_none());
         let final_pax_data = data_frame(&frames, 2);
         assert_eq!(final_pax_data.owner, DataOwner::Pax(PaxKind::Local));
         assert_eq!(
             final_pax_data
-                .completed_pax_records
-                .as_ref()
+                .completed_pax_records()
                 .and_then(|records| records.last()),
             Some(&PaxRecord::Size(PaxValue::Value(513)))
         );
@@ -1111,11 +1175,6 @@ mod tests {
         assert_eq!(header.declared_size, 1);
         assert_eq!(header.effective_size, 513);
         assert_eq!(header.payload_size, 513);
-        assert_eq!(header.local_pax_records.len(), 2);
-        assert_eq!(
-            header.local_pax_records[1],
-            PaxRecord::Size(PaxValue::Value(513))
-        );
         let last = data_frame(&frames, 5);
         assert_eq!(last.len, 1);
     }
@@ -1157,21 +1216,19 @@ mod tests {
                 ..
             }))
         )));
-        let completed_global_payloads: Vec<&Vec<PaxRecord>> = frames
+        let completed_global_payloads: Vec<&[PaxRecord]> = frames
             .iter()
             .filter_map(|frame| match frame {
-                Ok(Frame::Data(DataFrame {
-                    owner: DataOwner::Pax(PaxKind::Global),
-                    completed_pax_records: Some(records),
-                    ..
-                })) => Some(records),
+                Ok(Frame::Data(frame)) if frame.owner == DataOwner::Pax(PaxKind::Global) => {
+                    frame.completed_pax_records()
+                }
                 _ => None,
             })
             .collect();
         assert_eq!(completed_global_payloads.len(), 3);
         assert_eq!(
             completed_global_payloads[2],
-            &[
+            [
                 PaxRecord::Comment(PaxValue::Deleted),
                 PaxRecord::Size(PaxValue::Deleted),
             ]
@@ -1185,15 +1242,15 @@ mod tests {
             .collect();
         assert_eq!(headers.len(), 2);
         assert_eq!(headers[0].effective_size, 2);
-        assert_eq!(
-            headers[0].global_pax_records,
-            [
-                PaxRecord::Size(PaxValue::Value(2)),
-                PaxRecord::Comment(PaxValue::Value("new".to_owned())),
-            ]
-        );
         assert_eq!(headers[1].effective_size, 3);
-        assert_eq!(headers[1].local_pax_records, local_records("local", 3));
+        assert!(frames.iter().any(|frame| {
+            matches!(
+                frame,
+                Ok(Frame::Data(frame))
+                    if frame.owner == DataOwner::Pax(PaxKind::Local)
+                        && frame.completed_pax_records() == Some(local_records("local", 3).as_slice())
+            )
+        }));
         assert!(matches!(
             last_error_inner(&frames),
             FrameErrorInner::DeletedPaxMetadata { keyword: "size" }
@@ -1221,8 +1278,14 @@ mod tests {
         let header = header_frame(&frames, 2);
         assert_eq!(header.effective_size, 2);
         assert_eq!(
-            header.local_pax_records[0],
-            PaxRecord::Size(PaxValue::Deleted)
+            data_frame(&frames, 1).completed_pax_records(),
+            Some(
+                [
+                    PaxRecord::Size(PaxValue::Deleted),
+                    PaxRecord::Size(PaxValue::Value(2)),
+                ]
+                .as_slice()
+            )
         );
     }
 
@@ -1275,12 +1338,12 @@ mod tests {
         let header = header_frame(&frames, 4);
         assert_eq!(header.effective_size, 2);
         assert_eq!(
-            header.global_pax_records[0],
-            PaxRecord::Size(PaxValue::Deleted)
+            data_frame(&frames, 1).completed_pax_records(),
+            Some([PaxRecord::Size(PaxValue::Deleted)].as_slice())
         );
         assert_eq!(
-            header.local_pax_records[0],
-            PaxRecord::Size(PaxValue::Value(2))
+            data_frame(&frames, 3).completed_pax_records(),
+            Some([PaxRecord::Size(PaxValue::Value(2))].as_slice())
         );
     }
 
@@ -1353,7 +1416,7 @@ mod tests {
         let final_name = data_frame(&frames, 2);
         assert_eq!(final_name.owner, DataOwner::Gnu(GnuKind::LongName));
         assert_eq!(final_name.len, 1);
-        assert!(final_name.completed_pax_records.is_none());
+        assert!(final_name.completed_pax_records().is_none());
         assert!(matches!(
             frames[3].as_ref().unwrap(),
             Frame::Gnu(GnuFrame {
@@ -1363,8 +1426,6 @@ mod tests {
         ));
         let header = header_frame(&frames, 5);
         assert_eq!(header.kind, MemberKind::SymbolicLink);
-        assert!(header.global_pax_records.is_empty());
-        assert!(header.local_pax_records.is_empty());
     }
 
     #[test]
@@ -1444,18 +1505,25 @@ mod tests {
         append_terminator(&mut bytes);
         let frames = collect(bytes, BLOCK_SIZE);
         let member_header = header_frame(&frames, 4);
+        assert_eq!(member_header.kind, MemberKind::Regular);
         assert_eq!(
-            member_header.global_pax_records,
-            [
-                PaxRecord::HdrCharset(PaxValue::Value(HdrCharset::Binary)),
-                PaxRecord::Path(PaxValue::Value(PaxString::Binary(b"global".to_vec()))),
-            ]
+            data_frame(&frames, 1).completed_pax_records(),
+            Some(
+                [
+                    PaxRecord::HdrCharset(PaxValue::Value(HdrCharset::Binary)),
+                    PaxRecord::Path(PaxValue::Value(PaxString::Binary(b"global".to_vec()))),
+                ]
+                .as_slice()
+            )
         );
         assert_eq!(
-            member_header.local_pax_records,
-            [PaxRecord::Path(PaxValue::Value(PaxString::Binary(
-                b"local".to_vec()
-            )))]
+            data_frame(&frames, 3).completed_pax_records(),
+            Some(
+                [PaxRecord::Path(PaxValue::Value(PaxString::Binary(
+                    b"local".to_vec()
+                )))]
+                .as_slice()
+            )
         );
 
         let records = record("hdrcharset", "ISO-IR 8859 1 1998");

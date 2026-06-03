@@ -1,9 +1,87 @@
-use std::{borrow::Cow, str::FromStr};
+//! PAX record parsing, active-global updates, and per-member metadata state.
 
-use super::{FrameError, FrameErrorInner};
+use std::{borrow::Cow, str::FromStr, sync::Arc};
+
+use super::{FrameError, FrameErrorInner, PaxKind};
 
 const UTF8_HDRCHARSET: &str = "ISO-IR 10646 2000 UTF-8";
 const BINARY_HDRCHARSET: &str = "BINARY";
+
+pub(crate) type SharedPaxRecords = Arc<Vec<PaxRecord>>;
+
+/// One positioned parsed pax extended header.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaxExtension {
+    /// The absolute byte position of the pax extension header block.
+    pub position: u64,
+    /// Whether this extension has local or global scope.
+    pub kind: PaxKind,
+    records: SharedPaxRecords,
+}
+
+impl PaxExtension {
+    pub(crate) fn new(position: u64, kind: PaxKind, records: SharedPaxRecords) -> Self {
+        Self {
+            position,
+            kind,
+            records,
+        }
+    }
+
+    /// Returns the parsed pax records in archive order.
+    pub fn records(&self) -> &[PaxRecord] {
+        &self.records
+    }
+}
+
+/// Unified pax metadata state applicable to one ordinary member.
+///
+/// Effective values apply local records over the active global state using
+/// standard last-record-wins and deletion semantics. [`Self::extensions`]
+/// retains the positioned extension headers newly encountered for this member.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaxState {
+    global_records: Option<SharedPaxRecords>,
+    global_extensions: Vec<PaxExtension>,
+    local_extension: Option<PaxExtension>,
+}
+
+impl PaxState {
+    pub(crate) fn new(
+        global_records: Option<SharedPaxRecords>,
+        global_extensions: Vec<PaxExtension>,
+        local_extension: Option<PaxExtension>,
+    ) -> Self {
+        Self {
+            global_records,
+            global_extensions,
+            local_extension,
+        }
+    }
+
+    /// Returns positioned extensions newly encountered for this member.
+    ///
+    /// Global extensions are yielded in source order, followed by the optional
+    /// local extension.
+    pub fn extensions(&self) -> impl Iterator<Item = &PaxExtension> {
+        self.global_extensions
+            .iter()
+            .chain(self.local_extension.iter())
+    }
+
+    /// Returns the final applicable record for `keyword`, including deletions.
+    pub fn effective_record(&self, keyword: &str) -> Option<&PaxRecord> {
+        let local_records = self
+            .local_extension
+            .as_ref()
+            .map_or(&[] as &[PaxRecord], PaxExtension::records);
+        let global_records = self
+            .global_records
+            .as_deref()
+            .map_or(&[] as &[PaxRecord], Vec::as_slice);
+        effective_record(local_records, global_records, keyword)
+    }
+}
 
 /// A character encoding for PAX pathname and user/group-name values.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -411,18 +489,27 @@ fn parse_time(
         .ok_or_else(invalid)
 }
 
-pub(super) fn size(records: &[PaxRecord]) -> Option<&PaxValue<u64>> {
-    records.iter().rev().find_map(|record| match record {
+fn effective_record<'a>(
+    local_records: &'a [PaxRecord],
+    global_records: &'a [PaxRecord],
+    keyword: &str,
+) -> Option<&'a PaxRecord> {
+    record(local_records, keyword).or_else(|| record(global_records, keyword))
+}
+
+pub(super) fn size<'a>(
+    local_records: &'a [PaxRecord],
+    global_records: &'a [PaxRecord],
+) -> Option<&'a PaxValue<u64>> {
+    effective_record(local_records, global_records, "size").and_then(|record| match record {
         PaxRecord::Size(value) => Some(value),
         _ => None,
     })
 }
 
 pub(super) fn hdrcharset(records: &[PaxRecord]) -> HdrCharset {
-    records
-        .iter()
-        .rev()
-        .find_map(|record| match record {
+    record(records, "hdrcharset")
+        .and_then(|record| match record {
             PaxRecord::HdrCharset(value) => Some(value),
             _ => None,
         })
@@ -432,12 +519,40 @@ pub(super) fn hdrcharset(records: &[PaxRecord]) -> HdrCharset {
         })
 }
 
-pub(super) fn apply_global(active: &mut Vec<PaxRecord>, records: Vec<PaxRecord>) {
+pub(super) fn apply_global(active: &mut Option<SharedPaxRecords>, records: &SharedPaxRecords) {
+    if let Some(active) = active {
+        apply_records(Arc::make_mut(active), records);
+    } else if records_have_unique_keywords(records) {
+        *active = Some(Arc::clone(records));
+    } else {
+        let mut effective = Vec::with_capacity(records.len());
+        apply_records(&mut effective, records);
+        *active = Some(Arc::new(effective));
+    }
+}
+
+fn record<'a>(records: &'a [PaxRecord], keyword: &str) -> Option<&'a PaxRecord> {
+    records
+        .iter()
+        .rev()
+        .find(|record| record.keyword() == keyword)
+}
+
+fn apply_records(active: &mut Vec<PaxRecord>, records: &[PaxRecord]) {
     for record in records {
         let keyword = record.keyword();
         active.retain(|existing| existing.keyword() != keyword);
-        active.push(record);
+        active.push(record.clone());
     }
+}
+
+fn records_have_unique_keywords(records: &[PaxRecord]) -> bool {
+    records.iter().enumerate().all(|(index, record)| {
+        let keyword = record.keyword();
+        records[..index]
+            .iter()
+            .all(|existing| existing.keyword() != keyword)
+    })
 }
 
 fn parse_integer(value: &str) -> Option<u64> {
@@ -465,6 +580,142 @@ mod tests {
             name: "label".to_owned(),
             value: PaxValue::Value(value.to_owned()),
         }
+    }
+
+    fn extension(position: u64, kind: PaxKind, records: Vec<PaxRecord>) -> PaxExtension {
+        PaxExtension::new(position, kind, Arc::new(records))
+    }
+
+    #[test]
+    fn resolves_state_precedence_and_preserves_extension_order() {
+        struct Case {
+            name: &'static str,
+            global: Vec<PaxRecord>,
+            local: Option<Vec<PaxRecord>>,
+            expected: Option<PaxRecord>,
+        }
+
+        for case in [
+            Case {
+                name: "missing",
+                global: Vec::new(),
+                local: None,
+                expected: None,
+            },
+            Case {
+                name: "global",
+                global: vec![PaxRecord::Comment(PaxValue::Value("global".to_owned()))],
+                local: None,
+                expected: Some(PaxRecord::Comment(PaxValue::Value("global".to_owned()))),
+            },
+            Case {
+                name: "local overrides global",
+                global: vec![PaxRecord::Comment(PaxValue::Value("global".to_owned()))],
+                local: Some(vec![PaxRecord::Comment(PaxValue::Value(
+                    "local".to_owned(),
+                ))]),
+                expected: Some(PaxRecord::Comment(PaxValue::Value("local".to_owned()))),
+            },
+            Case {
+                name: "last local duplicate wins",
+                global: Vec::new(),
+                local: Some(vec![
+                    PaxRecord::Comment(PaxValue::Value("first".to_owned())),
+                    PaxRecord::Comment(PaxValue::Value("last".to_owned())),
+                ]),
+                expected: Some(PaxRecord::Comment(PaxValue::Value("last".to_owned()))),
+            },
+            Case {
+                name: "local deletion suppresses global",
+                global: vec![PaxRecord::Comment(PaxValue::Value("global".to_owned()))],
+                local: Some(vec![PaxRecord::Comment(PaxValue::Deleted)]),
+                expected: Some(PaxRecord::Comment(PaxValue::Deleted)),
+            },
+        ] {
+            let state = PaxState::new(
+                (!case.global.is_empty()).then(|| Arc::new(case.global)),
+                Vec::new(),
+                case.local
+                    .map(|records| extension(0, PaxKind::Local, records)),
+            );
+            assert_eq!(
+                state.effective_record("comment"),
+                case.expected.as_ref(),
+                "{}",
+                case.name
+            );
+        }
+
+        let state = PaxState::new(
+            None,
+            vec![
+                extension(3, PaxKind::Global, vec![vendor("first", "value")]),
+                extension(7, PaxKind::Global, vec![vendor("second", "value")]),
+            ],
+            Some(extension(
+                11,
+                PaxKind::Local,
+                vec![vendor("local", "value")],
+            )),
+        );
+        assert_eq!(
+            state
+                .extensions()
+                .map(|extension| (extension.position, extension.kind))
+                .collect::<Vec<_>>(),
+            [
+                (3, PaxKind::Global),
+                (7, PaxKind::Global),
+                (11, PaxKind::Local),
+            ]
+        );
+    }
+
+    #[test]
+    fn shares_unchanged_global_state_and_copies_on_write() {
+        let initial = Arc::new(vec![PaxRecord::Comment(PaxValue::Value(
+            "initial".to_owned(),
+        ))]);
+        let mut active = None;
+        apply_global(&mut active, &initial);
+        let first_snapshot = active.clone().expect("global state should exist");
+        assert!(Arc::ptr_eq(&initial, &first_snapshot));
+
+        let first_state = PaxState::new(Some(first_snapshot.clone()), Vec::new(), None);
+        let second_state = PaxState::new(active.clone(), Vec::new(), None);
+        assert!(Arc::ptr_eq(
+            first_state
+                .global_records
+                .as_ref()
+                .expect("global state should exist"),
+            second_state
+                .global_records
+                .as_ref()
+                .expect("global state should exist"),
+        ));
+
+        let replacement = Arc::new(vec![PaxRecord::Comment(PaxValue::Value(
+            "replacement".to_owned(),
+        ))]);
+        apply_global(&mut active, &replacement);
+        let final_state = PaxState::new(active, Vec::new(), None);
+        assert!(!Arc::ptr_eq(
+            &first_snapshot,
+            final_state
+                .global_records
+                .as_ref()
+                .expect("global state should exist"),
+        ));
+        assert_eq!(
+            first_state.effective_record("comment"),
+            Some(&PaxRecord::Comment(PaxValue::Value("initial".to_owned())))
+        );
+        assert_eq!(
+            final_state.effective_record("comment"),
+            Some(&PaxRecord::Comment(PaxValue::Value(
+                "replacement".to_owned()
+            )))
+        );
     }
 
     #[test]
@@ -634,19 +885,23 @@ mod tests {
 
     #[test]
     fn applies_namespaced_globals_and_accepts_supported_hdrcharset_records() {
-        let mut active = vec![
+        let mut active = Some(Arc::new(vec![
             vendor("first", "old"),
             vendor("second", "kept"),
             security("old"),
-        ];
-        apply_global(&mut active, vec![vendor("first", "new"), security("new")]);
+        ]));
+        let update = Arc::new(vec![vendor("first", "new"), security("new")]);
+        apply_global(&mut active, &update);
         assert_eq!(
-            active,
-            [
-                vendor("second", "kept"),
-                vendor("first", "new"),
-                security("new"),
-            ]
+            active.as_deref().map(Vec::as_slice),
+            Some(
+                [
+                    vendor("second", "kept"),
+                    vendor("first", "new"),
+                    security("new"),
+                ]
+                .as_slice()
+            )
         );
 
         for (case, payload) in [
