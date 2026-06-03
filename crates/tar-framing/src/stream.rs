@@ -231,6 +231,47 @@ impl<R> TarStream<R> {
 }
 
 impl<R: AsyncRead + Unpin> TarStream<R> {
+    /// Reads one ordinary-member payload block without constructing a [`Frame`].
+    ///
+    /// Returns the block's position, lossless bytes, and meaningful length.
+    pub(crate) async fn read_member_block(&mut self) -> Result<(u64, Block, usize), FrameError> {
+        let remaining = match &self.state {
+            State::ReadingMember { remaining } => *remaining,
+            _ => {
+                self.state = State::Failed;
+                return Err(FrameError::unexpected_order(
+                    self.position,
+                    "ordinary member payload",
+                    "parser state without member payload",
+                ));
+            }
+        };
+        if self.block_len != 0 {
+            self.state = State::Failed;
+            return Err(FrameError::unexpected_order(
+                self.position,
+                "aligned ordinary member payload",
+                "partially buffered physical block",
+            ));
+        }
+
+        let (position, block) = match poll_fn(|context| self.poll_read_block(context)).await {
+            Ok(Some(block)) => block,
+            Ok(None) => {
+                let error = self.handle_eof();
+                self.state = State::Failed;
+                return Err(error);
+            }
+            Err(error) => {
+                self.state = State::Failed;
+                return Err(error);
+            }
+        };
+        let meaningful_len = remaining.min(BLOCK_SIZE as u64) as usize;
+        self.state = member_payload_state(remaining - meaningful_len as u64);
+        Ok((position, block, meaningful_len))
+    }
+
     /// Reads aligned ordinary-member payload blocks directly into `buffer`.
     ///
     /// This internal path preserves exact physical-block completion checks
@@ -260,13 +301,12 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             ));
         }
 
-        let target_blocks = target_len.max(BLOCK_SIZE).div_ceil(BLOCK_SIZE);
-        let target_blocks = u64::try_from(target_blocks).map_err(|_| {
-            FrameError::arithmetic_overflow(self.position, "member payload chunk block count")
+        let target_len = u64::try_from(target_len.max(BLOCK_SIZE)).map_err(|_| {
+            FrameError::arithmetic_overflow(self.position, "member payload chunk target length")
         })?;
-        let remaining_blocks = remaining.div_ceil(BLOCK_SIZE as u64);
-        let physical_len = target_blocks
-            .min(remaining_blocks)
+        let physical_len = remaining
+            .min(target_len)
+            .div_ceil(BLOCK_SIZE as u64)
             .checked_mul(BLOCK_SIZE as u64)
             .ok_or_else(|| {
                 FrameError::arithmetic_overflow(

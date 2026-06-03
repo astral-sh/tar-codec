@@ -14,7 +14,7 @@ use std::{
 
 use tar_framing::{
     ArchiveFormat, FrameError, MemberKind, PaxKind, PaxRecord,
-    logical::{LogicalFrame, MemberExtensions, MemberFrame, TarReader},
+    logical::{MemberExtensions, MemberFrame, TarReader},
 };
 use thiserror::Error;
 use tokio::io::AsyncRead;
@@ -57,6 +57,8 @@ pub struct DecodePolicy {
 ///
 /// The default permits global pax extension headers while rejecting global
 /// per-member metadata, vendor-namespaced records, and duplicate records.
+/// Global headers are checked with the following ordinary member; an
+/// unattached global header is rejected structurally by [`TarReader`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PaxDecodePolicy {
     allow_global_pax_extensions: bool,
@@ -168,6 +170,11 @@ impl DecodePolicy {
     }
 
     fn check_member<R>(&self, frame: &MemberFrame<'_, R>) -> Result<(), DecodeError> {
+        if let MemberExtensions::Pax { global_updates, .. } = &frame.extensions {
+            for update in global_updates {
+                self.check_global_pax(update.position, &update.records)?;
+            }
+        }
         let format_position = match &frame.extensions {
             MemberExtensions::Pax { .. } => frame.header.position,
             MemberExtensions::Gnu {
@@ -184,6 +191,7 @@ impl DecodePolicy {
         self.check_member_kind(frame.header.position, frame.header.kind)?;
         if let MemberExtensions::Pax {
             local_position: Some(position),
+            ..
         } = &frame.extensions
         {
             self.pax_policy.check_pax_records(
@@ -201,7 +209,8 @@ impl PaxDecodePolicy {
     ///
     /// When enabled, [`Self::allow_global_pax_member_metadata`] separately
     /// controls whether global `path`, `linkpath`, and `size` records are
-    /// accepted.
+    /// accepted. This does not permit a global header without a following
+    /// ordinary member.
     pub fn allow_global_pax_extensions(mut self, allow: bool) -> Self {
         self.allow_global_pax_extensions = allow;
         self

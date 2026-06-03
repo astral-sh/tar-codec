@@ -84,40 +84,31 @@ impl<R: AsyncRead + Unpin> Archive<R> {
         let mut root = ExtractionRoot::open(dest.as_ref(), policy.allow_overwrites).await?;
         let mut payload_chunk = Vec::new();
         while let Some(frame) = self.reader.next_frame().await? {
-            match frame {
-                LogicalFrame::GlobalPax(header) => {
-                    policy.check_global_pax(header.position, &header.records)?;
+            policy.check_member(&frame)?;
+            let member = decode_member(&frame)?;
+            match member.kind {
+                MemberKind::Regular | MemberKind::Contiguous => {
+                    root.extract_file(&member, frame.payload, &mut payload_chunk)
+                        .await?;
                 }
-                LogicalFrame::Member(frame) => {
-                    policy.check_member(&frame)?;
-                    let member = decode_member(&frame)?;
-                    match member.kind {
-                        MemberKind::Regular | MemberKind::Contiguous => {
-                            root.extract_file(&member, frame.payload, &mut payload_chunk)
-                                .await?;
-                        }
-                        MemberKind::Directory => {
-                            root.extract_directory(&member.path).await?;
-                            frame.payload.skip().await?;
-                        }
-                        MemberKind::SymbolicLink => {
-                            root.reserve_symlink(&member).await?;
-                            frame.payload.skip().await?;
-                        }
-                        MemberKind::HardLink => {
-                            root.extract_hard_link(&member, frame.payload, &mut payload_chunk)
-                                .await?;
-                        }
-                        MemberKind::CharacterDevice
-                        | MemberKind::BlockDevice
-                        | MemberKind::Fifo => {
-                            return Err(DecodeError::UnsupportedMember {
-                                position: member.position,
-                                path: member.path,
-                                kind: member.kind,
-                            });
-                        }
-                    }
+                MemberKind::Directory => {
+                    root.extract_directory(&member.path).await?;
+                    frame.payload.skip().await?;
+                }
+                MemberKind::SymbolicLink => {
+                    root.reserve_symlink(&member).await?;
+                    frame.payload.skip().await?;
+                }
+                MemberKind::HardLink => {
+                    root.extract_hard_link(&member, frame.payload, &mut payload_chunk)
+                        .await?;
+                }
+                MemberKind::CharacterDevice | MemberKind::BlockDevice | MemberKind::Fifo => {
+                    return Err(DecodeError::UnsupportedMember {
+                        position: member.position,
+                        path: member.path,
+                        kind: member.kind,
+                    });
                 }
             }
         }
@@ -1592,32 +1583,20 @@ mod tests {
     #[tokio::test]
     async fn rejects_every_pax_vendor_record_when_otherwise_permitted() {
         let temp = tempdir().unwrap();
-        for (case, typeflag, payload, add_member) in [
-            ("local", b'x', record("ACME.attribute", "value"), true),
-            (
-                "active-global",
-                b'g',
-                record("ACME.attribute", "value"),
-                true,
-            ),
-            ("deleted-global", b'g', record("ACME.attribute", ""), false),
-            (
-                "replaced-global",
-                b'g',
-                {
-                    let mut payload = record("ACME.attribute", "value");
-                    payload.extend_from_slice(&record("ACME.attribute", ""));
-                    payload
-                },
-                false,
-            ),
+        for (case, typeflag, payload) in [
+            ("local", b'x', record("ACME.attribute", "value")),
+            ("active-global", b'g', record("ACME.attribute", "value")),
+            ("deleted-global", b'g', record("ACME.attribute", "")),
+            ("replaced-global", b'g', {
+                let mut payload = record("ACME.attribute", "value");
+                payload.extend_from_slice(&record("ACME.attribute", ""));
+                payload
+            }),
         ] {
             let dest = temp.path().join(case);
             let mut bytes = Vec::new();
             append_pax(&mut bytes, typeflag, &payload);
-            if add_member {
-                append_posix_member(&mut bytes, "file", b'0', b"", "", 0o644);
-            }
+            append_posix_member(&mut bytes, "file", b'0', b"", "", 0o644);
             finish(&mut bytes);
             assert!(matches!(
                 extract_with_policy(
@@ -1647,6 +1626,7 @@ mod tests {
         let mut partial = Vec::new();
         append_posix_member(&mut partial, "created", b'0', b"kept", "", 0o644);
         append_pax(&mut partial, b'g', &record("ACME.attribute", "value"));
+        append_posix_member(&mut partial, "blocked", b'0', b"", "", 0o644);
         finish(&mut partial);
         assert!(matches!(
             extract_with_policy(
@@ -1729,6 +1709,7 @@ mod tests {
         let rejected_dest = temp.path().join("rejected");
         let mut rejected = Vec::new();
         append_pax(&mut rejected, b'g', &record("comment", "metadata"));
+        append_posix_member(&mut rejected, "file", b'0', b"", "", 0o644);
         finish(&mut rejected);
         assert!(matches!(
             extract_with_policy(
@@ -1755,6 +1736,38 @@ mod tests {
             std::fs::read_to_string(permitted_dest.join("file")).unwrap(),
             "contents"
         );
+    }
+
+    #[tokio::test]
+    async fn reports_pending_global_pax_framing_errors_before_policy() {
+        let temp = tempdir().unwrap();
+        let policy = DecodePolicy::default()
+            .pax_policy(PaxDecodePolicy::default().allow_global_pax_extensions(false));
+
+        let mut dangling = Vec::new();
+        append_pax(&mut dangling, b'g', &record("comment", "metadata"));
+        finish(&mut dangling);
+        assert!(matches!(
+            extract_with_policy(dangling, &temp.path().join("dangling"), policy)
+                .await
+                .unwrap_err(),
+            DecodeError::Framing(FrameError {
+                position: 0,
+                inner: FrameErrorInner::DanglingGlobalPax,
+            })
+        ));
+
+        let mut missing_end = Vec::new();
+        append_pax(&mut missing_end, b'g', &record("comment", "metadata"));
+        assert!(matches!(
+            extract_with_policy(missing_end, &temp.path().join("missing-end"), policy)
+                .await
+                .unwrap_err(),
+            DecodeError::Framing(FrameError {
+                inner: FrameErrorInner::MissingEndMarker,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
@@ -1797,6 +1810,7 @@ mod tests {
             let dest = temp.path().join(case);
             let mut bytes = Vec::new();
             append_pax(&mut bytes, b'g', &record(keyword, value));
+            append_posix_member(&mut bytes, "raw", b'0', b"", "", 0o644);
             finish(&mut bytes);
 
             assert!(matches!(

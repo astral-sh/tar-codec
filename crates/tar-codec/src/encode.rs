@@ -572,7 +572,7 @@ mod tests {
 
     use tar_framing::{
         PaxKind,
-        logical::{LogicalFrame, TarReader},
+        logical::TarReader,
         stream::{Frame, TarStream},
     };
     use tempfile::tempdir;
@@ -753,16 +753,9 @@ mod tests {
         let bytes = encode_source_directory(&source).await;
         let mut reader = TarReader::new(ChunkedReader::new(bytes.clone(), 17));
         let mut paths = Vec::new();
-        while let Some(frame) = reader.next_frame().await.unwrap() {
-            match frame {
-                LogicalFrame::GlobalPax(_) => panic!("encoder never writes global pax headers"),
-                LogicalFrame::Member(member) => {
-                    paths.push(
-                        String::from_utf8(member.effective_path().unwrap().into_owned()).unwrap(),
-                    );
-                    member.payload.skip().await.unwrap();
-                }
-            }
+        while let Some(member) = reader.next_frame().await.unwrap() {
+            paths.push(String::from_utf8(member.effective_path().unwrap().into_owned()).unwrap());
+            member.payload.skip().await.unwrap();
         }
         assert_eq!(
             paths,
@@ -914,13 +907,11 @@ mod tests {
         let bytes = encode_source_directory(&source).await;
         let mut reader = TarReader::new(ChunkedReader::new(bytes, 17));
         let mut regular = 0;
-        while let Some(frame) = reader.next_frame().await.unwrap() {
-            if let LogicalFrame::Member(member) = frame {
-                if member.header.kind == MemberKind::Regular {
-                    regular += 1;
-                }
-                member.payload.skip().await.unwrap();
+        while let Some(member) = reader.next_frame().await.unwrap() {
+            if member.header.kind == MemberKind::Regular {
+                regular += 1;
             }
+            member.payload.skip().await.unwrap();
         }
         assert_eq!(regular, 2);
 

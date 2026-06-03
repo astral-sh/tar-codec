@@ -3,7 +3,7 @@ use std::{hint::black_box, time::Duration};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tar_framing::{
     BLOCK_SIZE, MemberKind,
-    logical::{LogicalFrame, TarReader},
+    logical::TarReader,
     write::{PaxMember, end_marker_bytes, frame_pax_member_into},
 };
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
@@ -184,9 +184,7 @@ async fn decode_payload(fixture: &Fixture, mode: DecodeMode) -> (u64, u64) {
         .await
         .expect("fixture archive should decode")
     {
-        let LogicalFrame::Member(mut member) = frame else {
-            continue;
-        };
+        let mut member = frame;
         entries += 1;
         match mode {
             DecodeMode::Block => {

@@ -25,9 +25,11 @@ It owns:
 - deterministic POSIX-pax block construction through `write`.
 
 `TarStream` preserves accepted 512-byte source blocks for low-level consumers.
-`TarReader` groups local PAX or GNU extension metadata with its member, emits
-global PAX updates separately, resolves effective member path/link bytes, and
-streams ordinary member payloads.
+`TarReader` emits only ordinary members, grouping local PAX or GNU extension
+metadata and newly encountered positioned global PAX updates with the member
+they precede. Ordinary PAX headers retain the effective active global state.
+The reader resolves effective member path/link bytes and streams ordinary
+member payloads.
 
 ## `tar-codec`
 
