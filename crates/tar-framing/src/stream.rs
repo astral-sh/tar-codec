@@ -732,7 +732,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 PaxValue::Value(size) => Ok(*size),
                 PaxValue::Deleted => Err(FrameError::deleted_pax_metadata(position, "size")),
             })?;
-        let payload_size = posix_payload_size(position, kind, effective_size)?;
+        let payload_size = posix_payload_size(position, kind, parsed.size, effective_size)?;
         self.state = member_payload_state(payload_size);
         Ok(Frame::Header(HeaderFrame {
             position,
@@ -969,14 +969,17 @@ impl TryFromFramed<u8> for MemberKind {
     }
 }
 
-fn posix_payload_size(position: u64, kind: MemberKind, size: u64) -> Result<u64, FrameError> {
+fn posix_payload_size(
+    position: u64,
+    kind: MemberKind,
+    declared_size: u64,
+    effective_size: u64,
+) -> Result<u64, FrameError> {
     match kind {
-        MemberKind::Regular | MemberKind::HardLink | MemberKind::Contiguous => Ok(size),
+        MemberKind::Regular | MemberKind::HardLink | MemberKind::Contiguous => Ok(effective_size),
         MemberKind::SymbolicLink => {
-            if size != 0 {
-                return Err(FrameError::invalid_member_size(position, kind, size));
-            }
-            Ok(0)
+            payload_free_size(position, kind, declared_size)?;
+            payload_free_size(position, kind, effective_size)
         }
         MemberKind::CharacterDevice
         | MemberKind::BlockDevice
@@ -988,15 +991,19 @@ fn posix_payload_size(position: u64, kind: MemberKind, size: u64) -> Result<u64,
 fn gnu_payload_size(position: u64, kind: MemberKind, size: u64) -> Result<u64, FrameError> {
     match kind {
         MemberKind::Regular | MemberKind::Contiguous => Ok(size),
-        MemberKind::HardLink | MemberKind::SymbolicLink if size != 0 => {
-            Err(FrameError::invalid_member_size(position, kind, size))
-        }
-        MemberKind::HardLink
-        | MemberKind::SymbolicLink
-        | MemberKind::CharacterDevice
+        MemberKind::HardLink | MemberKind::SymbolicLink => payload_free_size(position, kind, size),
+        MemberKind::CharacterDevice
         | MemberKind::BlockDevice
         | MemberKind::Directory
         | MemberKind::Fifo => Ok(0),
+    }
+}
+
+fn payload_free_size(position: u64, kind: MemberKind, size: u64) -> Result<u64, FrameError> {
+    if size == 0 {
+        Ok(0)
+    } else {
+        Err(FrameError::invalid_member_size(position, kind, size))
     }
 }
 
@@ -1434,6 +1441,132 @@ mod tests {
             let frames = collect(block.to_vec(), BLOCK_SIZE);
             let error = last_error_inner(&frames);
             assert!(expected.matches(error), "{case}: {error:?}");
+        }
+    }
+
+    #[test]
+    fn ignores_directory_device_and_fifo_sizes_for_framing() {
+        for (format, make_header) in [
+            (ArchiveFormat::Pax, header as fn(u8, u64) -> Block),
+            (ArchiveFormat::Gnu, gnu_header as fn(u8, u64) -> Block),
+        ] {
+            for (typeflag, kind) in [
+                (b'3', MemberKind::CharacterDevice),
+                (b'4', MemberKind::BlockDevice),
+                (b'5', MemberKind::Directory),
+                (b'6', MemberKind::Fifo),
+            ] {
+                let mut bytes = Vec::new();
+                append_block(&mut bytes, &make_header(typeflag, 1));
+                append_block(&mut bytes, &make_header(b'0', 0));
+                append_terminator(&mut bytes);
+
+                let frames = collect(bytes, BLOCK_SIZE);
+                assert!(frames.iter().all(Result::is_ok), "{format:?} {kind:?}");
+                let headers = frames
+                    .iter()
+                    .filter_map(|frame| match frame {
+                        Ok(Frame::Header(header)) => Some(header),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(headers.len(), 2, "{format:?} {kind:?}");
+                assert_eq!(headers[0].kind, kind, "{format:?} {kind:?}");
+                assert_eq!(headers[0].declared_size, 1, "{format:?} {kind:?}");
+                assert_eq!(headers[0].effective_size, 1, "{format:?} {kind:?}");
+                assert_eq!(headers[0].payload_size, 0, "{format:?} {kind:?}");
+                assert_eq!(headers[1].kind, MemberKind::Regular, "{format:?} {kind:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn ignores_pax_directory_device_and_fifo_size_overrides_for_framing() {
+        for (typeflag, kind) in [
+            (b'3', MemberKind::CharacterDevice),
+            (b'4', MemberKind::BlockDevice),
+            (b'5', MemberKind::Directory),
+            (b'6', MemberKind::Fifo),
+        ] {
+            for (case, declared_size, override_size) in
+                [("effective", 0, "1"), ("declared", 1, "0")]
+            {
+                let mut bytes = Vec::new();
+                append_posix(&mut bytes, b'x', &record("size", override_size));
+                append_block(&mut bytes, &header(typeflag, declared_size));
+                append_block(&mut bytes, &header(b'0', 0));
+                append_terminator(&mut bytes);
+
+                let frames = collect(bytes, BLOCK_SIZE);
+                assert!(frames.iter().all(Result::is_ok), "{case} {kind:?}");
+                let headers = frames
+                    .iter()
+                    .filter_map(|frame| match frame {
+                        Ok(Frame::Header(header)) => Some(header),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(headers.len(), 2, "{case} {kind:?}");
+                assert_eq!(headers[0].kind, kind, "{case} {kind:?}");
+                assert_eq!(headers[0].declared_size, declared_size, "{case} {kind:?}");
+                assert_eq!(
+                    headers[0].effective_size,
+                    override_size.parse().expect("test size"),
+                    "{case} {kind:?}"
+                );
+                assert_eq!(headers[0].payload_size, 0, "{case} {kind:?}");
+                assert_eq!(headers[1].kind, MemberKind::Regular, "{case} {kind:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_nonzero_sizes_for_links_without_supported_bodies() {
+        for (format, block, kind) in [
+            (
+                ArchiveFormat::Pax,
+                header(b'2', 1),
+                MemberKind::SymbolicLink,
+            ),
+            (
+                ArchiveFormat::Gnu,
+                gnu_header(b'1', 1),
+                MemberKind::HardLink,
+            ),
+            (
+                ArchiveFormat::Gnu,
+                gnu_header(b'2', 1),
+                MemberKind::SymbolicLink,
+            ),
+        ] {
+            let frames = collect(block.to_vec(), BLOCK_SIZE);
+            assert!(
+                matches!(
+                    last_error_inner(&frames),
+                    FrameErrorInner::InvalidMemberSize {
+                        kind: found,
+                        size: 1,
+                    } if *found == kind
+                ),
+                "{format:?} {kind:?}"
+            );
+        }
+
+        for (case, declared_size, override_size) in [("effective", 0, "1"), ("declared", 1, "0")] {
+            let mut bytes = Vec::new();
+            append_posix(&mut bytes, b'x', &record("size", override_size));
+            append_block(&mut bytes, &header(b'2', declared_size));
+
+            assert!(
+                matches!(
+                    last_error_inner(&collect(bytes, BLOCK_SIZE)),
+                    FrameErrorInner::InvalidMemberSize {
+                        kind: MemberKind::SymbolicLink,
+                        size: 1,
+                    }
+                ),
+                "{case}"
+            );
         }
     }
 

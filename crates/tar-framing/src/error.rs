@@ -186,12 +186,12 @@ pub enum FrameErrorInner {
         /// The computation that overflowed.
         context: &'static str,
     },
-    /// A member's effective size is invalid for its type.
+    /// A member's declared or effective size is invalid for its type.
     #[error("member type {kind:?} cannot carry payload size {size}")]
     InvalidMemberSize {
         /// The member type.
         kind: MemberKind,
-        /// The effective payload size.
+        /// The rejected declared or effective payload size.
         size: u64,
     },
     /// The stream ended while a payload still required bytes.
