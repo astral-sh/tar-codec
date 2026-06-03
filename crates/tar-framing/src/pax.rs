@@ -719,6 +719,28 @@ mod tests {
     }
 
     #[test]
+    fn global_deletions_remain_effective_tombstones() {
+        let initial = Arc::new(vec![
+            PaxRecord::Path(PaxValue::Value(PaxString::Utf8("global".to_owned()))),
+            vendor("kept", "value"),
+        ]);
+        let deletion = Arc::new(vec![PaxRecord::Path(PaxValue::Deleted)]);
+        let mut active = None;
+        apply_global(&mut active, &initial);
+        apply_global(&mut active, &deletion);
+
+        assert_eq!(
+            active.as_deref().map(Vec::as_slice),
+            Some([vendor("kept", "value"), PaxRecord::Path(PaxValue::Deleted),].as_slice())
+        );
+        let state = PaxState::new(active, Vec::new(), None);
+        assert_eq!(
+            state.effective_record("path"),
+            Some(&PaxRecord::Path(PaxValue::Deleted))
+        );
+    }
+
+    #[test]
     fn parses_values_and_deletions_through_from_str() {
         assert!(matches!(
             "".parse::<PaxValue<String>>(),

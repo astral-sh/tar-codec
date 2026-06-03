@@ -1806,6 +1806,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_path_deletion_suppresses_the_physical_header_path_when_enabled() {
+        let temp = tempdir().unwrap();
+        let dest = temp.path().join("out");
+        let mut bytes = Vec::new();
+        append_pax(&mut bytes, b'g', &record("path", ""));
+        append_posix_member(&mut bytes, "physical", b'0', b"", "", 0o644);
+        finish(&mut bytes);
+
+        assert!(matches!(
+            extract_with_policy(
+                bytes,
+                &dest,
+                DecodePolicy::default().pax_policy(
+                    PaxDecodePolicy::default()
+                        .allow_global_pax_extensions(true)
+                        .allow_global_pax_member_metadata(true),
+                ),
+            )
+            .await
+            .unwrap_err(),
+            DecodeError::Framing(FrameError {
+                inner: FrameErrorInner::DeletedPaxMetadata { keyword: "path" },
+                ..
+            })
+        ));
+        assert!(!dest.join("physical").exists());
+    }
+
+    #[tokio::test]
     async fn rejects_member_specific_global_pax_records_when_global_extensions_are_allowed() {
         let temp = tempdir().unwrap();
         for (case, keyword, value) in [

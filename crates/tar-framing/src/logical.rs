@@ -668,6 +668,49 @@ mod tests {
     }
 
     #[test]
+    fn global_path_deletion_suppresses_the_physical_header_path() {
+        let mut physical_header = header(b'0', 0);
+        set_field(&mut physical_header, NAME_RANGE, b"physical");
+        set_checksum(&mut physical_header);
+
+        let mut bytes = Vec::new();
+        append_posix(&mut bytes, b'g', &record("path", "global"));
+        append_block(&mut bytes, &header(b'0', 0));
+        append_posix(&mut bytes, b'g', &record("path", ""));
+        append_block(&mut bytes, &physical_header);
+        append_terminator(&mut bytes);
+
+        ready_ok(async {
+            let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+            {
+                let member = next_member(&mut reader).await?;
+                assert_eq!(member.effective_path()?.as_ref(), b"global");
+            }
+
+            let member = next_member(&mut reader).await?;
+            assert!(matches!(
+                member.effective_path(),
+                Err(FrameError {
+                    inner: FrameErrorInner::DeletedPaxMetadata { keyword: "path" },
+                    ..
+                })
+            ));
+            let state = pax_state(&member).expect("expected pax member metadata");
+            assert_eq!(
+                state.effective_record("path"),
+                Some(&PaxRecord::Path(PaxValue::Deleted))
+            );
+            let extensions = state.extensions().collect::<Vec<_>>();
+            assert_eq!(extensions.len(), 1);
+            assert!(matches!(
+                extensions[0].records(),
+                [PaxRecord::Path(PaxValue::Deleted)]
+            ));
+            Ok(())
+        });
+    }
+
+    #[test]
     fn resolves_and_validates_gnu_metadata_lazily() {
         let mut bytes = Vec::new();
         append_block(&mut bytes, &gnu_header(b'L', 5));
