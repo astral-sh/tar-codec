@@ -21,15 +21,15 @@ the machine and filesystem, and are lower-is-better.
 
 | Recursive encoding | `tar-codec` | `tar` | `astral-tokio-tar` |
 | --- | ---: | ---: | ---: |
-| large: 1 x 16 MiB | 0.91 ms | 1.04 ms | 12.50 ms |
-| many-small: 1,024 x 1 KiB | 26.8 ms | 20.9 ms | 54.6 ms |
+| large: 1 x 16 MiB | 0.79 ms | 0.94 ms | 13.17 ms |
+| many-small: 1,024 x 1 KiB | 26.2 ms | 20.6 ms | 54.8 ms |
 
 | Extraction | `tar-codec` | `tar` | `astral-tokio-tar` |
 | --- | ---: | ---: | ---: |
-| pax large | 1.68 ms | 7.29 ms | 2.99 ms |
-| ustar large | 1.72 ms | 7.33 ms | 2.99 ms |
-| pax many-small | 108.0 ms | 112.8 ms | 174.9 ms |
-| ustar many-small | 114.8 ms | 118.7 ms | 151.1 ms |
+| pax large | 1.59 ms | 7.09 ms | 2.86 ms |
+| ustar large | 1.62 ms | 7.15 ms | 2.89 ms |
+| pax many-small | 103.9 ms | 106.5 ms | 140.8 ms |
+| ustar many-small | 102.9 ms | 107.4 ms | 141.2 ms |
 
 In this snapshot, `tar-codec` leads every extraction workload and is
 particularly strong on large payloads and recursive encoding. The synchronous
