@@ -25,6 +25,9 @@ impl PendingSymlink {
 // Keep graph validation bounded when each symbolic-link substitution grows the
 // remaining path instead of revisiting an identical expansion.
 const MAX_SYMLINK_EXPANSIONS: usize = 256;
+
+// How big of a chunk to read from each member, at a time.
+// This is also the limit for our single-read optimization; see below.
 const EXTRACTION_CHUNK_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -84,8 +87,8 @@ impl<R: AsyncRead + Unpin> Archive<R> {
                     let member = decode_member(&frame)?;
                     match member.kind {
                         MemberKind::Regular | MemberKind::Contiguous => {
-                            // Buffering is an optimization; larger files stream below.
                             if member.payload_size <= EXTRACTION_CHUNK_BYTES as u64 {
+                                // Fast path: the member fits in our payload buffer.
                                 payload_chunk.clear();
                                 if member.payload_size != 0 {
                                     frame
@@ -99,6 +102,7 @@ impl<R: AsyncRead + Unpin> Archive<R> {
                                 payload_chunk = returned_buffer;
                                 result?;
                             } else {
+                                // Slow path: the member needs to be streamed.
                                 let writer = root.start_member(member).await?;
                                 consume_payload(frame.payload, &mut payload_chunk, writer).await?;
                             }
@@ -121,6 +125,13 @@ impl<R: AsyncRead + Unpin> Archive<R> {
     }
 }
 
+/// Consume the payload, i.e. data from a member.
+///
+/// `payload` is a wrapper over an asynchronous reader, bounded to
+/// the member's data, while `payload_chunk` is a reusable buffer to
+/// stream data into.
+///
+/// If `writer` is `None`, the payload is skipped.
 async fn consume_payload<R: AsyncRead + Unpin>(
     mut payload: MemberPayload<'_, R>,
     payload_chunk: &mut Vec<u8>,
@@ -235,6 +246,11 @@ impl ExtractionRoot {
         }
     }
 
+    /// Create an extracted member according to its type.
+    ///
+    /// This creates the corresponding filesystem state but does not
+    /// necessarily fully complete it; for example, files are not fully
+    /// completed until [`consume_payload`] is called.
     fn create_member(
         &mut self,
         member: &DecodedMember,
@@ -264,6 +280,7 @@ impl ExtractionRoot {
         }
     }
 
+    /// Create a regular file at the given path.
     fn create_file(
         &mut self,
         path: &Path,
