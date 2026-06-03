@@ -32,7 +32,8 @@ link-path fallbacks from reusable reader storage instead of retaining lossless
 physical blocks. Each PAX member carries one unified `PaxState` that resolves
 active global and local precedence while retaining newly encountered positioned
 extensions for policy inspection. The reader resolves effective member
-path/link bytes and streams ordinary member payloads.
+path/link bytes, silently ignores trailing global updates without a following
+member, and streams ordinary member payloads.
 
 ## `tar-codec`
 

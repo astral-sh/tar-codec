@@ -1739,21 +1739,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reports_pending_global_pax_framing_errors_before_policy() {
+    async fn ignores_trailing_global_pax_but_reports_framing_errors_before_policy() {
         let temp = tempdir().unwrap();
         let policy = DecodePolicy::default()
             .pax_policy(PaxDecodePolicy::default().allow_global_pax_extensions(false));
 
-        let mut dangling = Vec::new();
-        append_pax(&mut dangling, b'g', &record("comment", "metadata"));
-        finish(&mut dangling);
+        let mut trailing = Vec::new();
+        append_pax(&mut trailing, b'g', &record("comment", "metadata"));
+        finish(&mut trailing);
+        extract_with_policy(trailing, &temp.path().join("trailing"), policy)
+            .await
+            .unwrap();
+
+        let mut malformed = Vec::new();
+        append_pax(&mut malformed, b'g', b"invalid");
+        finish(&mut malformed);
         assert!(matches!(
-            extract_with_policy(dangling, &temp.path().join("dangling"), policy)
+            extract_with_policy(malformed, &temp.path().join("malformed"), policy)
                 .await
                 .unwrap_err(),
             DecodeError::Framing(FrameError {
                 position: 0,
-                inner: FrameErrorInner::DanglingGlobalPax,
+                inner: FrameErrorInner::InvalidPaxRecords { .. },
             })
         ));
 

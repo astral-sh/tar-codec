@@ -11,8 +11,9 @@ This crate provides two views over an asynchronous I/O source:
 
 For PAX members, one `PaxState` provides standards-consistent effective values
 while preserving each positioned global or local extension newly encountered
-for that member. Use `TarStream` when standalone physical extension headers
-must be inspected losslessly.
+for that member. Trailing global extensions without a following member are
+consumed and ignored. Use `TarStream` when standalone physical extension
+headers must be inspected losslessly.
 
 It also provides `write` helpers for constructing deterministic POSIX-pax
 member blocks without performing I/O.

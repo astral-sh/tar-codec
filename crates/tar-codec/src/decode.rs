@@ -59,7 +59,7 @@ pub struct DecodePolicy {
 /// per-member metadata, vendor-namespaced records, and duplicate records.
 /// Policy checks inspect positioned extensions retained by the member's unified
 /// logical PAX state. Global headers are checked with the following ordinary
-/// member; an unattached global header is rejected structurally by [`TarReader`].
+/// member; trailing global headers are consumed and ignored by [`TarReader`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PaxDecodePolicy {
     allow_global_pax_extensions: bool,
@@ -214,8 +214,8 @@ impl PaxDecodePolicy {
     ///
     /// When enabled, [`Self::allow_global_pax_member_metadata`] separately
     /// controls whether global `path`, `linkpath`, and `size` records are
-    /// accepted. This does not permit a global header without a following
-    /// ordinary member.
+    /// accepted. Trailing global headers without a following ordinary member
+    /// are consumed and ignored before policy checks.
     pub fn allow_global_pax_extensions(mut self, allow: bool) -> Self {
         self.allow_global_pax_extensions = allow;
         self

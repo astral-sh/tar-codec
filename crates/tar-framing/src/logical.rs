@@ -303,8 +303,8 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
     ///
     /// If the preceding member payload was not fully consumed, it is first
     /// drained and validated. Extension metadata is then consumed and attached
-    /// before the next member is returned. A global pax update not followed by
-    /// an ordinary member is rejected.
+    /// before the next member is returned. Global pax updates not followed by
+    /// an ordinary member are consumed and ignored.
     pub async fn next_frame(&mut self) -> Result<Option<MemberFrame<'_, R>>, FrameError> {
         self.payload.drain_payload().await?;
 
@@ -314,9 +314,6 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
         let mut long_link = None;
         loop {
             let Some(frame) = self.next_physical_frame().await? else {
-                if let Some(extension) = global_extensions.first() {
-                    return Err(FrameError::dangling_global_pax(extension.position));
-                }
                 return Ok(None);
             };
             match frame {
@@ -1154,7 +1151,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_empty_archives_and_rejects_dangling_metadata() {
+    fn handles_empty_archives_and_trailing_global_pax() {
         let mut empty = Vec::new();
         append_terminator(&mut empty);
         ready_ok(async {
@@ -1189,15 +1186,24 @@ mod tests {
         append_posix(&mut global, b'g', &record("comment", "metadata"));
         append_posix(&mut global, b'g', &record("gname", "group"));
         append_terminator(&mut global);
-        let error: Result<(), FrameError> = ready(async {
+        ready_ok(async {
             let mut reader = TarReader::new(ChunkedReader::new(global, BLOCK_SIZE));
+            assert!(reader.next_frame().await?.is_none());
+            Ok(())
+        });
+
+        let mut malformed_global = Vec::new();
+        append_posix(&mut malformed_global, b'g', b"invalid");
+        append_terminator(&mut malformed_global);
+        let error: Result<(), FrameError> = ready(async {
+            let mut reader = TarReader::new(ChunkedReader::new(malformed_global, BLOCK_SIZE));
             reader.next_frame().await.map(|_| ())
         });
         assert!(matches!(
             error,
             Err(FrameError {
                 position: 0,
-                inner: FrameErrorInner::DanglingGlobalPax,
+                inner: FrameErrorInner::InvalidPaxRecords { .. },
             })
         ));
     }

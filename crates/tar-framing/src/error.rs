@@ -26,10 +26,6 @@ impl FrameError {
         Self::at(position, FrameErrorInner::DeletedPaxMetadata { keyword })
     }
 
-    pub(crate) fn dangling_global_pax(position: u64) -> Self {
-        Self::at(position, FrameErrorInner::DanglingGlobalPax)
-    }
-
     pub(crate) fn invalid_gnu_metadata(position: u64, kind: GnuKind, reason: &'static str) -> Self {
         Self::at(
             position,
@@ -184,9 +180,6 @@ pub enum FrameErrorInner {
         /// The standard pax keyword that deleted its header fallback.
         keyword: &'static str,
     },
-    /// A global pax header was not followed by an ordinary member.
-    #[error("global pax extended header is not followed by an ordinary member")]
-    DanglingGlobalPax,
     /// A framing offset or record length overflowed.
     #[error("arithmetic overflow while computing {context}")]
     ArithmeticOverflow {
