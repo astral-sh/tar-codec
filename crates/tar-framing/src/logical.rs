@@ -138,10 +138,23 @@ impl Header<'_> {
         parse_mode(self.position, self.format, self.mode)
     }
 
+    /// Returns the header's claimed path for its member.
+    ///
+    /// For ustar headers, this is the combination of the `name` and `prefix`
+    /// fields, i.e. `{name}/{prefix}`. For GNU headers, this is `name` alone.
+    ///
+    /// **IMPORTANT**: This is **not** guaranteed to be the fully effective path
+    /// for a member. Most users should call [`MemberFrame::effective_path`].
     fn header_path(&self) -> Cow<'_, [u8]> {
         Cow::Borrowed(self.header_path)
     }
 
+    /// Returns the header's claimed link name for its member.
+    ///
+    /// For both ustar and GNU headers, this is the `linkname` field.
+    ///
+    /// **IMPORTANT**: This is **not** guaranteed to be the fully effective
+    /// link path for a member. Most users should call [`MemberFrame::effective_link_path`].
     fn link_name(&self) -> &[u8] {
         self.link_name
     }
