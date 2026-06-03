@@ -1,7 +1,8 @@
 //! Member-oriented reading above the lossless physical frame stream.
 //!
 //! This API assembles PAX and GNU extension payloads with the ordinary members
-//! they describe. Each PAX member carries one unified [`PaxState`].
+//! they describe. Each member carries a compact borrowed [`Header`], and each
+//! PAX member carries one unified [`PaxState`].
 
 use std::{borrow::Cow, mem};
 
@@ -9,9 +10,9 @@ use tokio::io::AsyncRead;
 use tokio_stream::StreamExt;
 
 use crate::{
-    ArchiveFormat, Block, FrameError, GnuKind, PaxKind, PaxRecord, PaxString, PaxValue,
+    ArchiveFormat, Block, FrameError, GnuKind, MemberKind, PaxKind, PaxRecord, PaxString, PaxValue,
     pax::{SharedPaxRecords, effective_record},
-    stream::{DataOwner, Frame, GnuFrame, HeaderFrame, PaxFrame, TarStream},
+    stream::{DataOwner, Frame, GnuFrame, HeaderFrame, PaxFrame, TarStream, parse_mode},
 };
 
 const PAYLOAD_DRAIN_CHUNK_BYTES: usize = 1024 * 1024;
@@ -107,6 +108,45 @@ pub enum MemberExtensions {
     },
 }
 
+/// Extracted ordinary-header metadata for one logical archive member.
+///
+/// Unlike [`HeaderFrame`], this type does not retain the lossless physical
+/// header block. Its ordinary path and link-path fallbacks borrow reusable
+/// storage owned by [`TarReader`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Header<'a> {
+    /// The absolute byte position of the ordinary member header block.
+    pub position: u64,
+    /// The selected archive family of this member header.
+    pub format: ArchiveFormat,
+    /// The member type identified by the header.
+    pub kind: MemberKind,
+    /// The size encoded directly in the member header field.
+    pub declared_size: u64,
+    /// The size after applying applicable pax `size` records.
+    pub effective_size: u64,
+    /// The number of payload bytes exposed through [`MemberPayload`].
+    pub payload_size: u64,
+    mode: [u8; 8],
+    header_path: &'a [u8],
+    link_name: &'a [u8],
+}
+
+impl Header<'_> {
+    /// Decodes the ordinary header's numeric mode according to its archive family.
+    pub fn mode(&self) -> Result<u64, FrameError> {
+        parse_mode(self.position, self.format, self.mode)
+    }
+
+    fn header_path(&self) -> Cow<'_, [u8]> {
+        Cow::Borrowed(self.header_path)
+    }
+
+    fn link_name(&self) -> &[u8] {
+        self.link_name
+    }
+}
+
 /// One meaningful payload block belonging to an ordinary archive member.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PayloadBlock {
@@ -121,7 +161,7 @@ pub struct PayloadBlock {
 /// An ordinary archive member and its streaming payload cursor.
 pub struct MemberFrame<'a, R> {
     /// The ordinary member header.
-    pub header: HeaderFrame,
+    pub header: Header<'a>,
     /// Extension metadata applying to this member.
     pub extensions: MemberExtensions,
     /// A cursor over the member payload bytes.
@@ -184,27 +224,63 @@ impl<R> MemberFrame<'_, R> {
 
 /// A streaming, typed cursor over one member's payload blocks.
 pub struct MemberPayload<'a, R> {
-    reader: &'a mut TarReader<R>,
+    reader: &'a mut PayloadReader<R>,
 }
 
 /// A logical reader that assembles physical frames into archive-level items.
 ///
 /// Unlike [`TarStream`], this API attaches PAX or GNU extension metadata to the
 /// ordinary member it describes. Each PAX member carries one [`PaxState`] with
-/// effective metadata and newly encountered positioned extensions.
+/// effective metadata and newly encountered positioned extensions. Ordinary
+/// header path and link-path fallbacks are copied into reusable storage and
+/// borrowed by the returned [`Header`].
 pub struct TarReader<R> {
+    payload: PayloadReader<R>,
+    header_storage: HeaderStorage,
+}
+
+/// Payload state kept separate so [`MemberPayload`] can borrow it mutably while
+/// the logical [`Header`] borrows reusable header storage.
+struct PayloadReader<R> {
     stream: TarStream<R>,
-    payload_remaining: u64,
+    remaining: u64,
     drain_buffer: Vec<u8>,
+}
+
+#[derive(Default)]
+struct HeaderStorage {
+    path: Vec<u8>,
+    link_name: Vec<u8>,
+}
+
+impl HeaderStorage {
+    fn update<'a>(&'a mut self, frame: &HeaderFrame) -> Header<'a> {
+        frame.copy_header_path_into(&mut self.path);
+        frame.copy_link_name_into(&mut self.link_name);
+        Header {
+            position: frame.position,
+            format: frame.format,
+            kind: frame.kind,
+            declared_size: frame.declared_size,
+            effective_size: frame.effective_size,
+            payload_size: frame.payload_size,
+            mode: frame.mode_bytes(),
+            header_path: &self.path,
+            link_name: &self.link_name,
+        }
+    }
 }
 
 impl<R> TarReader<R> {
     /// Creates a new logical reader from an uncompressed tar reader.
     pub fn new(reader: R) -> Self {
         Self {
-            stream: TarStream::new(reader),
-            payload_remaining: 0,
-            drain_buffer: Vec::new(),
+            payload: PayloadReader {
+                stream: TarStream::new(reader),
+                remaining: 0,
+                drain_buffer: Vec::new(),
+            },
+            header_storage: HeaderStorage::default(),
         }
     }
 }
@@ -217,7 +293,7 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
     /// before the next member is returned. A global pax update not followed by
     /// an ordinary member is rejected.
     pub async fn next_frame(&mut self) -> Result<Option<MemberFrame<'_, R>>, FrameError> {
-        self.drain_payload().await?;
+        self.payload.drain_payload().await?;
 
         let mut global_extensions: Vec<PaxExtension> = Vec::new();
         let mut local_extension = None;
@@ -249,7 +325,7 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
                 Frame::Header(header) => {
                     let extensions = match header.format {
                         ArchiveFormat::Pax => MemberExtensions::Pax(PaxState::new(
-                            self.stream.global_pax_records(),
+                            self.payload.stream.global_pax_records(),
                             global_extensions,
                             local_extension,
                         )),
@@ -258,11 +334,14 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
                             long_link,
                         },
                     };
-                    self.payload_remaining = header.payload_size;
+                    self.payload.remaining = header.payload_size;
+                    let header = self.header_storage.update(&header);
                     return Ok(Some(MemberFrame {
                         header,
                         extensions,
-                        payload: MemberPayload { reader: self },
+                        payload: MemberPayload {
+                            reader: &mut self.payload,
+                        },
                     }));
                 }
                 Frame::Data(frame) => {
@@ -277,7 +356,7 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
     }
 
     async fn next_physical_frame(&mut self) -> Result<Option<Frame>, FrameError> {
-        self.stream.next().await.transpose()
+        self.payload.stream.next().await.transpose()
     }
 
     async fn read_pax_extension(
@@ -341,23 +420,36 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
         })
     }
 
+    fn unexpected_end(&self, expected: &'static str) -> FrameError {
+        FrameError::unexpected_eof(self.payload.stream.position(), expected)
+    }
+
+    fn unexpected_frame(&self, frame: &Frame, expected: &'static str) -> FrameError {
+        let (position, found) = match frame {
+            Frame::Pax(frame) => (frame.position, "pax extension header"),
+            Frame::Gnu(frame) => (frame.position, "GNU metadata header"),
+            Frame::Header(frame) => (frame.position, "ordinary member header"),
+            Frame::Data(frame) => (frame.position, "payload data"),
+        };
+        FrameError::unexpected_order(position, expected, found)
+    }
+}
+
+impl<R: AsyncRead + Unpin> PayloadReader<R> {
     async fn next_payload_block(&mut self) -> Result<Option<PayloadBlock>, FrameError> {
-        if self.payload_remaining == 0 {
+        if self.remaining == 0 {
             return Ok(None);
         }
         let (position, block, len) = self.stream.read_member_block().await?;
         let payload_len = u64::try_from(len)
             .map_err(|_| FrameError::arithmetic_overflow(position, "member payload length"))?;
-        self.payload_remaining =
-            self.payload_remaining
-                .checked_sub(payload_len)
-                .ok_or_else(|| {
-                    FrameError::unexpected_order(
-                        position,
-                        "bounded member payload",
-                        "oversized member payload",
-                    )
-                })?;
+        self.remaining = self.remaining.checked_sub(payload_len).ok_or_else(|| {
+            FrameError::unexpected_order(
+                position,
+                "bounded member payload",
+                "oversized member payload",
+            )
+        })?;
         Ok(Some(PayloadBlock {
             position,
             block,
@@ -370,7 +462,7 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
         buffer: &mut Vec<u8>,
         target_len: usize,
     ) -> Result<bool, FrameError> {
-        if self.payload_remaining == 0 {
+        if self.remaining == 0 {
             buffer.clear();
             return Ok(false);
         }
@@ -379,7 +471,7 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
         let len = u64::try_from(len).map_err(|_| {
             FrameError::arithmetic_overflow(position, "member payload chunk length")
         })?;
-        self.payload_remaining = self.payload_remaining.checked_sub(len).ok_or_else(|| {
+        self.remaining = self.remaining.checked_sub(len).ok_or_else(|| {
             FrameError::unexpected_order(
                 position,
                 "bounded member payload",
@@ -403,20 +495,6 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
         };
         self.drain_buffer = buffer;
         result
-    }
-
-    fn unexpected_end(&self, expected: &'static str) -> FrameError {
-        FrameError::unexpected_eof(self.stream.position(), expected)
-    }
-
-    fn unexpected_frame(&self, frame: &Frame, expected: &'static str) -> FrameError {
-        let (position, found) = match frame {
-            Frame::Pax(frame) => (frame.position, "pax extension header"),
-            Frame::Gnu(frame) => (frame.position, "GNU metadata header"),
-            Frame::Header(frame) => (frame.position, "ordinary member header"),
-            Frame::Data(frame) => (frame.position, "payload data"),
-        };
-        FrameError::unexpected_order(position, expected, found)
     }
 }
 
@@ -594,6 +672,33 @@ mod tests {
             assert_eq!(member.header.format, ArchiveFormat::Gnu);
             assert_eq!(member.header.header_path().as_ref(), b"name");
             assert_eq!(member.header.mode()?, 0o755);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn keeps_borrowed_header_metadata_available_while_streaming_payload() {
+        let mut member_header = header(b'0', 1);
+        set_field(&mut member_header, NAME_RANGE, b"file");
+        set_field(&mut member_header, PREFIX_RANGE, b"dir");
+        set_field(&mut member_header, LINK_NAME_RANGE, b"target");
+        member_header[MODE_RANGE].copy_from_slice(b"0000755\0");
+        set_checksum(&mut member_header);
+
+        ready_ok(async {
+            let mut bytes = Vec::new();
+            append_block(&mut bytes, &member_header);
+            append_payload(&mut bytes, b"x");
+            append_terminator(&mut bytes);
+            let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+            let mut member = next_member(&mut reader).await?;
+
+            assert!(member.payload.next_block().await?.is_some());
+            assert_eq!(member.header.header_path().as_ref(), b"dir/file");
+            assert_eq!(member.header.link_name(), b"target");
+            assert_eq!(member.header.mode()?, 0o755);
+            assert_eq!(member.effective_path()?.as_ref(), b"dir/file");
+            assert_eq!(member.effective_link_path()?.as_ref(), b"target");
             Ok(())
         });
     }

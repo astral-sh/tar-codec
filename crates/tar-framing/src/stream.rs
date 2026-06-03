@@ -4,7 +4,6 @@
 //! tar block and preserves each source block verbatim.
 
 use std::{
-    borrow::Cow,
     future::poll_fn,
     pin::Pin,
     sync::Arc,
@@ -93,35 +92,35 @@ pub struct HeaderFrame {
 impl HeaderFrame {
     /// Decodes the ordinary header's numeric mode according to its archive family.
     pub fn mode(&self) -> Result<u64, FrameError> {
-        let bytes: [u8; 8] = self.block[MODE_RANGE]
-            .try_into()
-            .expect("fixed header range");
-        parse_number(self.format, &bytes).ok_or_else(|| {
-            FrameError::at(self.position, FrameErrorInner::InvalidMode { found: bytes })
-        })
+        parse_mode(self.position, self.format, self.mode_bytes())
     }
 
-    pub(crate) fn header_path(&self) -> Cow<'_, [u8]> {
+    pub(crate) fn copy_header_path_into(&self, path: &mut Vec<u8>) {
+        path.clear();
         let name = trim_nul(&self.block[NAME_RANGE]);
         if self.format == ArchiveFormat::Gnu {
-            return Cow::Borrowed(name);
+            path.extend_from_slice(name);
+            return;
         }
         let prefix = trim_nul(&self.block[PREFIX_RANGE]);
-        if prefix.is_empty() {
-            Cow::Borrowed(name)
-        } else if name.is_empty() {
-            Cow::Borrowed(prefix)
-        } else {
-            let mut path = Vec::with_capacity(prefix.len() + 1 + name.len());
+        if !prefix.is_empty() {
             path.extend_from_slice(prefix);
-            path.push(b'/');
-            path.extend_from_slice(name);
-            Cow::Owned(path)
+            if !name.is_empty() {
+                path.push(b'/');
+            }
         }
+        path.extend_from_slice(name);
     }
 
-    pub(crate) fn link_name(&self) -> &[u8] {
-        trim_nul(&self.block[LINK_NAME_RANGE])
+    pub(crate) fn copy_link_name_into(&self, link_name: &mut Vec<u8>) {
+        link_name.clear();
+        link_name.extend_from_slice(trim_nul(&self.block[LINK_NAME_RANGE]));
+    }
+
+    pub(crate) fn mode_bytes(&self) -> [u8; 8] {
+        self.block[MODE_RANGE]
+            .try_into()
+            .expect("fixed header range")
     }
 }
 
@@ -936,6 +935,15 @@ pub(crate) fn parse_number(format: ArchiveFormat, bytes: &[u8]) -> Option<u64> {
         ArchiveFormat::Pax => parse_octal(bytes),
         ArchiveFormat::Gnu => parse_gnu_number(bytes),
     }
+}
+
+pub(crate) fn parse_mode(
+    position: u64,
+    format: ArchiveFormat,
+    bytes: [u8; 8],
+) -> Result<u64, FrameError> {
+    parse_number(format, &bytes)
+        .ok_or_else(|| FrameError::at(position, FrameErrorInner::InvalidMode { found: bytes }))
 }
 
 fn parse_gnu_number(bytes: &[u8]) -> Option<u64> {
