@@ -1,7 +1,15 @@
 //! Filesystem extraction implementation and its private support types.
 
+use std::{
+    collections::{HashMap, HashSet},
+    fs::{self as std_fs, Metadata},
+};
+
 use super::*;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use tar_framing::logical::MemberPayload;
+use tokio::{fs, io::AsyncWriteExt};
 
 #[derive(Clone, Debug)]
 struct PendingSymlink {
@@ -45,7 +53,7 @@ impl ExtractedEntry {
 }
 
 struct ExtractionRoot {
-    dir: Arc<Dir>,
+    path: PathBuf,
     allow_overwrites: bool,
     entries: HashMap<PathBuf, ExtractedEntry>,
     symlink_indices: HashMap<PathBuf, usize>,
@@ -80,40 +88,34 @@ impl<R: AsyncRead + Unpin> Archive<R> {
                 LogicalFrame::GlobalPax(header) => {
                     policy.check_global_pax(header.position, &header.records)?;
                 }
-                LogicalFrame::Member(mut frame) => {
+                LogicalFrame::Member(frame) => {
                     policy.check_member(&frame)?;
                     let member = decode_member(&frame)?;
                     match member.kind {
                         MemberKind::Regular | MemberKind::Contiguous => {
-                            if member.payload_size <= EXTRACTION_CHUNK_BYTES as u64 {
-                                // Fast path: the member fits in our payload buffer.
-                                payload_chunk.clear();
-                                if member.payload_size != 0 {
-                                    frame
-                                        .payload
-                                        .next_chunk(&mut payload_chunk, EXTRACTION_CHUNK_BYTES)
-                                        .await?;
-                                }
-                                let buffer = mem::take(&mut payload_chunk);
-                                let (returned_buffer, result) =
-                                    root.create_buffered_file(member, buffer).await;
-                                payload_chunk = returned_buffer;
-                                result?;
-                            } else {
-                                // Slow path: the member needs to be streamed.
-                                let writer = root.start_member(member).await?;
-                                consume_payload(frame.payload, &mut payload_chunk, writer).await?;
-                            }
+                            root.extract_file(&member, frame.payload, &mut payload_chunk)
+                                .await?;
                         }
-                        MemberKind::Directory
-                        | MemberKind::SymbolicLink
-                        | MemberKind::HardLink
-                        | MemberKind::CharacterDevice
+                        MemberKind::Directory => {
+                            root.extract_directory(&member.path).await?;
+                            frame.payload.skip().await?;
+                        }
+                        MemberKind::SymbolicLink => {
+                            root.reserve_symlink(&member).await?;
+                            frame.payload.skip().await?;
+                        }
+                        MemberKind::HardLink => {
+                            root.extract_hard_link(&member, frame.payload, &mut payload_chunk)
+                                .await?;
+                        }
+                        MemberKind::CharacterDevice
                         | MemberKind::BlockDevice
                         | MemberKind::Fifo => {
-                            // Directories and symlinks have no writer; hard links may have linkdata.
-                            let writer = root.start_member(member).await?;
-                            consume_payload(frame.payload, &mut payload_chunk, writer).await?;
+                            return Err(DecodeError::UnsupportedMember {
+                                position: member.position,
+                                path: member.path,
+                                kind: member.kind,
+                            });
                         }
                     }
                 }
@@ -123,47 +125,38 @@ impl<R: AsyncRead + Unpin> Archive<R> {
     }
 }
 
-/// Consume the payload, i.e. data from a member.
-///
-/// `payload` is a wrapper over an asynchronous reader, bounded to
-/// the member's data, while `payload_chunk` is a reusable buffer to
-/// stream data into.
-///
-/// If `writer` is `None`, the payload is skipped.
-async fn consume_payload<R: AsyncRead + Unpin>(
+async fn write_payload<R: AsyncRead + Unpin>(
     mut payload: MemberPayload<'_, R>,
     payload_chunk: &mut Vec<u8>,
-    writer: Option<(PathBuf, tokio::fs::File)>,
+    path: &Path,
+    mut file: fs::File,
 ) -> Result<(), DecodeError> {
-    if let Some((path, mut file)) = writer {
-        while payload
-            .next_chunk(payload_chunk, EXTRACTION_CHUNK_BYTES)
-            .await?
-        {
-            file.write_all(payload_chunk)
-                .await
-                .map_err(|source| DecodeError::filesystem("write file", path.clone(), source))?;
-        }
-        file.flush()
+    while payload
+        .next_chunk(payload_chunk, EXTRACTION_CHUNK_BYTES)
+        .await?
+    {
+        file.write_all(payload_chunk)
             .await
-            .map_err(|source| DecodeError::filesystem("flush file", path, source))?;
-    } else {
-        payload.skip().await?;
+            .map_err(|source| DecodeError::filesystem("write file", path.to_owned(), source))?;
     }
+    file.flush()
+        .await
+        .map_err(|source| DecodeError::filesystem("flush file", path.to_owned(), source))?;
     Ok(())
 }
 
 impl ExtractionRoot {
     async fn open(dest: &Path, allow_overwrites: bool) -> Result<Self, DecodeError> {
         let dest = dest.to_owned();
-        let path = dest.clone();
-        let dir = tokio::task::spawn_blocking(move || open_destination(&dest))
-            .await?
+        let error_path = dest.clone();
+        let path = tokio::task::spawn_blocking(move || open_destination(&dest))
+            .await
+            .map_err(DecodeError::BlockingTask)?
             .map_err(|source| {
-                DecodeError::filesystem("open destination directory", path, source)
+                DecodeError::filesystem("open destination directory", error_path, source)
             })?;
         Ok(Self {
-            dir: Arc::new(dir),
+            path,
             allow_overwrites,
             entries: HashMap::new(),
             symlink_indices: HashMap::new(),
@@ -171,146 +164,74 @@ impl ExtractionRoot {
         })
     }
 
-    async fn start_member(
-        &mut self,
-        member: DecodedMember,
-    ) -> Result<Option<(PathBuf, tokio::fs::File)>, DecodeError> {
-        let (member, file) = self
-            .run(move |root| {
-                let file = root.create_member(&member)?;
-                Ok((member, file))
-            })
-            .await?;
-        Ok(file.and_then(|file| {
-            (member.payload_size != 0)
-                .then(|| (member.path, tokio::fs::File::from_std(file.into_std())))
-        }))
-    }
-
-    async fn create_buffered_file(
-        &mut self,
-        member: DecodedMember,
-        buffer: Vec<u8>,
-    ) -> (Vec<u8>, Result<(), DecodeError>) {
-        let DecodedMember {
-            path, executable, ..
-        } = member;
-        let mut root = self.take();
-        let (buffer, result) = with_reusable_buffer(buffer, move |buffer| {
-            let result = root.create_file(&path, executable).and_then(|mut file| {
-                file.write_all(buffer)
-                    .map_err(|source| DecodeError::filesystem("write file", path.clone(), source))
-            });
-            buffer.clear();
-            result.map(|()| root)
-        })
-        .await;
-        match result {
-            Ok(root) => {
-                *self = root;
-                (buffer, Ok(()))
-            }
-            Err(error) => (buffer, Err(error)),
-        }
-    }
-
-    async fn install_symlinks(&mut self, allow_dangling_symlinks: bool) -> Result<(), DecodeError> {
-        self.run(move |root| root.install_pending_symlinks(allow_dangling_symlinks))
-            .await
-    }
-
-    async fn run<T, F>(&mut self, operation: F) -> Result<T, DecodeError>
-    where
-        T: Send + 'static,
-        F: FnOnce(&mut Self) -> Result<T, DecodeError> + Send + 'static,
-    {
-        let mut root = self.take();
-        let (root, value) = tokio::task::spawn_blocking(move || {
-            let value = operation(&mut root)?;
-            Ok::<_, DecodeError>((root, value))
-        })
-        .await??;
-        *self = root;
-        Ok(value)
-    }
-
-    fn take(&mut self) -> Self {
-        Self {
-            dir: Arc::clone(&self.dir),
-            allow_overwrites: self.allow_overwrites,
-            entries: mem::take(&mut self.entries),
-            symlink_indices: mem::take(&mut self.symlink_indices),
-            symlinks: mem::take(&mut self.symlinks),
-        }
-    }
-
-    /// Create an extracted member according to its type.
-    ///
-    /// This creates the corresponding filesystem state but does not
-    /// necessarily fully complete it; for example, files are not fully
-    /// completed until [`consume_payload`] is called.
-    fn create_member(
+    async fn extract_file<R: AsyncRead + Unpin>(
         &mut self,
         member: &DecodedMember,
-    ) -> Result<Option<cap_std::fs::File>, DecodeError> {
-        match member.kind {
-            MemberKind::Regular | MemberKind::Contiguous => {
-                self.create_file(&member.path, member.executable).map(Some)
+        mut payload: MemberPayload<'_, R>,
+        payload_chunk: &mut Vec<u8>,
+    ) -> Result<(), DecodeError> {
+        if member.payload_size <= EXTRACTION_CHUNK_BYTES as u64 {
+            payload_chunk.clear();
+            if member.payload_size != 0 {
+                payload
+                    .next_chunk(payload_chunk, EXTRACTION_CHUNK_BYTES)
+                    .await?;
             }
-            MemberKind::Directory if member.path.as_os_str().is_empty() => Ok(None),
-            MemberKind::Directory => {
-                self.ensure_parents(&member.path)?;
-                self.ensure_directory(&member.path, true)?;
-                Ok(None)
-            }
-            MemberKind::SymbolicLink => {
-                self.reserve_symlink(member)?;
-                Ok(None)
-            }
-            MemberKind::HardLink => self.create_hard_link(member),
-            MemberKind::CharacterDevice | MemberKind::BlockDevice | MemberKind::Fifo => {
-                Err(DecodeError::UnsupportedMember {
-                    position: member.position,
-                    path: member.path.clone(),
-                    kind: member.kind,
-                })
-            }
+            let mut file = self.create_file(&member.path, member.executable).await?;
+            file.write_all(payload_chunk).await.map_err(|source| {
+                DecodeError::filesystem("write file", member.path.clone(), source)
+            })?;
+            file.flush().await.map_err(|source| {
+                DecodeError::filesystem("flush file", member.path.clone(), source)
+            })?;
+            return Ok(());
         }
+        let file = self.create_file(&member.path, member.executable).await?;
+        write_payload(payload, payload_chunk, &member.path, file).await
     }
 
-    /// Create a regular file at the given path.
-    fn create_file(
+    async fn extract_directory(&mut self, path: &Path) -> Result<(), DecodeError> {
+        if !path.as_os_str().is_empty() {
+            self.ensure_parents(path).await?;
+            self.ensure_directory(path, true).await?;
+        }
+        Ok(())
+    }
+
+    async fn create_file(
         &mut self,
         path: &Path,
         executable: bool,
-    ) -> Result<cap_std::fs::File, DecodeError> {
-        self.ensure_parents(path)?;
+    ) -> Result<fs::File, DecodeError> {
+        self.ensure_parents(path).await?;
         if self.symlink_indices.contains_key(path) {
-            self.replace_leaf(path)?;
+            self.replace_leaf(path).await?;
         }
-        let file = match self.open_file(path, true, false) {
+        let file = match self.open_file(path, true, false).await {
             Ok(file) => file,
             Err(source) => {
-                if !self.replace_leaf(path)? {
+                if !self.replace_leaf(path).await? {
                     return Err(DecodeError::filesystem(
                         "create file",
                         path.to_owned(),
                         source,
                     ));
                 }
-                self.fs("create file", path, self.open_file(path, true, false))?
+                let result = self.open_file(path, true, false).await;
+                self.fs("create file", path, result)?
             }
         };
-        self.fs("create file", path, add_executable(&file, executable))?;
+        let result = add_executable(&file, executable).await;
+        self.fs("create file", path, result)?;
         self.entries.insert(path.to_owned(), ExtractedEntry::File);
         Ok(file)
     }
 
-    fn reserve_symlink(&mut self, member: &DecodedMember) -> Result<(), DecodeError> {
+    async fn reserve_symlink(&mut self, member: &DecodedMember) -> Result<(), DecodeError> {
         let target_text = member.link_target.clone();
         let target = normalize_symlink_target(member.position, &member.path, &target_text)?;
-        self.ensure_parents(&member.path)?;
-        self.replace_leaf(&member.path)?;
+        self.ensure_parents(&member.path).await?;
+        self.replace_leaf(&member.path).await?;
         let path = member.path.clone();
         self.entries.insert(path.clone(), ExtractedEntry::Symlink);
         self.symlink_indices
@@ -324,10 +245,12 @@ impl ExtractionRoot {
         Ok(())
     }
 
-    fn create_hard_link(
+    async fn extract_hard_link<R: AsyncRead + Unpin>(
         &mut self,
         member: &DecodedMember,
-    ) -> Result<Option<cap_std::fs::File>, DecodeError> {
+        payload: MemberPayload<'_, R>,
+        payload_chunk: &mut Vec<u8>,
+    ) -> Result<(), DecodeError> {
         let target_text = member.link_target.clone();
         let target = normalize_path(member.position, "hard-link target", &target_text, &[])?;
         let reason = if !matches!(self.entries.get(&target), Some(ExtractedEntry::File)) {
@@ -347,33 +270,43 @@ impl ExtractionRoot {
                 reason,
             ));
         }
-        self.ensure_parents(&member.path)?;
-        self.replace_leaf(&member.path)?;
-        let result = self.dir.hard_link(&target, &self.dir, &member.path);
+        self.ensure_parents(&member.path).await?;
+        self.replace_leaf(&member.path).await?;
+        let result = fs::hard_link(
+            self.destination_path(&target),
+            self.destination_path(&member.path),
+        )
+        .await;
         self.fs("create hard link", &member.path, result)?;
         self.entries
             .insert(member.path.clone(), ExtractedEntry::File);
         if member.payload_size == 0 {
-            Ok(None)
+            payload.skip().await?;
+            Ok(())
         } else {
-            let result = self.open_file(&member.path, false, true);
-            self.fs("truncate file", &member.path, result).map(Some)
+            let result = self.open_file(&member.path, false, true).await;
+            let file = self.fs("truncate file", &member.path, result)?;
+            write_payload(payload, payload_chunk, &member.path, file).await
         }
     }
 
-    fn ensure_parents(&mut self, path: &Path) -> Result<(), DecodeError> {
+    async fn ensure_parents(&mut self, path: &Path) -> Result<(), DecodeError> {
         let Some(parent) = path.parent() else {
             return Ok(());
         };
         let mut current = PathBuf::new();
         for component in parent.components() {
             current.push(component.as_os_str());
-            self.ensure_directory(&current, false)?;
+            self.ensure_directory(&current, false).await?;
         }
         Ok(())
     }
 
-    fn ensure_directory(&mut self, path: &Path, archive_member: bool) -> Result<(), DecodeError> {
+    async fn ensure_directory(
+        &mut self,
+        path: &Path,
+        archive_member: bool,
+    ) -> Result<(), DecodeError> {
         if let Some(entry) = self.entries.get(path).copied()
             && entry.is_directory()
         {
@@ -383,7 +316,17 @@ impl ExtractionRoot {
             }
             return Ok(());
         }
-        let metadata = self.metadata(path)?;
+        if self.entries.contains_key(path) {
+            self.replace_leaf(path).await?;
+        }
+        // Missing parents are common, so inspect and replace only after a collision.
+        let create_result = fs::create_dir(self.destination_path(path)).await;
+        if create_result.is_ok() {
+            self.entries
+                .insert(path.to_owned(), ExtractedEntry::Directory);
+            return Ok(());
+        }
+        let metadata = self.metadata(path).await?;
         if metadata
             .as_ref()
             .is_some_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
@@ -396,17 +339,19 @@ impl ExtractionRoot {
             self.entries.insert(path.to_owned(), entry);
             return Ok(());
         }
-        if metadata.is_some() || self.entries.contains_key(path) {
-            self.replace_leaf(path)?;
+        if metadata.is_none() && !self.entries.contains_key(path) {
+            return self.fs("create directory", path, create_result);
         }
-        self.fs("create directory", path, self.dir.create_dir(path))?;
+        self.replace_leaf(path).await?;
+        let result = fs::create_dir(self.destination_path(path)).await;
+        self.fs("create directory", path, result)?;
         self.entries
             .insert(path.to_owned(), ExtractedEntry::Directory);
         Ok(())
     }
 
-    fn replace_leaf(&mut self, path: &Path) -> Result<bool, DecodeError> {
-        let metadata = self.metadata(path)?;
+    async fn replace_leaf(&mut self, path: &Path) -> Result<bool, DecodeError> {
+        let metadata = self.metadata(path).await?;
         if metadata.is_none() && !self.entries.contains_key(path) {
             return Ok(false);
         }
@@ -414,7 +359,7 @@ impl ExtractionRoot {
             return Err(DecodeError::path_collision(path.to_owned()));
         }
         if let Some(metadata) = metadata {
-            self.remove_leaf(path, &metadata)?;
+            self.remove_leaf(path, &metadata).await?;
         }
         self.entries.remove(path);
         self.symlink_indices.remove(path);
@@ -427,7 +372,7 @@ impl ExtractionRoot {
             .any(|candidate| candidate != path && candidate.starts_with(path))
     }
 
-    fn install_pending_symlinks(&self, allow_dangling_symlinks: bool) -> Result<(), DecodeError> {
+    async fn install_symlinks(&self, allow_dangling_symlinks: bool) -> Result<(), DecodeError> {
         let mut links = Vec::with_capacity(self.symlinks.len());
         for (index, link) in self.symlinks.iter().enumerate() {
             if self.symlink_indices.get(&link.path) != Some(&index) {
@@ -443,7 +388,7 @@ impl ExtractionRoot {
         }
         for (link, kind) in links {
             let contents = relative_link_contents(&link.path, &link.target);
-            let result = create_symlink(&self.dir, &contents, &link.path, kind);
+            let result = create_symlink(&contents, &self.destination_path(&link.path), kind).await;
             self.fs("create symbolic link", &link.path, result)?;
         }
         Ok(())
@@ -485,44 +430,47 @@ impl ExtractionRoot {
         Err("symbolic-link target expansion limit exceeded")
     }
 
-    fn metadata(&self, path: &Path) -> Result<Option<cap_std::fs::Metadata>, DecodeError> {
-        match self.dir.symlink_metadata(path) {
+    async fn metadata(&self, path: &Path) -> Result<Option<Metadata>, DecodeError> {
+        match fs::symlink_metadata(self.destination_path(path)).await {
             Ok(metadata) => Ok(Some(metadata)),
             Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(source) => Err(DecodeError::filesystem("inspect", path.to_owned(), source)),
         }
     }
 
-    fn remove_leaf(
-        &self,
-        path: &Path,
-        metadata: &cap_std::fs::Metadata,
-    ) -> Result<(), DecodeError> {
+    async fn remove_leaf(&self, path: &Path, metadata: &Metadata) -> Result<(), DecodeError> {
+        let destination = self.destination_path(path);
         if metadata.is_dir() && !metadata.file_type().is_symlink() {
-            let mut entries = self.fs("inspect directory", path, self.dir.read_dir(path))?;
-            if let Some(entry) = entries.next() {
-                self.fs("inspect directory", path, entry)?;
+            let result = fs::read_dir(&destination).await;
+            let mut entries = self.fs("inspect directory", path, result)?;
+            let result = entries.next_entry().await;
+            if self.fs("inspect directory", path, result)?.is_some() {
                 return Err(DecodeError::path_collision(path.to_owned()));
             }
-            self.fs("remove directory", path, self.dir.remove_dir(path))
+            let result = fs::remove_dir(destination).await;
+            self.fs("remove directory", path, result)
         } else {
-            let result = remove_non_directory(&self.dir, path, metadata);
+            let result = remove_non_directory(&destination, metadata).await;
             self.fs("remove file", path, result)
         }
     }
 
-    fn open_file(
+    async fn open_file(
         &self,
         path: &Path,
         create_new: bool,
         truncate: bool,
-    ) -> io::Result<cap_std::fs::File> {
-        let mut options = OpenOptions::new();
+    ) -> io::Result<fs::File> {
+        let mut options = fs::OpenOptions::new();
         options
             .write(true)
             .create_new(create_new)
             .truncate(truncate);
-        self.dir.open_with(path, &options)
+        options.open(self.destination_path(path)).await
+    }
+
+    fn destination_path(&self, path: &Path) -> PathBuf {
+        self.path.join(path)
     }
 
     fn fs<T>(
@@ -535,62 +483,68 @@ impl ExtractionRoot {
     }
 }
 
-fn open_destination(dest: &Path) -> io::Result<Dir> {
-    match std::fs::symlink_metadata(dest) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(io::Error::other("destination is not a real directory"));
-        }
+fn open_destination(dest: &Path) -> io::Result<PathBuf> {
+    match std_fs::symlink_metadata(dest) {
         Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => std::fs::create_dir_all(dest)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => std_fs::create_dir_all(dest)?,
         Err(error) => return Err(error),
     }
-    Dir::open_ambient_dir(dest, ambient_authority())
+    let metadata = std_fs::symlink_metadata(dest)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::other("destination is not a real directory"));
+    }
+    std_fs::canonicalize(dest)
 }
 
-fn remove_non_directory(
-    dir: &Dir,
-    path: &Path,
-    metadata: &cap_std::fs::Metadata,
-) -> io::Result<()> {
+async fn remove_non_directory(path: &Path, metadata: &Metadata) -> io::Result<()> {
     #[cfg(windows)]
     if metadata.file_type().is_symlink() {
         // Stable Windows does not expose whether a symlink is file- or directory-shaped.
-        return dir.remove_file(path).or_else(|_| dir.remove_dir(path));
+        return match fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(_) => fs::remove_dir(path).await,
+        };
     }
     #[cfg(not(windows))]
     let _ = metadata;
-    dir.remove_file(path)
+    fs::remove_file(path).await
 }
 
 #[cfg(unix)]
-fn add_executable(file: &cap_std::fs::File, executable: bool) -> io::Result<()> {
-    use cap_std::fs::PermissionsExt;
-
+async fn add_executable(file: &fs::File, executable: bool) -> io::Result<()> {
     if executable {
-        let mut permissions = file.metadata()?.permissions();
+        let mut permissions = file.metadata().await?.permissions();
         permissions.set_mode(permissions.mode() | 0o111);
-        file.set_permissions(permissions)?;
+        file.set_permissions(permissions).await?;
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn add_executable(_file: &cap_std::fs::File, _executable: bool) -> io::Result<()> {
+async fn add_executable(_file: &fs::File, _executable: bool) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
-fn create_symlink(dir: &Dir, contents: &Path, path: &Path, _kind: TerminalKind) -> io::Result<()> {
-    dir.symlink(contents, path)
+#[cfg(unix)]
+async fn create_symlink(contents: &Path, path: &Path, _kind: TerminalKind) -> io::Result<()> {
+    fs::symlink(contents, path).await
 }
 
 #[cfg(windows)]
-fn create_symlink(dir: &Dir, contents: &Path, path: &Path, kind: TerminalKind) -> io::Result<()> {
+async fn create_symlink(contents: &Path, path: &Path, kind: TerminalKind) -> io::Result<()> {
     match kind {
-        TerminalKind::File => dir.symlink_file(contents, path),
-        TerminalKind::Directory => dir.symlink_dir(contents, path),
-        TerminalKind::Dangling => dir.symlink_file(contents, path),
+        TerminalKind::File => fs::symlink_file(contents, path).await,
+        TerminalKind::Directory => fs::symlink_dir(contents, path).await,
+        TerminalKind::Dangling => fs::symlink_file(contents, path).await,
     }
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn create_symlink(_contents: &Path, _path: &Path, _kind: TerminalKind) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "symbolic links are not supported on this platform",
+    ))
 }
 
 #[cfg(test)]
@@ -800,6 +754,32 @@ mod tests {
                     & 0o111,
                 0
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_non_directory_extraction_roots_without_modifying_them() {
+        let temp = tempdir().unwrap();
+        let bytes = single_posix_member_archive("file", b'0', b"archive", "", 0o644);
+
+        let file_dest = temp.path().join("file");
+        std::fs::write(&file_dest, b"keep").unwrap();
+        let error = extract(bytes.clone(), &file_dest).await.unwrap_err();
+        assert!(matches!(error, DecodeError::Filesystem { .. }));
+        assert_eq!(std::fs::read(&file_dest).unwrap(), b"keep");
+
+        #[cfg(any(unix, windows))]
+        {
+            let target = temp.path().join("target");
+            let link_dest = temp.path().join("link");
+            std::fs::create_dir(&target).unwrap();
+            std::fs::write(target.join("keep"), b"keep").unwrap();
+            symlink_dir(&target, &link_dest).unwrap();
+
+            let error = extract(bytes, &link_dest).await.unwrap_err();
+            assert!(matches!(error, DecodeError::Filesystem { .. }));
+            assert_eq!(std::fs::read(target.join("keep")).unwrap(), b"keep");
+            assert!(!target.join("file").exists());
         }
     }
 

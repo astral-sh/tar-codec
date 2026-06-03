@@ -1,9 +1,8 @@
 //! Helpers for synchronous work that owns reusable payload buffers.
 //!
-//! Encoding and extraction use synchronous [`std::fs`] and [`cap_std::fs`]
-//! operations in otherwise asynchronous APIs. Those operations run through
-//! [`tokio::task::spawn_blocking`] so filesystem latency does not occupy a
-//! Tokio async worker thread.
+//! Encoding uses synchronous [`std::fs`] operations in an otherwise
+//! asynchronous API. Those operations run through [`tokio::task::spawn_blocking`]
+//! so filesystem latency does not occupy a Tokio async worker thread.
 //!
 //! Some of that work also reads or writes payload bytes using a buffer reused
 //! across archive members. A blocking task requires owned `'static` state, so

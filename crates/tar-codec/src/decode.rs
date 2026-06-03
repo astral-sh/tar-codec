@@ -1,31 +1,25 @@
 //! Secure high-level decoding and extraction for validated tar streams.
 //!
 //! `tar-codec` interprets member metadata above [`tar_framing`] and extracts
-//! archive contents into a capability-scoped destination. Decompression is the
-//! caller's responsibility. Extraction requires a [`DecodePolicy`] so that
-//! security-sensitive archive features are explicit at each call site.
+//! archive contents beneath a validated destination root. Decompression is
+//! the caller's responsibility. Extraction requires a [`DecodePolicy`] so
+//! that security-sensitive archive features are explicit at each call site.
 
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
-    io::{self, Write},
-    mem,
+    collections::HashSet,
+    io,
     path::{Component, Path, PathBuf},
-    sync::Arc,
 };
 
-use cap_std::{
-    ambient_authority,
-    fs::{Dir, OpenOptions},
-};
 use tar_framing::{
     ArchiveFormat, FrameError, MemberKind, PaxKind, PaxRecord,
     logical::{LogicalFrame, MemberExtensions, MemberFrame, TarReader},
 };
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWriteExt};
+use tokio::io::AsyncRead;
 
-use crate::{blocking::with_reusable_buffer, has_windows_prefix};
+use crate::has_windows_prefix;
 
 mod extract;
 
@@ -355,7 +349,7 @@ pub enum DecodeError {
         #[source]
         source: io::Error,
     },
-    /// A blocking capability operation failed to complete.
+    /// A blocking extraction operation failed to complete.
     #[error("failed to complete blocking extraction operation: {0}")]
     BlockingTask(#[from] tokio::task::JoinError),
     /// An effective member path or link target is not UTF-8 text.

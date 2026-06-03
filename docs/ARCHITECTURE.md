@@ -43,8 +43,9 @@ It owns:
   non-empty directory removal;
 - deferred symbolic-link installation, including bounded graph validation,
   policy-controlled dangling links, and unconditional rejection of escaping
-  targets; and
-- capability-relative creation of files, directories, and permitted links;
+  targets;
+- path-based creation beneath a validated destination root, under the contract
+  that callers do not concurrently mutate that destination;
 - recursive encoding traversal, source symlink preservation, and async writes.
 
 It relies on `tar-framing` for structural validity and effective payload
