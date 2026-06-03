@@ -85,7 +85,7 @@ impl<R: AsyncRead + Unpin> Archive<R> {
         let mut payload_chunk = Vec::new();
         while let Some(frame) = self.reader.next_frame().await? {
             policy.check_member(&frame)?;
-            let member = decode_member(&frame)?;
+            let member = decode_member(&frame, &policy)?;
             match member.kind {
                 MemberKind::Regular | MemberKind::Contiguous => {
                     root.extract_file(&member, frame.payload, &mut payload_chunk)
@@ -749,6 +749,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interprets_empty_regular_trailing_slash_paths_as_directories_when_enabled() {
+        let mut posix = Vec::new();
+        append_posix_member(&mut posix, "physical/", b'0', b"", "", 0o644);
+        append_posix_member(&mut posix, "nul/", 0, b"", "", 0o644);
+        append_pax(&mut posix, b'x', &record("path", "pax/"));
+        append_posix_member(&mut posix, "raw", b'0', b"", "", 0o644);
+        append_posix_member(&mut posix, "after", b'0', b"kept", "", 0o644);
+        finish(&mut posix);
+
+        let mut gnu = Vec::new();
+        append_gnu_member(&mut gnu, "longname", b'L', b"gnu/\0", "", 0o644);
+        append_gnu_member(&mut gnu, "raw", b'0', b"", "", 0o644);
+        append_gnu_member(&mut gnu, "after", b'0', b"kept", "", 0o644);
+        finish(&mut gnu);
+
+        let temp = tempdir().expect("temporary directory");
+        let policy = DecodePolicy::default().allow_regular_files_as_directories(true);
+        for (case, bytes, directories) in [
+            ("posix", posix, &["physical", "nul", "pax"][..]),
+            ("gnu", gnu, &["gnu"][..]),
+        ] {
+            let dest = temp.path().join(case);
+            extract_with_policy(bytes, &dest, policy)
+                .await
+                .expect("trailing-slash directories should extract");
+            for directory in directories {
+                assert!(dest.join(directory).is_dir(), "{case}: {directory}");
+            }
+            assert_eq!(
+                std::fs::read(dest.join("after")).expect("later member should extract"),
+                b"kept",
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_trailing_slash_directories_by_default() {
+        let mut physical = Vec::new();
+        append_posix_member(&mut physical, "directory/", b'0', b"", "", 0o644);
+        finish(&mut physical);
+
+        let mut pax = Vec::new();
+        append_pax(&mut pax, b'x', &record("path", "directory/"));
+        append_posix_member(&mut pax, "raw", b'0', b"", "", 0o644);
+        finish(&mut pax);
+
+        let mut gnu = Vec::new();
+        append_gnu_member(&mut gnu, "longname", b'L', b"directory/\0", "", 0o644);
+        append_gnu_member(&mut gnu, "raw", b'0', b"", "", 0o644);
+        finish(&mut gnu);
+
+        let temp = tempdir().expect("temporary directory");
+        for (case, bytes, position) in [
+            ("physical", physical, 0),
+            ("pax", pax, 1024),
+            ("gnu", gnu, 1024),
+        ] {
+            let dest = temp.path().join(case);
+            assert!(matches!(
+                extract(bytes, &dest)
+                    .await
+                    .expect_err("trailing-slash directory should be rejected"),
+                DecodeError::PolicyViolation {
+                    position: found,
+                    violation: DecodePolicyViolation::TrailingSlashDirectory,
+                } if found == position
+            ));
+            assert!(!dest.join("directory").exists(), "{case}");
+        }
+
+        let explicit_dest = temp.path().join("explicit");
+        let explicit = single_posix_member_archive("directory/", b'5', b"", "", 0o755);
+        extract(explicit, &explicit_dest)
+            .await
+            .expect("explicit directory should remain allowed");
+        assert!(explicit_dest.join("directory").is_dir());
+    }
+
+    #[tokio::test]
+    async fn rejects_nonempty_trailing_slash_directories_when_enabled() {
+        let mut physical = Vec::new();
+        append_posix_member(&mut physical, "directory/", b'0', b"payload", "", 0o644);
+        finish(&mut physical);
+
+        let mut pax = Vec::new();
+        append_pax(&mut pax, b'x', &record("path", "directory/"));
+        append_posix_member(&mut pax, "raw", b'0', b"payload", "", 0o644);
+        finish(&mut pax);
+
+        let mut gnu = Vec::new();
+        append_gnu_member(&mut gnu, "longname", b'L', b"directory/\0", "", 0o644);
+        append_gnu_member(&mut gnu, "raw", b'0', b"payload", "", 0o644);
+        finish(&mut gnu);
+
+        let temp = tempdir().expect("temporary directory");
+        let policy = DecodePolicy::default().allow_regular_files_as_directories(true);
+        for (case, bytes, position) in [
+            ("physical", physical, 0),
+            ("pax", pax, 1024),
+            ("gnu", gnu, 1024),
+        ] {
+            let dest = temp.path().join(case);
+            assert!(matches!(
+                extract_with_policy(bytes, &dest, policy)
+                    .await
+                    .expect_err("nonempty trailing-slash directory should be rejected"),
+                DecodeError::PolicyViolation {
+                    position: found,
+                    violation: DecodePolicyViolation::TrailingSlashDirectoryPayload { size: 7 },
+                } if found == position
+            ));
+            assert!(!dest.join("directory").exists(), "{case}");
+        }
+    }
+
+    #[tokio::test]
     async fn rejects_non_directory_extraction_roots_without_modifying_them() {
         let temp = tempdir().unwrap();
         let bytes = single_posix_member_archive("file", b'0', b"archive", "", 0o644);
@@ -901,6 +1018,9 @@ mod tests {
                 b'0',
                 (|error| matches!(error, DecodeError::UnsafePath { .. })) as DecodeErrorMatcher,
             ),
+            ("unsafe trailing-slash path", "../escape/", b'0', |error| {
+                matches!(error, DecodeError::UnsafePath { .. })
+            }),
             ("path collision", "occupied", b'0', |error| {
                 matches!(error, DecodeError::PathCollision { .. })
             }),

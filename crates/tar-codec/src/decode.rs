@@ -45,6 +45,7 @@ pub struct DecodePolicy {
     allow_symlinks: bool,
     allow_dangling_symlinks: bool,
     allow_hard_links: bool,
+    allow_regular_files_as_directories: bool,
     allow_overwrites: bool,
     allow_gnu: bool,
     pax_policy: PaxDecodePolicy,
@@ -79,6 +80,7 @@ impl Default for DecodePolicy {
             allow_symlinks: true,
             allow_dangling_symlinks: true,
             allow_hard_links: false,
+            allow_regular_files_as_directories: false,
             allow_overwrites: true,
             allow_gnu: true,
             pax_policy: PaxDecodePolicy::default(),
@@ -115,6 +117,17 @@ impl DecodePolicy {
     /// trust the archive you're extracting from.
     pub fn allow_hard_links(mut self, allow: bool) -> Self {
         self.allow_hard_links = allow;
+        self
+    }
+
+    /// Configures whether regular members whose effective paths end in `/`
+    /// may be extracted as directories.
+    ///
+    /// This historical tar compatibility behavior is **forbidden by default**.
+    /// When enabled, only members with empty effective payloads are accepted;
+    /// members carrying data are always rejected rather than discarded.
+    pub fn allow_regular_files_as_directories(mut self, allow: bool) -> Self {
+        self.allow_regular_files_as_directories = allow;
         self
     }
 
@@ -338,6 +351,15 @@ pub enum DecodePolicyViolation {
     /// A hard-link member appeared when links are forbidden.
     #[error("hard-link members are not allowed")]
     HardLink,
+    /// A regular member used the historical trailing-slash directory convention.
+    #[error("regular members with trailing-slash paths are not allowed as directories")]
+    TrailingSlashDirectory,
+    /// A trailing-slash regular member carried data that cannot become a directory.
+    #[error("regular member with trailing-slash path carries payload size {size}")]
+    TrailingSlashDirectoryPayload {
+        /// The rejected effective payload size.
+        size: u64,
+    },
     /// A GNU-family frame appeared when only POSIX-pax extraction is allowed.
     #[error("GNU archives are not allowed")]
     GnuArchive,
@@ -504,13 +526,44 @@ struct DecodedMember {
     payload_size: u64,
 }
 
-fn decode_member<R>(frame: &MemberFrame<'_, R>) -> Result<DecodedMember, DecodeError> {
+fn decode_member<R>(
+    frame: &MemberFrame<'_, R>,
+    policy: &DecodePolicy,
+) -> Result<DecodedMember, DecodeError> {
     let header = &frame.header;
     let mode = header.mode()?;
     let executable = mode & 0o111 != 0;
-    let path = resolved_text(header.position, "path", frame.effective_path()?)?;
-    let path = normalize_member_path(header.position, &path)?;
-    if path.as_os_str().is_empty() && header.kind != MemberKind::Directory {
+    let path_text = resolved_text(header.position, "path", frame.effective_path()?)?;
+    let path = normalize_member_path(header.position, &path_text)?;
+    let kind = if header.kind == MemberKind::Regular && path_text.ends_with('/') {
+        // Special case: legacy (pre-ustar) archives didn't include a directory
+        // typeflag, so the convention of using a regular file entry with a trailing
+        // slash to indicate a directory emerged.
+        //
+        // This should not occur in modern archives, but we allow it
+        // (when enabled by policy) under the condition that the regular file *also*
+        // has an empty payload. pax does not require us to do this;
+        // we do it because the extraction step is otherwise ambiguous.
+
+        if !policy.allow_regular_files_as_directories {
+            return Err(DecodeError::policy_violation(
+                header.position,
+                DecodePolicyViolation::TrailingSlashDirectory,
+            ));
+        }
+        if header.payload_size != 0 {
+            return Err(DecodeError::policy_violation(
+                header.position,
+                DecodePolicyViolation::TrailingSlashDirectoryPayload {
+                    size: header.payload_size,
+                },
+            ));
+        }
+        MemberKind::Directory
+    } else {
+        header.kind
+    };
+    if path.as_os_str().is_empty() && kind != MemberKind::Directory {
         return Err(DecodeError::unsafe_path(
             header.position,
             "member path",
@@ -518,7 +571,7 @@ fn decode_member<R>(frame: &MemberFrame<'_, R>) -> Result<DecodedMember, DecodeE
             "only a directory may name the extraction root",
         ));
     }
-    let link_target = if matches!(header.kind, MemberKind::HardLink | MemberKind::SymbolicLink) {
+    let link_target = if matches!(kind, MemberKind::HardLink | MemberKind::SymbolicLink) {
         let target = resolved_text(header.position, "linkpath", frame.effective_link_path()?)?;
         if target.is_empty() {
             return Err(DecodeError::invalid_link(
@@ -536,7 +589,7 @@ fn decode_member<R>(frame: &MemberFrame<'_, R>) -> Result<DecodedMember, DecodeE
     Ok(DecodedMember {
         position: header.position,
         path,
-        kind: header.kind,
+        kind,
         link_target,
         executable,
         payload_size: header.payload_size,

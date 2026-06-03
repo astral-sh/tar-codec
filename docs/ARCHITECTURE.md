@@ -44,6 +44,9 @@ It owns:
 
 - applying UTF-8 extraction policy to effective member path and link bytes;
 - extraction policy, including `DecodePolicy` and `PaxDecodePolicy`;
+- policy-controlled interpretation of regular members whose effective paths
+  use the historical trailing-slash directory convention, disabled by default
+  and accepted only when their effective payload is empty;
 - archive-path normalization and policy-controlled last-entry-wins replacement,
   including no-follow leaf removal, reuse of real directories, and rejection of
   non-empty directory removal;
