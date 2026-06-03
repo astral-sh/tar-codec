@@ -90,11 +90,6 @@ pub struct HeaderFrame {
 }
 
 impl HeaderFrame {
-    /// Decodes the ordinary header's numeric mode according to its archive family.
-    pub fn mode(&self) -> Result<u64, FrameError> {
-        parse_mode(self.position, self.format, self.mode_bytes())
-    }
-
     pub(crate) fn copy_header_path_into(&self, path: &mut Vec<u8>) {
         path.clear();
         let name = trim_nul(&self.block[NAME_RANGE]);
