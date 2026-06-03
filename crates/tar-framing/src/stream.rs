@@ -86,6 +86,10 @@ pub struct HeaderFrame {
     /// The size after applying applicable pax `size` records.
     pub effective_size: u64,
     /// The number of payload bytes for which data frames will be emitted.
+    ///
+    /// For pax hard links, the physical size may be nonzero and an applicable
+    /// pax `size` record may override it. Every nonzero effective size is
+    /// treated as payload because the format carries no separate marker.
     pub payload_size: u64,
 }
 
@@ -976,6 +980,10 @@ fn posix_payload_size(
     effective_size: u64,
 ) -> Result<u64, FrameError> {
     match kind {
+        // PAX permits a nonzero physical hardlink size and allows pax `size`
+        // records to override it, so the effective size controls framing.
+        // This is a broadening of what ustar allows; ustar requires
+        // hardlink members to have `size=0`.
         MemberKind::Regular | MemberKind::HardLink | MemberKind::Contiguous => Ok(effective_size),
         MemberKind::SymbolicLink => {
             payload_free_size(position, kind, declared_size)?;
@@ -1355,18 +1363,29 @@ mod tests {
     }
 
     #[test]
-    fn accepts_pax_linkdata() {
-        let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'1', 3));
-        append_payload(&mut bytes, b"abc");
-        append_terminator(&mut bytes);
+    fn frames_pax_hard_link_bodies_from_header_or_size_override() {
+        for (case, declared_size, override_size, header_index, data_index) in [
+            ("physical size", 3, None, 0, 1),
+            ("pax size", 0, Some("3"), 2, 3),
+            ("pax size overrides physical size", 1, Some("3"), 2, 3),
+        ] {
+            let mut bytes = Vec::new();
+            if let Some(override_size) = override_size {
+                append_posix(&mut bytes, b'x', &record("size", override_size));
+            }
+            append_block(&mut bytes, &header(b'1', declared_size));
+            append_payload(&mut bytes, b"abc");
+            append_terminator(&mut bytes);
 
-        let frames = collect(bytes, BLOCK_SIZE);
-        let header = header_frame(&frames, 0);
-        assert_eq!(header.kind, MemberKind::HardLink);
-        assert_eq!(header.payload_size, 3);
-        let data = data_frame(&frames, 1);
-        assert_eq!(data.len, 3);
+            let frames = collect(bytes, BLOCK_SIZE);
+            let header = header_frame(&frames, header_index);
+            assert_eq!(header.format, ArchiveFormat::Pax, "{case}");
+            assert_eq!(header.kind, MemberKind::HardLink, "{case}");
+            assert_eq!(header.declared_size, declared_size, "{case}");
+            assert_eq!(header.effective_size, 3, "{case}");
+            assert_eq!(header.payload_size, 3, "{case}");
+            assert_eq!(data_frame(&frames, data_index).len, 3, "{case}");
+        }
     }
 
     #[test]

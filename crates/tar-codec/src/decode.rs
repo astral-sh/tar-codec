@@ -108,10 +108,11 @@ impl DecodePolicy {
 
     /// Configures whether hard-link members may be extracted.
     ///
-    /// When enabled, pax `linkdata` payloads may update the contents of an
-    /// earlier extracted file through its shared inode. Hard-link headers with
-    /// modes different from their targets are accepted without changing the
-    /// shared inode mode.
+    /// The pax format permits hard-link bodies but carries no marker recording
+    /// why a body was included, so enabling hard links permits every nonzero
+    /// effective payload to update the contents of an earlier extracted file
+    /// through its shared inode. Hard-link headers with modes different from
+    /// their targets are accepted without changing the shared inode mode.
     pub fn allow_hard_links(mut self, allow: bool) -> Self {
         self.allow_hard_links = allow;
         self

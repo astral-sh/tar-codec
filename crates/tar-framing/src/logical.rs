@@ -59,6 +59,10 @@ pub struct Header<'a> {
     /// The size after applying applicable pax `size` records.
     pub effective_size: u64,
     /// The number of payload bytes exposed through [`MemberPayload`].
+    ///
+    /// For pax hard links, the physical size may be nonzero and an applicable
+    /// pax `size` record may override it. Every nonzero effective size is
+    /// treated as payload because the format carries no separate marker.
     pub payload_size: u64,
     mode: [u8; 8],
     header_path: &'a [u8],
