@@ -57,6 +57,15 @@ It owns:
 It relies on `tar-framing` for structural validity and effective payload
 sizing; it does not re-parse the tar wire format.
 
+The pax format permits hard-link data blocks, including those required by its
+`linkdata` option, but does not record why a particular hard-link body was
+included. Its physical size field may be nonzero, and an applicable pax `size`
+record overrides that field. `tar-framing` must therefore treat every nonzero
+effective pax hard-link size as payload to preserve framing. `tar-codec` owns
+the trust decision: extraction rejects all hard links by default, and enabling
+them also permits those indistinguishable payloads to update an earlier
+extracted target.
+
 The filesystem extraction implementation and its private support types are
 isolated in `decode/extract.rs`. The implementation logic is kept under a
 550-line budget; policy, path decoding, and error APIs remain in `decode.rs`.

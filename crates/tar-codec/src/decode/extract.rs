@@ -1541,14 +1541,28 @@ mod tests {
         assert!(!symlink_dest.join("link").exists());
 
         let hard_link_dest = temp.path().join("hard-link");
-        let hard_link = single_posix_member_archive("link", b'1', b"", "missing", 0o644);
+        let mut hard_link = Vec::new();
+        append_posix_member(&mut hard_link, "target", b'0', b"keep", "", 0o644);
+        append_posix_member(
+            &mut hard_link,
+            "link",
+            b'1',
+            b"untrusted linkdata",
+            "target",
+            0o644,
+        );
+        finish(&mut hard_link);
         assert!(matches!(
             extract(hard_link, &hard_link_dest).await.unwrap_err(),
             DecodeError::PolicyViolation {
-                position: 0,
+                position: 1024,
                 violation: DecodePolicyViolation::HardLink,
             }
         ));
+        assert_eq!(
+            std::fs::read_to_string(hard_link_dest.join("target")).unwrap(),
+            "keep"
+        );
         assert!(!hard_link_dest.join("link").exists());
     }
 
@@ -1803,6 +1817,35 @@ mod tests {
             "contents"
         );
         assert!(!dest.join("old").exists());
+    }
+
+    #[tokio::test]
+    async fn global_path_deletion_suppresses_the_physical_header_path_when_enabled() {
+        let temp = tempdir().unwrap();
+        let dest = temp.path().join("out");
+        let mut bytes = Vec::new();
+        append_pax(&mut bytes, b'g', &record("path", ""));
+        append_posix_member(&mut bytes, "physical", b'0', b"", "", 0o644);
+        finish(&mut bytes);
+
+        assert!(matches!(
+            extract_with_policy(
+                bytes,
+                &dest,
+                DecodePolicy::default().pax_policy(
+                    PaxDecodePolicy::default()
+                        .allow_global_pax_extensions(true)
+                        .allow_global_pax_member_metadata(true),
+                ),
+            )
+            .await
+            .unwrap_err(),
+            DecodeError::Framing(FrameError {
+                inner: FrameErrorInner::DeletedPaxMetadata { keyword: "path" },
+                ..
+            })
+        ));
+        assert!(!dest.join("physical").exists());
     }
 
     #[tokio::test]
