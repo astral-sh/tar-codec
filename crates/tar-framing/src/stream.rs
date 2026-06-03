@@ -240,7 +240,6 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         buffer: &mut Vec<u8>,
         target_len: usize,
     ) -> Result<usize, FrameError> {
-        buffer.clear();
         let remaining = match &self.state {
             State::ReadingMember { remaining } => *remaining,
             _ => {
@@ -283,7 +282,12 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             FrameError::arithmetic_overflow(self.position, "member payload chunk meaningful length")
         })?;
 
-        buffer.resize(physical_len, 0);
+        // Reuse initialized bytes so repeated chunks do not zero-fill storage
+        // immediately before the reader overwrites it.
+        if buffer.len() != physical_len {
+            buffer.clear();
+            buffer.resize(physical_len, 0);
+        }
         let start_position = self.position;
         let mut filled = 0;
         while filled < physical_len {

@@ -393,12 +393,13 @@ impl<R: AsyncRead + Unpin> MemberPayload<'_, R> {
 
     /// Reads validated payload bytes into a reusable chunk buffer.
     ///
-    /// The buffer is cleared first. Complete physical blocks are read directly
-    /// into it until the chunk contains at least `target_len` bytes or the
-    /// payload ends. The target is raised to one physical block when it is
-    /// smaller, and final-block padding is removed before this returns. This
-    /// preserves [`Self::next_block`] as the lossless interface while allowing
-    /// higher-level consumers to amortize per-block bookkeeping and copies.
+    /// On success, the buffer's existing contents are replaced. Complete
+    /// physical blocks are read directly into it until the chunk contains at
+    /// least `target_len` bytes or the payload ends. The target is raised to one
+    /// physical block when it is smaller, and final-block padding is removed
+    /// before this returns. This preserves [`Self::next_block`] as the lossless
+    /// interface while allowing higher-level consumers to amortize per-block
+    /// bookkeeping and copies.
     pub async fn next_chunk(
         &mut self,
         buffer: &mut Vec<u8>,
@@ -407,7 +408,7 @@ impl<R: AsyncRead + Unpin> MemberPayload<'_, R> {
         self.reader.next_payload_chunk(buffer, target_len).await
     }
 
-    /// Discards and validates all remaining payload bytes for this member.
+    /// Discards and validates all remaining payload bytes using reusable storage.
     pub async fn skip(self) -> Result<(), FrameError> {
         self.reader.drain_payload().await
     }
@@ -721,7 +722,7 @@ mod tests {
         ready_ok(async {
             let mut reader = TarReader::new(ChunkedReader::new(bytes, 17));
             let mut member = next_member(&mut reader).await?;
-            let mut chunk = Vec::with_capacity(BLOCK_SIZE * 2);
+            let mut chunk = vec![b'x'; BLOCK_SIZE * 2];
             assert!(
                 member
                     .payload
