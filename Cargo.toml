@@ -19,6 +19,7 @@ async-compression = { version = "0.4", features = ["gzip", "tokio"] }
 astral-tokio-tar = "0.6.2"
 clap = "4.6"
 criterion = { version = "0.8.2", features = ["async_tokio"] }
+memchr = "2.8"
 tar = "0.4.46"
 tempfile = "3"
 thiserror = "2"

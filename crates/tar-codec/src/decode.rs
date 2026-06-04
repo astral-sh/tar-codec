@@ -653,21 +653,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_windows_drive_prefixes_during_path_normalization() {
+    fn rejects_nonportable_paths_during_legalization() {
         let path = LegalizedPath::from_string("tests/snippets/ballon:main.py".to_owned())
             .and_then(LegalizedPath::normalize)
             .expect("ordinary colon should be accepted");
         assert_eq!(path.as_str(), "tests/snippets/ballon:main.py");
-        for value in ["C:", "C:/escape", "nested/C:/escape"] {
+        for (value, reason) in [
+            ("C:", "contains a platform path prefix"),
+            ("C:/escape", "contains a platform path prefix"),
+            ("nested/C:/escape", "contains a platform path prefix"),
+            (
+                "nested/\u{1f}",
+                "contains an unacceptable character (NUL, ASCII control, or backslash)",
+            ),
+            ("nested/CON.txt", "contains a Windows reserved name"),
+        ] {
             let result = LegalizedPath::from_string(value.to_owned())
                 .and_then(LegalizedPath::normalize)
                 .map_err(|error| path_error(0, "member path", error));
             assert!(matches!(
                 result,
                 Err(DecodeError::UnsafePath {
-                    reason: "contains a platform path prefix",
+                    reason: actual_reason,
                     ..
-                })
+                }) if actual_reason == reason
             ));
         }
     }

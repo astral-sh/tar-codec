@@ -686,6 +686,9 @@ mod tests {
             "a/../../escape",
             "/absolute",
             "C:/ambiguous",
+            "control\u{1f}",
+            "nested/CON.txt",
+            "nested/lpt9.log",
             "trailing/",
         ] {
             assert!(

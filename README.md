@@ -13,10 +13,12 @@ Anti-goals:
 - Decoding support for legacy (pre-ustar) archives
 - Decoding archives that mix POSIX pax/ustar and GNU framing in one stream, for now
 
-Encoder paths must be portable UTF-8 relative paths. Safe non-canonical inputs
-such as `a/./b` or `a/x/../b` are normalized before collision checks and
-framing; paths that escape the archive root or end in a directory separator
-are rejected.
+Archive member paths must be portable UTF-8 relative paths. Safe non-canonical
+encoder inputs such as `a/./b` or `a/x/../b` are normalized before collision
+checks and framing; paths that escape the archive root or end in a directory
+separator are rejected. Encoding and extraction also reject ASCII control
+characters and Windows-reserved device components such as `CON`, `NUL.txt`,
+and `LPT1`.
 
 ## Performance
 

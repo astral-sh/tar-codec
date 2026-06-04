@@ -2,8 +2,11 @@
 
 use std::{
     borrow::{Borrow, Cow},
+    mem::size_of,
     path::{Path, PathBuf},
 };
+
+use memchr::memchr3;
 
 /// A UTF-8 archive path whose bytes are safe to interpret portably.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,27 +52,38 @@ impl LegalizedPath {
 
     /// Legalizes an owned UTF-8 archive path.
     pub(crate) fn from_string(value: String) -> Result<Self, PathError> {
-        let contains_nul = value.contains('\0');
-        let contains_backslash = value.contains('\\');
+        if value.is_empty() {
+            return Ok(Self {
+                value,
+                normalized: true,
+            });
+        }
+        if contains_unsafe_ascii(value.as_bytes()) {
+            return Err(PathError::Unsafe {
+                value,
+                reason: "contains an unacceptable character (NUL, ASCII control, or backslash)",
+            });
+        }
         let mut contains_platform_prefix = false;
+        let mut contains_windows_reserved_name = false;
         let mut normalized = true;
-        if !value.is_empty() {
-            for component in value.as_bytes().split(|byte| *byte == b'/') {
-                contains_platform_prefix |= component.len() >= 2
-                    && component[0].is_ascii_alphabetic()
-                    && component[1] == b':';
-                normalized &= !matches!(component, [] | [b'.'] | [b'.', b'.']);
+        for component in value.as_bytes().split(|byte| *byte == b'/') {
+            contains_platform_prefix |=
+                component.len() >= 2 && component[0].is_ascii_alphabetic() && component[1] == b':';
+            if component.first().is_some_and(|byte| {
+                matches!(byte.to_ascii_uppercase(), b'A' | b'C' | b'L' | b'N' | b'P')
+            }) {
+                contains_windows_reserved_name |= is_windows_reserved_component(component);
             }
+            normalized &= !matches!(component, [] | [b'.'] | [b'.', b'.']);
         }
 
-        let reason = if contains_nul {
-            Some("contains a NUL byte")
-        } else if contains_backslash {
-            Some("contains a backslash separator")
-        } else if value.starts_with('/') {
+        let reason = if value.starts_with('/') {
             Some("is absolute")
         } else if contains_platform_prefix {
             Some("contains a platform path prefix")
+        } else if contains_windows_reserved_name {
+            Some("contains a Windows reserved name")
         } else {
             None
         };
@@ -123,6 +137,63 @@ impl LegalizedPath {
         };
         normalize_in_place(&mut value)?;
         Ok(NormalizedPath(value))
+    }
+}
+
+fn contains_unsafe_ascii(bytes: &[u8]) -> bool {
+    const ONES: u64 = u64::MAX / u8::MAX as u64;
+    const HIGHS: u64 = ONES * 0x80;
+
+    if memchr3(b'\0', b'\\', 0x7f, bytes).is_some() {
+        return true;
+    }
+    let mut chunks = bytes.chunks_exact(size_of::<u64>());
+    for chunk in &mut chunks {
+        let Ok(chunk) = <&[u8; size_of::<u64>()]>::try_from(chunk) else {
+            continue;
+        };
+        let word = u64::from_ne_bytes(*chunk);
+        if has_byte_below(word, 0x20, ONES, HIGHS) {
+            return true;
+        }
+    }
+    chunks
+        .remainder()
+        .iter()
+        .any(|byte| byte.is_ascii_control() || *byte == b'\\')
+}
+
+fn has_byte_below(value: u64, limit: u8, ones: u64, highs: u64) -> bool {
+    // Detect a high borrow bit independently in each packed byte lane.
+    value.wrapping_sub(ones * u64::from(limit)) & !value & highs != 0
+}
+
+fn is_windows_reserved_component(component: &[u8]) -> bool {
+    let [first, second, third, suffix @ ..] = component else {
+        return false;
+    };
+    let prefix = (
+        first.to_ascii_uppercase(),
+        second.to_ascii_uppercase(),
+        third.to_ascii_uppercase(),
+    );
+    if matches!(
+        prefix,
+        (b'C', b'O', b'N') | (b'P', b'R', b'N') | (b'A', b'U', b'X') | (b'N', b'U', b'L')
+    ) {
+        return suffix.first().is_none_or(|byte| *byte == b'.');
+    }
+    if !matches!(prefix, (b'C', b'O', b'M') | (b'L', b'P', b'T')) {
+        return false;
+    }
+    match suffix {
+        [digit, extension @ ..] if matches!(*digit, b'1'..=b'9') => {
+            extension.first().is_none_or(|byte| *byte == b'.')
+        }
+        [0xc2, digit, extension @ ..] if matches!(*digit, 0xb9 | 0xb2 | 0xb3) => {
+            extension.first().is_none_or(|byte| *byte == b'.')
+        }
+        _ => false,
     }
 }
 
@@ -298,11 +369,35 @@ mod tests {
     #[test]
     fn rejects_unsafe_paths() {
         for (value, reason) in [
-            ("\0", "contains a NUL byte"),
-            ("a\\b", "contains a backslash separator"),
+            (
+                "\0",
+                "contains an unacceptable character (NUL, ASCII control, or backslash)",
+            ),
+            (
+                "\t",
+                "contains an unacceptable character (NUL, ASCII control, or backslash)",
+            ),
+            (
+                "\u{7f}",
+                "contains an unacceptable character (NUL, ASCII control, or backslash)",
+            ),
+            (
+                "a\\b",
+                "contains an unacceptable character (NUL, ASCII control, or backslash)",
+            ),
             ("/a", "is absolute"),
             ("C:/a", "contains a platform path prefix"),
             ("a/C:/b", "contains a platform path prefix"),
+            ("CON", "contains a Windows reserved name"),
+            ("nested/prn.txt", "contains a Windows reserved name"),
+            ("AUX.tar.gz", "contains a Windows reserved name"),
+            ("nul", "contains a Windows reserved name"),
+            ("COM1", "contains a Windows reserved name"),
+            ("com9.txt", "contains a Windows reserved name"),
+            ("LPT1", "contains a Windows reserved name"),
+            ("lpt9.log", "contains a Windows reserved name"),
+            ("COM¹", "contains a Windows reserved name"),
+            ("lpt³.txt", "contains a Windows reserved name"),
             ("../a", "escapes the destination root"),
             ("a/../../b", "escapes the destination root"),
         ] {
@@ -314,6 +409,37 @@ mod tests {
                 }),
                 "{value}"
             );
+        }
+    }
+
+    #[test]
+    fn accepts_non_reserved_windows_name_prefixes() {
+        for value in [
+            "console",
+            "printer",
+            "auxiliary",
+            "null",
+            "COM0",
+            "COM10",
+            "LPT0",
+            "LPT10",
+            ".CON",
+            "name.CON",
+        ] {
+            assert_eq!(normalize(value), Ok(value.to_owned()), "{value}");
+        }
+    }
+
+    #[test]
+    fn unsafe_ascii_scan_matches_scalar_classification() {
+        for first in u8::MIN..=u8::MAX {
+            for second in u8::MIN..=u8::MAX {
+                let bytes = [b'a', b'b', b'c', first, second, b'x', b'y', b'z'];
+                let expected = bytes
+                    .iter()
+                    .any(|byte| byte.is_ascii_control() || *byte == b'\\');
+                assert_eq!(contains_unsafe_ascii(&bytes), expected, "{bytes:?}");
+            }
         }
     }
 

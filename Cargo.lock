@@ -843,6 +843,7 @@ version = "0.1.0"
 dependencies = [
  "astral-tokio-tar",
  "criterion",
+ "memchr",
  "tar",
  "tar-framing",
  "tempfile",

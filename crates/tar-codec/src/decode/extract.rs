@@ -909,6 +909,24 @@ mod tests {
                 b'0',
                 (|error| matches!(error, DecodeError::UnsafePath { .. })) as DecodeErrorMatcher,
             ),
+            ("ASCII control", "control\u{1f}", b'0', |error| {
+                matches!(
+                    error,
+                    DecodeError::UnsafePath {
+                        reason: "contains an unacceptable character (NUL, ASCII control, or backslash)",
+                        ..
+                    }
+                )
+            }),
+            ("Windows reserved name", "nested/CON.txt", b'0', |error| {
+                matches!(
+                    error,
+                    DecodeError::UnsafePath {
+                        reason: "contains a Windows reserved name",
+                        ..
+                    }
+                )
+            }),
             ("path collision", "occupied", b'0', |error| {
                 matches!(error, DecodeError::PathCollision { .. })
             }),
