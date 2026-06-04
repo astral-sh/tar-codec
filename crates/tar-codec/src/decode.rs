@@ -4,13 +4,10 @@
 //! archive contents beneath a validated destination root. Decompression is
 //! the caller's responsibility. Extraction requires a [`DecodePolicy`] so
 //! that security-sensitive archive features are explicit at each call site.
+//! Effective member and link bytes are legalized and normalized before they
+//! enter extraction state.
 
-use std::{
-    borrow::Cow,
-    collections::HashSet,
-    io,
-    path::{Component, Path, PathBuf},
-};
+use std::{borrow::Cow, collections::HashSet, io, path::PathBuf};
 
 use tar_framing::{
     ArchiveFormat, FrameError, MemberKind, PaxKind, PaxRecord,
@@ -19,7 +16,7 @@ use tar_framing::{
 use thiserror::Error;
 use tokio::io::AsyncRead;
 
-use crate::has_windows_prefix;
+use crate::paths::{LegalizedPath, NormalizedPath, PathError};
 
 mod extract;
 
@@ -497,20 +494,41 @@ impl DecodeError {
 #[derive(Debug)]
 struct DecodedMember {
     position: u64,
-    path: PathBuf,
+    path: NormalizedPath,
     kind: MemberKind,
-    link_target: String,
+    link_target: Option<DecodedLinkTarget>,
     executable: bool,
     payload_size: u64,
+}
+
+#[derive(Debug)]
+struct DecodedLinkTarget {
+    path: NormalizedPath,
+    text: String,
+}
+
+impl DecodedMember {
+    fn link_target(&self) -> Result<&DecodedLinkTarget, DecodeError> {
+        self.link_target
+            .as_ref()
+            .ok_or(DecodeError::InvalidFrameSequence {
+                reason: "link member is missing its decoded target",
+            })
+    }
 }
 
 fn decode_member<R>(frame: &MemberFrame<'_, R>) -> Result<DecodedMember, DecodeError> {
     let header = &frame.header;
     let mode = header.mode()?;
     let executable = mode & 0o111 != 0;
-    let path = resolved_text(header.position, "path", frame.effective_path()?)?;
-    let path = normalize_member_path(header.position, &path)?;
-    if path.as_os_str().is_empty() && header.kind != MemberKind::Directory {
+    let path = legalized_path(
+        header.position,
+        "path",
+        "member path",
+        frame.effective_path()?,
+    )?;
+    let path = normalized_path(header.position, "member path", path)?;
+    if path.is_empty() && header.kind != MemberKind::Directory {
         return Err(DecodeError::unsafe_path(
             header.position,
             "member path",
@@ -519,18 +537,35 @@ fn decode_member<R>(frame: &MemberFrame<'_, R>) -> Result<DecodedMember, DecodeE
         ));
     }
     let link_target = if matches!(header.kind, MemberKind::HardLink | MemberKind::SymbolicLink) {
-        let target = resolved_text(header.position, "linkpath", frame.effective_link_path()?)?;
-        if target.is_empty() {
+        let context = if header.kind == MemberKind::SymbolicLink {
+            "symbolic-link target"
+        } else {
+            "hard-link target"
+        };
+        let target = legalized_path(
+            header.position,
+            "linkpath",
+            context,
+            frame.effective_link_path()?,
+        )?;
+        if target.as_str().is_empty() {
             return Err(DecodeError::invalid_link(
                 header.position,
-                path,
-                target,
+                path.to_path_buf(),
+                String::new(),
                 "link target is empty",
             ));
         }
-        target
+        let text = target.as_str().to_owned();
+        let target = if header.kind == MemberKind::SymbolicLink {
+            path.resolve_from_parent(target)
+        } else {
+            target.normalize()
+        };
+        let target = target.map_err(|error| path_error(header.position, context, error))?;
+        Some(DecodedLinkTarget { path: target, text })
     } else {
-        String::new()
+        None
     };
 
     Ok(DecodedMember {
@@ -543,102 +578,58 @@ fn decode_member<R>(frame: &MemberFrame<'_, R>) -> Result<DecodedMember, DecodeE
     })
 }
 
-fn resolved_text(
+fn legalized_path(
     position: u64,
     keyword: &'static str,
+    context: &'static str,
     value: Cow<'_, [u8]>,
-) -> Result<String, DecodeError> {
-    std::str::from_utf8(value.as_ref())
-        .map(str::to_owned)
-        .map_err(|_| DecodeError::InvalidUtf8 {
+) -> Result<LegalizedPath, DecodeError> {
+    LegalizedPath::from_bytes(value).map_err(|error| match error {
+        PathError::InvalidUtf8 => DecodeError::InvalidUtf8 {
             position,
             field: keyword,
-        })
+        },
+        PathError::Unsafe { value, reason } => {
+            DecodeError::unsafe_path(position, context, &value, reason)
+        }
+    })
 }
 
-fn normalize_member_path(position: u64, value: &str) -> Result<PathBuf, DecodeError> {
-    normalize_path(position, "member path", value, &[])
-}
-
-fn normalize_symlink_target(
-    position: u64,
-    path: &Path,
-    value: &str,
-) -> Result<PathBuf, DecodeError> {
-    let base = path.parent().map(path_components).unwrap_or_default();
-    normalize_path(position, "symbolic-link target", value, &base)
-}
-
-fn normalize_path(
+fn normalized_path(
     position: u64,
     context: &'static str,
-    value: &str,
-    base: &[String],
-) -> Result<PathBuf, DecodeError> {
-    if value.contains('\0') {
-        return Err(DecodeError::unsafe_path(
+    path: LegalizedPath,
+) -> Result<NormalizedPath, DecodeError> {
+    path.normalize()
+        .map_err(|error| path_error(position, context, error))
+}
+
+fn path_error(position: u64, context: &'static str, error: PathError) -> DecodeError {
+    match error {
+        PathError::InvalidUtf8 => DecodeError::InvalidUtf8 {
             position,
-            context,
-            value,
-            "contains a NUL byte",
-        ));
-    }
-    if value.contains('\\') {
-        return Err(DecodeError::unsafe_path(
-            position,
-            context,
-            value,
-            "contains a backslash separator",
-        ));
-    }
-    if value.starts_with('/') {
-        return Err(DecodeError::unsafe_path(
-            position,
-            context,
-            value,
-            "is absolute",
-        ));
-    }
-    let mut components = base.to_vec();
-    for component in value.split('/') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                if components.pop().is_none() {
-                    return Err(DecodeError::unsafe_path(
-                        position,
-                        context,
-                        value,
-                        "escapes the destination root",
-                    ));
-                }
-            }
-            component if has_windows_prefix(component) => {
-                return Err(DecodeError::unsafe_path(
-                    position,
-                    context,
-                    value,
-                    "contains a platform path prefix",
-                ));
-            }
-            component => components.push(component.to_owned()),
+            field: context,
+        },
+        PathError::Unsafe { value, reason } => {
+            DecodeError::unsafe_path(position, context, &value, reason)
         }
     }
-    Ok(components.iter().collect())
 }
 
-fn path_components(path: &Path) -> Vec<String> {
-    path.components()
-        .filter_map(|component| match component {
-            Component::Normal(component) => Some(component.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect()
-}
-
-fn relative_link_contents(link: &Path, target: &Path) -> PathBuf {
-    let from = link.parent().map(path_components).unwrap_or_default();
-    let to = path_components(target);
+fn relative_link_contents(link: &NormalizedPath, target: &NormalizedPath) -> PathBuf {
+    let parent = link
+        .as_str()
+        .rfind('/')
+        .map_or("", |separator| &link.as_str()[..separator]);
+    let from: Vec<_> = parent
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect();
+    let to: Vec<_> = target
+        .as_str()
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect();
     let common = from
         .iter()
         .zip(&to)
@@ -663,13 +654,16 @@ mod tests {
 
     #[test]
     fn rejects_windows_drive_prefixes_during_path_normalization() {
-        assert_eq!(
-            normalize_member_path(0, "tests/snippets/ballon:main.py").unwrap(),
-            PathBuf::from("tests/snippets/ballon:main.py")
-        );
+        let path = LegalizedPath::from_string("tests/snippets/ballon:main.py".to_owned())
+            .and_then(LegalizedPath::normalize)
+            .expect("ordinary colon should be accepted");
+        assert_eq!(path.as_str(), "tests/snippets/ballon:main.py");
         for value in ["C:", "C:/escape", "nested/C:/escape"] {
+            let result = LegalizedPath::from_string(value.to_owned())
+                .and_then(LegalizedPath::normalize)
+                .map_err(|error| path_error(0, "member path", error));
             assert!(matches!(
-                normalize_member_path(0, value),
+                result,
                 Err(DecodeError::UnsafePath {
                     reason: "contains a platform path prefix",
                     ..

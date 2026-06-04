@@ -2,6 +2,8 @@
 //!
 //! The encoder emits one local pax header before every member. Compression is
 //! intentionally left to callers, which may wrap the underlying async writer.
+//! Safe non-canonical archive paths are normalized before collision checks and
+//! framing.
 
 mod traversal;
 
@@ -24,7 +26,10 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use self::traversal::{TraversalEntry, TraversalKind, TraversalStream, stream_directory_entries};
-use crate::{blocking::with_reusable_buffer, has_windows_prefix};
+use crate::{
+    blocking::with_reusable_buffer,
+    paths::{LegalizedPath, NormalizedPath, PathError},
+};
 
 const SOURCE_FILE_CHUNK_BYTES: usize = 1024 * 1024;
 
@@ -46,7 +51,7 @@ impl EntryMetadata {
 pub struct Encoder<W> {
     writer: W,
     sequence: u64,
-    entries: HashMap<String, ArchivedEntry>,
+    entries: HashMap<NormalizedPath, ArchivedEntry>,
     framing_buffer: Vec<u8>,
     poisoned: bool,
 }
@@ -83,7 +88,7 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
         let size = u64::try_from(data.len())
             .map_err(|_| arithmetic_overflow("manual entry payload size"))?;
         self.write_member(PaxMember {
-            path: &path,
+            path: path.as_str(),
             kind: MemberKind::Regular,
             size,
             link_path: None,
@@ -148,7 +153,7 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
                             ArchivedEntry::Directory { explicit: true },
                         )?;
                         self.write_member(PaxMember {
-                            path: &entry.archive_path,
+                            path: entry.archive_path.as_str(),
                             kind: MemberKind::Directory,
                             size: 0,
                             link_path: None,
@@ -172,7 +177,7 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
                             ArchivedEntry::SymbolicLink,
                         )?;
                         self.write_member(PaxMember {
-                            path: &entry.archive_path,
+                            path: entry.archive_path.as_str(),
                             kind: MemberKind::SymbolicLink,
                             size: 0,
                             link_path: Some(&target),
@@ -197,7 +202,7 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
         let file = result?;
         let (size, executable) = file.metadata();
         self.write_member(PaxMember {
-            path: &entry.archive_path,
+            path: entry.archive_path.as_str(),
             kind: MemberKind::Regular,
             size,
             link_path: None,
@@ -427,7 +432,7 @@ enum ArchivedEntry {
 
 #[derive(Debug)]
 struct DirectoryTraversal {
-    entries: HashMap<String, ArchivedEntry>,
+    entries: HashMap<NormalizedPath, ArchivedEntry>,
     buffer: Vec<u8>,
 }
 
@@ -444,12 +449,12 @@ enum PreparedSourceFile {
 }
 
 fn reserve_entry(
-    entries: &mut HashMap<String, ArchivedEntry>,
-    path: &str,
+    entries: &mut HashMap<NormalizedPath, ArchivedEntry>,
+    path: &NormalizedPath,
     entry: ArchivedEntry,
 ) -> Result<(), EncodeError> {
-    for (separator, _) in path.match_indices('/') {
-        let ancestor = &path[..separator];
+    for (separator, _) in path.as_str().match_indices('/') {
+        let ancestor = &path.as_str()[..separator];
         match entries.get(ancestor) {
             Some(ArchivedEntry::Directory { .. }) => {}
             Some(_) => {
@@ -457,76 +462,74 @@ fn reserve_entry(
             }
             None => {
                 entries.insert(
-                    ancestor.to_owned(),
+                    path.prefix(separator),
                     ArchivedEntry::Directory { explicit: false },
                 );
             }
         }
     }
-    match (entries.get_mut(path), entry) {
+    match (entries.get_mut(path.as_str()), entry) {
         (Some(ArchivedEntry::Directory { explicit: false }), ArchivedEntry::Directory { .. }) => {
-            entries.insert(path.to_owned(), ArchivedEntry::Directory { explicit: true });
+            entries.insert(path.clone(), ArchivedEntry::Directory { explicit: true });
         }
         (Some(_), _) => {
-            return Err(path_collision(path));
+            return Err(path_collision(path.as_str()));
         }
         (None, entry) => {
-            entries.insert(path.to_owned(), entry);
+            entries.insert(path.clone(), entry);
         }
     }
     Ok(())
 }
 
 fn preflight_regular_entry(
-    entries: &HashMap<String, ArchivedEntry>,
-    path: &str,
-) -> Result<Vec<String>, EncodeError> {
+    entries: &HashMap<NormalizedPath, ArchivedEntry>,
+    path: &NormalizedPath,
+) -> Result<Vec<NormalizedPath>, EncodeError> {
     let mut implicit_ancestors = Vec::new();
-    for (separator, _) in path.match_indices('/') {
-        let ancestor = &path[..separator];
+    for (separator, _) in path.as_str().match_indices('/') {
+        let ancestor = &path.as_str()[..separator];
         match entries.get(ancestor) {
             Some(ArchivedEntry::Directory { .. }) => {}
             Some(_) => {
                 return Err(path_collision(ancestor));
             }
-            None => implicit_ancestors.push(ancestor.to_owned()),
+            None => implicit_ancestors.push(path.prefix(separator)),
         }
     }
-    if entries.contains_key(path) {
-        return Err(path_collision(path));
+    if entries.contains_key(path.as_str()) {
+        return Err(path_collision(path.as_str()));
     }
     Ok(implicit_ancestors)
 }
 
-pub(crate) fn normalize_archive_path(path: &Path) -> Result<String, EncodeError> {
-    validate_archive_path(path)
-        .map(str::to_owned)
-        .map_err(|reason| EncodeError::InvalidArchivePath {
-            path: path.to_path_buf(),
-            reason,
-        })
+pub(crate) fn normalize_archive_path(path: &Path) -> Result<NormalizedPath, EncodeError> {
+    let invalid = |reason| invalid_archive_path(path, reason);
+    let legalized = LegalizedPath::from_path(path).map_err(|error| match error {
+        PathError::InvalidUtf8 => invalid("path is not valid UTF-8"),
+        PathError::Unsafe { reason, .. } => invalid(reason),
+    })?;
+    if legalized.as_str().is_empty() {
+        return Err(invalid("path is empty"));
+    }
+    if legalized.as_str().ends_with('/') {
+        return Err(invalid("path has a trailing separator"));
+    }
+    let normalized = legalized.normalize().map_err(|error| match error {
+        PathError::InvalidUtf8 => invalid("path is not valid UTF-8"),
+        PathError::Unsafe { reason, .. } => invalid(reason),
+    })?;
+    if normalized.is_empty() {
+        return Err(invalid("path normalizes to empty"));
+    }
+    Ok(normalized)
 }
 
-fn validate_archive_path(path: &Path) -> Result<&str, &'static str> {
-    let Some(path) = path.to_str() else {
-        return Err("path is not valid UTF-8");
-    };
-    if path.is_empty() {
-        return Err("path is empty");
+fn invalid_archive_path(path: &Path, reason: &'static str) -> EncodeError {
+    EncodeError::InvalidArchivePath {
+        path: path.to_path_buf(),
+        reason,
     }
-    if Path::new(path).is_absolute() || has_windows_prefix(path) {
-        return Err("path is absolute");
-    }
-    if path.contains('\0') || path.contains('\\') {
-        return Err("path contains an ambiguous separator or NUL byte");
-    }
-    if path
-        .split('/')
-        .any(|component| matches!(component, "" | "." | ".."))
-    {
-        return Err("path contains an empty, current, or parent component");
-    }
-    Ok(path)
 }
 
 fn filesystem_error(operation: &'static str, path: &Path, source: io::Error) -> EncodeError {
@@ -675,7 +678,16 @@ mod tests {
     #[tokio::test]
     async fn rejects_invalid_manual_paths_and_collisions_without_poisoning() {
         let mut encoder = Encoder::new(Vec::new());
-        for path in ["/absolute", "C:/ambiguous"] {
+        for path in [
+            "",
+            ".",
+            "a/..",
+            "../escape",
+            "a/../../escape",
+            "/absolute",
+            "C:/ambiguous",
+            "trailing/",
+        ] {
             assert!(
                 matches!(
                     encoder.add_entry(path, b"", EntryMetadata::default()).await,
@@ -715,6 +727,35 @@ mod tests {
             Some(ArchivedEntry::Regular)
         ));
         encoder.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn canonicalizes_manual_paths_before_framing_and_collision_checks() {
+        let temp = tempdir().unwrap();
+        let dest = temp.path().join("out");
+        let mut encoder = Encoder::new(Vec::new());
+        encoder
+            .add_entry(
+                "dir/./nested/../file",
+                b"contents",
+                EntryMetadata::default(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            encoder.entries.get("dir/file"),
+            Some(ArchivedEntry::Regular)
+        ));
+        assert!(matches!(
+            encoder
+                .add_entry("dir//file", b"duplicate", EntryMetadata::default())
+                .await,
+            Err(EncodeError::PathCollision { path }) if path == "dir/file"
+        ));
+
+        let bytes = encoder.finish().await.unwrap();
+        extract_archive(bytes, &dest).await.unwrap();
+        assert_eq!(std::fs::read(dest.join("dir/file")).unwrap(), b"contents");
     }
 
     #[tokio::test]

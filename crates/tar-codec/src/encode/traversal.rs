@@ -23,7 +23,7 @@ use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinHandle};
 use walkdir::{DirEntry, WalkDir};
 
-use super::validate_archive_path;
+use crate::paths::{LegalizedPath, NormalizedPath, PathError};
 
 /// Number of filesystem entries grouped into one producer batch.
 ///
@@ -41,7 +41,7 @@ pub(crate) struct TraversalEntry {
     /// Source path used when opening regular files or reporting errors.
     pub(crate) source: PathBuf,
     /// Normalized archive path beneath the recursive root basename.
-    pub(crate) archive_path: String,
+    pub(crate) archive_path: NormalizedPath,
     /// Supported filesystem kind and any kind-specific traversal metadata.
     pub(crate) kind: TraversalKind,
 }
@@ -152,18 +152,18 @@ pub(crate) fn stream_directory_entries(source: PathBuf) -> Result<TraversalStrea
     })
 }
 
-fn source_archive_path(source: &Path) -> Result<String, TraversalError> {
+fn source_archive_path(source: &Path) -> Result<NormalizedPath, TraversalError> {
     let Some(name) = source.file_name().and_then(|name| name.to_str()) else {
         return Err(TraversalError::NonUtf8SourcePath {
             path: source.to_path_buf(),
         });
     };
-    Ok(validate_traversal_archive_path(Path::new(name))?.to_owned())
+    validate_traversal_archive_path(Path::new(name))
 }
 
 fn stream_directory_entries_blocking(
     source: &Path,
-    archive_path: &str,
+    archive_path: &NormalizedPath,
     output: &mut TraversalSender,
 ) -> Result<(), TraversalError> {
     let entries = WalkDir::new(source)
@@ -217,7 +217,7 @@ impl TraversalSender {
 /// deliberately left to archive consumers.
 fn traversal_entry(
     source: &Path,
-    archive_path: &str,
+    archive_path: &NormalizedPath,
     entry: DirEntry,
 ) -> Result<TraversalEntry, TraversalError> {
     let path = entry.path();
@@ -234,7 +234,7 @@ fn traversal_entry(
             reason: "source entry is outside recursive root",
         })?;
     let archive_path = if relative.as_os_str().is_empty() {
-        archive_path.to_owned()
+        archive_path.clone()
     } else {
         join_normalized_archive_path(archive_path, relative, path)?
     };
@@ -264,11 +264,11 @@ fn traversal_entry(
 }
 
 fn join_normalized_archive_path(
-    archive_path: &str,
+    archive_path: &NormalizedPath,
     relative: &Path,
     source_path: &Path,
-) -> Result<String, TraversalError> {
-    let mut joined = archive_path.to_owned();
+) -> Result<NormalizedPath, TraversalError> {
+    let mut joined = archive_path.as_str().to_owned();
     for component in relative {
         let Some(component) = component.to_str() else {
             return Err(TraversalError::NonUtf8SourcePath {
@@ -278,15 +278,42 @@ fn join_normalized_archive_path(
         joined.push('/');
         joined.push_str(component);
     }
-    validate_traversal_archive_path(Path::new(&joined))?;
-    Ok(joined)
+    normalize_traversal_archive_path(joined)
 }
 
-fn validate_traversal_archive_path(path: &Path) -> Result<&str, TraversalError> {
-    validate_archive_path(path).map_err(|reason| TraversalError::InvalidArchivePath {
-        path: path.to_path_buf(),
-        reason,
-    })
+fn validate_traversal_archive_path(path: &Path) -> Result<NormalizedPath, TraversalError> {
+    let Some(path) = path.to_str() else {
+        return Err(TraversalError::InvalidArchivePath {
+            path: path.to_path_buf(),
+            reason: "path is not valid UTF-8",
+        });
+    };
+    normalize_traversal_archive_path(path.to_owned())
+}
+
+fn normalize_traversal_archive_path(path: String) -> Result<NormalizedPath, TraversalError> {
+    let path = LegalizedPath::from_string(path).map_err(traversal_path_error)?;
+    let path = path.normalize().map_err(traversal_path_error)?;
+    if path.is_empty() {
+        return Err(TraversalError::InvalidArchivePath {
+            path: PathBuf::new(),
+            reason: "path normalizes to empty",
+        });
+    }
+    Ok(path)
+}
+
+fn traversal_path_error(error: PathError) -> TraversalError {
+    match error {
+        PathError::InvalidUtf8 => TraversalError::InvalidArchivePath {
+            path: PathBuf::new(),
+            reason: "path is not valid UTF-8",
+        },
+        PathError::Unsafe { value, reason } => TraversalError::InvalidArchivePath {
+            path: PathBuf::from(value),
+            reason,
+        },
+    }
 }
 
 fn filesystem_error(operation: &'static str, path: &Path, source: io::Error) -> TraversalError {
@@ -304,8 +331,12 @@ mod tests {
     #[test]
     fn joins_native_relative_paths_with_archive_separators() {
         let relative = Path::new("nested").join("file");
+        let archive_path =
+            validate_traversal_archive_path(Path::new("tree")).expect("root path should normalize");
         assert_eq!(
-            join_normalized_archive_path("tree", &relative, &relative).unwrap(),
+            join_normalized_archive_path(&archive_path, &relative, &relative)
+                .expect("relative path should normalize")
+                .as_str(),
             "tree/nested/file"
         );
     }
@@ -314,8 +345,10 @@ mod tests {
     #[test]
     fn rejects_backslashes_in_source_path_components() {
         let relative = Path::new("nested\\file");
+        let archive_path =
+            validate_traversal_archive_path(Path::new("tree")).expect("root path should normalize");
         assert!(matches!(
-            join_normalized_archive_path("tree", relative, relative),
+            join_normalized_archive_path(&archive_path, relative, relative),
             Err(TraversalError::InvalidArchivePath { .. })
         ));
     }
