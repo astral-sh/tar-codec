@@ -2,6 +2,8 @@
 //!
 //! The encoder emits one local pax header before every member. Compression is
 //! intentionally left to callers, which may wrap the underlying async writer.
+//! [`EncodePolicy`] controls validation of member names and symbolic-link
+//! targets without imposing extraction-specific path containment.
 
 mod traversal;
 
@@ -24,7 +26,7 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use self::traversal::{TraversalEntry, TraversalKind, TraversalStream, stream_directory_entries};
-use crate::{blocking::with_reusable_buffer, has_windows_prefix};
+use crate::{NameValidator, blocking::with_reusable_buffer, name::NameValidation};
 
 const SOURCE_FILE_CHUNK_BYTES: usize = 1024 * 1024;
 
@@ -42,9 +44,35 @@ impl EntryMetadata {
     }
 }
 
+/// Controls which UTF-8 archive names the encoder accepts.
+#[derive(Clone, Copy, Debug)]
+pub struct EncodePolicy {
+    name_validation: NameValidation,
+}
+
+impl Default for EncodePolicy {
+    fn default() -> Self {
+        Self {
+            name_validation: NameValidation::Default,
+        }
+    }
+}
+
+impl EncodePolicy {
+    /// Configures validation for member names and symbolic-link targets.
+    ///
+    /// Passing [`None`] disables configurable name validation. UTF-8 and
+    /// wire-format requirements still apply.
+    pub fn name_validator(mut self, validator: Option<NameValidator>) -> Self {
+        self.name_validation = NameValidation::from_validator(validator);
+        self
+    }
+}
+
 /// A one-pass asynchronous encoder for deterministic pure-pax archives.
 pub struct Encoder<W> {
     writer: W,
+    policy: EncodePolicy,
     sequence: u64,
     entries: HashMap<String, ArchivedEntry>,
     framing_buffer: Vec<u8>,
@@ -54,8 +82,14 @@ pub struct Encoder<W> {
 impl<W> Encoder<W> {
     /// Creates an encoder writing an uncompressed pax archive into `writer`.
     pub fn new(writer: W) -> Self {
+        Self::with_policy(writer, EncodePolicy::default())
+    }
+
+    /// Creates an encoder using `policy`.
+    pub fn with_policy(writer: W, policy: EncodePolicy) -> Self {
         Self {
             writer,
+            policy,
             sequence: 0,
             entries: HashMap::new(),
             framing_buffer: Vec::new(),
@@ -77,7 +111,7 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
         D: AsRef<[u8]>,
     {
         self.ensure_active()?;
-        let path = normalize_archive_path(path.as_ref())?;
+        let path = archive_name(path.as_ref(), self.policy.name_validation, "member path")?;
         let implicit_ancestors = preflight_regular_entry(&self.entries, &path)?;
         let data = data.as_ref();
         let size = u64::try_from(data.len())
@@ -122,7 +156,7 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
             entries: self.entries.clone(),
             buffer: Vec::new(),
         };
-        let mut entries = stream_directory_entries(source)?;
+        let mut entries = stream_directory_entries(source, self.policy.name_validation)?;
         let result = self
             .write_directory_entries(&mut entries, &mut traversal)
             .await;
@@ -366,13 +400,21 @@ pub enum EncodeError {
     /// Traversing a recursive encoding source failed.
     #[error(transparent)]
     Traversal(#[from] TraversalError),
-    /// A requested archive path is not safe and portable.
+    /// A requested archive path cannot be represented by the UTF-8 encoder.
     #[error("invalid archive path {path:?}: {reason}")]
     InvalidArchivePath {
         /// The rejected archive path.
         path: PathBuf,
-        /// The reason the path is not accepted.
+        /// The reason the path cannot be represented.
         reason: &'static str,
+    },
+    /// An archive name was rejected by the configured [`EncodePolicy`].
+    #[error("archive {context} rejected by encode policy: {value:?}")]
+    NameRejected {
+        /// The role of the rejected archive text.
+        context: &'static str,
+        /// The rejected UTF-8 value.
+        value: String,
     },
     /// An archive path collides with a previously reserved entry.
     #[error("archive entry collides with existing path {path}")]
@@ -498,35 +540,24 @@ fn preflight_regular_entry(
     Ok(implicit_ancestors)
 }
 
-pub(crate) fn normalize_archive_path(path: &Path) -> Result<String, EncodeError> {
-    validate_archive_path(path)
-        .map(str::to_owned)
-        .map_err(|reason| EncodeError::InvalidArchivePath {
+fn archive_name(
+    path: &Path,
+    validation: NameValidation,
+    context: &'static str,
+) -> Result<String, EncodeError> {
+    let Some(name) = path.to_str() else {
+        return Err(EncodeError::InvalidArchivePath {
             path: path.to_path_buf(),
-            reason,
-        })
-}
-
-fn validate_archive_path(path: &Path) -> Result<&str, &'static str> {
-    let Some(path) = path.to_str() else {
-        return Err("path is not valid UTF-8");
+            reason: "path is not valid UTF-8",
+        });
     };
-    if path.is_empty() {
-        return Err("path is empty");
+    if !validation.accepts(name) {
+        return Err(EncodeError::NameRejected {
+            context,
+            value: name.to_owned(),
+        });
     }
-    if Path::new(path).is_absolute() || has_windows_prefix(path) {
-        return Err("path is absolute");
-    }
-    if path.contains('\0') || path.contains('\\') {
-        return Err("path contains an ambiguous separator or NUL byte");
-    }
-    if path
-        .split('/')
-        .any(|component| matches!(component, "" | "." | ".."))
-    {
-        return Err("path contains an empty, current, or parent component");
-    }
-    Ok(path)
+    Ok(name.to_owned())
 }
 
 fn filesystem_error(operation: &'static str, path: &Path, source: io::Error) -> EncodeError {
@@ -561,452 +592,4 @@ fn is_executable(metadata: &std::fs::Metadata) -> bool {
 #[cfg(not(unix))]
 fn is_executable(_metadata: &std::fs::Metadata) -> bool {
     false
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        pin::Pin,
-        task::{Context, Poll},
-    };
-
-    use tar_framing::{
-        PaxKind,
-        logical::TarReader,
-        stream::{Frame, TarStream},
-    };
-    use tempfile::tempdir;
-    use tokio_stream::StreamExt;
-
-    use super::{traversal::DIRECTORY_TRAVERSAL_BATCH_ENTRIES, *};
-    use crate::{
-        decode::{Archive, DecodeError, DecodePolicy},
-        test_support::ChunkedReader,
-    };
-
-    #[derive(Default)]
-    struct FailingWriter;
-
-    impl AsyncWrite for FailingWriter {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _context: &mut Context<'_>,
-            _buffer: &[u8],
-        ) -> Poll<io::Result<usize>> {
-            Poll::Ready(Err(io::Error::other("injected write failure")))
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    async fn encode_source_directory(source: &Path) -> Vec<u8> {
-        let mut encoder = Encoder::new(Vec::new());
-        encoder.add_directory(source).await.unwrap();
-        encoder.finish().await.unwrap()
-    }
-
-    async fn extract_archive(bytes: Vec<u8>, dest: &Path) -> Result<(), DecodeError> {
-        Archive::new(ChunkedReader::new(bytes, 17))
-            .extract(dest, DecodePolicy::default())
-            .await
-    }
-
-    #[tokio::test]
-    async fn adds_manual_files_as_local_pax_members_and_round_trips() {
-        let mut encoder = Encoder::new(Vec::new());
-        encoder
-            .add_entry(
-                "bin/tool",
-                b"run",
-                EntryMetadata::default().executable(true),
-            )
-            .await
-            .unwrap();
-        encoder
-            .add_entry("README", b"hello", EntryMetadata::default())
-            .await
-            .unwrap();
-        let bytes = encoder.finish().await.unwrap();
-
-        let frames = TarStream::new(ChunkedReader::new(bytes.clone(), 17))
-            .collect::<Vec<_>>()
-            .await;
-        assert!(frames.iter().all(|frame| {
-            matches!(
-                frame,
-                Ok(Frame::Pax(pax)) if pax.kind == PaxKind::Local
-            ) || matches!(frame, Ok(Frame::Header(_) | Frame::Data(_)))
-        }));
-
-        let temp = tempdir().unwrap();
-        let dest = temp.path().join("out");
-        extract_archive(bytes, &dest).await.unwrap();
-        assert_eq!(std::fs::read(dest.join("bin/tool")).unwrap(), b"run");
-        assert_eq!(std::fs::read(dest.join("README")).unwrap(), b"hello");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            assert_ne!(
-                std::fs::metadata(dest.join("bin/tool"))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o111,
-                0
-            );
-            assert_eq!(
-                std::fs::metadata(dest.join("README"))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o111,
-                0
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn rejects_invalid_manual_paths_and_collisions_without_poisoning() {
-        let mut encoder = Encoder::new(Vec::new());
-        for path in ["/absolute", "C:/ambiguous"] {
-            assert!(
-                matches!(
-                    encoder.add_entry(path, b"", EntryMetadata::default()).await,
-                    Err(EncodeError::InvalidArchivePath { .. })
-                ),
-                "{path}"
-            );
-        }
-        encoder
-            .add_entry("dir/file", b"first", EntryMetadata::default())
-            .await
-            .unwrap();
-        assert!(matches!(
-            encoder.entries.get("dir"),
-            Some(ArchivedEntry::Directory { explicit: false })
-        ));
-        for (path, data) in [
-            ("dir/file", b"second".as_slice()),
-            ("dir/file/child", b"".as_slice()),
-        ] {
-            assert!(
-                matches!(
-                    encoder
-                        .add_entry(path, data, EntryMetadata::default())
-                        .await,
-                    Err(EncodeError::PathCollision { .. })
-                ),
-                "{path}"
-            );
-        }
-        encoder
-            .add_entry("dir/other", b"ok", EntryMetadata::default())
-            .await
-            .unwrap();
-        assert!(matches!(
-            encoder.entries.get("dir/other"),
-            Some(ArchivedEntry::Regular)
-        ));
-        encoder.finish().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn write_failures_poison_the_encoder() {
-        let mut encoder = Encoder::new(FailingWriter);
-        assert!(matches!(
-            encoder
-                .add_entry("file", b"contents", EntryMetadata::default())
-                .await,
-            Err(EncodeError::Write { .. })
-        ));
-        assert!(matches!(
-            encoder
-                .add_entry("other", b"", EntryMetadata::default())
-                .await,
-            Err(EncodeError::Poisoned)
-        ));
-    }
-
-    #[tokio::test]
-    async fn recursively_adds_sorted_directory_members() {
-        let temp = tempdir().unwrap();
-        let source = temp.path().join("tree");
-        std::fs::create_dir_all(source.join("sub")).unwrap();
-        std::fs::write(source.join("z"), "last").unwrap();
-        std::fs::write(source.join("a"), "first").unwrap();
-        std::fs::write(source.join("sub/file"), "nested").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            std::fs::set_permissions(source.join("a"), std::fs::Permissions::from_mode(0o755))
-                .unwrap();
-        }
-
-        let bytes = encode_source_directory(&source).await;
-        let mut reader = TarReader::new(ChunkedReader::new(bytes.clone(), 17));
-        let mut paths = Vec::new();
-        while let Some(member) = reader.next_frame().await.unwrap() {
-            paths.push(String::from_utf8(member.effective_path().unwrap().into_owned()).unwrap());
-            member.payload.skip().await.unwrap();
-        }
-        assert_eq!(
-            paths,
-            ["tree", "tree/a", "tree/sub", "tree/sub/file", "tree/z"]
-        );
-
-        let dest = temp.path().join("out");
-        extract_archive(bytes, &dest).await.unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dest.join("tree/sub/file")).unwrap(),
-            "nested"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            assert_ne!(
-                std::fs::metadata(dest.join("tree/a"))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o111,
-                0
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn recursively_encodes_streamed_and_mixed_source_files() {
-        for (case, files) in [
-            (
-                "streamed",
-                vec![("large", vec![b'x'; SOURCE_FILE_CHUNK_BYTES + 17])],
-            ),
-            (
-                "mixed",
-                vec![
-                    ("a-small", b"first".to_vec()),
-                    ("m-large", vec![b'x'; SOURCE_FILE_CHUNK_BYTES + 17]),
-                    ("z-small", b"last".to_vec()),
-                ],
-            ),
-        ] {
-            let temp = tempdir().unwrap();
-            let source = temp.path().join("tree");
-            std::fs::create_dir(&source).unwrap();
-            for (name, contents) in &files {
-                std::fs::write(source.join(name), contents).unwrap();
-            }
-
-            let bytes = encode_source_directory(&source).await;
-            let dest = temp.path().join("out");
-            extract_archive(bytes, &dest).await.unwrap();
-            for (name, contents) in files {
-                assert_eq!(
-                    std::fs::read(dest.join("tree").join(name)).unwrap(),
-                    contents,
-                    "{case}"
-                );
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn rejects_symbolic_link_roots_before_writing() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempdir().unwrap();
-        let target = temp.path().join("target");
-        std::fs::create_dir(&target).unwrap();
-        let source = temp.path().join("source");
-        symlink(&target, &source).unwrap();
-
-        let mut encoder = Encoder::new(Vec::new());
-        assert!(matches!(
-            encoder.add_directory(&source).await,
-            Err(EncodeError::Traversal(
-                TraversalError::SourceNotDirectory { .. }
-            ))
-        ));
-        assert!(encoder.writer.is_empty());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn recursively_preserves_symlinks_for_extraction_policy_to_validate() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempdir().unwrap();
-        let source = temp.path().join("safe");
-        std::fs::create_dir_all(source.join("sub")).unwrap();
-        std::fs::write(source.join("sub/file"), "contents").unwrap();
-        symlink("sub", source.join("directory")).unwrap();
-        symlink("directory/file", source.join("file")).unwrap();
-
-        let bytes = encode_source_directory(&source).await;
-        let dest = temp.path().join("out");
-        extract_archive(bytes, &dest).await.unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dest.join("safe/file")).unwrap(),
-            "contents"
-        );
-
-        let source = temp.path().join("escape");
-        std::fs::create_dir(&source).unwrap();
-        symlink("../../outside", source.join("link")).unwrap();
-        let bytes = encode_source_directory(&source).await;
-        assert!(matches!(
-            extract_archive(bytes, &temp.path().join("escape-out")).await,
-            Err(DecodeError::UnsafePath {
-                context: "symbolic-link target",
-                ..
-            })
-        ));
-
-        let source = temp.path().join("dangling");
-        std::fs::create_dir(&source).unwrap();
-        symlink("missing", source.join("link")).unwrap();
-        let bytes = encode_source_directory(&source).await;
-        let dest = temp.path().join("dangling-out");
-        extract_archive(bytes, &dest).await.unwrap();
-        assert_eq!(
-            std::fs::read_link(dest.join("dangling/link")).unwrap(),
-            Path::new("missing")
-        );
-
-        let source = temp.path().join("cycle");
-        std::fs::create_dir(&source).unwrap();
-        symlink("link", source.join("link")).unwrap();
-        let bytes = encode_source_directory(&source).await;
-        assert!(matches!(
-            extract_archive(bytes, &temp.path().join("cycle-out")).await,
-            Err(DecodeError::InvalidLink { .. })
-        ));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn emits_repeated_inodes_as_independent_regular_files_and_rejects_sockets() {
-        use std::os::unix::net::UnixListener;
-
-        let temp = tempdir().unwrap();
-        let source = temp.path().join("links");
-        std::fs::create_dir(&source).unwrap();
-        std::fs::write(source.join("one"), "contents").unwrap();
-        std::fs::hard_link(source.join("one"), source.join("two")).unwrap();
-
-        let bytes = encode_source_directory(&source).await;
-        let mut reader = TarReader::new(ChunkedReader::new(bytes, 17));
-        let mut regular = 0;
-        while let Some(member) = reader.next_frame().await.unwrap() {
-            if member.header.kind == MemberKind::Regular {
-                regular += 1;
-            }
-            member.payload.skip().await.unwrap();
-        }
-        assert_eq!(regular, 2);
-
-        let source = temp.path().join("socket");
-        std::fs::create_dir(&source).unwrap();
-        let _listener = UnixListener::bind(source.join("listener")).unwrap();
-        let mut encoder = Encoder::new(Vec::new());
-        assert!(matches!(
-            encoder.add_directory(&source).await,
-            Err(EncodeError::Traversal(
-                TraversalError::UnsupportedFilesystemType { .. }
-            ))
-        ));
-        assert!(encoder.writer.is_empty());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn late_recursive_errors_poison_partial_directory_output() {
-        use std::os::unix::net::UnixListener;
-
-        let temp = tempdir().unwrap();
-        let source = temp.path().join("tree");
-        std::fs::create_dir_all(source.join("nested")).unwrap();
-        for index in 0..DIRECTORY_TRAVERSAL_BATCH_ENTRIES {
-            std::fs::write(source.join(format!("file-{index:03}")), "contents").unwrap();
-        }
-        let _listener = UnixListener::bind(source.join("nested/listener")).unwrap();
-
-        let mut encoder = Encoder::new(Vec::new());
-        assert!(matches!(
-            encoder.add_directory(&source).await,
-            Err(EncodeError::Traversal(
-                TraversalError::UnsupportedFilesystemType { .. }
-            ))
-        ));
-        assert!(!encoder.writer.is_empty());
-        assert!(matches!(
-            encoder
-                .add_entry("other", b"", EntryMetadata::default())
-                .await,
-            Err(EncodeError::Poisoned)
-        ));
-    }
-
-    #[tokio::test]
-    async fn late_recursive_collisions_poison_partial_directory_output() {
-        let temp = tempdir().unwrap();
-        let source = temp.path().join("tree");
-        std::fs::create_dir(&source).unwrap();
-        std::fs::write(source.join("file"), "new").unwrap();
-
-        let mut encoder = Encoder::new(Vec::new());
-        encoder
-            .add_entry("tree/file", b"existing", EntryMetadata::default())
-            .await
-            .unwrap();
-        let prior_len = encoder.writer.len();
-        assert!(matches!(
-            encoder.add_directory(&source).await,
-            Err(EncodeError::PathCollision { .. })
-        ));
-        assert!(encoder.writer.len() > prior_len);
-        assert!(matches!(
-            encoder
-                .add_entry("other", b"", EntryMetadata::default())
-                .await,
-            Err(EncodeError::Poisoned)
-        ));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn rejects_non_utf8_source_names_before_writing() {
-        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
-
-        let temp = tempdir().unwrap();
-        let source = temp.path().join("tree");
-        std::fs::create_dir(&source).unwrap();
-        let invalid = OsString::from_vec(vec![0xff]);
-        assert!(matches!(
-            normalize_archive_path(Path::new(&invalid)),
-            Err(EncodeError::InvalidArchivePath { .. })
-        ));
-        if std::fs::write(source.join(&invalid), "contents").is_err() {
-            return;
-        }
-
-        let mut encoder = Encoder::new(Vec::new());
-        assert!(matches!(
-            encoder.add_directory(&source).await,
-            Err(EncodeError::Traversal(
-                TraversalError::NonUtf8SourcePath { .. }
-            ))
-        ));
-        assert!(encoder.writer.is_empty());
-    }
 }

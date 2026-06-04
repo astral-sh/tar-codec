@@ -4,9 +4,10 @@
 //! archive contents beneath a validated destination root. Decompression is
 //! the caller's responsibility. Extraction requires a [`DecodePolicy`] so
 //! that security-sensitive archive features are explicit at each call site.
+//! Configurable name validation is applied before mandatory extraction path
+//! containment.
 
 use std::{
-    borrow::Cow,
     collections::HashSet,
     io,
     path::{Component, Path, PathBuf},
@@ -19,7 +20,7 @@ use tar_framing::{
 use thiserror::Error;
 use tokio::io::AsyncRead;
 
-use crate::has_windows_prefix;
+use crate::{NameValidator, name::NameValidation};
 
 mod extract;
 
@@ -40,7 +41,7 @@ impl<R> Archive<R> {
 /// Controls which otherwise valid archive features extraction may accept.
 ///
 /// See each allow API for its default.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct DecodePolicy {
     allow_symlinks: bool,
     allow_dangling_symlinks: bool,
@@ -48,6 +49,7 @@ pub struct DecodePolicy {
     allow_overwrites: bool,
     allow_gnu: bool,
     pax_policy: PaxDecodePolicy,
+    name_validation: NameValidation,
 }
 
 /// Controls which otherwise valid pax features extraction may accept.
@@ -82,6 +84,7 @@ impl Default for DecodePolicy {
             allow_overwrites: true,
             allow_gnu: true,
             pax_policy: PaxDecodePolicy::default(),
+            name_validation: NameValidation::Default,
         }
     }
 }
@@ -145,6 +148,15 @@ impl DecodePolicy {
     /// Configures the accepted pax feature subset.
     pub fn pax_policy(mut self, policy: PaxDecodePolicy) -> Self {
         self.pax_policy = policy;
+        self
+    }
+
+    /// Configures validation for member names and link targets.
+    ///
+    /// Passing [`None`] disables configurable name validation. UTF-8 and
+    /// extraction containment requirements still apply.
+    pub fn name_validator(mut self, validator: Option<NameValidator>) -> Self {
+        self.name_validation = NameValidation::from_validator(validator);
         self
     }
 
@@ -212,6 +224,24 @@ impl DecodePolicy {
                     extension.records(),
                 )?;
             }
+        }
+        Ok(())
+    }
+
+    fn check_name(
+        &self,
+        position: u64,
+        context: &'static str,
+        value: &str,
+    ) -> Result<(), DecodeError> {
+        if !self.name_validation.accepts(value) {
+            return Err(DecodeError::policy_violation(
+                position,
+                DecodePolicyViolation::NameRejected {
+                    context,
+                    value: value.to_owned(),
+                },
+            ));
         }
         Ok(())
     }
@@ -332,6 +362,14 @@ impl PaxDecodePolicy {
 /// A valid archive feature rejected by the selected [`DecodePolicy`].
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum DecodePolicyViolation {
+    /// An effective member name or link target was rejected by the configured validator.
+    #[error("archive {context} rejected by name policy: {value:?}")]
+    NameRejected {
+        /// The role of the rejected archive text.
+        context: &'static str,
+        /// The rejected UTF-8 value.
+        value: String,
+    },
     /// A symbolic-link member appeared when links are forbidden.
     #[error("symbolic-link members are not allowed")]
     SymbolicLink,
@@ -458,10 +496,6 @@ impl DecodeError {
         }
     }
 
-    fn path_collision(path: PathBuf) -> Self {
-        Self::PathCollision { path }
-    }
-
     fn invalid_link(position: u64, path: PathBuf, target: String, reason: &'static str) -> Self {
         Self::InvalidLink {
             position,
@@ -504,22 +538,42 @@ struct DecodedMember {
     payload_size: u64,
 }
 
-fn decode_member<R>(frame: &MemberFrame<'_, R>) -> Result<DecodedMember, DecodeError> {
+fn decode_member<R>(
+    frame: &MemberFrame<'_, R>,
+    policy: &DecodePolicy,
+) -> Result<DecodedMember, DecodeError> {
     let header = &frame.header;
     let mode = header.mode()?;
     let executable = mode & 0o111 != 0;
-    let path = resolved_text(header.position, "path", frame.effective_path()?)?;
-    let path = normalize_member_path(header.position, &path)?;
+    let path_text = std::str::from_utf8(frame.effective_path()?.as_ref())
+        .map(str::to_owned)
+        .map_err(|_| DecodeError::InvalidUtf8 {
+            position: header.position,
+            field: "path",
+        })?;
+    policy.check_name(header.position, "member path", &path_text)?;
+    let path = normalize_member_path(header.position, &path_text)?;
     if path.as_os_str().is_empty() && header.kind != MemberKind::Directory {
         return Err(DecodeError::unsafe_path(
             header.position,
             "member path",
-            ".",
-            "only a directory may name the extraction root",
+            &path_text,
+            "only a directory may resolve to the extraction root",
         ));
     }
     let link_target = if matches!(header.kind, MemberKind::HardLink | MemberKind::SymbolicLink) {
-        let target = resolved_text(header.position, "linkpath", frame.effective_link_path()?)?;
+        let target = std::str::from_utf8(frame.effective_link_path()?.as_ref())
+            .map(str::to_owned)
+            .map_err(|_| DecodeError::InvalidUtf8 {
+                position: header.position,
+                field: "linkpath",
+            })?;
+        let context = if header.kind == MemberKind::SymbolicLink {
+            "symbolic-link target"
+        } else {
+            "hard-link target"
+        };
+        policy.check_name(header.position, context, &target)?;
         if target.is_empty() {
             return Err(DecodeError::invalid_link(
                 header.position,
@@ -543,46 +597,131 @@ fn decode_member<R>(frame: &MemberFrame<'_, R>) -> Result<DecodedMember, DecodeE
     })
 }
 
-fn resolved_text(
-    position: u64,
-    keyword: &'static str,
-    value: Cow<'_, [u8]>,
-) -> Result<String, DecodeError> {
-    std::str::from_utf8(value.as_ref())
-        .map(str::to_owned)
-        .map_err(|_| DecodeError::InvalidUtf8 {
-            position,
-            field: keyword,
-        })
-}
-
 fn normalize_member_path(position: u64, value: &str) -> Result<PathBuf, DecodeError> {
-    normalize_path(position, "member path", value, &[])
+    validate_extraction_path(position, "member path", value)?;
+    let mut path = PathBuf::new();
+    for component in Path::new(value).components() {
+        match component {
+            Component::Prefix(_) => {
+                return Err(DecodeError::unsafe_path(
+                    position,
+                    "member path",
+                    value,
+                    "contains a platform path prefix",
+                ));
+            }
+            Component::RootDir => {
+                return Err(DecodeError::unsafe_path(
+                    position,
+                    "member path",
+                    value,
+                    "is absolute",
+                ));
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(DecodeError::unsafe_path(
+                    position,
+                    "member path",
+                    value,
+                    "contains a parent-directory component",
+                ));
+            }
+            Component::Normal(component) => path.push(component),
+        }
+    }
+    Ok(path)
 }
 
+/// A validated symbolic-link target represented in both coordinate systems
+/// needed during extraction.
+struct NormalizedSymlinkTarget {
+    /// Normalized contents interpreted by the filesystem relative to the
+    /// symbolic link's parent.
+    link_contents: PathBuf,
+    /// The same target resolved relative to the extraction root, used for
+    /// containment and symbolic-link graph validation.
+    resolved_target: PathBuf,
+}
+
+/// Normalizes and resolves a symbolic-link target without changing its base.
+///
+/// [`NormalizedSymlinkTarget::link_contents`] preserves the target as a
+/// parent-relative link value, while [`NormalizedSymlinkTarget::resolved_target`]
+/// identifies its destination relative to the extraction root. For example,
+/// `../file` on a link at `dir/link` remains `../file` as link contents and
+/// resolves to `file`.
+///
+/// Absolute, platform-prefixed, and escaping targets are rejected.
 fn normalize_symlink_target(
     position: u64,
     path: &Path,
     value: &str,
-) -> Result<PathBuf, DecodeError> {
-    let base = path.parent().map(path_components).unwrap_or_default();
-    normalize_path(position, "symbolic-link target", value, &base)
+) -> Result<NormalizedSymlinkTarget, DecodeError> {
+    validate_extraction_path(position, "symbolic-link target", value)?;
+    let base = path.parent().unwrap_or_else(|| Path::new(""));
+    let mut contents = PathBuf::new();
+    let mut resolved = base.to_owned();
+    for component in Path::new(value).components() {
+        match component {
+            Component::Prefix(_) => {
+                return Err(DecodeError::unsafe_path(
+                    position,
+                    "symbolic-link target",
+                    value,
+                    "contains a platform path prefix",
+                ));
+            }
+            Component::RootDir => {
+                return Err(DecodeError::unsafe_path(
+                    position,
+                    "symbolic-link target",
+                    value,
+                    "is absolute",
+                ));
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(
+                    contents.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    contents.pop();
+                } else {
+                    contents.push("..");
+                }
+                if !resolved.pop() {
+                    return Err(DecodeError::unsafe_path(
+                        position,
+                        "symbolic-link target",
+                        value,
+                        "escapes the destination root",
+                    ));
+                }
+            }
+            Component::Normal(component) => {
+                contents.push(component);
+                resolved.push(component);
+            }
+        }
+    }
+    if contents.as_os_str().is_empty() {
+        contents.push(".");
+    }
+    Ok(NormalizedSymlinkTarget {
+        link_contents: contents,
+        resolved_target: resolved,
+    })
 }
 
-fn normalize_path(
+/// Reject absolute paths, as well as any path containing backslashes.
+///
+/// The latter effectively rejects Windows-style paths.
+fn validate_extraction_path(
     position: u64,
     context: &'static str,
     value: &str,
-    base: &[String],
-) -> Result<PathBuf, DecodeError> {
-    if value.contains('\0') {
-        return Err(DecodeError::unsafe_path(
-            position,
-            context,
-            value,
-            "contains a NUL byte",
-        ));
-    }
+) -> Result<(), DecodeError> {
     if value.contains('\\') {
         return Err(DecodeError::unsafe_path(
             position,
@@ -599,12 +738,38 @@ fn normalize_path(
             "is absolute",
         ));
     }
-    let mut components = base.to_vec();
-    for component in value.split('/') {
+    Ok(())
+}
+
+fn resolve_link_target(
+    position: u64,
+    context: &'static str,
+    value: &str,
+    base: &Path,
+) -> Result<PathBuf, DecodeError> {
+    validate_extraction_path(position, context, value)?;
+    let mut path = base.to_owned();
+    for component in Path::new(value).components() {
         match component {
-            "" | "." => {}
-            ".." => {
-                if components.pop().is_none() {
+            Component::Prefix(_) => {
+                return Err(DecodeError::unsafe_path(
+                    position,
+                    context,
+                    value,
+                    "contains a platform path prefix",
+                ));
+            }
+            Component::RootDir => {
+                return Err(DecodeError::unsafe_path(
+                    position,
+                    context,
+                    value,
+                    "is absolute",
+                ));
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !path.pop() {
                     return Err(DecodeError::unsafe_path(
                         position,
                         context,
@@ -613,48 +778,10 @@ fn normalize_path(
                     ));
                 }
             }
-            component if has_windows_prefix(component) => {
-                return Err(DecodeError::unsafe_path(
-                    position,
-                    context,
-                    value,
-                    "contains a platform path prefix",
-                ));
-            }
-            component => components.push(component.to_owned()),
+            Component::Normal(component) => path.push(component),
         }
     }
-    Ok(components.iter().collect())
-}
-
-fn path_components(path: &Path) -> Vec<String> {
-    path.components()
-        .filter_map(|component| match component {
-            Component::Normal(component) => Some(component.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect()
-}
-
-fn relative_link_contents(link: &Path, target: &Path) -> PathBuf {
-    let from = link.parent().map(path_components).unwrap_or_default();
-    let to = path_components(target);
-    let common = from
-        .iter()
-        .zip(&to)
-        .take_while(|(left, right)| left == right)
-        .count();
-    let mut contents = PathBuf::new();
-    for _ in common..from.len() {
-        contents.push("..");
-    }
-    for component in to.iter().skip(common) {
-        contents.push(component);
-    }
-    if contents.as_os_str().is_empty() {
-        contents.push(".");
-    }
-    contents
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -662,19 +789,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_windows_drive_prefixes_during_path_normalization() {
-        assert_eq!(
-            normalize_member_path(0, "tests/snippets/ballon:main.py").unwrap(),
-            PathBuf::from("tests/snippets/ballon:main.py")
-        );
-        for value in ["C:", "C:/escape", "nested/C:/escape"] {
+    fn rejects_parent_directory_components_in_member_paths() {
+        for value in [
+            "..",
+            "../name",
+            "name/..",
+            "name/../other",
+            "name//../other",
+        ] {
             assert!(matches!(
                 normalize_member_path(0, value),
                 Err(DecodeError::UnsafePath {
-                    reason: "contains a platform path prefix",
+                    context: "member path",
+                    reason: "contains a parent-directory component",
                     ..
                 })
             ));
+        }
+    }
+
+    #[test]
+    fn normalizes_symlink_contents_and_resolves_targets() {
+        for (link, target, expected_contents, expected_resolved) in [
+            ("link", "target", "target", "target"),
+            ("nested/link", "../target", "../target", "target"),
+            ("nested/link", "./target", "target", "nested/target"),
+            ("a/b/link", "../c/target", "../c/target", "a/c/target"),
+            ("nested/link", ".", ".", "nested"),
+            ("nested/link", "a/../target", "target", "nested/target"),
+        ] {
+            let normalized = normalize_symlink_target(0, Path::new(link), target).unwrap();
+            assert_eq!(normalized.link_contents, Path::new(expected_contents));
+            assert_eq!(normalized.resolved_target, Path::new(expected_resolved));
         }
     }
 }

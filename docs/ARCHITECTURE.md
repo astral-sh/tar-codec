@@ -19,6 +19,9 @@ It owns:
 - typed PAX record parsing, including UTF-8/binary `hdrcharset` values, and
   PAX size effects on framing;
 - byte-oriented member metadata access and PAX/GNU/header precedence;
+- rejection of ordinary members without an effective pathname after applying
+  PAX or GNU metadata, and rejection of embedded NUL bytes in effective member
+  paths and link targets;
 - mode decoding and GNU long-name/long-link structural validation;
 - the physical block API, `stream::TarStream`; and
 - the assembled read API, `logical::TarReader`; and
@@ -42,17 +45,30 @@ filesystem-oriented pure-pax encoding.
 
 It owns:
 
-- applying UTF-8 extraction policy to effective member path and link bytes;
-- extraction policy, including `DecodePolicy` and `PaxDecodePolicy`;
-- archive-path normalization and policy-controlled last-entry-wins replacement,
-  including no-follow leaf removal, reuse of real directories, and rejection of
-  non-empty directory removal;
+- applying UTF-8 and configurable name policy to effective member path and link
+  bytes;
+- encoding and extraction policy, including `EncodePolicy`, `DecodePolicy`, and
+  `PaxDecodePolicy`;
+- extraction-only path containment and normalization, followed by
+  policy-controlled last-entry-wins replacement, including no-follow leaf
+  removal, reuse of real directories, and rejection of non-empty directory
+  removal;
 - deferred symbolic-link installation, including bounded graph validation,
   policy-controlled dangling links, and unconditional rejection of escaping
   targets;
 - path-based creation beneath a validated destination root, under the contract
   that callers do not concurrently mutate that destination;
-- recursive encoding traversal, source symlink preservation, and async writes.
+- recursive encoding traversal, configurable validation of generated member
+  names and source symlink targets, source symlink preservation, and async
+  writes.
+
+Name validation is deliberately separate from extraction containment.
+Validators may accept absolute paths, parent components, or platform-specific
+syntax for encoding and metadata inspection. Filesystem extraction always
+applies its non-configurable destination-root containment checks afterward,
+including unconditional rejection of parent-directory components in member
+paths. Link targets remain location-aware so safe parent-relative symbolic
+links can be represented.
 
 It relies on `tar-framing` for structural validity and effective payload
 sizing; it does not re-parse the tar wire format.

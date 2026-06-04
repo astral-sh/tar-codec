@@ -50,10 +50,10 @@ cargo bench -p tar-codec --bench comparison
 The benchmarks compare `tar-codec` against `tar` and `astral-tokio-tar` for
 uncompressed encoding and extraction. Encoder output formats intentionally
 differ: `tar-codec` emits pure pax archives, while the comparison builders emit
-conventional headers. `tar-codec` validates recursive entries incrementally,
-preserves UTF-8 source symbolic-link targets without applying extraction
-policy, and may return an error after writing partial output if a late source
-entry is invalid.
+conventional headers. `tar-codec` applies its configurable archive-name policy
+to recursive entries incrementally, preserves accepted UTF-8 source
+symbolic-link targets without applying extraction containment, and may return
+an error after writing partial output if a late source entry is rejected.
 
 `encode_entries_framing` measures in-memory entry framing and bookkeeping with a
 sink that does not read payload bytes, so it reports entries per second.

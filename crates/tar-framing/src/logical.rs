@@ -10,7 +10,8 @@ use tokio::io::AsyncRead;
 use tokio_stream::StreamExt;
 
 use crate::{
-    ArchiveFormat, Block, FrameError, GnuKind, MemberKind, PaxKind, PaxRecord, PaxString, PaxValue,
+    ArchiveFormat, Block, FrameError, FrameErrorInner, GnuKind, MemberKind, PaxKind, PaxRecord,
+    PaxString, PaxValue,
     stream::{DataOwner, Frame, GnuFrame, HeaderFrame, PaxFrame, TarStream, parse_mode},
 };
 
@@ -76,27 +77,6 @@ impl Header<'_> {
     pub fn mode(&self) -> Result<u64, FrameError> {
         parse_mode(self.position, self.format, self.mode)
     }
-
-    /// Returns the header's claimed path for its member.
-    ///
-    /// For ustar headers, this is the combination of the `name` and `prefix`
-    /// fields, i.e. `{prefix}/{name}`. For GNU headers, this is `name` alone.
-    ///
-    /// **IMPORTANT**: This is **not** guaranteed to be the fully effective path
-    /// for a member. Most users should call [`MemberFrame::effective_path`].
-    fn header_path(&self) -> Cow<'_, [u8]> {
-        Cow::Borrowed(self.header_path)
-    }
-
-    /// Returns the header's claimed link name for its member.
-    ///
-    /// For both ustar and GNU headers, this is the `linkname` field.
-    ///
-    /// **IMPORTANT**: This is **not** guaranteed to be the fully effective
-    /// link path for a member. Most users should call [`MemberFrame::effective_link_path`].
-    fn link_name(&self) -> &[u8] {
-        self.link_name
-    }
 }
 
 /// One meaningful payload block belonging to an ordinary archive member.
@@ -124,40 +104,32 @@ impl<R> MemberFrame<'_, R> {
     /// Returns the effective member path after applying pax or GNU metadata.
     ///
     /// An explicit pax deletion is an error because it also removes the
-    /// ordinary-header fallback required to identify this member.
+    /// ordinary-header fallback required to identify this member. Empty paths
+    /// and paths containing embedded NUL bytes are also rejected.
     pub fn effective_path(&self) -> Result<Cow<'_, [u8]>, FrameError> {
-        match &self.extensions {
-            MemberExtensions::Pax(state) => resolve_pax_text(
+        let path = effective_member_path(&self.header, &self.extensions)?;
+        if path.is_empty() {
+            return Err(FrameError::at(
                 self.header.position,
-                state,
-                "path",
-                self.header.header_path(),
-                |record| match record {
-                    PaxRecord::Path(value) => Some(value),
-                    _ => None,
-                },
-            ),
-            MemberExtensions::Gnu { long_name, .. } => match long_name {
-                Some(metadata) => Ok(Cow::Borrowed(parse_gnu_metadata(
-                    metadata,
-                    GnuKind::LongName,
-                )?)),
-                None => Ok(self.header.header_path()),
-            },
+                FrameErrorInner::EmptyMemberPath,
+            ));
         }
+        reject_nul(self.header.position, "path", path.as_ref())?;
+        Ok(path)
     }
 
     /// Returns the effective member link target after applying pax or GNU metadata.
     ///
     /// An explicit pax deletion is an error because it also removes the
-    /// ordinary-header fallback required to identify a link target.
+    /// ordinary-header fallback required to identify a link target. Link
+    /// targets containing embedded NUL bytes are also rejected.
     pub fn effective_link_path(&self) -> Result<Cow<'_, [u8]>, FrameError> {
-        match &self.extensions {
+        let path = match &self.extensions {
             MemberExtensions::Pax(state) => resolve_pax_text(
                 self.header.position,
                 state,
                 "linkpath",
-                Cow::Borrowed(self.header.link_name()),
+                Cow::Borrowed(self.header.link_name),
                 |record| match record {
                     PaxRecord::LinkPath(value) => Some(value),
                     _ => None,
@@ -168,9 +140,11 @@ impl<R> MemberFrame<'_, R> {
                     metadata,
                     GnuKind::LongLink,
                 )?)),
-                None => Ok(Cow::Borrowed(self.header.link_name())),
+                None => Ok(Cow::Borrowed(self.header.link_name)),
             },
-        }
+        }?;
+        reject_nul(self.header.position, "link path", path.as_ref())?;
+        Ok(path)
     }
 }
 
@@ -252,7 +226,7 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
         let mut long_name = None;
         let mut long_link = None;
         loop {
-            let Some(frame) = self.next_physical_frame().await? else {
+            let Some(frame) = self.payload.stream.next().await.transpose()? else {
                 return Ok(None);
             };
             match frame {
@@ -304,18 +278,19 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
         }
     }
 
-    async fn next_physical_frame(&mut self) -> Result<Option<Frame>, FrameError> {
-        self.payload.stream.next().await.transpose()
-    }
-
     async fn read_pax_extension(
         &mut self,
         position: u64,
         kind: PaxKind,
     ) -> Result<PaxExtension, FrameError> {
         loop {
-            let Some(next) = self.next_physical_frame().await? else {
-                return Err(self.unexpected_end("pax extension payload"));
+            let Some(next) = self.payload.stream.next().await.transpose()? else {
+                return Err(FrameError::at(
+                    self.payload.stream.position(),
+                    FrameErrorInner::UnexpectedEof {
+                        expected: "pax extension payload",
+                    },
+                ));
             };
             match next {
                 Frame::Data(data) if data.owner == DataOwner::Pax(kind) => {
@@ -334,8 +309,13 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
         let mut remaining = frame.payload_size;
         let mut payload = Vec::new();
         while remaining != 0 {
-            let Some(next) = self.next_physical_frame().await? else {
-                return Err(self.unexpected_end("GNU metadata payload"));
+            let Some(next) = self.payload.stream.next().await.transpose()? else {
+                return Err(FrameError::at(
+                    self.payload.stream.position(),
+                    FrameErrorInner::UnexpectedEof {
+                        expected: "GNU metadata payload",
+                    },
+                ));
             };
             match next {
                 Frame::Data(data) if data.owner == DataOwner::Gnu(frame.kind) => {
@@ -363,10 +343,6 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
             position: frame.position,
             payload,
         })
-    }
-
-    fn unexpected_end(&self, expected: &'static str) -> FrameError {
-        FrameError::unexpected_eof(self.payload.stream.position(), expected)
     }
 
     fn unexpected_frame(&self, frame: &Frame, expected: &'static str) -> FrameError {
@@ -470,6 +446,41 @@ impl<R: AsyncRead + Unpin> MemberPayload<'_, R> {
     pub async fn skip(self) -> Result<(), FrameError> {
         self.reader.drain_payload().await
     }
+}
+
+fn effective_member_path<'a>(
+    header: &Header<'a>,
+    extensions: &'a MemberExtensions,
+) -> Result<Cow<'a, [u8]>, FrameError> {
+    match extensions {
+        MemberExtensions::Pax(state) => resolve_pax_text(
+            header.position,
+            state,
+            "path",
+            Cow::Borrowed(header.header_path),
+            |record| match record {
+                PaxRecord::Path(value) => Some(value),
+                _ => None,
+            },
+        ),
+        MemberExtensions::Gnu { long_name, .. } => match long_name {
+            Some(metadata) => Ok(Cow::Borrowed(parse_gnu_metadata(
+                metadata,
+                GnuKind::LongName,
+            )?)),
+            None => Ok(Cow::Borrowed(header.header_path)),
+        },
+    }
+}
+
+fn reject_nul(position: u64, field: &'static str, value: &[u8]) -> Result<(), FrameError> {
+    if value.contains(&0) {
+        return Err(FrameError::at(
+            position,
+            FrameErrorInner::NulInMemberName { field },
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_pax_text<'a>(
@@ -582,8 +593,8 @@ mod tests {
             let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
             let member = next_member(&mut reader).await?;
             assert_eq!(member.header.format, ArchiveFormat::Pax);
-            assert_eq!(member.header.header_path().as_ref(), b"dir/file");
-            assert_eq!(member.header.link_name(), b"target");
+            assert_eq!(member.header.header_path, b"dir/file");
+            assert_eq!(member.header.link_name, b"target");
             assert_eq!(member.header.mode()?, 0o755);
             assert_eq!(member.effective_path()?.as_ref(), b"dir/file");
             assert_eq!(member.effective_link_path()?.as_ref(), b"target");
@@ -605,7 +616,7 @@ mod tests {
             let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
             let member = next_member(&mut reader).await?;
             assert_eq!(member.header.format, ArchiveFormat::Gnu);
-            assert_eq!(member.header.header_path().as_ref(), b"name");
+            assert_eq!(member.header.header_path, b"name");
             assert_eq!(member.header.mode()?, 0o755);
             Ok(())
         });
@@ -629,8 +640,8 @@ mod tests {
             let mut member = next_member(&mut reader).await?;
 
             assert!(member.payload.next_block().await?.is_some());
-            assert_eq!(member.header.header_path().as_ref(), b"dir/file");
-            assert_eq!(member.header.link_name(), b"target");
+            assert_eq!(member.header.header_path, b"dir/file");
+            assert_eq!(member.header.link_name, b"target");
             assert_eq!(member.header.mode()?, 0o755);
             assert_eq!(member.effective_path()?.as_ref(), b"dir/file");
             assert_eq!(member.effective_link_path()?.as_ref(), b"target");
@@ -671,6 +682,156 @@ mod tests {
             assert_eq!(member.effective_link_path()?.as_ref(), b"global-link");
             Ok(())
         });
+    }
+
+    #[test]
+    fn rejects_empty_effective_member_paths() {
+        for (case, mut bytes) in [
+            ("pax-header", {
+                let mut bytes = Vec::new();
+                let mut member = header(b'0', 0);
+                set_field(&mut member, NAME_RANGE, b"");
+                set_field(&mut member, PREFIX_RANGE, b"");
+                set_checksum(&mut member);
+                append_block(&mut bytes, &member);
+                bytes
+            }),
+            ("gnu-header", {
+                let mut bytes = Vec::new();
+                let mut member = gnu_header(b'0', 0);
+                set_field(&mut member, NAME_RANGE, b"");
+                set_checksum(&mut member);
+                append_block(&mut bytes, &member);
+                bytes
+            }),
+            ("gnu-long-name", {
+                let mut bytes = Vec::new();
+                append_gnu(&mut bytes, b'L', b"\0");
+                let mut member = gnu_header(b'0', 0);
+                set_field(&mut member, NAME_RANGE, b"physical");
+                set_checksum(&mut member);
+                append_block(&mut bytes, &member);
+                bytes
+            }),
+        ] {
+            append_terminator(&mut bytes);
+            let result: Result<(), FrameError> = ready(async {
+                let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+                let member = next_member(&mut reader).await?;
+                member.effective_path().map(|_| ())
+            });
+            assert!(
+                matches!(
+                    result,
+                    Err(FrameError {
+                        inner: FrameErrorInner::EmptyMemberPath,
+                        ..
+                    })
+                ),
+                "{case}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_nul_in_effective_member_names() {
+        for (field, mut bytes) in [
+            ("path", {
+                let mut bytes = Vec::new();
+                append_posix(&mut bytes, b'x', &record("path", "bad\0name"));
+                append_block(&mut bytes, &header(b'0', 0));
+                bytes
+            }),
+            ("link path", {
+                let mut bytes = Vec::new();
+                append_posix(&mut bytes, b'x', &record("linkpath", "bad\0target"));
+                append_block(&mut bytes, &header(b'2', 0));
+                bytes
+            }),
+        ] {
+            append_terminator(&mut bytes);
+            let result: Result<(), FrameError> = ready(async {
+                let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+                let member = next_member(&mut reader).await?;
+                if field == "path" {
+                    member.effective_path().map(|_| ())
+                } else {
+                    member.effective_link_path().map(|_| ())
+                }
+            });
+            assert!(
+                matches!(
+                    result,
+                    Err(FrameError {
+                        inner: FrameErrorInner::NulInMemberName { field: found },
+                        ..
+                    }) if found == field
+                ),
+                "{field}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_nul_in_overridden_pax_member_names() {
+        let mut global = record("path", "bad\0name");
+        global.extend_from_slice(&record("linkpath", "bad\0target"));
+        let mut local = record("path", "good-name");
+        local.extend_from_slice(&record("linkpath", "good-target"));
+        let mut bytes = Vec::new();
+        append_posix(&mut bytes, b'g', &global);
+        append_posix(&mut bytes, b'x', &local);
+        append_block(&mut bytes, &header(b'2', 0));
+        append_terminator(&mut bytes);
+
+        ready_ok(async {
+            let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+            let member = next_member(&mut reader).await?;
+            assert_eq!(member.effective_path()?.as_ref(), b"good-name");
+            assert_eq!(member.effective_link_path()?.as_ref(), b"good-target");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn accepts_nonempty_extension_paths_over_empty_header_names() {
+        for (case, mut bytes, expected) in [
+            (
+                "pax",
+                {
+                    let mut bytes = Vec::new();
+                    append_posix(&mut bytes, b'x', &record("path", "pax-name"));
+                    let mut member = header(b'0', 0);
+                    set_field(&mut member, NAME_RANGE, b"");
+                    set_field(&mut member, PREFIX_RANGE, b"");
+                    set_checksum(&mut member);
+                    append_block(&mut bytes, &member);
+                    bytes
+                },
+                b"pax-name".as_slice(),
+            ),
+            (
+                "gnu",
+                {
+                    let mut bytes = Vec::new();
+                    append_gnu(&mut bytes, b'L', b"gnu-name\0");
+                    let mut member = gnu_header(b'0', 0);
+                    set_field(&mut member, NAME_RANGE, b"");
+                    set_checksum(&mut member);
+                    append_block(&mut bytes, &member);
+                    bytes
+                },
+                b"gnu-name".as_slice(),
+            ),
+        ] {
+            append_terminator(&mut bytes);
+            ready_ok(async {
+                let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+                let member = next_member(&mut reader).await?;
+                assert_eq!(member.effective_path()?.as_ref(), expected, "{case}");
+                Ok(())
+            });
+        }
     }
 
     #[test]

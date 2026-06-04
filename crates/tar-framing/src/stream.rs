@@ -1014,7 +1014,10 @@ fn payload_free_size(position: u64, kind: MemberKind, size: u64) -> Result<u64, 
     if size == 0 {
         Ok(0)
     } else {
-        Err(FrameError::invalid_member_size(position, kind, size))
+        Err(FrameError::at(
+            position,
+            FrameErrorInner::InvalidMemberSize { kind, size },
+        ))
     }
 }
 

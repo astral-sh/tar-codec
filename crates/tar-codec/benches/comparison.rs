@@ -31,10 +31,6 @@ struct FramingSink {
 }
 
 impl FramingSink {
-    fn bytes_written(&self) -> u64 {
-        self.bytes_written
-    }
-
     fn record_write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         let len = u64::try_from(buffer.len())
             .map_err(|_| io::Error::other("write length cannot be represented"))?;
@@ -88,23 +84,19 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn entry_count(&self) -> usize {
-        self.entries.len()
-    }
-
     fn benchmark_id(&self) -> String {
-        format!("{}-{}-entries", self.id, self.entry_count())
+        format!("{}-{}-entries", self.id, self.entries.len())
     }
 
     fn entry_throughput(&self) -> Throughput {
         Throughput::Elements(
-            u64::try_from(self.entry_count()).expect("fixture entry count should be representable"),
+            u64::try_from(self.entries.len()).expect("fixture entry count should be representable"),
         )
     }
 
     fn payload_throughput(&self) -> Throughput {
         Throughput::ElementsAndBytes {
-            elements: u64::try_from(self.entry_count())
+            elements: u64::try_from(self.entries.len())
                 .expect("fixture entry count should be representable"),
             bytes: self.payload_bytes,
         }
@@ -195,7 +187,7 @@ async fn encode_entries_tar_codec(fixture: &Fixture) -> u64 {
         .finish()
         .await
         .expect("tar-codec archive should finish")
-        .bytes_written()
+        .bytes_written
 }
 
 fn encode_entries_tar(fixture: &Fixture) -> u64 {
@@ -210,7 +202,7 @@ fn encode_entries_tar(fixture: &Fixture) -> u64 {
     builder
         .into_inner()
         .expect("tar archive should finish")
-        .bytes_written()
+        .bytes_written
 }
 
 async fn encode_entries_tokio_tar(fixture: &Fixture) -> u64 {
@@ -227,7 +219,7 @@ async fn encode_entries_tokio_tar(fixture: &Fixture) -> u64 {
         .into_inner()
         .await
         .expect("astral-tokio-tar archive should finish")
-        .bytes_written()
+        .bytes_written
 }
 
 async fn encode_directory_tar_codec(fixture: &Fixture) -> u64 {
@@ -240,7 +232,7 @@ async fn encode_directory_tar_codec(fixture: &Fixture) -> u64 {
         .finish()
         .await
         .expect("tar-codec archive should finish")
-        .bytes_written()
+        .bytes_written
 }
 
 fn encode_directory_tar(fixture: &Fixture) -> u64 {
@@ -252,7 +244,7 @@ fn encode_directory_tar(fixture: &Fixture) -> u64 {
     builder
         .into_inner()
         .expect("tar archive should finish")
-        .bytes_written()
+        .bytes_written
 }
 
 async fn encode_directory_tokio_tar(fixture: &Fixture) -> u64 {
@@ -266,7 +258,7 @@ async fn encode_directory_tokio_tar(fixture: &Fixture) -> u64 {
         .into_inner()
         .await
         .expect("astral-tokio-tar archive should finish")
-        .bytes_written()
+        .bytes_written
 }
 
 fn configure_tar_header(header: &mut tar::Header, payload_len: usize) {

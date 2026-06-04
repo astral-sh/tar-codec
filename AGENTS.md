@@ -1,6 +1,8 @@
 - Read CONTRIBUTING.md for guidelines on how to run tools
 - Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) before changing crate boundaries, format behavior, or extraction policy
-- ALWAYS attempt to add a test case for changed behavior
+- ALWAYS attempt to add a test case for changed behavior, except for the `tarpit` CLI since it's dev only
+- PREFER integration tests (`tar-codec/tests`) over unit tests when changed behavior concerns multiple APIs or whole tar streams
+- AVOID writing duplicate or tautological testcases
 - NEVER perform builds with the release profile, unless asked or reproducing performance issues
 - PREFER running specific tests over running the entire test suite
 - AVOID using `panic!`, `unreachable!`, `.unwrap()`, unsafe code, and clippy rule ignores
@@ -13,4 +15,6 @@
 - ALWAYS read and copy the style of similar tests when adding new cases
 - PREFER top-level imports over local imports or fully qualified names
 - AVOID shortening variable names, e.g., use `version` instead of `ver`
+- AVOID single-line functions that just call another function
+- AVOID single-use bindings, and prefer point-free style
 - PREFER [`TypeName`] references when writing Rust doc comments

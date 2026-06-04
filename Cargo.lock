@@ -870,7 +870,6 @@ dependencies = [
  "clap",
  "tar-codec",
  "tar-framing",
- "tempfile",
  "thiserror",
  "tokio",
  "tokio-stream",
