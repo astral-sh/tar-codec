@@ -118,6 +118,9 @@ mod tests {
     #[test]
     fn parses_strict_octal_fields() {
         for (field, expected) in [
+            // OK: leading zeroes.
+            (&b"000017 "[..], Some(0o17)),
+            (&b"0000000000000000000000000000017 "[..], Some(0o17)),
             // OK: 0o17, null terminated.
             (&b"17\0"[..], Some(0o17)),
             // OK: 0o17, space terminated.
