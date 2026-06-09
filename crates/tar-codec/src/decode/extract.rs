@@ -56,8 +56,11 @@ impl ExtractedEntry {
     }
 }
 
+/// Represents a root directory for an extraction operation.
 struct ExtractionRoot {
+    /// The root's path.
     path: PathBuf,
+    /// Whether overwrites are allowed during extraction.
     allow_overwrites: bool,
     entries: HashMap<PathBuf, ExtractedEntry>,
     symlink_indices: HashMap<PathBuf, usize>,
@@ -74,12 +77,13 @@ enum TerminalKind {
 impl<R: AsyncRead + Unpin> Archive<R> {
     /// Securely extracts this archive beneath `dest` under `policy`.
     ///
-    /// The destination is created when missing. When overwrites are enabled,
-    /// later members replace earlier members and existing destination leaves
-    /// without following symbolic links or recursively removing non-empty
-    /// directories. On failure, already-created and replaced entries may
-    /// remain, as with conventional streaming tar extractors. The caller must
-    /// not concurrently mutate `dest` while extraction is in progress.
+    /// `dest` is created if it does not already exist.
+    ///
+    /// `policy` controls extraction semantics, including overwrite behavior.
+    /// See [`DecodePolicy`] for information about each option and its default.
+    ///
+    /// **IMPORTANT**: `dest` **MUST NOT** be concurrently modified during extraction.
+    /// No correctness/isolation guarantees are made if `dest` is externally modified.
     pub async fn extract<P: AsRef<Path>>(
         mut self,
         dest: P,
