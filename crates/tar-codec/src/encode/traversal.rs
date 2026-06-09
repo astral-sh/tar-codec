@@ -23,7 +23,7 @@ use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinHandle};
 use walkdir::{DirEntry, WalkDir};
 
-use super::validate_archive_path;
+use crate::name::NameValidation;
 
 /// Number of filesystem entries grouped into one producer batch.
 ///
@@ -85,13 +85,21 @@ impl TraversalStream {
 /// A failure while traversing a recursive encoding source.
 #[derive(Debug, Error)]
 pub enum TraversalError {
-    /// A generated archive path is not safe and portable.
+    /// A traversed source entry unexpectedly falls outside the recursive root.
     #[error("invalid archive path {path:?}: {reason}")]
     InvalidArchivePath {
-        /// The rejected archive path.
+        /// The source entry outside the recursive root.
         path: PathBuf,
-        /// The reason the path is not accepted.
+        /// The failed traversal invariant.
         reason: &'static str,
+    },
+    /// An archive name was rejected by the configured encode policy.
+    #[error("archive {context} rejected by encode policy: {value:?}")]
+    NameRejected {
+        /// The role of the rejected archive text.
+        context: &'static str,
+        /// The rejected UTF-8 value.
+        value: String,
     },
     /// A source path component cannot be represented by this UTF-8-only encoder.
     #[error("source path is not valid UTF-8: {path}")]
@@ -135,14 +143,17 @@ pub enum TraversalError {
 
 /// Starts a bounded, blocking traversal beneath `source`.
 ///
-/// The root basename is normalized before spawning so invalid roots fail
+/// The root basename is validated before spawning so rejected roots fail
 /// without starting background work or producing entries.
-pub(crate) fn stream_directory_entries(source: PathBuf) -> Result<TraversalStream, TraversalError> {
-    let archive_path = source_archive_path(&source)?;
+pub(crate) fn stream_directory_entries(
+    source: PathBuf,
+    validation: NameValidation,
+) -> Result<TraversalStream, TraversalError> {
+    let archive_path = source_archive_path(&source, validation)?;
     let (sender, receiver) = mpsc::channel(DIRECTORY_TRAVERSAL_BUFFER_BATCHES);
     let task = tokio::task::spawn_blocking(move || {
         let mut output = TraversalSender::new(sender);
-        stream_directory_entries_blocking(&source, &archive_path, &mut output)?;
+        stream_directory_entries_blocking(&source, &archive_path, validation, &mut output)?;
         output.flush();
         Ok(())
     });
@@ -152,18 +163,23 @@ pub(crate) fn stream_directory_entries(source: PathBuf) -> Result<TraversalStrea
     })
 }
 
-fn source_archive_path(source: &Path) -> Result<String, TraversalError> {
+fn source_archive_path(
+    source: &Path,
+    validation: NameValidation,
+) -> Result<String, TraversalError> {
     let Some(name) = source.file_name().and_then(|name| name.to_str()) else {
         return Err(TraversalError::NonUtf8SourcePath {
             path: source.to_path_buf(),
         });
     };
-    Ok(validate_traversal_archive_path(Path::new(name))?.to_owned())
+    validate_name(name, validation, "member path")?;
+    Ok(name.to_owned())
 }
 
 fn stream_directory_entries_blocking(
     source: &Path,
     archive_path: &str,
+    validation: NameValidation,
     output: &mut TraversalSender,
 ) -> Result<(), TraversalError> {
     let entries = WalkDir::new(source)
@@ -175,7 +191,7 @@ fn stream_directory_entries_blocking(
             let path = error.path().unwrap_or(source).to_path_buf();
             filesystem_error("traverse source directory", &path, error.into())
         })?;
-        if !output.push(traversal_entry(source, archive_path, entry)?) {
+        if !output.push(traversal_entry(source, archive_path, validation, entry)?) {
             break;
         }
     }
@@ -218,6 +234,7 @@ impl TraversalSender {
 fn traversal_entry(
     source: &Path,
     archive_path: &str,
+    validation: NameValidation,
     entry: DirEntry,
 ) -> Result<TraversalEntry, TraversalError> {
     let path = entry.path();
@@ -236,7 +253,7 @@ fn traversal_entry(
     let archive_path = if relative.as_os_str().is_empty() {
         archive_path.to_owned()
     } else {
-        join_normalized_archive_path(archive_path, relative, path)?
+        join_archive_path(archive_path, relative, path, validation)?
     };
     let kind = if file_type.is_dir() {
         TraversalKind::Directory
@@ -250,6 +267,7 @@ fn traversal_entry(
                 path: path.to_path_buf(),
             });
         };
+        validate_name(&target, validation, "symbolic-link target")?;
         TraversalKind::SymbolicLink { target }
     } else {
         return Err(TraversalError::UnsupportedFilesystemType {
@@ -263,10 +281,11 @@ fn traversal_entry(
     })
 }
 
-fn join_normalized_archive_path(
+fn join_archive_path(
     archive_path: &str,
     relative: &Path,
     source_path: &Path,
+    validation: NameValidation,
 ) -> Result<String, TraversalError> {
     let mut joined = archive_path.to_owned();
     for component in relative {
@@ -278,15 +297,23 @@ fn join_normalized_archive_path(
         joined.push('/');
         joined.push_str(component);
     }
-    validate_traversal_archive_path(Path::new(&joined))?;
+    validate_name(&joined, validation, "member path")?;
     Ok(joined)
 }
 
-fn validate_traversal_archive_path(path: &Path) -> Result<&str, TraversalError> {
-    validate_archive_path(path).map_err(|reason| TraversalError::InvalidArchivePath {
-        path: path.to_path_buf(),
-        reason,
-    })
+fn validate_name(
+    name: &str,
+    validation: NameValidation,
+    context: &'static str,
+) -> Result<(), TraversalError> {
+    if validation.accepts(name) {
+        Ok(())
+    } else {
+        Err(TraversalError::NameRejected {
+            context,
+            value: name.to_owned(),
+        })
+    }
 }
 
 fn filesystem_error(operation: &'static str, path: &Path, source: io::Error) -> TraversalError {
@@ -305,18 +332,23 @@ mod tests {
     fn joins_native_relative_paths_with_archive_separators() {
         let relative = Path::new("nested").join("file");
         assert_eq!(
-            join_normalized_archive_path("tree", &relative, &relative).unwrap(),
+            join_archive_path("tree", &relative, &relative, NameValidation::Default,).unwrap(),
             "tree/nested/file"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn rejects_backslashes_in_source_path_components() {
+    fn preserves_backslashes_in_source_path_components() {
         let relative = Path::new("nested\\file");
         assert!(matches!(
-            join_normalized_archive_path("tree", relative, relative),
-            Err(TraversalError::InvalidArchivePath { .. })
+            join_archive_path(
+                "tree",
+                relative,
+                relative,
+                NameValidation::Default,
+            ),
+            Ok(path) if path == r"tree/nested\file"
         ));
     }
 }

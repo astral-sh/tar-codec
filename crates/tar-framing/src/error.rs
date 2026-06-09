@@ -33,10 +33,6 @@ impl FrameError {
         )
     }
 
-    pub(crate) fn invalid_member_size(position: u64, kind: MemberKind, size: u64) -> Self {
-        Self::at(position, FrameErrorInner::InvalidMemberSize { kind, size })
-    }
-
     pub(crate) fn invalid_pax_records(position: u64, reason: &'static str) -> Self {
         Self::at(position, FrameErrorInner::InvalidPaxRecords { reason })
     }
@@ -46,10 +42,6 @@ impl FrameError {
             position,
             FrameErrorInner::TruncatedPayload { owner, remaining },
         )
-    }
-
-    pub(crate) fn unexpected_eof(position: u64, expected: &'static str) -> Self {
-        Self::at(position, FrameErrorInner::UnexpectedEof { expected })
     }
 
     pub(crate) fn unexpected_order(
@@ -179,6 +171,15 @@ pub enum FrameErrorInner {
     DeletedPaxMetadata {
         /// The standard pax keyword that deleted its header fallback.
         keyword: &'static str,
+    },
+    /// An ordinary member has no effective pathname after applying extensions.
+    #[error("ordinary member has an empty effective path")]
+    EmptyMemberPath,
+    /// An effective member path or link target contains an embedded NUL byte.
+    #[error("effective member {field} contains a NUL byte")]
+    NulInMemberName {
+        /// The effective metadata field containing the NUL byte.
+        field: &'static str,
     },
     /// A framing offset or record length overflowed.
     #[error("arithmetic overflow while computing {context}")]

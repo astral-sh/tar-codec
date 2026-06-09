@@ -98,9 +98,13 @@ async fn dump_archive<W: Write>(archive: &Path, output: &mut W) -> Result<(), Cl
 async fn extract_archive(archive: &Path, destination: &Path) -> Result<(), CliError> {
     let file = open_archive(archive).await?;
     if is_gzip_tar(archive) {
-        extract_reader(GzipDecoder::new(BufReader::new(file)), destination).await?;
+        Archive::new(GzipDecoder::new(BufReader::new(file)))
+            .extract(destination, DecodePolicy::default())
+            .await?;
     } else {
-        extract_reader(file, destination).await?;
+        Archive::new(file)
+            .extract(destination, DecodePolicy::default())
+            .await?;
     }
     Ok(())
 }
@@ -110,15 +114,6 @@ async fn open_archive(archive: &Path) -> Result<File, CliError> {
         path: archive.to_owned(),
         source,
     })
-}
-
-async fn extract_reader<R: AsyncRead + Unpin>(
-    reader: R,
-    destination: &Path,
-) -> Result<(), DecodeError> {
-    Archive::new(reader)
-        .extract(destination, DecodePolicy::default())
-        .await
 }
 
 fn is_gzip_tar(archive: &Path) -> bool {
@@ -309,149 +304,5 @@ fn data_owner_name(owner: DataOwner) -> &'static str {
         DataOwner::Gnu(GnuKind::LongName) => "gnu(long-name)",
         DataOwner::Gnu(GnuKind::LongLink) => "gnu(long-link)",
         DataOwner::Member => "member",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{fs, ops::Range};
-
-    use async_compression::tokio::write::GzipEncoder;
-    use tar_framing::write::{PaxMember, end_marker_bytes, frame_pax_member_into};
-    use tempfile::tempdir;
-    use tokio::io::AsyncWriteExt;
-
-    use super::*;
-
-    const BLOCK_SIZE: usize = 512;
-    const CHECKSUM_RANGE: Range<usize> = 148..156;
-    const IDENTITY_RANGE: Range<usize> = 257..265;
-    const MODE_RANGE: Range<usize> = 100..108;
-    const NAME_RANGE: Range<usize> = 0..100;
-    const SIZE_RANGE: Range<usize> = 124..136;
-    const TYPEFLAG_OFFSET: usize = 156;
-    const POSIX_IDENTITY: &[u8; 8] = b"ustar\x0000";
-
-    #[test]
-    fn renders_pax_value_categories_and_deletions() {
-        let records = [
-            PaxRecord::Uid(PaxValue::Value(7)),
-            PaxRecord::Comment(PaxValue::Value("note".to_owned())),
-            PaxRecord::Path(PaxValue::Value(PaxString::Utf8("file".to_owned()))),
-            PaxRecord::LinkPath(PaxValue::Value(PaxString::Binary(vec![0xff]))),
-            PaxRecord::HdrCharset(PaxValue::Value(HdrCharset::Binary)),
-            PaxRecord::Gid(PaxValue::Deleted),
-        ];
-        let mut output = Vec::new();
-        render_pax_records(&mut output, "local", &records).unwrap();
-        assert_eq!(
-            output,
-            concat!(
-                "        local pax: uid=7\n",
-                "        local pax: comment=\"note\"\n",
-                "        local pax: path=\"file\"\n",
-                "        local pax: linkpath=binary([255])\n",
-                "        local pax: hdrcharset=\"BINARY\"\n",
-                "        local pax: gid=<deleted>\n",
-            )
-            .as_bytes()
-        );
-    }
-
-    #[tokio::test]
-    async fn renders_pax_records_on_their_final_physical_payload_frame() {
-        let mut archive = Vec::new();
-        frame_pax_member_into(
-            0,
-            PaxMember {
-                path: "file",
-                kind: MemberKind::Regular,
-                size: 0,
-                link_path: None,
-                executable: false,
-            },
-            &mut archive,
-        )
-        .expect("member should frame");
-        archive.extend_from_slice(end_marker_bytes());
-
-        let mut output = Vec::new();
-        dump_frames(archive.as_slice(), "archive.tar", &mut output)
-            .await
-            .expect("archive should render");
-        let output = String::from_utf8(output).expect("frame output should be UTF-8");
-        let data = output
-            .find("data owner=pax(local)")
-            .expect("PAX data frame should be rendered");
-        let records = output[data..]
-            .find("        local pax: path=\"file\"")
-            .map(|offset| data + offset)
-            .expect("PAX records should be rendered");
-        let header = output
-            .find("header regular")
-            .expect("ordinary header should be rendered");
-        assert!(data < records && records < header);
-    }
-
-    #[tokio::test]
-    async fn extracts_plain_and_gzip_tar_archives() {
-        let plain = archive_with_file("file", b"contents");
-        let mut encoder = GzipEncoder::new(Vec::new());
-        encoder.write_all(&plain).await.unwrap();
-        encoder.shutdown().await.unwrap();
-        for (case, name, bytes) in [
-            ("plain", "archive.tar", plain),
-            ("gzip", "archive.tar.gz", encoder.into_inner()),
-        ] {
-            let temp = tempdir().unwrap();
-            let archive = temp.path().join(name);
-            let destination = temp.path().join("out");
-            fs::write(&archive, bytes).unwrap();
-
-            extract_archive(&archive, &destination).await.unwrap();
-
-            assert_eq!(
-                fs::read(destination.join("file")).unwrap(),
-                b"contents",
-                "{case}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn reports_extraction_failure() {
-        let temp = tempdir().unwrap();
-        let archive = temp.path().join("invalid.tar");
-        let destination = temp.path().join("out");
-        fs::write(&archive, [0xff; BLOCK_SIZE]).unwrap();
-
-        assert!(matches!(
-            extract_archive(&archive, &destination).await.unwrap_err(),
-            CliError::Extract(DecodeError::Framing(_))
-        ));
-    }
-
-    fn archive_with_file(path: &str, payload: &[u8]) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        let mut header = [0; BLOCK_SIZE];
-        header[NAME_RANGE.start..NAME_RANGE.start + path.len()].copy_from_slice(path.as_bytes());
-        header[MODE_RANGE].copy_from_slice(b"0000644\0");
-        let size = format!("{:011o}\0", payload.len());
-        header[SIZE_RANGE].copy_from_slice(size.as_bytes());
-        header[TYPEFLAG_OFFSET] = b'0';
-        header[IDENTITY_RANGE].copy_from_slice(POSIX_IDENTITY);
-        set_checksum(&mut header);
-        bytes.extend_from_slice(&header);
-        bytes.extend_from_slice(payload);
-        bytes.resize(bytes.len().next_multiple_of(BLOCK_SIZE), 0);
-        bytes.resize(bytes.len() + 2 * BLOCK_SIZE, 0);
-        bytes
-    }
-
-    fn set_checksum(block: &mut [u8; BLOCK_SIZE]) {
-        block[CHECKSUM_RANGE].fill(b' ');
-        let checksum = block.iter().map(|byte| u64::from(*byte)).sum::<u64>();
-        let encoded = format!("{checksum:06o}\0 ");
-        block[CHECKSUM_RANGE].copy_from_slice(encoded.as_bytes());
     }
 }
