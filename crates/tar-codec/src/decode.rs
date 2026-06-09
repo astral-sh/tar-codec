@@ -1,11 +1,4 @@
-//! Secure high-level decoding and extraction for validated tar streams.
-//!
-//! `tar-codec` interprets member metadata above [`tar_framing`] and extracts
-//! archive contents beneath a validated destination root. Decompression is
-//! the caller's responsibility. Extraction requires a [`DecodePolicy`] so
-//! that security-sensitive archive features are explicit at each call site.
-//! Configurable name validation is applied before mandatory extraction path
-//! containment.
+//! Decoding and extraction of pax or GNU tar streams.
 
 use std::{
     collections::HashSet,
