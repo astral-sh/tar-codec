@@ -1,15 +1,15 @@
 //! Low level framing of tar streams.
 //!
-//! This crate provides the lossless block-level [`stream`] framing API and
-//! the assembled member-level [`logical`] reader API. Logical PAX members use
-//! one unified [`PaxState`] for effective values and positioned
-//! extension history, while [`logical::Header`] borrows compact extracted
-//! ordinary-header metadata rather than retaining a lossless block.
+//! This crate provides two APIs:
 //!
-//! The stream is strict in the sense that it defines a state machine
-//! that enforces the pax (ustar superset) or GNU format rules
-//! and rejects streams that attempt to combine the two formats or that
-//! are otherwise ambiguous.
+//! - [`stream`] is a low-level, lossless per-block framing API.
+//! - [`logical`] is a medium-level, assembled member reader API.
+//!
+//! [`stream`] provides the basic static machine enforcement for a tar
+//! stream, including ensuring that any given stream is either strictly
+//! pax *or* GNU and not a mix of the two. [`logical`] is layered on top
+//! of [`stream`] and provides APIs for accessing the "effective" metadata
+//! for each assembled member.
 
 mod error;
 mod header;
