@@ -6,8 +6,6 @@ use std::{
 };
 
 use super::*;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use tar_framing::logical::MemberPayload;
 use tokio::{fs, io::AsyncWriteExt};
 
@@ -198,7 +196,7 @@ impl ExtractionRoot {
         if self.symlink_indices.contains_key(path) {
             self.replace_leaf(path).await?;
         }
-        let file = match self.open_file(path, true, false).await {
+        let file = match self.open_file(path, true, false, executable).await {
             Ok(file) => file,
             Err(source) => {
                 if !self.replace_leaf(path).await? {
@@ -208,12 +206,10 @@ impl ExtractionRoot {
                         source,
                     ));
                 }
-                let result = self.open_file(path, true, false).await;
+                let result = self.open_file(path, true, false, executable).await;
                 self.fs("create file", path, result)?
             }
         };
-        let result = add_executable(&file, executable).await;
-        self.fs("create file", path, result)?;
         self.entries.insert(path.to_owned(), ExtractedEntry::File);
         Ok(file)
     }
@@ -275,7 +271,7 @@ impl ExtractionRoot {
             payload.skip().await?;
             Ok(())
         } else {
-            let result = self.open_file(&member.path, false, true).await;
+            let result = self.open_file(&member.path, false, true, false).await;
             let file = self.fs("truncate file", &member.path, result)?;
             write_payload(payload, payload_chunk, &member.path, file).await
         }
@@ -451,12 +447,17 @@ impl ExtractionRoot {
         path: &Path,
         create_new: bool,
         truncate: bool,
+        executable: bool,
     ) -> io::Result<fs::File> {
         let mut options = fs::OpenOptions::new();
         options
             .write(true)
             .create_new(create_new)
             .truncate(truncate);
+        #[cfg(unix)]
+        options.mode(if executable { 0o777 } else { 0o666 });
+        #[cfg(not(unix))]
+        let _ = executable;
         options.open(self.destination_path(path)).await
     }
 
@@ -499,21 +500,6 @@ async fn remove_non_directory(path: &Path, metadata: &Metadata) -> io::Result<()
     #[cfg(not(windows))]
     let _ = metadata;
     fs::remove_file(path).await
-}
-
-#[cfg(unix)]
-async fn add_executable(file: &fs::File, executable: bool) -> io::Result<()> {
-    if executable {
-        let mut permissions = file.metadata().await?.permissions();
-        permissions.set_mode(permissions.mode() | 0o111);
-        file.set_permissions(permissions).await?;
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-async fn add_executable(_file: &fs::File, _executable: bool) -> io::Result<()> {
-    Ok(())
 }
 
 #[cfg(unix)]
