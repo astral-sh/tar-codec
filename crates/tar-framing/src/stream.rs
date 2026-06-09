@@ -86,7 +86,8 @@ use crate::{
     PaxRecord, PaxValue,
     header::{
         CHECKSUM_RANGE, GNU_IDENTITY, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE, NAME_RANGE,
-        POSIX_IDENTITY, PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, checksum, parse_octal,
+        POSIX_IDENTITY, PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, checksum, parse_number,
+        parse_octal,
     },
     pax::{
         SharedPaxRecords, apply_global as apply_global_pax_records, hdrcharset as pax_hdrcharset,
@@ -998,31 +999,6 @@ impl TryFromFramed<&Block> for ParsedHeader {
             size,
         })
     }
-}
-
-pub(crate) fn parse_number(format: ArchiveFormat, bytes: &[u8]) -> Option<u64> {
-    match format {
-        ArchiveFormat::Pax => parse_octal(bytes),
-        ArchiveFormat::Gnu => parse_gnu_number(bytes),
-    }
-}
-
-pub(crate) fn parse_mode(
-    position: u64,
-    format: ArchiveFormat,
-    bytes: [u8; 8],
-) -> Result<u64, FrameError> {
-    parse_number(format, &bytes)
-        .ok_or_else(|| FrameError::at(position, FrameErrorInner::InvalidMode { found: bytes }))
-}
-
-fn parse_gnu_number(bytes: &[u8]) -> Option<u64> {
-    if bytes.first() != Some(&0x80) {
-        return parse_octal(bytes);
-    }
-    bytes[1..].iter().try_fold(0_u64, |value, byte| {
-        value.checked_mul(256)?.checked_add(u64::from(*byte))
-    })
 }
 
 impl TryFromFramed<u8> for MemberKind {

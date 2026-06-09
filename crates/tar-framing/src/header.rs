@@ -1,4 +1,4 @@
-use crate::Block;
+use crate::{ArchiveFormat, Block};
 
 pub(crate) const NAME_RANGE: std::ops::Range<usize> = 0..100;
 pub(crate) const MODE_RANGE: std::ops::Range<usize> = 100..108;
@@ -76,6 +76,10 @@ fn encode_octal_digits(field: &mut [u8], mut value: u64) -> bool {
     value == 0
 }
 
+/// Parse an octal number from the given bytes.
+///
+/// Per pax, an octal number is a leading-zero filled sequence of octal characters
+/// (0-7), terminated by one or more NUL or space characters.
 pub(crate) fn parse_octal(bytes: &[u8]) -> Option<u64> {
     let mut value = 0_u64;
     let mut has_digits = false;
@@ -91,6 +95,35 @@ pub(crate) fn parse_octal(bytes: &[u8]) -> Option<u64> {
         }
     }
     (has_digits && terminated).then_some(value)
+}
+
+/// Parse a number from the given bytes, depending on the archive format.
+///
+/// See [`parse_octal`] for the pax parsing rules and [`parse_gnu_number`]
+/// for the GNU parsing rules.
+pub(crate) fn parse_number(format: ArchiveFormat, bytes: &[u8]) -> Option<u64> {
+    match format {
+        ArchiveFormat::Pax => parse_octal(bytes),
+        ArchiveFormat::Gnu => parse_gnu_number(bytes),
+    }
+}
+
+/// Parse a number according to the GNU tar rules.
+///
+/// This implements a subset of the GNU rules: negative numbers are rejected entirely,
+/// and we don't reject base256 encodings that *would* fit in the octal encoding.
+/// TODO: Consider rejecting these? The GNU spec describes base256 encodings that would
+/// fit in octal as "reserved for future use."
+fn parse_gnu_number(bytes: &[u8]) -> Option<u64> {
+    match bytes.first()? {
+        0x80 => bytes[1..].iter().try_fold(0_u64, |value, byte| {
+            value.checked_mul(256)?.checked_add(u64::from(*byte))
+        }),
+        // Negative encoding; reject for now. This would also be rejected by
+        // `parse_octal` but here is clearer.
+        0xff => None,
+        _ => parse_octal(bytes),
+    }
 }
 
 #[cfg(test)]
@@ -114,21 +147,37 @@ mod tests {
     #[test]
     fn parses_strict_octal_fields() {
         for (field, expected) in [
+            // OK: leading zeroes.
+            (&b"000017 "[..], Some(0o17)),
+            (&b"0000000000000000000000000000017 "[..], Some(0o17)),
+            // OK: 0o17, null terminated.
             (&b"17\0"[..], Some(0o17)),
+            // OK: 0o17, space terminated.
+            (&b"17 "[..], Some(0o17)),
+            // OK: 0o17, space terminated (trailing null ignored)
             (&b"17 \0"[..], Some(0o17)),
+            // Invalid: empty
             (&b""[..], None),
+            // Invalid: terminator only
             (&b"\0"[..], None),
+            (&b" "[..], None),
+            // Invalid: no terminator
             (&b"17"[..], None),
+            // Invalid: not in octal domain
             (&b"18\0"[..], None),
+            // Invalid: not in octal domain, even after terminator
             (&b"1\0\x32"[..], None),
+            // Invalid: octal after terminator.
+            (&b"1\0\x31"[..], None),
+            (&b"1 1"[..], None),
+            // Invalid: not in octal domain.
             (&[0x80, 0][..], None),
+            // Invalid: overflows u64.
+            (&b"77777777777777777777777 "[..], None),
+            (&b"77777777777777777777777\0"[..], None),
         ] {
             assert_eq!(parse_octal(field), expected, "{field:?}");
         }
-
-        let mut overflow = [b'7'; 24];
-        overflow[23] = 0;
-        assert_eq!(parse_octal(&overflow), None);
     }
 
     #[test]
