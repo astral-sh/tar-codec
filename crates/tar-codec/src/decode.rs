@@ -52,7 +52,7 @@ pub struct DecodePolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PaxDecodePolicy {
     allow_global_pax_extensions: bool,
-    allow_pax_vendor_extensions: bool,
+    allow_unknown_pax_vendor_records: bool,
     allow_duplicate_pax_records: bool,
     allow_global_pax_member_metadata: bool,
 }
@@ -61,7 +61,7 @@ impl Default for PaxDecodePolicy {
     fn default() -> Self {
         Self {
             allow_global_pax_extensions: true,
-            allow_pax_vendor_extensions: false,
+            allow_unknown_pax_vendor_records: false,
             allow_duplicate_pax_records: false,
             allow_global_pax_member_metadata: false,
         }
@@ -254,14 +254,22 @@ impl PaxDecodePolicy {
         self
     }
 
-    /// Configures whether vendor-namespaced pax records may be accepted.
+    /// Configures whether unknown vendor-namespaced pax records may be accepted.
     ///
-    /// When enabled, well-formed vendor-namespaced pax records will not cause
-    /// a decoding error.
+    /// When enabled, well-formed vendor-namespaced pax records do not cause a
+    /// decoding error. Their values are parsed structurally but their semantics
+    /// are not interpreted or validated.
     ///
-    /// Vendor-namespaced pax records are **forbidden by default**.
-    pub fn allow_pax_vendor_extensions(mut self, allow: bool) -> Self {
-        self.allow_pax_vendor_extensions = allow;
+    /// This can produce output that differs from the archive's intended
+    /// contents. For example, `GNU.sparse.*` records can change a member's
+    /// effective name, logical size, and mapping from stored payload bytes to
+    /// file contents; these semantics are ignored when this option is enabled.
+    ///
+    /// **IMPORTANT**: Only enable this when silently ignoring unknown vendor
+    /// semantics is acceptable. Unknown vendor-namespaced pax records are
+    /// **forbidden by default**.
+    pub fn allow_unknown_pax_vendor_records(mut self, allow: bool) -> Self {
+        self.allow_unknown_pax_vendor_records = allow;
         self
     }
 
@@ -304,7 +312,7 @@ impl PaxDecodePolicy {
         kind: PaxKind,
         records: &[PaxRecord],
     ) -> Result<(), DecodeError> {
-        if !self.allow_pax_vendor_extensions {
+        if !self.allow_unknown_pax_vendor_records {
             for record in records {
                 if let PaxRecord::Vendor { vendor, name, .. } = record {
                     return Err(DecodeError::policy_violation(
@@ -545,6 +553,14 @@ fn decode_member<R>(
             field: "path",
         })?;
     policy.check_name(header.position, "member path", &path_text)?;
+    if path_text.ends_with('/') && header.kind != MemberKind::Directory {
+        return Err(DecodeError::unsafe_path(
+            header.position,
+            "member path",
+            &path_text,
+            "only a directory may have a trailing separator",
+        ));
+    }
     let path = normalize_member_path(header.position, &path_text)?;
     if path.as_os_str().is_empty() && header.kind != MemberKind::Directory {
         return Err(DecodeError::unsafe_path(

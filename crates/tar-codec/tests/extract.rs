@@ -1,5 +1,8 @@
 pub mod support;
 
+#[path = "extract/malo.rs"]
+mod malo;
+
 use std::path::Path;
 
 use support::{ArchiveBuilder, EntryKind, single_posix_member};
@@ -19,7 +22,7 @@ async fn extracts_files_directories_large_payloads_and_archive_path_syntax() {
     archive
         .posix("bin/tool", b'0', b"run", "", 0o755)
         .posix("bin", b'5', b"", "", 0o755)
-        .posix("empty", b'5', b"", "", 0o755)
+        .posix("empty/", b'5', b"", "", 0o755)
         .posix(".", b'5', b"", "", 0o755)
         .posix("large", b'0', &large_payload, "", 0o644);
     #[cfg(unix)]

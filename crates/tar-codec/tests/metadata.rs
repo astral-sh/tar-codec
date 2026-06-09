@@ -276,7 +276,7 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
         .posix("file", b'0', b"ok", "", 0o644);
     let bytes = archive.finish();
     let policy = DecodePolicy::default()
-        .pax_policy(PaxDecodePolicy::default().allow_pax_vendor_extensions(true));
+        .pax_policy(PaxDecodePolicy::default().allow_unknown_pax_vendor_records(true));
     Archive::new(bytes.as_slice())
         .extract(&destination, policy)
         .await
