@@ -86,7 +86,8 @@ use crate::{
     PaxRecord, PaxValue,
     header::{
         CHECKSUM_RANGE, GNU_IDENTITY, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE, NAME_RANGE,
-        POSIX_IDENTITY, PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, checksum, parse_octal,
+        POSIX_IDENTITY, PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, checksum, parse_number,
+        parse_octal,
     },
     pax::{
         SharedPaxRecords, apply_global as apply_global_pax_records, hdrcharset as pax_hdrcharset,
@@ -997,44 +998,6 @@ impl TryFromFramed<&Block> for ParsedHeader {
             typeflag: block[TYPEFLAG_OFFSET],
             size,
         })
-    }
-}
-
-/// Parse a number from the given bytes, depending on the archive format.
-///
-/// See [`parse_octal`] for the pax parsing rules and [`parse_gnu_number`]
-/// for the GNU parsing rules.
-pub(crate) fn parse_number(format: ArchiveFormat, bytes: &[u8]) -> Option<u64> {
-    match format {
-        ArchiveFormat::Pax => parse_octal(bytes),
-        ArchiveFormat::Gnu => parse_gnu_number(bytes),
-    }
-}
-
-pub(crate) fn parse_mode(
-    position: u64,
-    format: ArchiveFormat,
-    bytes: [u8; 8],
-) -> Result<u64, FrameError> {
-    parse_number(format, &bytes)
-        .ok_or_else(|| FrameError::at(position, FrameErrorInner::InvalidMode { found: bytes }))
-}
-
-/// Parse a number according to the GNU tar rules.
-///
-/// This implements a subset of the GNU rules: negative numbers are rejected entirely,
-/// and we don't reject base256 encodings that *would* fit in the octal encoding.
-/// TODO: Consider rejecting these? The GNU spec describes base256 encodings that would
-/// fit in octal as "reserved for future use."
-fn parse_gnu_number(bytes: &[u8]) -> Option<u64> {
-    match bytes.first()? {
-        0x80 => bytes[1..].iter().try_fold(0_u64, |value, byte| {
-            value.checked_mul(256)?.checked_add(u64::from(*byte))
-        }),
-        // Negative encoding; reject for now. This would also be rejected by
-        // `parse_octal` but here is clearer.
-        0xff => None,
-        _ => parse_octal(bytes),
     }
 }
 

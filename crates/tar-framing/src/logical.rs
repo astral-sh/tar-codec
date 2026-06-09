@@ -12,7 +12,8 @@ use tokio_stream::StreamExt;
 use crate::{
     ArchiveFormat, Block, FrameError, FrameErrorInner, GnuKind, MemberKind, PaxKind, PaxRecord,
     PaxString, PaxValue,
-    stream::{DataOwner, Frame, GnuFrame, HeaderFrame, PaxFrame, TarStream, parse_mode},
+    header::parse_number,
+    stream::{DataOwner, Frame, GnuFrame, HeaderFrame, PaxFrame, TarStream},
 };
 
 pub use crate::{PaxExtension, PaxState};
@@ -75,7 +76,12 @@ pub struct Header<'a> {
 impl Header<'_> {
     /// Decodes the ordinary header's numeric mode according to its archive family.
     pub fn mode(&self) -> Result<u64, FrameError> {
-        parse_mode(self.position, self.format, self.mode)
+        parse_number(self.format, &self.mode).ok_or_else(|| {
+            FrameError::at(
+                self.position,
+                FrameErrorInner::InvalidMode { found: self.mode },
+            )
+        })
     }
 }
 

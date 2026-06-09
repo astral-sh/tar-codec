@@ -1,4 +1,4 @@
-use crate::Block;
+use crate::{ArchiveFormat, Block};
 
 pub(crate) const NAME_RANGE: std::ops::Range<usize> = 0..100;
 pub(crate) const MODE_RANGE: std::ops::Range<usize> = 100..108;
@@ -97,6 +97,35 @@ pub(crate) fn parse_octal(bytes: &[u8]) -> Option<u64> {
     (has_digits && terminated).then_some(value)
 }
 
+/// Parse a number from the given bytes, depending on the archive format.
+///
+/// See [`parse_octal`] for the pax parsing rules and [`parse_gnu_number`]
+/// for the GNU parsing rules.
+pub(crate) fn parse_number(format: ArchiveFormat, bytes: &[u8]) -> Option<u64> {
+    match format {
+        ArchiveFormat::Pax => parse_octal(bytes),
+        ArchiveFormat::Gnu => parse_gnu_number(bytes),
+    }
+}
+
+/// Parse a number according to the GNU tar rules.
+///
+/// This implements a subset of the GNU rules: negative numbers are rejected entirely,
+/// and we don't reject base256 encodings that *would* fit in the octal encoding.
+/// TODO: Consider rejecting these? The GNU spec describes base256 encodings that would
+/// fit in octal as "reserved for future use."
+fn parse_gnu_number(bytes: &[u8]) -> Option<u64> {
+    match bytes.first()? {
+        0x80 => bytes[1..].iter().try_fold(0_u64, |value, byte| {
+            value.checked_mul(256)?.checked_add(u64::from(*byte))
+        }),
+        // Negative encoding; reject for now. This would also be rejected by
+        // `parse_octal` but here is clearer.
+        0xff => None,
+        _ => parse_octal(bytes),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,7 +168,7 @@ mod tests {
             // Invalid: not in octal domain, even after terminator
             (&b"1\0\x32"[..], None),
             // Invalid: octal after terminator.
-            (&b"1\01"[..], None),
+            (&b"1\0\x31"[..], None),
             (&b"1 1"[..], None),
             // Invalid: not in octal domain.
             (&[0x80, 0][..], None),
