@@ -73,6 +73,9 @@
 //! Because pax and GNU both use ustar as their baseline, any compatibility aspect of pax
 //! that is derived from ustar also applies during GNU tar decoding.
 //!
+//! Separately, higher-level crates (like `tar_codec`) may choose to apply additional
+//! restrictions when processing logical archive members.
+//!
 //! [POSIX.1-2024]: https://pubs.opengroup.org/onlinepubs/9799919799/
 //! [pax specification]: https://pubs.opengroup.org/onlinepubs/9799919799/utilities/pax.html
 //! [POSIX.1-2004]: https://pubs.opengroup.org/onlinepubs/009695399/toc.htm

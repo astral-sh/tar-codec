@@ -73,7 +73,7 @@ mod tests {
         ] {
             assert!(default_name_validator(name), "{name:?}");
         }
-        for name in [" leading", "trailing ", "\tname", "name\n"] {
+        for name in [" leading", "trailing ", "\tname", "name\n", "inside\nname"] {
             assert!(!default_name_validator(name), "{name:?}");
         }
     }
