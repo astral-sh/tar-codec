@@ -59,15 +59,11 @@ pub struct Header<'a> {
     /// The size encoded directly in the member header field.
     pub declared_size: u64,
     /// The size after applying applicable pax `size` records.
-    pub effective_size: u64,
-    /// The number of payload bytes exposed through [`MemberPayload`].
     ///
-    /// This can vary from both [`Header::declared_size`] and [`Header::effective_size`]
-    /// depending on [`Header::kind`]. For example, a dictory member is permitted
-    /// to declare a non-zero size in either the ustar or pax header, but ustar
-    /// explicitly says that no 'logical records' (i.e. payload) is emitted
-    /// for a directory.
-    pub payload_size: u64,
+    /// This is also the number of payload bytes exposed through
+    /// [`MemberPayload`]. Member kinds that cannot carry payload are rejected
+    /// when either their declared or effective size is nonzero.
+    pub effective_size: u64,
     mode: [u8; 8],
     header_path: &'a [u8],
     link_name: &'a [u8],
@@ -195,7 +191,6 @@ impl HeaderStorage {
             kind: frame.kind,
             declared_size: frame.declared_size,
             effective_size: frame.effective_size,
-            payload_size: frame.payload_size,
             mode: frame.mode_bytes(),
             header_path: &self.path,
             link_name: &self.link_name,
@@ -263,7 +258,7 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
                             long_link,
                         },
                     };
-                    self.payload.remaining = header.payload_size;
+                    self.payload.remaining = header.effective_size;
                     let header = self.header_storage.update(&header);
                     return Ok(Some(MemberFrame {
                         header,
@@ -1278,7 +1273,7 @@ mod tests {
                     member.payload.skip().await?;
                 }
                 let member = next_member(&mut reader).await?;
-                assert_eq!(member.header.payload_size, 0);
+                assert_eq!(member.header.effective_size, 0);
                 drop(member);
                 assert!(reader.next_frame().await?.is_none());
                 Ok(())

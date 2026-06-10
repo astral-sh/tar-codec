@@ -2,8 +2,9 @@ pub mod support;
 
 use std::path::Path;
 
-use support::{ArchiveBuilder, EntryKind, single_posix_member};
+use support::{ArchiveBuilder, ArchiveFormat, EntryKind, header, pax_record, single_posix_member};
 use tar_codec::decode::{Archive, DecodeError, DecodePolicy};
+use tar_framing::{FrameError, FrameErrorInner, MemberKind};
 use tempfile::tempdir;
 
 #[tokio::test]
@@ -19,7 +20,7 @@ async fn extracts_files_directories_large_payloads_and_archive_path_syntax() {
     archive
         .posix("bin/tool", b'0', b"run", "", 0o755)
         .posix("bin", b'5', b"", "", 0o755)
-        .posix("empty", b'5', b"", "", 0o755)
+        .posix("empty/", b'5', b"", "", 0o755)
         .posix(".", b'5', b"", "", 0o755)
         .posix("large", b'0', &large_payload, "", 0o644);
     #[cfg(unix)]
@@ -100,6 +101,63 @@ async fn rejects_invalid_destinations_unsafe_paths_and_unsupported_members() {
             .await,
         Err(DecodeError::UnsupportedMember { .. })
     ));
+}
+
+/// Ensures that we reject a directory entry with a declared size that embeds a regular file.
+/// See malo's `malicious/dir_with_embedded_header.tar` for the case that this was derived from.
+/// See: <https://github.com/fastzip/malo/tree/3df544f1a2fc498b2a84eb34981deb111cadbf32/tar/malicious>
+#[tokio::test]
+async fn rejects_directory_payload_without_writing_embedded_members() {
+    let embedded_header = header(ArchiveFormat::Posix, "embedded.txt", b'0', 5, "", 0o644);
+    let mut archive = ArchiveBuilder::new();
+    archive.posix("dir/", b'5', &embedded_header, "", 0o755);
+    let bytes = archive.finish();
+
+    let temp = tempdir().unwrap();
+    let destination = temp.path().join("out");
+    assert!(matches!(
+        Archive::new(bytes.as_slice())
+            .extract(&destination, DecodePolicy::default())
+            .await,
+        Err(DecodeError::Framing(FrameError {
+            position: 0,
+            inner: FrameErrorInner::InvalidMemberSize {
+                kind: MemberKind::Directory,
+                size: 512,
+            },
+        }))
+    ));
+    assert!(destination.is_dir());
+    assert!(std::fs::read_dir(destination).unwrap().next().is_none());
+}
+
+/// Ensures that we reject a regular file that ends with a trailing slash.
+/// See malo's `malicious/pax_path_trailoing_slash_file.tar` for the case
+/// that this was derived from.
+/// See: <https://github.com/fastzip/malo/tree/3df544f1a2fc498b2a84eb34981deb111cadbf32/tar/malicious>
+#[tokio::test]
+async fn rejects_trailing_separator_on_regular_file_without_writing_members() {
+    let mut archive = ArchiveBuilder::new();
+    archive
+        .pax(b'x', &pax_record("path", "file.txt/"))
+        .posix("ignored", b'0', b"hello", "", 0o644);
+    let bytes = archive.finish();
+
+    let temp = tempdir().unwrap();
+    let destination = temp.path().join("out");
+    assert!(matches!(
+        Archive::new(bytes.as_slice())
+            .extract(&destination, DecodePolicy::default())
+            .await,
+        Err(DecodeError::UnsafePath {
+            position: 1024,
+            context: "member path",
+            value,
+            reason: "only a directory may have a trailing separator",
+        }) if value == "file.txt/"
+    ));
+    assert!(destination.is_dir());
+    assert!(std::fs::read_dir(destination).unwrap().next().is_none());
 }
 
 #[tokio::test]

@@ -183,12 +183,11 @@ fn render_frame(output: &mut impl Write, index: usize, frame: &Frame) -> io::Res
         ),
         Frame::Header(frame) => writeln!(
             output,
-            "    [{index}] @{} header {} declared={} effective={} payload={}",
+            "    [{index}] @{} header {} declared={} effective={}",
             frame.position,
             member_kind_name(frame.kind),
             frame.declared_size,
-            frame.effective_size,
-            frame.payload_size
+            frame.effective_size
         ),
         Frame::Data(frame) => {
             writeln!(

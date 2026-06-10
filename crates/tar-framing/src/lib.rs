@@ -10,6 +10,78 @@
 //! pax *or* GNU and not a mix of the two. [`logical`] is layered on top
 //! of [`stream`] and provides APIs for accessing the "effective" metadata
 //! for each assembled member.
+//!
+//! This crate tries to faithfully extract pax or GNU entries without mixing the
+//! two. See the sections below for compatibility notes.
+//!
+//! ## pax compatibility
+//!
+//! When decoding pax-formatted tar streams, tar-framing attempts to conform to
+//! pax as specified in [POSIX.1-2024], i.e. "issue 8" of the POSIX specification.
+//! See the [pax specification] for full details.
+//!
+//! However, there are a few small deviations from a pedantic reading of [POSIX.1-2024]
+//! that are worth noting:
+//!
+//! - tar-framing permits a `ctime` pax record, despite not being specified in [POSIX.1-2024].
+//!   The ctime record was removed from pax in [POSIX.1-2004] (which is itself a minor edit
+//!   of POSIX.1-2001). However, many real-world pax archives still contain it, and its
+//!   presence does not compromise or introduce ambiguity during framing.
+//!
+//! - tar-framing rejects directory entries (typeflag `'5'`) that present a nonzero size
+//!   in their ustar header or pax `size` record. pax says that this size should be treated
+//!   as a filesystem allocation hint rather than a physical size, but real-world parsers vary
+//!   widely in how they handle it (some ignore it, others skip over that number of bytes, etc.).
+//!
+//! - tar-framing rejects regular file entries (typeflag `'0'` or `'\0'`) that include a trailing
+//!   slash (e.g. `foo.txt/`). pax is ambiguous about to handle these cases: it notes that
+//!   pre-ustar tar had no directory entry typeflag and thus a trailing slash was used
+//!   to indicate a directory by convention, but does not prescribe that pax implementors
+//!   honor this legacy behavior. We choose to reject it since it presents the same directory
+//!   size problem mentioned above.
+//!
+//! - tar-framing rejects negative timestamps as well as timestamps that would exceed the
+//!   precision of a `u64`. pax allows both of these, although it notes that portable timestamps
+//!   cannot be negative and that tools may reject such timestamps.
+//!
+//! - tar-framing silently removes fractional components from parsed timestamps. Timestamps
+//!   are truncated to second precision.
+//!
+//! ## GNU compatibility
+//!
+//! When decoding GNU-formatted tar streams, tar-framing attempts to follow the
+//! ["Basic Tar Format"] in the GNU docs. Specifically, tar-framing attempts
+//! to follow the rules for the "old GNU" format, i.e. GNU tar's non-pax format.
+//!
+//! tar-framing intentionally only supports a subset of the GNU tar format:
+//!
+//! - The GNU "longname" and "longlink" (`'L'` and `'K'`) typeflags are supported,
+//!   with similar path-precedence semantics as their pax record equivalents.
+//!
+//! - Other GNU-specific typeflags are **not** supported whatsoever, and produce
+//!   a framing error. This includes sparse files (`'S'`) and multivolume headers
+//!   (`'M'`).
+//!
+//! - tar-framing accepts the GNU-specific "base-256" encoding for numbers, but rejects
+//!   negative encodings as well as any value that would exceed the precision of a `u64`.
+//!   tar-framing also allows "base-256" encodings where the numeric value _would_ fit
+//!   into an octal encoding in the alloted buffer/byte span; GNU technically says that
+//!   this is reserved for future use.
+//!
+//! ## General compatibility
+//!
+//! Because pax and GNU both use ustar as their baseline, any compatibility aspect of pax
+//! that is derived from ustar also applies during GNU tar decoding.
+//!
+//! Separately, higher-level crates (like tar-codec) may choose to apply additional
+//! restrictions when processing logical archive members. For example, a consumer
+//! of tar-framing may choose to reject vendor-specific pax records, or member names
+//! that contain forbidden characters, or any other additional restriction.
+//!
+//! [POSIX.1-2024]: https://pubs.opengroup.org/onlinepubs/9799919799/
+//! [pax specification]: https://pubs.opengroup.org/onlinepubs/9799919799/utilities/pax.html
+//! [POSIX.1-2004]: https://pubs.opengroup.org/onlinepubs/009695399/toc.htm
+//! ["Basic Tar Format"]: https://www.gnu.org/software/tar/manual/html_node/Standard.html
 
 mod error;
 mod header;

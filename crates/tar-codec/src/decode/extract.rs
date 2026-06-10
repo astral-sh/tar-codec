@@ -169,9 +169,9 @@ impl ExtractionRoot {
         mut payload: MemberPayload<'_, R>,
         payload_chunk: &mut Vec<u8>,
     ) -> Result<(), DecodeError> {
-        if member.payload_size <= EXTRACTION_CHUNK_BYTES as u64 {
+        if member.effective_size <= EXTRACTION_CHUNK_BYTES as u64 {
             payload_chunk.clear();
-            if member.payload_size != 0 {
+            if member.effective_size != 0 {
                 payload
                     .next_chunk(payload_chunk, EXTRACTION_CHUNK_BYTES)
                     .await?;
@@ -283,7 +283,7 @@ impl ExtractionRoot {
         self.fs("create hard link", &member.path, result)?;
         self.entries
             .insert(member.path.clone(), ExtractedEntry::File);
-        if member.payload_size == 0 {
+        if member.effective_size == 0 {
             payload.skip().await?;
             Ok(())
         } else {
