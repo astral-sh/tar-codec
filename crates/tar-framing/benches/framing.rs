@@ -210,7 +210,7 @@ async fn decode_payload(fixture: &Fixture, mode: DecodeMode) -> (u64, u64) {
                 }
             }
             DecodeMode::Skip => {
-                payload_bytes += member.header.payload_size;
+                payload_bytes += member.header.effective_size;
                 member
                     .payload
                     .skip()

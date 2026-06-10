@@ -536,7 +536,7 @@ struct DecodedMember {
     kind: MemberKind,
     link_target: String,
     executable: bool,
-    payload_size: u64,
+    effective_size: u64,
 }
 
 fn decode_member<R>(
@@ -553,6 +553,13 @@ fn decode_member<R>(
             field: "path",
         })?;
     policy.check_name(header.position, "member path", &path_text)?;
+
+    // This is a conservative choice: some other decoders treat a trailing slash
+    // on a regular file as a signal to make a directory, while others silently
+    // strip it and create a regular file instead. The former is consistent
+    // with pre-ustar ("v7 tar") behavior, but is ambiguous in a ustar/pax/GNU
+    // setting.
+    // TODO: Make this configurable through policy?
     if path_text.ends_with('/') && header.kind != MemberKind::Directory {
         return Err(DecodeError::unsafe_path(
             header.position,
@@ -602,7 +609,7 @@ fn decode_member<R>(
         kind: header.kind,
         link_target,
         executable,
-        payload_size: header.payload_size,
+        effective_size: header.effective_size,
     })
 }
 
