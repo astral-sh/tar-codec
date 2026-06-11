@@ -6,8 +6,19 @@ use std::{
 };
 
 use super::*;
+use cap_primitives::{
+    ambient_authority,
+    fs::{
+        FollowSymlinks, Metadata as CapabilityMetadata, open_ambient_dir, open_dir_nofollow, stat,
+    },
+};
 use tar_framing::logical::MemberPayload;
 use tokio::{fs, io::AsyncWriteExt};
+#[cfg(windows)]
+use {
+    cap_primitives::fs::MetadataExt as _, std::os::windows::fs::MetadataExt as _,
+    windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT,
+};
 
 /// A symbolic link awaiting graph validation and filesystem installation.
 ///
@@ -45,14 +56,14 @@ const EXTRACTION_CHUNK_BYTES: usize = 1024 * 1024;
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ExtractedEntry {
     File,
-    Directory,
-    ExistingDirectory,
+    CreatedDirectory,
+    AmbientDirectory,
     Symlink,
 }
 
 impl ExtractedEntry {
     fn is_directory(self) -> bool {
-        matches!(self, Self::Directory | Self::ExistingDirectory)
+        matches!(self, Self::CreatedDirectory | Self::AmbientDirectory)
     }
 }
 
@@ -60,6 +71,8 @@ impl ExtractedEntry {
 struct ExtractionRoot {
     /// The root's path.
     path: PathBuf,
+    /// An open handle anchoring capability-relative target inspection.
+    handle: std_fs::File,
     /// Whether overwrites are allowed during extraction.
     allow_overwrites: bool,
     entries: HashMap<PathBuf, ExtractedEntry>,
@@ -72,6 +85,16 @@ enum TerminalKind {
     File,
     Directory,
     Dangling,
+}
+
+enum ResolvedTarget {
+    Known(TerminalKind),
+    Unowned(PathBuf),
+}
+
+enum AmbientTarget {
+    Terminal(TerminalKind),
+    Link,
 }
 
 impl<R: AsyncRead + Unpin> Archive<R> {
@@ -122,7 +145,7 @@ impl<R: AsyncRead + Unpin> Archive<R> {
                 }
             }
         }
-        root.install_symlinks(policy.allow_dangling_symlinks).await
+        root.install_symlinks(policy.symlink_target_policy).await
     }
 }
 
@@ -150,7 +173,7 @@ impl ExtractionRoot {
     async fn open(dest: &Path, allow_overwrites: bool) -> Result<Self, DecodeError> {
         let dest = dest.to_owned();
         let error_path = dest.clone();
-        let path = tokio::task::spawn_blocking(move || open_destination(&dest))
+        let (path, handle) = tokio::task::spawn_blocking(move || open_destination(&dest))
             .await
             .map_err(DecodeError::BlockingTask)?
             .map_err(|source| {
@@ -158,6 +181,7 @@ impl ExtractionRoot {
             })?;
         Ok(Self {
             path,
+            handle,
             allow_overwrites,
             entries: HashMap::new(),
             symlink_indices: HashMap::new(),
@@ -194,7 +218,7 @@ impl ExtractionRoot {
     async fn extract_directory(&mut self, path: &Path) -> Result<(), DecodeError> {
         if !path.as_os_str().is_empty() {
             self.ensure_parents(path).await?;
-            self.ensure_directory(path, true).await?;
+            self.ensure_directory(path).await?;
         }
         Ok(())
     }
@@ -302,23 +326,15 @@ impl ExtractionRoot {
         let mut current = PathBuf::new();
         for component in parent.components() {
             current.push(component.as_os_str());
-            self.ensure_directory(&current, false).await?;
+            self.ensure_directory(&current).await?;
         }
         Ok(())
     }
 
-    async fn ensure_directory(
-        &mut self,
-        path: &Path,
-        archive_member: bool,
-    ) -> Result<(), DecodeError> {
+    async fn ensure_directory(&mut self, path: &Path) -> Result<(), DecodeError> {
         if let Some(entry) = self.entries.get(path).copied()
             && entry.is_directory()
         {
-            if archive_member && entry == ExtractedEntry::ExistingDirectory {
-                self.entries
-                    .insert(path.to_owned(), ExtractedEntry::Directory);
-            }
             return Ok(());
         }
         if self.entries.contains_key(path) {
@@ -328,20 +344,16 @@ impl ExtractionRoot {
         let create_result = fs::create_dir(self.destination_path(path)).await;
         if create_result.is_ok() {
             self.entries
-                .insert(path.to_owned(), ExtractedEntry::Directory);
+                .insert(path.to_owned(), ExtractedEntry::CreatedDirectory);
             return Ok(());
         }
         let metadata = self.metadata(path).await?;
         if metadata
             .as_ref()
-            .is_some_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            .is_some_and(|metadata| metadata.is_dir() && !metadata_is_link(metadata))
         {
-            let entry = if archive_member {
-                ExtractedEntry::Directory
-            } else {
-                ExtractedEntry::ExistingDirectory
-            };
-            self.entries.insert(path.to_owned(), entry);
+            self.entries
+                .insert(path.to_owned(), ExtractedEntry::AmbientDirectory);
             return Ok(());
         }
         if metadata.is_none() && !self.entries.contains_key(path) {
@@ -351,7 +363,7 @@ impl ExtractionRoot {
         let result = fs::create_dir(self.destination_path(path)).await;
         self.fs("create directory", path, result)?;
         self.entries
-            .insert(path.to_owned(), ExtractedEntry::Directory);
+            .insert(path.to_owned(), ExtractedEntry::CreatedDirectory);
         Ok(())
     }
 
@@ -379,18 +391,34 @@ impl ExtractionRoot {
             .any(|candidate| candidate != path && candidate.starts_with(path))
     }
 
-    async fn install_symlinks(&self, allow_dangling_symlinks: bool) -> Result<(), DecodeError> {
+    async fn install_symlinks(
+        &self,
+        target_policy: SymlinkTargetPolicy,
+    ) -> Result<(), DecodeError> {
         let mut links = Vec::with_capacity(self.symlinks.len());
         for (index, link) in self.symlinks.iter().enumerate() {
             if self.symlink_indices.get(&link.path) != Some(&index) {
                 continue;
             }
-            let kind = self
+            let target = self
                 .resolve_terminal(&link.resolved_target)
                 .map_err(|reason| link.error(reason))?;
-            if kind == TerminalKind::Dangling && !allow_dangling_symlinks {
-                return Err(link.error("target was not created by this extraction"));
-            }
+            let kind = match (target, target_policy) {
+                (ResolvedTarget::Known(kind), _) => kind,
+                (ResolvedTarget::Unowned(_), SymlinkTargetPolicy::ArchiveOnly) => {
+                    return Err(link.error("target was not created by this extraction"));
+                }
+                (ResolvedTarget::Unowned(path), SymlinkTargetPolicy::AllowAmbientAndMissing) => {
+                    match self.inspect_ambient_target(&path).await? {
+                        AmbientTarget::Terminal(kind) => kind,
+                        AmbientTarget::Link => {
+                            return Err(link.error(
+                                "target crosses an existing symbolic link or reparse point",
+                            ));
+                        }
+                    }
+                }
+            };
             links.push((link, kind));
         }
         for (link, kind) in links {
@@ -405,7 +433,7 @@ impl ExtractionRoot {
         Ok(())
     }
 
-    fn resolve_terminal(&self, path: &Path) -> Result<TerminalKind, &'static str> {
+    fn resolve_terminal(&self, path: &Path) -> Result<ResolvedTarget, &'static str> {
         let mut path = path.to_owned();
         let mut visited = HashSet::new();
         for _ in 0..=MAX_SYMLINK_EXPANSIONS {
@@ -430,15 +458,33 @@ impl ExtractionRoot {
                 path = rewritten;
             } else {
                 return Ok(match self.entries.get(&path) {
-                    _ if path.as_os_str().is_empty() => TerminalKind::Directory,
-                    Some(ExtractedEntry::Directory) => TerminalKind::Directory,
-                    Some(ExtractedEntry::File) => TerminalKind::File,
+                    _ if path.as_os_str().is_empty() => {
+                        ResolvedTarget::Known(TerminalKind::Directory)
+                    }
+                    Some(ExtractedEntry::CreatedDirectory) => {
+                        ResolvedTarget::Known(TerminalKind::Directory)
+                    }
+                    Some(ExtractedEntry::File) => ResolvedTarget::Known(TerminalKind::File),
                     Some(ExtractedEntry::Symlink) => continue,
-                    Some(ExtractedEntry::ExistingDirectory) | None => TerminalKind::Dangling,
+                    Some(ExtractedEntry::AmbientDirectory) | None => ResolvedTarget::Unowned(path),
                 });
             }
         }
         Err("symbolic-link target expansion limit exceeded")
+    }
+
+    async fn inspect_ambient_target(&self, path: &Path) -> Result<AmbientTarget, DecodeError> {
+        let handle = self.handle.try_clone().map_err(|source| {
+            DecodeError::filesystem("inspect symbolic-link target", path.to_owned(), source)
+        })?;
+        let target = path.to_owned();
+        let error_path = target.clone();
+        tokio::task::spawn_blocking(move || inspect_ambient_target(handle, &target))
+            .await
+            .map_err(DecodeError::BlockingTask)?
+            .map_err(|source| {
+                DecodeError::filesystem("inspect symbolic-link target", error_path, source)
+            })
     }
 
     async fn metadata(&self, path: &Path) -> Result<Option<Metadata>, DecodeError> {
@@ -451,7 +497,7 @@ impl ExtractionRoot {
 
     async fn remove_leaf(&self, path: &Path, metadata: &Metadata) -> Result<(), DecodeError> {
         let destination = self.destination_path(path);
-        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        if metadata.is_dir() && !metadata_is_link(metadata) {
             let result = fs::read_dir(&destination).await;
             let mut entries = self.fs("inspect directory", path, result)?;
             let result = entries.next_entry().await;
@@ -501,22 +547,99 @@ impl ExtractionRoot {
     }
 }
 
-fn open_destination(dest: &Path) -> io::Result<PathBuf> {
+fn open_destination(dest: &Path) -> io::Result<(PathBuf, std_fs::File)> {
     match std_fs::symlink_metadata(dest) {
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => std_fs::create_dir_all(dest)?,
         Err(error) => return Err(error),
     }
     let metadata = std_fs::symlink_metadata(dest)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    if metadata_is_link(&metadata) || !metadata.is_dir() {
         return Err(io::Error::other("destination is not a real directory"));
     }
-    std_fs::canonicalize(dest)
+    let path = std_fs::canonicalize(dest)?;
+    let handle = open_ambient_dir(&path, ambient_authority())?;
+    let metadata = CapabilityMetadata::from_file(&handle)?;
+    if capability_metadata_is_link(&metadata) || !metadata.is_dir() {
+        return Err(io::Error::other("destination is not a real directory"));
+    }
+    Ok((path, handle))
+}
+
+fn inspect_ambient_target(root: std_fs::File, path: &Path) -> io::Result<AmbientTarget> {
+    let mut directory = root;
+    let mut components = path.components().peekable();
+    if components.peek().is_none() {
+        return Ok(AmbientTarget::Terminal(TerminalKind::Directory));
+    }
+
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "symbolic-link target is not normalized",
+            ));
+        };
+        let component = Path::new(name);
+        let metadata = match stat(&directory, component, FollowSymlinks::No) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(AmbientTarget::Terminal(TerminalKind::Dangling));
+            }
+            Err(error) => return Err(error),
+        };
+        if capability_metadata_is_link(&metadata) {
+            return Ok(AmbientTarget::Link);
+        }
+        if components.peek().is_none() {
+            let kind = if metadata.is_dir() {
+                TerminalKind::Directory
+            } else {
+                TerminalKind::File
+            };
+            return Ok(AmbientTarget::Terminal(kind));
+        }
+        if !metadata.is_dir() {
+            return Ok(AmbientTarget::Terminal(TerminalKind::Dangling));
+        }
+
+        let next = open_dir_nofollow(&directory, component)?;
+        let metadata = CapabilityMetadata::from_file(&next)?;
+        if capability_metadata_is_link(&metadata) {
+            return Ok(AmbientTarget::Link);
+        }
+        if !metadata.is_dir() {
+            return Ok(AmbientTarget::Terminal(TerminalKind::Dangling));
+        }
+        directory = next;
+    }
+
+    Ok(AmbientTarget::Terminal(TerminalKind::Dangling))
+}
+
+#[cfg(not(windows))]
+fn metadata_is_link(metadata: &Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn metadata_is_link(metadata: &Metadata) -> bool {
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn capability_metadata_is_link(metadata: &CapabilityMetadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn capability_metadata_is_link(metadata: &CapabilityMetadata) -> bool {
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 async fn remove_non_directory(path: &Path, metadata: &Metadata) -> io::Result<()> {
     #[cfg(windows)]
-    if metadata.file_type().is_symlink() {
+    if metadata_is_link(metadata) {
         // Stable Windows does not expose whether a symlink is file- or directory-shaped.
         return match fs::remove_file(path).await {
             Ok(()) => Ok(()),

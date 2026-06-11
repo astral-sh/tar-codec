@@ -35,16 +35,29 @@ impl<R> Archive<R> {
 
 /// Controls which otherwise valid archive features extraction may accept.
 ///
-/// See each allow API for its default.
+/// See each configuration API for its default.
 #[derive(Clone, Copy, Debug)]
 pub struct DecodePolicy {
     allow_symlinks: bool,
-    allow_dangling_symlinks: bool,
+    symlink_target_policy: SymlinkTargetPolicy,
     allow_hard_links: bool,
     allow_overwrites: bool,
     allow_gnu: bool,
     pax_policy: PaxDecodePolicy,
     name_validation: NameValidation,
+}
+
+/// Controls which symbolic-link targets extraction may accept.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SymlinkTargetPolicy {
+    /// Allow only the extraction root or entries created by this extraction.
+    #[default]
+    ArchiveOnly,
+    /// Also allow missing targets and existing non-link filesystem entries.
+    ///
+    /// Existing target components are inspected without following symbolic
+    /// links or reparse points. A link-valued component is always rejected.
+    AllowAmbientAndMissing,
 }
 
 /// Controls which otherwise valid pax features extraction may accept.
@@ -76,7 +89,7 @@ impl Default for DecodePolicy {
     fn default() -> Self {
         Self {
             allow_symlinks: true,
-            allow_dangling_symlinks: true,
+            symlink_target_policy: SymlinkTargetPolicy::default(),
             allow_hard_links: false,
             allow_overwrites: true,
             allow_gnu: true,
@@ -95,13 +108,13 @@ impl DecodePolicy {
         self
     }
 
-    /// Configures whether symbolic links may name safe targets other than
-    /// entries created by this extraction or the extraction root.
+    /// Configures which symbolic-link targets extraction may accept.
     ///
-    /// Dangling symlinks are **allowed by default** as they do not typically
-    /// pose a security risk.
-    pub fn allow_dangling_symlinks(mut self, allow: bool) -> Self {
-        self.allow_dangling_symlinks = allow;
+    /// By default, only the extraction root and entries created by this
+    /// extraction are accepted. See [`SymlinkTargetPolicy`] for the available
+    /// policies.
+    pub fn symlink_target_policy(mut self, policy: SymlinkTargetPolicy) -> Self {
+        self.symlink_target_policy = policy;
         self
     }
 
