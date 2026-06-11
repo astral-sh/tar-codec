@@ -4,7 +4,7 @@ use std::path::Path;
 
 use support::{ArchiveBuilder, ArchiveFormat, EntryKind, header, pax_record, single_posix_member};
 use tar_codec::decode::{Archive, DecodeError, DecodePolicy};
-use tar_framing::{FrameError, FrameErrorInner, MemberKind};
+use tar_framing::{FrameError, FrameErrorInner, MemberKind, PaxKeyword};
 use tempfile::tempdir;
 
 #[tokio::test]
@@ -139,7 +139,7 @@ async fn rejects_directory_payload_without_writing_embedded_members() {
 async fn rejects_trailing_separator_on_regular_file_without_writing_members() {
     let mut archive = ArchiveBuilder::new();
     archive
-        .pax(b'x', &pax_record("path", "file.txt/"))
+        .pax(b'x', &pax_record(PaxKeyword::Path, "file.txt/"))
         .posix("ignored", b'0', b"hello", "", 0o644);
     let bytes = archive.finish();
 

@@ -5,7 +5,7 @@
 //! deciding which filesystem entries are appropriate to archive.
 
 use crate::{
-    BLOCK_SIZE, Block, MemberKind,
+    BLOCK_SIZE, Block, MemberKind, PaxKeyword,
     header::{
         GID_RANGE, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE, MTIME_RANGE, NAME_RANGE,
         POSIX_IDENTITY, PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, UID_RANGE, encode_checksum,
@@ -67,6 +67,9 @@ pub enum FramingWriteError {
         /// The affected metadata field.
         field: &'static str,
     },
+    /// A PAX record keyword is empty or contains `=`.
+    #[error("pax record keywords must be non-empty and cannot contain '='")]
+    InvalidPaxRecordKeyword,
     /// A non-directory member path has a trailing archive separator.
     #[error("member type {kind:?} cannot have a trailing path separator")]
     TrailingPathSeparator {
@@ -87,6 +90,34 @@ pub enum FramingWriteError {
     },
 }
 
+/// Appends one PAX extended-header record without block padding to `output`.
+///
+/// `keyword` must be nonempty and cannot contain `=`. `value` is copied
+/// verbatim and may contain arbitrary bytes.
+pub fn append_pax_record(
+    output: &mut Vec<u8>,
+    keyword: &PaxKeyword,
+    value: &[u8],
+) -> Result<(), FramingWriteError> {
+    let (namespace, name) = keyword.components();
+    if namespace.is_empty()
+        || namespace.contains('=')
+        || name.is_some_and(|name| name.is_empty() || name.contains('='))
+    {
+        return Err(FramingWriteError::InvalidPaxRecordKeyword);
+    }
+    let len = record_len(keyword, value)?;
+    output
+        .len()
+        .checked_add(len)
+        .ok_or(FramingWriteError::ArithmeticOverflow {
+            context: "pax record output length",
+        })?;
+    output.reserve(len);
+    append_record_with_len(output, keyword, value, len);
+    Ok(())
+}
+
 /// Writes one local pax header and its ordinary member header into `buffer`.
 ///
 /// The buffer is cleared first and its allocation is reused when possible.
@@ -103,24 +134,14 @@ pub fn frame_pax_member_into(
     let mut size_buffer = [0; MAX_DECIMAL_U64_BYTES];
     let size = decimal_u64(member.size, &mut size_buffer);
     let link_path = member.link_path.map(str::as_bytes);
-    let records = [
-        Some((
-            "path",
-            member.path.as_bytes(),
-            record_len("path", member.path.as_bytes())?,
-        )),
-        Some(("size", size, record_len("size", size)?)),
-        link_path
-            .map(|value| record_len("linkpath", value).map(|len| ("linkpath", value, len)))
-            .transpose()?,
-    ];
-    let payload_len = records
-        .iter()
-        .flatten()
-        .try_fold(0_usize, |total, (_, _, len)| total.checked_add(*len))
-        .ok_or(FramingWriteError::ArithmeticOverflow {
-            context: "pax payload length",
-        })?;
+    buffer.clear();
+    buffer.resize(BLOCK_SIZE, 0);
+    append_pax_record(buffer, &PaxKeyword::Path, member.path.as_bytes())?;
+    append_pax_record(buffer, &PaxKeyword::Size, size)?;
+    if let Some(link_path) = link_path {
+        append_pax_record(buffer, &PaxKeyword::LinkPath, link_path)?;
+    }
+    let payload_len = buffer.len() - BLOCK_SIZE;
     let payload_size =
         u64::try_from(payload_len).map_err(|_| FramingWriteError::ArithmeticOverflow {
             context: "pax payload length",
@@ -150,12 +171,6 @@ pub fn frame_pax_member_into(
             context: "pax framing length",
         },
     )?;
-    buffer.clear();
-    buffer.reserve(framing_len);
-    buffer.resize(BLOCK_SIZE, 0);
-    for (keyword, value, len) in records.into_iter().flatten() {
-        append_record_with_len(buffer, keyword, value, len);
-    }
     buffer.resize(framing_len, 0);
     let (extended_header, rest) = buffer.split_at_mut(BLOCK_SIZE);
     let (_, member_header) = rest.split_at_mut(padded_payload_len);
@@ -225,32 +240,45 @@ fn validate_text(field: &'static str, value: &str) -> Result<(), FramingWriteErr
     Ok(())
 }
 
-fn record_len(keyword: &'static str, value: &[u8]) -> Result<usize, FramingWriteError> {
-    let suffix_len = keyword
-        .len()
+fn record_len(keyword: &PaxKeyword, value: &[u8]) -> Result<usize, FramingWriteError> {
+    let (namespace, name) = keyword.components();
+    let keyword_len = name
+        .map_or(Some(namespace.len()), |name| {
+            namespace
+                .len()
+                .checked_add(1)
+                .and_then(|len| len.checked_add(name.len()))
+        })
+        .ok_or(FramingWriteError::ArithmeticOverflow {
+            context: "pax record keyword length",
+        })?;
+    let suffix_len = keyword_len
         .checked_add(value.len())
         .and_then(|len| len.checked_add(3))
         .ok_or(FramingWriteError::ArithmeticOverflow {
             context: "pax record length",
         })?;
-    let mut len = suffix_len;
-    loop {
-        let actual = (len.ilog10() as usize + 1).checked_add(suffix_len).ok_or(
-            FramingWriteError::ArithmeticOverflow {
-                context: "pax record length",
-            },
-        )?;
-        if actual == len {
-            return Ok(len);
-        }
-        len = actual;
-    }
+    let tentative_len = (suffix_len.ilog10() as usize + 1)
+        .checked_add(suffix_len)
+        .ok_or(FramingWriteError::ArithmeticOverflow {
+            context: "pax record length",
+        })?;
+    (tentative_len.ilog10() as usize + 1)
+        .checked_add(suffix_len)
+        .ok_or(FramingWriteError::ArithmeticOverflow {
+            context: "pax record length",
+        })
 }
 
-fn append_record_with_len(payload: &mut Vec<u8>, keyword: &'static str, value: &[u8], len: usize) {
+fn append_record_with_len(payload: &mut Vec<u8>, keyword: &PaxKeyword, value: &[u8], len: usize) {
     append_decimal_usize(payload, len);
     payload.push(b' ');
-    payload.extend_from_slice(keyword.as_bytes());
+    let (namespace, name) = keyword.components();
+    payload.extend_from_slice(namespace.as_bytes());
+    if let Some(name) = name {
+        payload.push(b'.');
+        payload.extend_from_slice(name.as_bytes());
+    }
     payload.push(b'=');
     payload.extend_from_slice(value);
     payload.push(b'\n');
@@ -356,6 +384,8 @@ fn append_decimal_usize(output: &mut Vec<u8>, value: usize) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use tokio_stream::StreamExt;
 
     use super::*;
@@ -477,6 +507,34 @@ mod tests {
 
         assert_eq!(end_marker_bytes().len(), BLOCK_SIZE * 2);
         assert!(end_marker_bytes().iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn appends_standalone_pax_records_across_decimal_boundaries() {
+        let mut record = Vec::new();
+        assert_eq!(
+            append_pax_record(&mut record, &PaxKeyword::Path, b"b"),
+            Ok(())
+        );
+        assert_eq!(record, b"9 path=b\n");
+        record.clear();
+        assert_eq!(
+            append_pax_record(&mut record, &PaxKeyword::Atime, b"x"),
+            Ok(())
+        );
+        assert_eq!(record, b"11 atime=x\n");
+        for keyword in [
+            PaxKeyword::Realtime(Arc::from("")),
+            PaxKeyword::Vendor {
+                vendor: Arc::from("invalid=vendor"),
+                name: Arc::from("attribute"),
+            },
+        ] {
+            assert_eq!(
+                append_pax_record(&mut Vec::new(), &keyword, b"value"),
+                Err(FramingWriteError::InvalidPaxRecordKeyword)
+            );
+        }
     }
 
     #[test]

@@ -57,26 +57,38 @@ pub enum PaxKeyword {
     },
 }
 
+impl PaxKeyword {
+    pub(crate) fn components(&self) -> (&str, Option<&str>) {
+        match self {
+            Self::Atime => ("atime", None),
+            Self::Charset => ("charset", None),
+            Self::Comment => ("comment", None),
+            Self::Ctime => ("ctime", None),
+            Self::Gid => ("gid", None),
+            Self::Gname => ("gname", None),
+            Self::HdrCharset => ("hdrcharset", None),
+            Self::LinkPath => ("linkpath", None),
+            Self::Mtime => ("mtime", None),
+            Self::Path => ("path", None),
+            Self::Realtime(name) => ("realtime", Some(name)),
+            Self::Security(name) => ("security", Some(name)),
+            Self::Size => ("size", None),
+            Self::Uid => ("uid", None),
+            Self::Uname => ("uname", None),
+            Self::Vendor { vendor, name } => (vendor, Some(name)),
+        }
+    }
+}
+
 impl fmt::Display for PaxKeyword {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Atime => formatter.write_str("atime"),
-            Self::Charset => formatter.write_str("charset"),
-            Self::Comment => formatter.write_str("comment"),
-            Self::Ctime => formatter.write_str("ctime"),
-            Self::Gid => formatter.write_str("gid"),
-            Self::Gname => formatter.write_str("gname"),
-            Self::HdrCharset => formatter.write_str("hdrcharset"),
-            Self::LinkPath => formatter.write_str("linkpath"),
-            Self::Mtime => formatter.write_str("mtime"),
-            Self::Path => formatter.write_str("path"),
-            Self::Realtime(name) => write!(formatter, "realtime.{name}"),
-            Self::Security(name) => write!(formatter, "security.{name}"),
-            Self::Size => formatter.write_str("size"),
-            Self::Uid => formatter.write_str("uid"),
-            Self::Uname => formatter.write_str("uname"),
-            Self::Vendor { vendor, name } => write!(formatter, "{vendor}.{name}"),
+        let (namespace, name) = self.components();
+        formatter.write_str(namespace)?;
+        if let Some(name) = name {
+            formatter.write_str(".")?;
+            formatter.write_str(name)?;
         }
+        Ok(())
     }
 }
 

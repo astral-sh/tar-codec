@@ -1,4 +1,4 @@
-use tar_framing::{BLOCK_SIZE, Block};
+use tar_framing::{BLOCK_SIZE, Block, PaxKeyword, write::append_pax_record};
 
 const NAME_RANGE: std::ops::Range<usize> = 0..100;
 const MODE_RANGE: std::ops::Range<usize> = 100..108;
@@ -159,25 +159,15 @@ pub fn set_identity_byte(block: &mut Block, index: usize, byte: u8) {
     block[IDENTITY_RANGE.start + index] = byte;
 }
 
-pub fn pax_record(keyword: &str, value: &str) -> Vec<u8> {
+pub fn pax_record(keyword: PaxKeyword, value: &str) -> Vec<u8> {
     raw_pax_record(keyword, value.as_bytes())
 }
 
-pub fn raw_pax_record(keyword: &str, value: &[u8]) -> Vec<u8> {
-    let mut suffix = format!(" {keyword}=").into_bytes();
-    suffix.extend_from_slice(value);
-    suffix.push(b'\n');
-    let mut len = suffix.len() + 1;
-    loop {
-        let prefix = len.to_string();
-        let actual = prefix.len() + suffix.len();
-        if actual == len {
-            let mut record = prefix.into_bytes();
-            record.extend_from_slice(&suffix);
-            return record;
-        }
-        len = actual;
-    }
+pub fn raw_pax_record(keyword: PaxKeyword, value: &[u8]) -> Vec<u8> {
+    let mut record = Vec::new();
+    append_pax_record(&mut record, &keyword, value)
+        .expect("test PAX record keyword should be valid");
+    record
 }
 
 fn set_text(field: &mut [u8], value: &str) {

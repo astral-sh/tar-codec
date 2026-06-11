@@ -6,6 +6,7 @@ use support::{ArchiveBuilder, pax_record, single_posix_member};
 use tar_codec::decode::{
     Archive, DecodeError, DecodePolicy, DecodePolicyViolation, SymlinkTargetPolicy,
 };
+use tar_framing::PaxKeyword;
 use tempfile::tempdir;
 
 #[tokio::test]
@@ -158,7 +159,7 @@ async fn ambient_link_components_are_rejected_even_with_explicit_opt_in() {
     let mut archive = ArchiveBuilder::new();
     archive
         .posix("safe", b'0', b"safe", "", 0o644)
-        .pax(b'x', &pax_record("linkpath", "ambient-link"))
+        .pax(b'x', &pax_record(PaxKeyword::LinkPath, "ambient-link"))
         .posix("alias", b'2', b"", "safe", 0o644);
     let bytes = archive.finish();
     assert!(matches!(

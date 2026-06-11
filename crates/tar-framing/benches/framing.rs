@@ -1,10 +1,10 @@
-use std::{hint::black_box, time::Duration};
+use std::{hint::black_box, sync::Arc, time::Duration};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tar_framing::{
-    BLOCK_SIZE, MemberKind,
+    BLOCK_SIZE, MemberKind, PaxKeyword,
     logical::TarReader,
-    write::{PaxMember, end_marker_bytes, frame_pax_member_into},
+    write::{PaxMember, append_pax_record, end_marker_bytes, frame_pax_member_into},
 };
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
@@ -157,16 +157,11 @@ fn append_padding(archive: &mut Vec<u8>, payload_len: usize) {
     }
 }
 
-fn pax_record(keyword: &str, value: &str) -> Vec<u8> {
-    let suffix = format!(" {keyword}={value}\n");
-    let mut length = suffix.len() + 1;
-    loop {
-        let record = format!("{length}{suffix}").into_bytes();
-        if record.len() == length {
-            return record;
-        }
-        length = record.len();
-    }
+fn pax_record(keyword: PaxKeyword, value: &str) -> Vec<u8> {
+    let mut record = Vec::new();
+    append_pax_record(&mut record, &keyword, value.as_bytes())
+        .expect("benchmark PAX record keyword should be valid");
+    record
 }
 
 fn global_pax_header(payload_len: usize) -> [u8; BLOCK_SIZE] {
@@ -191,7 +186,13 @@ fn append_global_pax(archive: &mut Vec<u8>, payload: &[u8]) {
 
 fn global_pax_archive(record_count: usize, replace: bool) -> Vec<u8> {
     let payload = (0..record_count).fold(Vec::new(), |mut payload, index| {
-        payload.extend_from_slice(&pax_record(&format!("ACME.attribute{index}"), "initial"));
+        payload.extend_from_slice(&pax_record(
+            PaxKeyword::Vendor {
+                vendor: Arc::from("ACME"),
+                name: Arc::from(format!("attribute{index}")),
+            },
+            "initial",
+        ));
         payload
     });
     let mut archive = Vec::new();
@@ -199,7 +200,10 @@ fn global_pax_archive(record_count: usize, replace: bool) -> Vec<u8> {
     if replace {
         let replacement = (0..record_count).fold(Vec::new(), |mut payload, index| {
             payload.extend_from_slice(&pax_record(
-                &format!("ACME.attribute{index}"),
+                PaxKeyword::Vendor {
+                    vendor: Arc::from("ACME"),
+                    name: Arc::from(format!("attribute{index}")),
+                },
                 "replacement",
             ));
             payload
