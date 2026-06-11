@@ -53,10 +53,10 @@ pub enum SymlinkTargetPolicy {
     /// Allow only the extraction root or entries created by this extraction.
     #[default]
     ArchiveOnly,
-    /// Also allow missing targets and existing non-link filesystem entries.
+    /// Also allow missing targets and existing filesystem entries.
     ///
-    /// Existing target components are inspected without following symbolic
-    /// links or reparse points. A link-valued component is always rejected.
+    /// Existing symbolic links are followed only when capability-relative
+    /// resolution remains beneath the extraction root.
     AllowAmbientAndMissing,
 }
 

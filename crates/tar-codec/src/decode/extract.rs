@@ -8,9 +8,7 @@ use std::{
 use super::*;
 use cap_primitives::{
     ambient_authority,
-    fs::{
-        FollowSymlinks, Metadata as CapabilityMetadata, open_ambient_dir, open_dir_nofollow, stat,
-    },
+    fs::{FollowSymlinks, Metadata as CapabilityMetadata, open_ambient_dir, stat},
 };
 use tar_framing::logical::MemberPayload;
 use tokio::{fs, io::AsyncWriteExt};
@@ -90,11 +88,6 @@ enum TerminalKind {
 enum ResolvedTarget {
     Known(TerminalKind),
     Unowned(PathBuf),
-}
-
-enum AmbientTarget {
-    Terminal(TerminalKind),
-    Link,
 }
 
 impl<R: AsyncRead + Unpin> Archive<R> {
@@ -414,14 +407,7 @@ impl ExtractionRoot {
                     return Err(link.error("target was not created by this extraction"));
                 }
                 (ResolvedTarget::Unowned(path), SymlinkTargetPolicy::AllowAmbientAndMissing) => {
-                    match self.inspect_ambient_target(&path).await? {
-                        AmbientTarget::Terminal(kind) => kind,
-                        AmbientTarget::Link => {
-                            return Err(link.error(
-                                "target crosses an existing symbolic link or reparse point",
-                            ));
-                        }
-                    }
+                    self.inspect_ambient_target(&path).await?
                 }
             };
             links.push((link, kind));
@@ -478,7 +464,7 @@ impl ExtractionRoot {
         Err("symbolic-link target expansion limit exceeded")
     }
 
-    async fn inspect_ambient_target(&self, path: &Path) -> Result<AmbientTarget, DecodeError> {
+    async fn inspect_ambient_target(&self, path: &Path) -> Result<TerminalKind, DecodeError> {
         let handle = self.handle.try_clone().map_err(|source| {
             DecodeError::filesystem("inspect symbolic-link target", path.to_owned(), source)
         })?;
@@ -571,55 +557,16 @@ fn open_destination(dest: &Path) -> io::Result<(PathBuf, std_fs::File)> {
     Ok((path, handle))
 }
 
-fn inspect_ambient_target(root: std_fs::File, path: &Path) -> io::Result<AmbientTarget> {
-    let mut directory = root;
-    let mut components = path.components().peekable();
-    if components.peek().is_none() {
-        return Ok(AmbientTarget::Terminal(TerminalKind::Directory));
+fn inspect_ambient_target(root: std_fs::File, path: &Path) -> io::Result<TerminalKind> {
+    if path.as_os_str().is_empty() {
+        return Ok(TerminalKind::Directory);
     }
-
-    while let Some(component) = components.next() {
-        let Component::Normal(name) = component else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "symbolic-link target is not normalized",
-            ));
-        };
-        let component = Path::new(name);
-        let metadata = match stat(&directory, component, FollowSymlinks::No) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(AmbientTarget::Terminal(TerminalKind::Dangling));
-            }
-            Err(error) => return Err(error),
-        };
-        if capability_metadata_is_link(&metadata) {
-            return Ok(AmbientTarget::Link);
-        }
-        if components.peek().is_none() {
-            let kind = if metadata.is_dir() {
-                TerminalKind::Directory
-            } else {
-                TerminalKind::File
-            };
-            return Ok(AmbientTarget::Terminal(kind));
-        }
-        if !metadata.is_dir() {
-            return Ok(AmbientTarget::Terminal(TerminalKind::Dangling));
-        }
-
-        let next = open_dir_nofollow(&directory, component)?;
-        let metadata = CapabilityMetadata::from_file(&next)?;
-        if capability_metadata_is_link(&metadata) {
-            return Ok(AmbientTarget::Link);
-        }
-        if !metadata.is_dir() {
-            return Ok(AmbientTarget::Terminal(TerminalKind::Dangling));
-        }
-        directory = next;
+    match stat(&root, path, FollowSymlinks::Yes) {
+        Ok(metadata) if metadata.is_dir() => Ok(TerminalKind::Directory),
+        Ok(_) => Ok(TerminalKind::File),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(TerminalKind::Dangling),
+        Err(error) => Err(error),
     }
-
-    Ok(AmbientTarget::Terminal(TerminalKind::Dangling))
 }
 
 #[cfg(not(windows))]

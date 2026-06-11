@@ -144,12 +144,40 @@ async fn ambient_file_and_directory_targets_require_explicit_opt_in() {
 
 #[cfg(any(unix, windows))]
 #[tokio::test]
-async fn ambient_link_components_are_rejected_even_with_explicit_opt_in() {
+async fn ambient_link_components_must_resolve_beneath_the_root() {
     use support::{symlink_dir, symlink_file};
 
     let temp = tempdir().unwrap();
     let policy =
         DecodePolicy::default().symlink_target_policy(SymlinkTargetPolicy::AllowAmbientAndMissing);
+
+    let destination = temp.path().join("contained-leaf");
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(destination.join("target"), b"inside").unwrap();
+    symlink_file(Path::new("target"), destination.join("ambient-link")).unwrap();
+    let bytes = single_posix_member("alias", b'2', b"", "ambient-link", 0o644);
+    Archive::new(bytes.as_slice())
+        .extract(&destination, policy)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_link(destination.join("alias")).unwrap(),
+        Path::new("ambient-link")
+    );
+
+    let destination = temp.path().join("contained-intermediate");
+    std::fs::create_dir_all(destination.join("target")).unwrap();
+    std::fs::write(destination.join("target/file"), b"inside").unwrap();
+    symlink_dir(Path::new("target"), destination.join("ambient-link")).unwrap();
+    let bytes = single_posix_member("alias", b'2', b"", "ambient-link/file", 0o644);
+    Archive::new(bytes.as_slice())
+        .extract(&destination, policy)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_link(destination.join("alias")).unwrap(),
+        Path::new("ambient-link/file")
+    );
 
     let destination = temp.path().join("leaf");
     let outside = temp.path().join("outside-file");
@@ -162,15 +190,12 @@ async fn ambient_link_components_are_rejected_even_with_explicit_opt_in() {
         .pax(b'x', &pax_record(PaxKeyword::LinkPath, "ambient-link"))
         .posix("alias", b'2', b"", "safe", 0o644);
     let bytes = archive.finish();
-    assert!(matches!(
+    assert!(
         Archive::new(bytes.as_slice())
             .extract(&destination, policy)
-            .await,
-        Err(DecodeError::InvalidLink {
-            reason: "target crosses an existing symbolic link or reparse point",
-            ..
-        })
-    ));
+            .await
+            .is_err()
+    );
     assert!(!destination.join("alias").exists());
     assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
 
@@ -181,21 +206,18 @@ async fn ambient_link_components_are_rejected_even_with_explicit_opt_in() {
     std::fs::write(outside.join("file"), b"outside").unwrap();
     symlink_dir(&outside, destination.join("ambient-link")).unwrap();
     let bytes = single_posix_member("alias", b'2', b"", "ambient-link/file", 0o644);
-    assert!(matches!(
+    assert!(
         Archive::new(bytes.as_slice())
             .extract(&destination, policy)
-            .await,
-        Err(DecodeError::InvalidLink {
-            reason: "target crosses an existing symbolic link or reparse point",
-            ..
-        })
-    ));
+            .await
+            .is_err()
+    );
     assert!(!destination.join("alias").exists());
 }
 
 #[cfg(windows)]
 #[tokio::test]
-async fn ambient_junction_components_are_rejected_even_with_explicit_opt_in() {
+async fn ambient_junction_components_outside_the_root_are_rejected() {
     let temp = tempdir().unwrap();
     let destination = temp.path().join("destination");
     let outside = temp.path().join("outside");
@@ -207,15 +229,12 @@ async fn ambient_junction_components_are_rejected_even_with_explicit_opt_in() {
     let bytes = single_posix_member("alias", b'2', b"", "ambient-junction/file", 0o644);
     let policy =
         DecodePolicy::default().symlink_target_policy(SymlinkTargetPolicy::AllowAmbientAndMissing);
-    assert!(matches!(
+    assert!(
         Archive::new(bytes.as_slice())
             .extract(&destination, policy)
-            .await,
-        Err(DecodeError::InvalidLink {
-            reason: "target crosses an existing symbolic link or reparse point",
-            ..
-        })
-    ));
+            .await
+            .is_err()
+    );
     assert!(!destination.join("alias").exists());
     assert_eq!(std::fs::read(outside.join("file")).unwrap(), b"outside");
 }
