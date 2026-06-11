@@ -47,6 +47,10 @@
 //! - tar-framing silently removes fractional components from parsed timestamps. Timestamps
 //!   are truncated to second precision.
 //!
+//! - tar-framing rejects typeflags that are not explicitly defined in pax. pax says to handle
+//!   these as regular files (i.e. assuming their size is a physical size), but this has marginal
+//!   benefit in practice.
+//!
 //! ## GNU compatibility
 //!
 //! When decoding GNU-formatted tar streams, tar-framing attempts to follow the
