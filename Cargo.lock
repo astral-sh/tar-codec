@@ -968,6 +968,7 @@ dependencies = [
  "criterion",
  "thiserror",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
@@ -980,6 +981,7 @@ dependencies = [
  "tar-framing",
  "thiserror",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
