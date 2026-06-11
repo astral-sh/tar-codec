@@ -3,6 +3,8 @@ pub mod support;
 use std::path::Path;
 
 use support::{ArchiveBuilder, ArchiveFormat, EntryKind, header, pax_record, single_posix_member};
+#[cfg(windows)]
+use tar_codec::decode::DecodePolicyViolation;
 use tar_codec::decode::{Archive, DecodeError, DecodePolicy};
 use tar_framing::{FrameError, FrameErrorInner, MemberKind};
 use tempfile::tempdir;
@@ -23,10 +25,6 @@ async fn extracts_files_directories_large_payloads_and_archive_path_syntax() {
         .posix("empty/", b'5', b"", "", 0o755)
         .posix(".", b'5', b"", "", 0o755)
         .posix("large", b'0', &large_payload, "", 0o644);
-    #[cfg(unix)]
-    archive
-        .posix("tests/snippets/ballon:main.py", b'0', b"ok", "", 0o644)
-        .posix("C:/target", b'0', b"ok", "", 0o644);
     let bytes = archive.finish();
 
     std::fs::create_dir_all(destination.join("large")).unwrap();
@@ -52,12 +50,6 @@ async fn extracts_files_directories_large_payloads_and_archive_path_syntax() {
                 & 0o111,
             0
         );
-        for path in ["tests/snippets/ballon:main.py", "C:/target"] {
-            assert_eq!(
-                std::fs::read_to_string(destination.join(path)).unwrap(),
-                "ok"
-            );
-        }
     }
 }
 
@@ -216,6 +208,52 @@ async fn ambient_file_replacement_unlinks_the_inode_and_applies_mode() {
     let sibling = std::fs::metadata(destination.join("sibling")).unwrap();
     assert_ne!(replaced.ino(), sibling.ino());
     assert_ne!(replaced.permissions().mode() & 0o111, 0);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn rejects_pax_paths_that_name_ntfs_alternate_streams() {
+    let temp = tempdir().unwrap();
+    for allow_overwrites in [false, true] {
+        let destination = temp.path().join(if allow_overwrites {
+            "overwrites-allowed"
+        } else {
+            "overwrites-disabled"
+        });
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("victim"), b"ambient base file").unwrap();
+
+        let mut archive = ArchiveBuilder::new();
+        archive
+            .pax(b'x', &pax_record("path", "victim:payload"))
+            .posix("ignored", b'0', b"archive stream", "", 0o644);
+        let bytes = archive.finish();
+        let result = Archive::new(bytes.as_slice())
+            .extract(
+                &destination,
+                DecodePolicy::default().allow_overwrites(allow_overwrites),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(DecodeError::PolicyViolation {
+                violation: DecodePolicyViolation::NameRejected {
+                    context: "member path",
+                    value,
+                },
+                ..
+            }) if value == "victim:payload"
+        ));
+        assert_eq!(
+            std::fs::read(destination.join("victim")).unwrap(),
+            b"ambient base file"
+        );
+        assert!(matches!(
+            std::fs::read(destination.join("victim:payload")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
 }
 
 #[tokio::test]

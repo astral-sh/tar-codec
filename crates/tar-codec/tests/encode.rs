@@ -103,7 +103,7 @@ async fn manual_entries_round_trip_and_preserve_archive_names() {
     }
 
     let mut encoder = Encoder::new(Vec::new());
-    for path in ["/absolute", "C:/ambiguous", "nested/../name", r"back\slash"] {
+    for path in ["/absolute", "nested/../name", r"back\slash"] {
         encoder
             .add_entry(path, b"", EntryMetadata::default())
             .await
@@ -112,22 +112,22 @@ async fn manual_entries_round_trip_and_preserve_archive_names() {
     let bytes = encoder.finish().await.unwrap();
     assert_eq!(
         encoded_paths(&bytes).await,
-        ["/absolute", "C:/ambiguous", "nested/../name", r"back\slash",]
+        ["/absolute", "nested/../name", r"back\slash",]
     );
 }
 
 #[tokio::test]
 async fn manual_validation_and_collision_errors_leave_the_encoder_usable() {
     let mut encoder = Encoder::new(Vec::new());
-    assert!(matches!(
-        encoder
-            .add_entry(" leading", b"", EntryMetadata::default())
-            .await,
-        Err(EncodeError::NameRejected {
-            context: "member path",
-            ..
-        })
-    ));
+    for path in [" leading", "name:stream"] {
+        assert!(matches!(
+            encoder.add_entry(path, b"", EntryMetadata::default()).await,
+            Err(EncodeError::NameRejected {
+                context: "member path",
+                ..
+            })
+        ));
+    }
     encoder
         .add_entry("allowed", b"ok", EntryMetadata::default())
         .await
@@ -167,6 +167,10 @@ async fn manual_validation_and_collision_errors_leave_the_encoder_usable() {
     let mut encoder = Encoder::with_policy(Vec::new(), policy);
     encoder
         .add_entry(" leading", b"", EntryMetadata::default())
+        .await
+        .unwrap();
+    encoder
+        .add_entry("name:stream", b"", EntryMetadata::default())
         .await
         .unwrap();
     encoder.finish().await.unwrap();
