@@ -957,7 +957,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "tokio-stream",
  "walkdir",
  "windows-sys 0.60.2",
 ]
@@ -969,7 +968,6 @@ dependencies = [
  "criterion",
  "thiserror",
  "tokio",
- "tokio-stream",
 ]
 
 [[package]]
@@ -982,7 +980,6 @@ dependencies = [
  "tar-framing",
  "thiserror",
  "tokio",
- "tokio-stream",
 ]
 
 [[package]]

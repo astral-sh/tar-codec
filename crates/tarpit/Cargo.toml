@@ -17,4 +17,3 @@ async-compression = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt"] }
-tokio-stream = { workspace = true }
