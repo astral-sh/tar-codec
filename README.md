@@ -15,6 +15,12 @@ Anti-goals:
 
 ## Performance
 
+tar-codec aims to be as fast as (or substantially faster than) other
+tar libraries for Rust, including [tar] and [astral-tokio-tar].
+
+[tar]: https://crates.io/crates/tar
+[astral-tokio-tar]: https://crates.io/crates/astral-tokio-tar
+
 The following elapsed times are Criterion median point estimates from a local
 snapshot on June 9, 2026. They measure uncompressed end-to-end filesystem
 operations, are sensitive to the machine and filesystem, and are
@@ -42,23 +48,3 @@ Recursive encoding policies are not identical: `tar-codec` emits pure pax
 archives and streams a deterministic sorted traversal, while the comparison
 builders emit conventional headers.
 
-## Benchmarking
-
-Run the public API comparison benchmarks with:
-
-```shell
-cargo bench -p tar-codec --bench comparison
-```
-
-The benchmarks compare `tar-codec` against `tar` and `astral-tokio-tar` for
-uncompressed encoding and extraction. Encoder output formats intentionally
-differ: `tar-codec` emits pure pax archives, while the comparison builders emit
-conventional headers. `tar-codec` applies its configurable archive-name policy
-to recursive entries incrementally, preserves accepted UTF-8 source
-symbolic-link targets without applying extraction containment, and may return
-an error after writing partial output if a late source entry is rejected.
-
-`encode_entries_framing` measures in-memory entry framing and bookkeeping with a
-sink that does not read payload bytes, so it reports entries per second.
-`encode_directory` and `extract` exercise filesystem operations and report both
-payload entries and payload bytes per second.

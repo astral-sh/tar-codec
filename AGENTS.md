@@ -1,5 +1,4 @@
 - Read CONTRIBUTING.md for guidelines on how to run tools
-- Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) before changing crate boundaries, format behavior, or extraction policy
 - ALWAYS attempt to add a test case for changed behavior, except for the `tarpit` CLI since it's dev only
 - PREFER integration tests (`tar-codec/tests`) over unit tests when changed behavior concerns multiple APIs or whole tar streams
 - AVOID writing duplicate or tautological testcases
