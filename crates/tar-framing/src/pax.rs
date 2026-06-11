@@ -48,9 +48,9 @@ pub enum PaxKeyword {
     Uid,
     /// User name.
     Uname,
-    /// An implementation extension in the `VENDOR.keyword` namespace.
+    /// An implementation extension in a `vendor.keyword` namespace.
     Vendor {
-        /// Uppercase ASCII vendor or organization identifier.
+        /// Vendor or organization identifier.
         vendor: Arc<str>,
         /// Keyword suffix after the vendor namespace.
         name: Arc<str>,
@@ -286,9 +286,9 @@ pub enum PaxRecord {
     Uid(PaxValue<u64>),
     /// User name encoded according to the effective [`HdrCharset`].
     Uname(PaxValue<PaxString>),
-    /// An implementation extension in the `VENDOR.keyword` namespace.
+    /// An implementation extension in a `vendor.keyword` namespace.
     Vendor {
-        /// Uppercase ASCII vendor or organization identifier.
+        /// Vendor or organization identifier.
         vendor: Arc<str>,
         /// Keyword suffix after the vendor namespace.
         name: Arc<str>,
@@ -465,13 +465,11 @@ fn parse_namespaced_record(
             name: Arc::from(name),
             value: parse_text(position, value)?,
         }),
-        vendor if !vendor.is_empty() && vendor.bytes().all(|byte| byte.is_ascii_uppercase()) => {
-            Ok(PaxRecord::Vendor {
-                vendor: Arc::from(vendor),
-                name: Arc::from(name),
-                value: parse_text(position, value)?,
-            })
-        }
+        vendor if !vendor.is_empty() => Ok(PaxRecord::Vendor {
+            vendor: Arc::from(vendor),
+            name: Arc::from(name),
+            value: parse_text(position, value)?,
+        }),
         _ => Err(invalid()),
     }
 }
@@ -665,7 +663,7 @@ mod tests {
 
     fn vendor(name: &str, value: &str) -> PaxRecord {
         PaxRecord::Vendor {
-            vendor: text("ACME"),
+            vendor: text("Acme"),
             name: text(name),
             value: PaxValue::Value(text(value)),
         }
@@ -914,7 +912,7 @@ mod tests {
             ("size", "0"),
             ("uid", "8"),
             ("uname", "user"),
-            ("ACME.attribute", "custom"),
+            ("Acme.attribute", "custom"),
         ];
         let mut payload = Vec::new();
         for (keyword, value) in fields {
@@ -990,15 +988,7 @@ mod tests {
             })
         ));
 
-        for keyword in [
-            "unknown",
-            "lowercase.extension",
-            "Vendor.attribute",
-            "VENDOR",
-            "VENDOR.",
-            "realtime.",
-            "security.",
-        ] {
+        for keyword in ["unknown", "VENDOR", "VENDOR.", "realtime.", "security."] {
             assert!(matches!(
                 parse_record(29, keyword, b"value", HdrCharset::Utf8),
                 Err(FrameError {
@@ -1022,7 +1012,7 @@ mod tests {
         assert_eq!(active.records.len(), 3);
         assert_eq!(
             active.get(&PaxKeyword::Vendor {
-                vendor: text("ACME"),
+                vendor: text("Acme"),
                 name: text("first"),
             }),
             Some(&vendor("first", "new"))

@@ -419,7 +419,7 @@ pub enum DecodePolicyViolation {
     /// A vendor-namespaced POSIX pax record appeared.
     #[error("pax vendor extension {vendor}.{name} is not allowed")]
     PaxVendorExtension {
-        /// Uppercase vendor namespace.
+        /// Vendor namespace.
         vendor: String,
         /// Keyword suffix following the vendor namespace.
         name: String,

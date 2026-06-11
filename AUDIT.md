@@ -27,7 +27,7 @@ The remaining findings are correctness, interoperability, platform-hardening, or
 | AUD-07 | Medium | Out of scope | Framing compatibility | Metadata-only sizes on payload-free entries are intentionally rejected |
 | AUD-08 | Medium | Remediated | PAX encoding | The encoder can emit a regular member that its decoder rejects as ambiguous |
 | AUD-09 | Medium | Out of scope | PAX metadata | Timestamp precision is intentionally limited to nonnegative whole seconds |
-| AUD-10 | Low | Open | PAX interoperability | Structurally valid implementation extensions are rejected in the physical layer |
+| AUD-10 | Low | Remediated | PAX interoperability | Mixed-case vendor namespaces are rejected in the physical layer |
 | AUD-11 | Low | Out of scope | PAX compatibility | Unsupported `hdrcharset` records are intentionally rejected even when overridden |
 | AUD-12 | Low | Open | Operational safety | Extraction errors leave earlier output and overwrites in place |
 
@@ -203,16 +203,16 @@ The PAX file-time section defines fractional digits as subsecond precision and r
 
 The `tar-framing` crate-level PAX compatibility notes explicitly document both whole-second truncation and rejection of negative or out-of-range timestamps. These are intentional API and compatibility boundaries rather than accidental information loss, so no remediation is planned.
 
-### AUD-10 — Structurally valid implementation extensions are rejected in the physical layer
+### AUD-10 — Mixed-case vendor namespaces are rejected in the physical layer
 
 Severity: Low  
 Class: PAX interoperability / policy layering
 
-`parse_namespaced_record` accepts only current standard keywords, `realtime.*`, `security.*`, or an all-uppercase ASCII namespace followed by a period (`pax.rs:321-379`). Other valid implementation-extension shapes, such as `Acme.feature`, are rejected as `InvalidPaxKeyword` before `tar-codec` policy can decide whether unknown semantics are acceptable.
+`parse_namespaced_record` accepted only current standard keywords, `realtime.*`, `security.*`, or an all-uppercase ASCII namespace followed by a period (`pax.rs:321-379`). Other namespaced implementation extensions, such as `Acme.feature`, were rejected as `InvalidPaxKeyword` before `tar-codec` policy could decide whether unknown semantics were acceptable.
 
-The PAX normative text permits listed keywords or implementation extensions and forbids `=` in the keyword. The uppercase `VENDOR.keyword` form appears in rationale as a suggested convention, not the only permitted extension grammar. Rejecting unknown semantics by default is prudent, especially for extensions such as GNU sparse metadata, but structural preservation and semantic acceptance should be separate decisions. `PaxDecodePolicy` already provides the right higher-layer pattern for this.
+The PAX normative text permits listed keywords or implementation extensions and forbids `=` in the keyword. The uppercase `VENDOR.keyword` form appears in rationale as a suggested convention rather than a casing requirement. Rejecting unknown semantics by default remains prudent, and `PaxDecodePolicy` provides that higher-layer control.
 
-Add an opaque record variant in the physical layer, preserve its bytes/UTF-8 text, and let extraction policy reject unknown semantics by default. Continue interpreting framing-sensitive standard records strictly.
+This was remediated by accepting any nonempty namespace before the first period as a vendor identifier while preserving its original case. Standard keywords, `realtime.*`, and `security.*` retain their specialized representations; other dotted keywords remain vendor records and are still rejected by default extraction policy unless explicitly enabled.
 
 ### AUD-11 — Unsupported `hdrcharset` records are intentionally rejected even when overridden
 
@@ -263,7 +263,7 @@ The following controls were specifically traced and, where applicable, covered b
 - [x] Make global PAX state updates linear (AUD-02).
 - [x] Close ambient-target resolution under the default symlink policy (AUD-03).
 - [x] Reject encoder inputs that create member/type ambiguity before writing bytes (AUD-08).
-- [ ] Preserve structurally valid implementation extensions so extraction policy can make the strictness decision (AUD-10).
+- [x] Accept mixed-case vendor namespaces while retaining higher-level policy enforcement (AUD-10).
 - [ ] Document partial extraction and offer a staging/transactional workflow (AUD-12).
 
 ## Suggested test expansion
@@ -274,5 +274,4 @@ After fixes are designed, prefer integration tests in `crates/tar-codec/tests` f
 - Complexity regression coverage for many unique and repeatedly updated global keys.
 - Ambient symlink/junction targets using effective PAX `linkpath`.
 - Public encoder rejection of trailing-separator regular members, with no partial output.
-- Opaque implementation extensions.
 - Differential fixtures produced by GNU tar, bsdtar/libarchive, Python `tarfile`, and Go's `archive/tar`, especially for duplicates, deletions, global state, binary names, and hard-link data.

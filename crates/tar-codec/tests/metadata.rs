@@ -228,7 +228,7 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
     let temp = tempdir().unwrap();
     let mut archive = ArchiveBuilder::new();
     archive
-        .pax(b'x', &pax_record("ACME.attribute", "value"))
+        .pax(b'x', &pax_record("Acme.attribute", "value"))
         .posix("file", b'0', b"", "", 0o644);
     let bytes = archive.finish();
     assert!(matches!(
@@ -241,14 +241,14 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
                 vendor,
                 name,
             },
-        }) if vendor == "ACME" && name == "attribute"
+        }) if vendor == "Acme" && name == "attribute"
     ));
 
     let destination = temp.path().join("partial");
     let mut archive = ArchiveBuilder::new();
     archive
         .posix("created", b'0', b"kept", "", 0o644)
-        .pax(b'g', &pax_record("ACME.attribute", "value"))
+        .pax(b'g', &pax_record("Acme.attribute", "value"))
         .posix("blocked", b'0', b"", "", 0o644);
     let bytes = archive.finish();
     assert!(matches!(
@@ -272,7 +272,7 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
     let destination = temp.path().join("permitted");
     let mut archive = ArchiveBuilder::new();
     archive
-        .pax(b'x', &pax_record("ACME.attribute", "value"))
+        .pax(b'x', &pax_record("Acme.attribute", "value"))
         .posix("file", b'0', b"ok", "", 0o644);
     let bytes = archive.finish();
     let policy = DecodePolicy::default()
