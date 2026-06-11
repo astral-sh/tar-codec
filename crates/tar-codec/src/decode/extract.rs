@@ -81,15 +81,29 @@ struct ExtractionRoot {
     symlinks: Vec<PendingSymlink>,
 }
 
+/// The filesystem shape of a fully resolved symbolic-link target.
+///
+/// This determines which kind of symbolic link to create on platforms such as
+/// Windows, where file and directory symbolic links use different operations.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum TerminalKind {
+    /// The target exists and is not a directory.
     File,
+    /// The target exists and is a directory.
     Directory,
+    /// The target does not yet exist.
     Dangling,
 }
 
+/// The result of resolving a target through the archive's symbolic-link graph.
+///
+/// Resolution stops when it reaches either an entry whose provenance and kind
+/// are known from this extraction, or a path whose terminal entry is not owned
+/// by the extraction and therefore requires policy-dependent handling.
 enum ResolvedTarget {
+    /// The extraction root or an archive-created entry of the given kind.
     Known(TerminalKind),
+    /// A normalized root-relative path not created by this extraction.
     Unowned(PathBuf),
 }
 
