@@ -125,23 +125,23 @@ impl<R: AsyncRead + Unpin> Archive<R> {
             policy.check_member(&frame)?;
             let member = decode_member(&frame, &policy)?;
             match member.kind {
-                MemberKind::Regular | MemberKind::Contiguous => {
+                UstarKind::Regular | UstarKind::Contiguous => {
                     root.extract_file(&member, frame.payload, &mut payload_chunk)
                         .await?;
                 }
-                MemberKind::Directory => {
+                UstarKind::Directory => {
                     root.extract_directory(&member.path).await?;
                     frame.payload.skip().await?;
                 }
-                MemberKind::SymbolicLink => {
+                UstarKind::SymbolicLink => {
                     root.reserve_symlink(&member).await?;
                     frame.payload.skip().await?;
                 }
-                MemberKind::HardLink => {
+                UstarKind::HardLink => {
                     root.extract_hard_link(&member, frame.payload, &mut payload_chunk)
                         .await?;
                 }
-                MemberKind::CharacterDevice | MemberKind::BlockDevice | MemberKind::Fifo => {
+                UstarKind::CharacterDevice | UstarKind::BlockDevice | UstarKind::Fifo => {
                     return Err(DecodeError::UnsupportedMember {
                         position: member.position,
                         path: member.path,

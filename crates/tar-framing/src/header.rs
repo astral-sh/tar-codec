@@ -1,22 +1,61 @@
 use crate::{ArchiveFormat, Block};
 
+/// The byte range that a member name appears at in a tar block,
+/// whether pax/ustar or GNU.
 pub const NAME_RANGE: std::ops::Range<usize> = 0..100;
+
+/// The byte range that a member's mode appears at in a tar block,
+/// whether pax/ustar or GNU.
 pub const MODE_RANGE: std::ops::Range<usize> = 100..108;
+
+/// The byte range that a member's user ID appears at in a tar block,
+/// whether pax/ustar or GNU.
 pub const UID_RANGE: std::ops::Range<usize> = 108..116;
+
+/// The byte range that a member's group ID appears at in a tar block,
+/// whether pax/ustar or GNU.
 pub const GID_RANGE: std::ops::Range<usize> = 116..124;
+
+/// The byte range that a member's size appears at in a tar block,
+/// whether pax/ustar or GNU.
 pub const SIZE_RANGE: std::ops::Range<usize> = 124..136;
+
+/// The byte range that a member's mtime appears at in a tar block,
+/// whether pax/ustar or GNU.
 pub const MTIME_RANGE: std::ops::Range<usize> = 136..148;
+
+/// The byte range that a member's checksum appears at in a tar block,
+/// whether pax/ustar or GNU.
 pub const CHECKSUM_RANGE: std::ops::Range<usize> = 148..156;
+
+/// The byte index that a member's typeflag appears at in a tar block,
+/// whether pax/ustar or GNU.
 pub const TYPEFLAG_OFFSET: usize = 156;
+
+/// The byte range that a member's link name (i.e. link target) appears
+/// at in a tar block, whether pax/ustar or GNU.
 pub const LINK_NAME_RANGE: std::ops::Range<usize> = 157..257;
+
+/// The byte range that a member's identity appears at in a tar block,
+/// whether pax/ustar or GNU.
+///
+/// This is both the tar magic and the tar version.
 pub const IDENTITY_RANGE: std::ops::Range<usize> = 257..265;
+
+/// The byte range that a member's checksum appears at in a tar block.
+///
+/// This is relevant only for pax/ustar; GNU blocks do not include a prefix.
 pub const PREFIX_RANGE: std::ops::Range<usize> = 345..500;
+
 /// The magic and version bytes for a ustar tar block.
 /// ustar blocks form the baseline for pax, since every pax block is
 /// a well-formed ustar block (and what makes it pax is whether
 /// it uses a pax typeflag).
 pub const USTAR_IDENTITY: &[u8; 8] = b"ustar\x0000";
+
 /// The magic and version bytes for a GNU tar block.
+/// Note that, despite not having the proper ustar identity, a GNU tar
+/// block uses a strict superset of the ustar typeflags.
 pub const GNU_IDENTITY: &[u8; 8] = b"ustar  \0";
 
 /// A tar header block (pax, ustar, or GNU) is exactly 512 bytes,

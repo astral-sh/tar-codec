@@ -2,7 +2,7 @@ use std::{hint::black_box, sync::Arc, time::Duration};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tar_framing::{
-    BLOCK_SIZE, MemberKind, PaxKeyword,
+    BLOCK_SIZE, UstarKind, PaxKeyword,
     logical::TarReader,
     write::{PaxMember, append_pax_record, end_marker_bytes, frame_pax_member_into},
 };
@@ -133,7 +133,7 @@ fn archive(entries: &[Entry]) -> Vec<u8> {
             u64::try_from(sequence).expect("fixture sequence should be representable"),
             PaxMember {
                 path: &entry.path,
-                kind: MemberKind::Regular,
+                kind: UstarKind::Regular,
                 size: u64::try_from(entry.data.len())
                     .expect("fixture payload length should be representable"),
                 link_path: None,
@@ -222,7 +222,7 @@ fn encode_pax_framing(fixture: &Fixture) -> usize {
             u64::try_from(sequence).expect("fixture sequence should be representable"),
             PaxMember {
                 path: &entry.path,
-                kind: MemberKind::Regular,
+                kind: UstarKind::Regular,
                 size: u64::try_from(entry.data.len())
                     .expect("fixture payload length should be representable"),
                 link_path: None,

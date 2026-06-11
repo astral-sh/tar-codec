@@ -11,7 +11,7 @@ use tokio_stream::StreamExt;
 
 use crate::{
     ArchiveFormat, Block, DEFAULT_MAX_PAX_EXTENSION_SIZE, FrameError, FrameErrorInner, GnuKind,
-    MemberKind, PaxKeyword, PaxKind, PaxRecord, PaxString, PaxValue,
+    PaxKeyword, PaxKind, PaxRecord, PaxString, PaxValue, UstarKind,
     header::parse_number,
     stream::{DataOwner, Frame, GnuFrame, HeaderFrame, PaxFrame, TarStream},
 };
@@ -55,7 +55,7 @@ pub struct Header<'a> {
     /// The selected archive family of this member header.
     pub format: ArchiveFormat,
     /// The member type identified by the header.
-    pub kind: MemberKind,
+    pub kind: UstarKind,
     /// The size encoded directly in the member header field.
     pub declared_size: u64,
     /// The size after applying applicable pax `size` records.

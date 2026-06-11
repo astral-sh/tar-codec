@@ -1,6 +1,6 @@
 use std::io;
 
-use crate::{ArchiveFormat, BLOCK_SIZE, GnuKind, MemberKind, stream::DataOwner};
+use crate::{ArchiveFormat, BLOCK_SIZE, GnuKind, UstarKind, stream::DataOwner};
 
 /// An error encountered at an absolute position in a tar stream.
 #[derive(Debug, thiserror::Error)]
@@ -199,7 +199,7 @@ pub enum FrameErrorInner {
     #[error("member type {kind:?} cannot carry payload size {size}")]
     InvalidMemberSize {
         /// The member type.
-        kind: MemberKind,
+        kind: UstarKind,
         /// The rejected declared or effective payload size.
         size: u64,
     },

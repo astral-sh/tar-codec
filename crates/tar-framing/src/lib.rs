@@ -145,7 +145,7 @@ pub enum GnuKind {
 ///
 /// These are shared across both pax and GNU tar streams.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MemberKind {
+pub enum UstarKind {
     /// A regular file (`'0'` or NUL).
     Regular,
     /// A hard link (`'1'`).

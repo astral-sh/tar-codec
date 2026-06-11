@@ -7,7 +7,7 @@ use std::{
 };
 
 use tar_framing::{
-    ArchiveFormat, FrameError, MemberKind, PaxKeyword, PaxKind, PaxRecord,
+    ArchiveFormat, FrameError, UstarKind, PaxKeyword, PaxKind, PaxRecord,
     logical::{MemberExtensions, MemberFrame, TarReader},
 };
 use thiserror::Error;
@@ -180,12 +180,12 @@ impl DecodePolicy {
         Ok(())
     }
 
-    fn check_member_kind(&self, position: u64, kind: MemberKind) -> Result<(), DecodeError> {
+    fn check_member_kind(&self, position: u64, kind: UstarKind) -> Result<(), DecodeError> {
         let violation = match kind {
-            MemberKind::SymbolicLink if !self.allow_symlinks => {
+            UstarKind::SymbolicLink if !self.allow_symlinks => {
                 Some(DecodePolicyViolation::SymbolicLink)
             }
-            MemberKind::HardLink if !self.allow_hard_links => Some(DecodePolicyViolation::HardLink),
+            UstarKind::HardLink if !self.allow_hard_links => Some(DecodePolicyViolation::HardLink),
             _ => None,
         };
         if let Some(violation) = violation {
@@ -492,7 +492,7 @@ pub enum DecodeError {
         /// Normalized extraction-relative path.
         path: PathBuf,
         /// Unsupported member kind.
-        kind: MemberKind,
+        kind: UstarKind,
     },
     /// A symbolic or hard link cannot be safely resolved.
     #[error("at byte {position}: invalid link {path} -> {target:?}: {reason}")]
@@ -566,7 +566,7 @@ impl DecodeError {
 struct DecodedMember {
     position: u64,
     path: PathBuf,
-    kind: MemberKind,
+    kind: UstarKind,
     link_target: String,
     executable: bool,
     effective_size: u64,
@@ -593,7 +593,7 @@ fn decode_member<R>(
     // with pre-ustar ("v7 tar") behavior, but is ambiguous in a ustar/pax/GNU
     // setting.
     // TODO: Make this configurable through policy?
-    if path_text.ends_with('/') && header.kind != MemberKind::Directory {
+    if path_text.ends_with('/') && header.kind != UstarKind::Directory {
         return Err(DecodeError::unsafe_path(
             header.position,
             "member path",
@@ -602,7 +602,7 @@ fn decode_member<R>(
         ));
     }
     let path = normalize_member_path(header.position, &path_text)?;
-    if path.as_os_str().is_empty() && header.kind != MemberKind::Directory {
+    if path.as_os_str().is_empty() && header.kind != UstarKind::Directory {
         return Err(DecodeError::unsafe_path(
             header.position,
             "member path",
@@ -610,14 +610,14 @@ fn decode_member<R>(
             "only a directory may resolve to the extraction root",
         ));
     }
-    let link_target = if matches!(header.kind, MemberKind::HardLink | MemberKind::SymbolicLink) {
+    let link_target = if matches!(header.kind, UstarKind::HardLink | UstarKind::SymbolicLink) {
         let target = std::str::from_utf8(frame.effective_link_path()?.as_ref())
             .map(str::to_owned)
             .map_err(|_| DecodeError::InvalidUtf8 {
                 position: header.position,
                 field: "linkpath",
             })?;
-        let context = if header.kind == MemberKind::SymbolicLink {
+        let context = if header.kind == UstarKind::SymbolicLink {
             "symbolic-link target"
         } else {
             "hard-link target"

@@ -17,7 +17,7 @@ use std::{
 };
 
 use tar_framing::{
-    MemberKind,
+    UstarKind,
     write::{
         FramingWriteError, PaxMember, end_marker_bytes, frame_pax_member_into, payload_padding,
     },
@@ -118,7 +118,7 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
             .map_err(|_| arithmetic_overflow("manual entry payload size"))?;
         self.write_member(PaxMember {
             path: &path,
-            kind: MemberKind::Regular,
+            kind: UstarKind::Regular,
             size,
             link_path: None,
             executable: metadata.executable,
@@ -183,7 +183,7 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
                         )?;
                         self.write_member(PaxMember {
                             path: &entry.archive_path,
-                            kind: MemberKind::Directory,
+                            kind: UstarKind::Directory,
                             size: 0,
                             link_path: None,
                             executable: false,
@@ -207,7 +207,7 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
                         )?;
                         self.write_member(PaxMember {
                             path: &entry.archive_path,
-                            kind: MemberKind::SymbolicLink,
+                            kind: UstarKind::SymbolicLink,
                             size: 0,
                             link_path: Some(&target),
                             executable: false,
@@ -232,7 +232,7 @@ impl<W: AsyncWrite + Unpin> Encoder<W> {
         let (size, executable) = file.metadata();
         self.write_member(PaxMember {
             path: &entry.archive_path,
-            kind: MemberKind::Regular,
+            kind: UstarKind::Regular,
             size,
             link_path: None,
             executable,

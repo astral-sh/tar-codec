@@ -5,7 +5,7 @@
 //! deciding which filesystem entries are appropriate to archive.
 
 use crate::{
-    BLOCK_SIZE, Block, MemberKind, PaxKeyword,
+    BLOCK_SIZE, Block, UstarKind, PaxKeyword,
     header::{
         GID_RANGE, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE, MTIME_RANGE, NAME_RANGE,
         PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, UID_RANGE, USTAR_IDENTITY, encode_checksum,
@@ -26,7 +26,7 @@ pub struct PaxMember<'a> {
     /// Non-directory paths cannot end in `/`.
     pub path: &'a str,
     /// The supported ordinary member kind.
-    pub kind: MemberKind,
+    pub kind: UstarKind,
     /// The meaningful regular-file payload size.
     pub size: u64,
     /// The UTF-8 symbolic-link target, when `kind` is [`MemberKind::SymbolicLink`].
@@ -42,13 +42,13 @@ pub enum FramingWriteError {
     #[error("cannot encode unsupported member type {kind:?}")]
     UnsupportedMemberKind {
         /// The rejected ordinary member kind.
-        kind: MemberKind,
+        kind: UstarKind,
     },
     /// A member kind that cannot carry data was assigned a nonzero payload size.
     #[error("member type {kind:?} cannot carry payload size {size}")]
     InvalidMemberSize {
         /// The affected member kind.
-        kind: MemberKind,
+        kind: UstarKind,
         /// The rejected payload size.
         size: u64,
     },
@@ -59,7 +59,7 @@ pub enum FramingWriteError {
     #[error("member type {kind:?} cannot carry a link path")]
     UnexpectedLinkPath {
         /// The affected member kind.
-        kind: MemberKind,
+        kind: UstarKind,
     },
     /// A required text value is empty or contains a NUL byte.
     #[error("invalid pax {field}: values must be non-empty and cannot contain NUL bytes")]
@@ -74,7 +74,7 @@ pub enum FramingWriteError {
     #[error("member type {kind:?} cannot have a trailing path separator")]
     TrailingPathSeparator {
         /// The affected member kind.
-        kind: MemberKind,
+        kind: UstarKind,
     },
     /// The local pax extended header payload cannot fit its ustar size field.
     #[error("pax extended header payload is too large: {size} bytes")]
@@ -159,9 +159,9 @@ pub fn frame_pax_member_into(
         0
     };
     let (mode, typeflag) = match member.kind {
-        MemberKind::Regular => (if member.executable { 0o755 } else { 0o644 }, b'0'),
-        MemberKind::Directory => (0o755, b'5'),
-        MemberKind::SymbolicLink => (0o777, b'2'),
+        UstarKind::Regular => (if member.executable { 0o755 } else { 0o644 }, b'0'),
+        UstarKind::Directory => (0o755, b'5'),
+        UstarKind::SymbolicLink => (0o777, b'2'),
         _ => {
             return Err(FramingWriteError::UnsupportedMemberKind { kind: member.kind });
         }
@@ -211,21 +211,21 @@ fn validate_member(member: PaxMember<'_>) -> Result<(), FramingWriteError> {
     // Defensive: our own decoder rejects non-directories that end with trailing
     // slashes, so we should never encode one.
     // TODO: Single-source this check, maybe in name validation?
-    if member.path.ends_with('/') && !matches!(member.kind, MemberKind::Directory) {
+    if member.path.ends_with('/') && !matches!(member.kind, UstarKind::Directory) {
         return Err(FramingWriteError::TrailingPathSeparator { kind: member.kind });
     }
     match member.kind {
-        MemberKind::Regular | MemberKind::Directory if member.link_path.is_some() => {
+        UstarKind::Regular | UstarKind::Directory if member.link_path.is_some() => {
             Err(FramingWriteError::UnexpectedLinkPath { kind: member.kind })
         }
-        MemberKind::Directory | MemberKind::SymbolicLink if member.size != 0 => {
+        UstarKind::Directory | UstarKind::SymbolicLink if member.size != 0 => {
             Err(FramingWriteError::InvalidMemberSize {
                 kind: member.kind,
                 size: member.size,
             })
         }
-        MemberKind::Regular | MemberKind::Directory => Ok(()),
-        MemberKind::SymbolicLink => validate_text(
+        UstarKind::Regular | UstarKind::Directory => Ok(()),
+        UstarKind::SymbolicLink => validate_text(
             "linkpath",
             member.link_path.ok_or(FramingWriteError::MissingLinkPath)?,
         ),
@@ -398,7 +398,7 @@ mod tests {
 
     fn pax_member<'a>(
         path: &'a str,
-        kind: MemberKind,
+        kind: UstarKind,
         size: u64,
         link_path: Option<&'a str>,
         executable: bool,
@@ -428,18 +428,18 @@ mod tests {
     #[test]
     fn frames_regular_directory_and_symbolic_link_members() {
         let members = [
-            pax_member("bin/tool", MemberKind::Regular, 3, None, true),
-            pax_member("bin", MemberKind::Directory, 0, None, false),
+            pax_member("bin/tool", UstarKind::Regular, 3, None, true),
+            pax_member("bin", UstarKind::Directory, 0, None, false),
             pax_member(
                 "alias",
-                MemberKind::SymbolicLink,
+                UstarKind::SymbolicLink,
                 0,
                 Some("bin/tool"),
                 false,
             ),
         ];
         for (sequence, member) in members.into_iter().enumerate() {
-            let payload: &[u8] = if member.kind == MemberKind::Regular {
+            let payload: &[u8] = if member.kind == UstarKind::Regular {
                 b"run"
             } else {
                 b""
@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn frames_members_into_a_reusable_buffer() {
-        let member = pax_member("bin/tool", MemberKind::Regular, 3, None, true);
+        let member = pax_member("bin/tool", UstarKind::Regular, 3, None, true);
         let mut bytes = Vec::with_capacity(BLOCK_SIZE * 3);
         bytes.extend_from_slice(b"stale bytes");
         frame_pax_member_into(7, member, &mut bytes).expect("valid member");
@@ -541,7 +541,7 @@ mod tests {
     fn uses_generated_fallbacks_for_long_paths_and_links() {
         let path = format!("{}/{}", "a".repeat(156), "b".repeat(101));
         let link_path = "c".repeat(101);
-        let member = pax_member(&path, MemberKind::SymbolicLink, 0, Some(&link_path), false);
+        let member = pax_member(&path, UstarKind::SymbolicLink, 0, Some(&link_path), false);
         let mut bytes = Vec::new();
         frame_pax_member_into(7, member, &mut bytes).expect("valid member");
         let member_header = &bytes[bytes.len() - BLOCK_SIZE..];
@@ -567,15 +567,15 @@ mod tests {
     fn rejects_unsupported_or_inconsistent_members() {
         for (member, expected) in [
             (
-                pax_member("file", MemberKind::HardLink, 0, None, false),
+                pax_member("file", UstarKind::HardLink, 0, None, false),
                 FramingWriteError::UnsupportedMemberKind {
-                    kind: MemberKind::HardLink,
+                    kind: UstarKind::HardLink,
                 },
             ),
             (
-                pax_member("link", MemberKind::SymbolicLink, 1, Some("file"), false),
+                pax_member("link", UstarKind::SymbolicLink, 1, Some("file"), false),
                 FramingWriteError::InvalidMemberSize {
-                    kind: MemberKind::SymbolicLink,
+                    kind: UstarKind::SymbolicLink,
                     size: 1,
                 },
             ),
@@ -592,7 +592,7 @@ mod tests {
         let mut bytes = Vec::new();
         frame_pax_member_into(
             0,
-            pax_member("large", MemberKind::Regular, u64::MAX, None, false),
+            pax_member("large", UstarKind::Regular, u64::MAX, None, false),
             &mut bytes,
         )
         .expect("pax size can represent u64 values");

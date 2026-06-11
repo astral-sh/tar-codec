@@ -12,7 +12,7 @@ use tar_codec::{
     encode::{EncodeError, EncodePolicy, Encoder, EntryMetadata, TraversalError},
 };
 use tar_framing::{
-    MemberKind,
+    UstarKind,
     logical::{MemberExtensions, TarReader},
     write::FramingWriteError,
 };
@@ -126,7 +126,7 @@ async fn manual_regular_entry_rejects_trailing_separator_before_writing() {
             .await,
         Err(EncodeError::Framing(
             FramingWriteError::TrailingPathSeparator {
-                kind: MemberKind::Regular
+                kind: UstarKind::Regular
             }
         ))
     ));
@@ -315,7 +315,7 @@ async fn recursive_encoding_preserves_symlinks_and_repeated_inodes() {
     let mut reader = TarReader::new(bytes.as_slice());
     let mut regular_files = 0;
     while let Some(member) = reader.next_frame().await.unwrap() {
-        if member.header.kind == MemberKind::Regular {
+        if member.header.kind == UstarKind::Regular {
             regular_files += 1;
         }
         member.payload.skip().await.unwrap();
