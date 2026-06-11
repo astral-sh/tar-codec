@@ -1,10 +1,10 @@
-use std::{hint::black_box, time::Duration};
+use std::{hint::black_box, sync::Arc, time::Duration};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tar_framing::{
-    BLOCK_SIZE, MemberKind,
+    BLOCK_SIZE, PaxKeyword, UstarKind,
     logical::TarReader,
-    write::{PaxMember, end_marker_bytes, frame_pax_member_into},
+    write::{PaxMember, append_pax_record, end_marker_bytes, frame_pax_member_into},
 };
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
@@ -13,6 +13,11 @@ const SMALL_FILE_BYTES: usize = 1024;
 const SMALL_FILE_COUNT: usize = 1024;
 const SMALL_DIRECTORY_COUNT: usize = 32;
 const PAYLOAD_CHUNK_BYTES: usize = 1024 * 1024;
+const GLOBAL_PAX_RECORD_COUNTS: [usize; 4] = [128, 256, 512, 1024];
+const SIZE_RANGE: std::ops::Range<usize> = 124..136;
+const CHECKSUM_RANGE: std::ops::Range<usize> = 148..156;
+const TYPEFLAG_OFFSET: usize = 156;
+const IDENTITY_RANGE: std::ops::Range<usize> = 257..265;
 
 struct Entry {
     path: String,
@@ -128,7 +133,7 @@ fn archive(entries: &[Entry]) -> Vec<u8> {
             u64::try_from(sequence).expect("fixture sequence should be representable"),
             PaxMember {
                 path: &entry.path,
-                kind: MemberKind::Regular,
+                kind: UstarKind::Regular,
                 size: u64::try_from(entry.data.len())
                     .expect("fixture payload length should be representable"),
                 link_path: None,
@@ -152,6 +157,63 @@ fn append_padding(archive: &mut Vec<u8>, payload_len: usize) {
     }
 }
 
+fn pax_record(keyword: PaxKeyword, value: &str) -> Vec<u8> {
+    let mut record = Vec::new();
+    append_pax_record(&mut record, &keyword, value.as_bytes())
+        .expect("benchmark PAX record keyword should be valid");
+    record
+}
+
+fn global_pax_header(payload_len: usize) -> [u8; BLOCK_SIZE] {
+    let mut header = [0; BLOCK_SIZE];
+    header[..10].copy_from_slice(b"pax-global");
+    let size = format!("{:011o}\0", payload_len);
+    header[SIZE_RANGE].copy_from_slice(size.as_bytes());
+    header[TYPEFLAG_OFFSET] = b'g';
+    header[IDENTITY_RANGE].copy_from_slice(b"ustar\x0000");
+    header[CHECKSUM_RANGE].fill(b' ');
+    let checksum = header.iter().map(|byte| u64::from(*byte)).sum::<u64>();
+    let checksum = format!("{checksum:06o}\0 ");
+    header[CHECKSUM_RANGE].copy_from_slice(checksum.as_bytes());
+    header
+}
+
+fn append_global_pax(archive: &mut Vec<u8>, payload: &[u8]) {
+    archive.extend_from_slice(&global_pax_header(payload.len()));
+    archive.extend_from_slice(payload);
+    append_padding(archive, payload.len());
+}
+
+fn global_pax_archive(record_count: usize, replace: bool) -> Vec<u8> {
+    let payload = (0..record_count).fold(Vec::new(), |mut payload, index| {
+        payload.extend_from_slice(&pax_record(
+            PaxKeyword::Vendor {
+                vendor: Arc::from("ACME"),
+                name: Arc::from(format!("attribute{index}")),
+            },
+            "initial",
+        ));
+        payload
+    });
+    let mut archive = Vec::new();
+    append_global_pax(&mut archive, &payload);
+    if replace {
+        let replacement = (0..record_count).fold(Vec::new(), |mut payload, index| {
+            payload.extend_from_slice(&pax_record(
+                PaxKeyword::Vendor {
+                    vendor: Arc::from("ACME"),
+                    name: Arc::from(format!("attribute{index}")),
+                },
+                "replacement",
+            ));
+            payload
+        });
+        append_global_pax(&mut archive, &replacement);
+    }
+    archive.resize(archive.len() + 2 * BLOCK_SIZE, 0);
+    archive
+}
+
 fn encode_pax_framing(fixture: &Fixture) -> usize {
     let mut framing = Vec::new();
     let mut bytes = 0;
@@ -160,7 +222,7 @@ fn encode_pax_framing(fixture: &Fixture) -> usize {
             u64::try_from(sequence).expect("fixture sequence should be representable"),
             PaxMember {
                 path: &entry.path,
-                kind: MemberKind::Regular,
+                kind: UstarKind::Regular,
                 size: u64::try_from(entry.data.len())
                     .expect("fixture payload length should be representable"),
                 link_path: None,
@@ -222,6 +284,18 @@ async fn decode_payload(fixture: &Fixture, mode: DecodeMode) -> (u64, u64) {
     (entries, payload_bytes)
 }
 
+async fn decode_trailing_global_pax(archive: &[u8]) -> usize {
+    let mut reader = TarReader::new(archive);
+    assert!(
+        reader
+            .next_frame()
+            .await
+            .expect("global pax fixture should decode")
+            .is_none()
+    );
+    archive.len()
+}
+
 fn bench_encode_pax_framing(criterion: &mut Criterion, fixtures: &[Fixture]) {
     let mut group = criterion.benchmark_group("encode_pax_framing");
     for fixture in fixtures {
@@ -255,11 +329,39 @@ fn bench_decode_payload(criterion: &mut Criterion, runtime: &Runtime, fixtures: 
     group.finish();
 }
 
+fn bench_global_pax_updates(criterion: &mut Criterion, runtime: &Runtime) {
+    let mut group = criterion.benchmark_group("global_pax_updates");
+    for record_count in GLOBAL_PAX_RECORD_COUNTS {
+        for (mode, replace) in [("unique", false), ("replace", true)] {
+            let archive = global_pax_archive(record_count, replace);
+            let updates = if replace {
+                record_count * 2
+            } else {
+                record_count
+            };
+            group.throughput(Throughput::Elements(
+                u64::try_from(updates).expect("fixture record count should be representable"),
+            ));
+            group.bench_with_input(
+                BenchmarkId::new(mode, record_count),
+                &archive,
+                |bencher, archive| {
+                    bencher.to_async(runtime).iter(|| async {
+                        black_box(decode_trailing_global_pax(black_box(archive)).await)
+                    });
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
 fn framing(criterion: &mut Criterion) {
     let runtime = runtime();
     let fixtures = fixtures();
     bench_encode_pax_framing(criterion, &fixtures);
     bench_decode_payload(criterion, &runtime, &fixtures);
+    bench_global_pax_updates(criterion, &runtime);
 }
 
 criterion_group!(benches, framing);

@@ -1,5 +1,7 @@
 pub mod support;
 
+use std::sync::Arc;
+
 use support::{
     ArchiveBuilder, ArchiveFormat, header, pax_record, raw_pax_record, set_checksum,
     set_identity_byte, single_posix_member,
@@ -8,17 +10,24 @@ use tar_codec::{
     decode::{Archive, DecodeError, DecodePolicy, DecodePolicyViolation, PaxDecodePolicy},
     default_name_validator,
 };
-use tar_framing::{FrameError, FrameErrorInner};
+use tar_framing::{FrameError, FrameErrorInner, PaxKeyword};
 use tempfile::tempdir;
+
+fn vendor_attribute_keyword() -> PaxKeyword {
+    PaxKeyword::Vendor {
+        vendor: Arc::from("Acme"),
+        name: Arc::from("attribute"),
+    }
+}
 
 #[tokio::test]
 async fn pax_precedence_and_validation_use_effective_names() {
     let temp = tempdir().unwrap();
     let destination = temp.path().join("precedence");
-    let global = pax_record("path", "wrong");
-    let local_file = pax_record("path", "actual/file");
-    let mut local_link = pax_record("path", "actual/link");
-    local_link.extend_from_slice(&pax_record("linkpath", "file"));
+    let global = pax_record(PaxKeyword::Path, "wrong");
+    let local_file = pax_record(PaxKeyword::Path, "actual/file");
+    let mut local_link = pax_record(PaxKeyword::Path, "actual/link");
+    local_link.extend_from_slice(&pax_record(PaxKeyword::LinkPath, "file"));
     let mut archive = ArchiveBuilder::new();
     archive
         .pax(b'g', &global)
@@ -43,10 +52,10 @@ async fn pax_precedence_and_validation_use_effective_names() {
     assert!(!destination.join("wrong").exists());
 
     let destination = temp.path().join("effective");
-    let mut local_file = pax_record("path", "actual/file");
-    local_file.extend_from_slice(&pax_record("comment", "metadata"));
-    let mut local_link = pax_record("path", "actual/link");
-    local_link.extend_from_slice(&pax_record("linkpath", "file"));
+    let mut local_file = pax_record(PaxKeyword::Path, "actual/file");
+    local_file.extend_from_slice(&pax_record(PaxKeyword::Comment, "metadata"));
+    let mut local_link = pax_record(PaxKeyword::Path, "actual/link");
+    local_link.extend_from_slice(&pax_record(PaxKeyword::LinkPath, "file"));
     let mut archive = ArchiveBuilder::new();
     archive
         .pax(b'x', &local_file)
@@ -69,7 +78,7 @@ async fn pax_precedence_and_validation_use_effective_names() {
     let destination = temp.path().join("rejected");
     let mut archive = ArchiveBuilder::new();
     archive
-        .pax(b'x', &pax_record("path", "blocked"))
+        .pax(b'x', &pax_record(PaxKeyword::Path, "blocked"))
         .posix("allowed", b'0', b"", "", 0o644);
     let bytes = archive.finish();
     let policy = DecodePolicy::default().name_validator(Some(|name| {
@@ -228,7 +237,7 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
     let temp = tempdir().unwrap();
     let mut archive = ArchiveBuilder::new();
     archive
-        .pax(b'x', &pax_record("ACME.attribute", "value"))
+        .pax(b'x', &pax_record(vendor_attribute_keyword(), "value"))
         .posix("file", b'0', b"", "", 0o644);
     let bytes = archive.finish();
     assert!(matches!(
@@ -241,14 +250,14 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
                 vendor,
                 name,
             },
-        }) if vendor == "ACME" && name == "attribute"
+        }) if vendor == "Acme" && name == "attribute"
     ));
 
     let destination = temp.path().join("partial");
     let mut archive = ArchiveBuilder::new();
     archive
         .posix("created", b'0', b"kept", "", 0o644)
-        .pax(b'g', &pax_record("ACME.attribute", "value"))
+        .pax(b'g', &pax_record(vendor_attribute_keyword(), "value"))
         .posix("blocked", b'0', b"", "", 0o644);
     let bytes = archive.finish();
     assert!(matches!(
@@ -272,7 +281,7 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
     let destination = temp.path().join("permitted");
     let mut archive = ArchiveBuilder::new();
     archive
-        .pax(b'x', &pax_record("ACME.attribute", "value"))
+        .pax(b'x', &pax_record(vendor_attribute_keyword(), "value"))
         .posix("file", b'0', b"ok", "", 0o644);
     let bytes = archive.finish();
     let policy = DecodePolicy::default()
@@ -290,8 +299,8 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
 #[tokio::test]
 async fn duplicate_pax_records_are_rejected_by_default_and_can_use_last_value() {
     let temp = tempdir().unwrap();
-    let mut local = pax_record("path", "wrong");
-    local.extend_from_slice(&pax_record("path", "actual"));
+    let mut local = pax_record(PaxKeyword::Path, "wrong");
+    local.extend_from_slice(&pax_record(PaxKeyword::Path, "actual"));
     let mut archive = ArchiveBuilder::new();
     archive
         .pax(b'x', &local)
@@ -323,11 +332,57 @@ async fn duplicate_pax_records_are_rejected_by_default_and_can_use_last_value() 
 }
 
 #[tokio::test]
+async fn pax_extension_size_limit_is_configurable_for_extraction() {
+    let temp = tempdir().expect("temporary directory should be created");
+    let mut payload = pax_record(PaxKeyword::Comment, "metadata");
+    payload.extend_from_slice(&pax_record(PaxKeyword::Mtime, "1"));
+    let mut archive = ArchiveBuilder::new();
+    archive
+        .pax(b'x', &payload)
+        .posix("file", b'0', b"contents", "", 0o644);
+    let bytes = archive.finish();
+    let payload_size = u64::try_from(payload.len()).expect("payload size should fit u64");
+
+    let destination = temp.path().join("rejected");
+    let policy = DecodePolicy::default()
+        .pax_policy(PaxDecodePolicy::default().max_extension_size(payload_size - 1));
+    assert!(matches!(
+        Archive::new(bytes.as_slice())
+            .extract(&destination, policy)
+            .await,
+        Err(DecodeError::Framing(FrameError {
+            position: 0,
+            inner: FrameErrorInner::PaxExtensionTooLarge { size, limit },
+        })) if size == payload_size && limit == payload_size - 1
+    ));
+    assert!(destination.is_dir());
+    assert!(
+        std::fs::read_dir(destination)
+            .expect("rejected destination should be readable")
+            .next()
+            .is_none()
+    );
+
+    let destination = temp.path().join("accepted");
+    let policy = DecodePolicy::default()
+        .pax_policy(PaxDecodePolicy::default().max_extension_size(payload_size));
+    Archive::new(bytes.as_slice())
+        .extract(&destination, policy)
+        .await
+        .expect("extension at configured limit should extract");
+    assert_eq!(
+        std::fs::read_to_string(destination.join("file"))
+            .expect("extracted file should be readable"),
+        "contents"
+    );
+}
+
+#[tokio::test]
 async fn global_pax_headers_support_opt_out_and_ignore_trailing_updates() {
     let temp = tempdir().unwrap();
     let mut archive = ArchiveBuilder::new();
     archive
-        .pax(b'g', &pax_record("comment", "metadata"))
+        .pax(b'g', &pax_record(PaxKeyword::Comment, "metadata"))
         .posix("file", b'0', b"", "", 0o644);
     let bytes = archive.finish();
     let reject_globals = DecodePolicy::default()
@@ -344,13 +399,9 @@ async fn global_pax_headers_support_opt_out_and_ignore_trailing_updates() {
 
     let destination = temp.path().join("permitted");
     let mut archive = ArchiveBuilder::new();
-    archive.pax(b'g', &pax_record("comment", "metadata")).posix(
-        "file",
-        b'0',
-        b"contents",
-        "",
-        0o644,
-    );
+    archive
+        .pax(b'g', &pax_record(PaxKeyword::Comment, "metadata"))
+        .posix("file", b'0', b"contents", "", 0o644);
     let bytes = archive.finish();
     Archive::new(bytes.as_slice())
         .extract(&destination, DecodePolicy::default())
@@ -362,7 +413,7 @@ async fn global_pax_headers_support_opt_out_and_ignore_trailing_updates() {
     );
 
     let mut archive = ArchiveBuilder::new();
-    archive.pax(b'g', &pax_record("comment", "metadata"));
+    archive.pax(b'g', &pax_record(PaxKeyword::Comment, "metadata"));
     let trailing = archive.finish();
     Archive::new(trailing.as_slice())
         .extract(temp.path().join("trailing"), reject_globals)
@@ -386,10 +437,10 @@ async fn global_pax_headers_support_opt_out_and_ignore_trailing_updates() {
 #[tokio::test]
 async fn global_member_metadata_requires_opt_in_and_uses_pax_precedence() {
     let temp = tempdir().unwrap();
-    for (case, keyword, value) in [
-        ("path", "path", "file"),
-        ("linkpath", "linkpath", "target"),
-        ("size", "size", "0"),
+    for (case, keyword, value, expected) in [
+        ("path", PaxKeyword::Path, "file", "path"),
+        ("linkpath", PaxKeyword::LinkPath, "target", "linkpath"),
+        ("size", PaxKeyword::Size, "0", "size"),
     ] {
         let mut archive = ArchiveBuilder::new();
         archive
@@ -407,15 +458,15 @@ async fn global_member_metadata_requires_opt_in_and_uses_pax_precedence() {
                 violation: DecodePolicyViolation::GlobalPaxMemberMetadata {
                     keyword: found,
                 },
-            }) if found == keyword
+            }) if found == expected
         ));
     }
 
     let destination = temp.path().join("updates");
     let mut archive = ArchiveBuilder::new();
     archive
-        .pax(b'g', &pax_record("path", "old"))
-        .pax(b'g', &pax_record("path", "current"))
+        .pax(b'g', &pax_record(PaxKeyword::Path, "old"))
+        .pax(b'g', &pax_record(PaxKeyword::Path, "current"))
         .posix("raw", b'0', b"contents", "", 0o644);
     let bytes = archive.finish();
     let policy = DecodePolicy::default().pax_policy(
@@ -438,8 +489,8 @@ async fn global_member_metadata_requires_opt_in_and_uses_pax_precedence() {
 async fn binary_names_are_rejected_and_streaming_failures_preserve_prior_output() {
     let temp = tempdir().unwrap();
 
-    let mut binary_path = pax_record("hdrcharset", "BINARY");
-    binary_path.extend_from_slice(&raw_pax_record("path", &[0xff]));
+    let mut binary_path = pax_record(PaxKeyword::HdrCharset, "BINARY");
+    binary_path.extend_from_slice(&raw_pax_record(PaxKeyword::Path, &[0xff]));
     let mut archive = ArchiveBuilder::new();
     archive
         .pax(b'x', &binary_path)
@@ -453,7 +504,7 @@ async fn binary_names_are_rejected_and_streaming_failures_preserve_prior_output(
     ));
 
     let destination = temp.path().join("partial");
-    let mut invalid = header(ArchiveFormat::Posix, "bad", b'0', 0, "", 0o644);
+    let mut invalid = header(ArchiveFormat::Pax, "bad", b'0', 0, "", 0o644);
     set_identity_byte(&mut invalid, 0, b'!');
     set_checksum(&mut invalid);
     let mut archive = ArchiveBuilder::new();

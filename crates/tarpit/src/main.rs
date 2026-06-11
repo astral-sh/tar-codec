@@ -8,8 +8,8 @@ use async_compression::tokio::bufread::GzipDecoder;
 use clap::{Parser, Subcommand};
 use tar_codec::decode::{Archive, DecodeError, DecodePolicy};
 use tar_framing::{
-    ArchiveFormat, FrameError, GnuKind, HdrCharset, MemberKind, PaxKind, PaxRecord, PaxString,
-    PaxValue,
+    ArchiveFormat, FrameError, GnuKind, HdrCharset, PaxKind, PaxRecord, PaxString, PaxValue,
+    UstarKind,
     stream::{DataOwner, Frame, TarStream},
 };
 use thiserror::Error;
@@ -214,7 +214,7 @@ fn render_pax_records(
 ) -> io::Result<()> {
     for record in records {
         let keyword = record.keyword();
-        write!(output, "        {scope} pax: {}=", keyword.escape_default())?;
+        write!(output, "        {scope} pax: {keyword}=")?;
         match record {
             PaxRecord::Atime(value)
             | PaxRecord::Ctime(value)
@@ -283,16 +283,16 @@ fn gnu_kind_name(kind: GnuKind) -> &'static str {
     }
 }
 
-fn member_kind_name(kind: MemberKind) -> &'static str {
+fn member_kind_name(kind: UstarKind) -> &'static str {
     match kind {
-        MemberKind::Regular => "regular",
-        MemberKind::HardLink => "hard-link",
-        MemberKind::SymbolicLink => "symbolic-link",
-        MemberKind::CharacterDevice => "character-device",
-        MemberKind::BlockDevice => "block-device",
-        MemberKind::Directory => "directory",
-        MemberKind::Fifo => "fifo",
-        MemberKind::Contiguous => "contiguous",
+        UstarKind::Regular => "regular",
+        UstarKind::HardLink => "hard-link",
+        UstarKind::SymbolicLink => "symbolic-link",
+        UstarKind::CharacterDevice => "character-device",
+        UstarKind::BlockDevice => "block-device",
+        UstarKind::Directory => "directory",
+        UstarKind::Fifo => "fifo",
+        UstarKind::Contiguous => "contiguous",
     }
 }
 

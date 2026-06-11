@@ -1,18 +1,15 @@
-use tar_framing::{BLOCK_SIZE, Block};
-
-const NAME_RANGE: std::ops::Range<usize> = 0..100;
-const MODE_RANGE: std::ops::Range<usize> = 100..108;
-const SIZE_RANGE: std::ops::Range<usize> = 124..136;
-const CHECKSUM_RANGE: std::ops::Range<usize> = 148..156;
-const TYPEFLAG_OFFSET: usize = 156;
-const LINK_NAME_RANGE: std::ops::Range<usize> = 157..257;
-const IDENTITY_RANGE: std::ops::Range<usize> = 257..265;
-const POSIX_IDENTITY: &[u8; 8] = b"ustar\x0000";
-const GNU_IDENTITY: &[u8; 8] = b"ustar  \0";
+use tar_framing::{
+    BLOCK_SIZE, Block, PaxKeyword,
+    header::{
+        CHECKSUM_RANGE, GNU_IDENTITY, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE, NAME_RANGE,
+        SIZE_RANGE, TYPEFLAG_OFFSET, USTAR_IDENTITY,
+    },
+    write::append_pax_record,
+};
 
 #[derive(Clone, Copy)]
 pub enum ArchiveFormat {
-    Posix,
+    Pax,
     Gnu,
 }
 
@@ -42,14 +39,7 @@ impl ArchiveBuilder {
         link_name: &str,
         mode: u32,
     ) -> &mut Self {
-        self.member(
-            ArchiveFormat::Posix,
-            name,
-            typeflag,
-            payload,
-            link_name,
-            mode,
-        )
+        self.member(ArchiveFormat::Pax, name, typeflag, payload, link_name, mode)
     }
 
     pub fn gnu(
@@ -142,7 +132,7 @@ pub fn header(
     block[TYPEFLAG_OFFSET] = typeflag;
     set_text(&mut block[LINK_NAME_RANGE], link_name);
     block[IDENTITY_RANGE].copy_from_slice(match format {
-        ArchiveFormat::Posix => POSIX_IDENTITY,
+        ArchiveFormat::Pax => USTAR_IDENTITY,
         ArchiveFormat::Gnu => GNU_IDENTITY,
     });
     set_checksum(&mut block);
@@ -159,25 +149,15 @@ pub fn set_identity_byte(block: &mut Block, index: usize, byte: u8) {
     block[IDENTITY_RANGE.start + index] = byte;
 }
 
-pub fn pax_record(keyword: &str, value: &str) -> Vec<u8> {
+pub fn pax_record(keyword: PaxKeyword, value: &str) -> Vec<u8> {
     raw_pax_record(keyword, value.as_bytes())
 }
 
-pub fn raw_pax_record(keyword: &str, value: &[u8]) -> Vec<u8> {
-    let mut suffix = format!(" {keyword}=").into_bytes();
-    suffix.extend_from_slice(value);
-    suffix.push(b'\n');
-    let mut len = suffix.len() + 1;
-    loop {
-        let prefix = len.to_string();
-        let actual = prefix.len() + suffix.len();
-        if actual == len {
-            let mut record = prefix.into_bytes();
-            record.extend_from_slice(&suffix);
-            return record;
-        }
-        len = actual;
-    }
+pub fn raw_pax_record(keyword: PaxKeyword, value: &[u8]) -> Vec<u8> {
+    let mut record = Vec::new();
+    append_pax_record(&mut record, &keyword, value)
+        .expect("test PAX record keyword should be valid");
+    record
 }
 
 fn set_text(field: &mut [u8], value: &str) {

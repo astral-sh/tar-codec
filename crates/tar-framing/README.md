@@ -30,6 +30,11 @@ as typed UTF-8 strings or unencoded bytes accordingly.
 Logical metadata access remains lossless bytes; consumers such as
 `tar-codec` decide how filenames and link targets may be decoded and used.
 
+Each local or global PAX extension is limited to 1 MiB by default and is
+rejected from its header before any payload is consumed when it exceeds that
+limit. `TarStream` and `TarReader` provide constructors for configuring the
+limit.
+
 ## Benchmarking
 
 Run the internal framing benchmarks with:

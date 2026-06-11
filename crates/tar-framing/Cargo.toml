@@ -21,3 +21,6 @@ tokio = { workspace = true, features = ["rt"] }
 [[bench]]
 name = "framing"
 harness = false
+
+[lib]
+doctest = false

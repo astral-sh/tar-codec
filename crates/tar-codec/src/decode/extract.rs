@@ -2,12 +2,24 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    fs::{self as std_fs, Metadata},
+    fs as std_fs,
+    sync::Arc,
 };
 
 use super::*;
+#[cfg(unix)]
+use cap_std::fs::OpenOptionsExt as _;
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, Metadata, OpenOptions},
+};
 use tar_framing::logical::MemberPayload;
-use tokio::{fs, io::AsyncWriteExt};
+use tokio::{fs::File, io::AsyncWriteExt};
+#[cfg(windows)]
+use {
+    cap_std::fs::MetadataExt as _, std::os::windows::fs::MetadataExt as _,
+    windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT,
+};
 
 /// A symbolic link awaiting graph validation and filesystem installation.
 ///
@@ -45,21 +57,23 @@ const EXTRACTION_CHUNK_BYTES: usize = 1024 * 1024;
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ExtractedEntry {
     File,
-    Directory,
-    ExistingDirectory,
+    CreatedDirectory,
+    AmbientDirectory,
     Symlink,
 }
 
 impl ExtractedEntry {
     fn is_directory(self) -> bool {
-        matches!(self, Self::Directory | Self::ExistingDirectory)
+        matches!(self, Self::CreatedDirectory | Self::AmbientDirectory)
     }
 }
 
 /// Represents a root directory for an extraction operation.
 struct ExtractionRoot {
-    /// The root's path.
-    path: PathBuf,
+    /// The capability anchoring all extraction filesystem operations.
+    directory: Arc<Dir>,
+    /// Capabilities for known directories, used to keep leaf operations cheap.
+    directory_handles: HashMap<PathBuf, Arc<Dir>>,
     /// Whether overwrites are allowed during extraction.
     allow_overwrites: bool,
     entries: HashMap<PathBuf, ExtractedEntry>,
@@ -67,11 +81,30 @@ struct ExtractionRoot {
     symlinks: Vec<PendingSymlink>,
 }
 
+/// The filesystem shape of a fully resolved symbolic-link target.
+///
+/// This determines which kind of symbolic link to create on platforms such as
+/// Windows, where file and directory symbolic links use different operations.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum TerminalKind {
+    /// The target exists and is not a directory.
     File,
+    /// The target exists and is a directory.
     Directory,
+    /// The target does not yet exist.
     Dangling,
+}
+
+/// The result of resolving a target through the archive's symbolic-link graph.
+///
+/// Resolution stops when it reaches either an entry whose provenance and kind
+/// are known from this extraction, or a path whose terminal entry is not owned
+/// by the extraction and therefore requires policy-dependent handling.
+enum ResolvedTarget {
+    /// The extraction root or an archive-created entry of the given kind.
+    Known(TerminalKind),
+    /// A normalized root-relative path not created by this extraction.
+    Unowned(PathBuf),
 }
 
 impl<R: AsyncRead + Unpin> Archive<R> {
@@ -84,34 +117,41 @@ impl<R: AsyncRead + Unpin> Archive<R> {
     ///
     /// **IMPORTANT**: `dest` **MUST NOT** be concurrently modified during extraction.
     /// No correctness/isolation guarantees are made if `dest` is externally modified.
+    ///
+    /// **IMPORTANT**: extraction occurs in a streamwise fashion, meaning that a late
+    /// error can leave a partially extracted state under `dest`. Users that require
+    /// "all or nothing" behavior should attempt extraction in a new temporary
+    /// directory, and then atomically rename that directory to `dest`.
     pub async fn extract<P: AsRef<Path>>(
         mut self,
         dest: P,
         policy: DecodePolicy,
     ) -> Result<(), DecodeError> {
+        self.reader
+            .set_max_pax_extension_size(policy.pax_policy.max_extension_size);
         let mut root = ExtractionRoot::open(dest.as_ref(), policy.allow_overwrites).await?;
         let mut payload_chunk = Vec::new();
         while let Some(frame) = self.reader.next_frame().await? {
             policy.check_member(&frame)?;
             let member = decode_member(&frame, &policy)?;
             match member.kind {
-                MemberKind::Regular | MemberKind::Contiguous => {
+                UstarKind::Regular | UstarKind::Contiguous => {
                     root.extract_file(&member, frame.payload, &mut payload_chunk)
                         .await?;
                 }
-                MemberKind::Directory => {
+                UstarKind::Directory => {
                     root.extract_directory(&member.path).await?;
                     frame.payload.skip().await?;
                 }
-                MemberKind::SymbolicLink => {
+                UstarKind::SymbolicLink => {
                     root.reserve_symlink(&member).await?;
                     frame.payload.skip().await?;
                 }
-                MemberKind::HardLink => {
+                UstarKind::HardLink => {
                     root.extract_hard_link(&member, frame.payload, &mut payload_chunk)
                         .await?;
                 }
-                MemberKind::CharacterDevice | MemberKind::BlockDevice | MemberKind::Fifo => {
+                UstarKind::CharacterDevice | UstarKind::BlockDevice | UstarKind::Fifo => {
                     return Err(DecodeError::UnsupportedMember {
                         position: member.position,
                         path: member.path,
@@ -120,7 +160,7 @@ impl<R: AsyncRead + Unpin> Archive<R> {
                 }
             }
         }
-        root.install_symlinks(policy.allow_dangling_symlinks).await
+        root.install_symlinks(policy.symlink_target_policy).await
     }
 }
 
@@ -128,7 +168,7 @@ async fn write_payload<R: AsyncRead + Unpin>(
     mut payload: MemberPayload<'_, R>,
     payload_chunk: &mut Vec<u8>,
     path: &Path,
-    mut file: fs::File,
+    mut file: File,
 ) -> Result<(), DecodeError> {
     while payload
         .next_chunk(payload_chunk, EXTRACTION_CHUNK_BYTES)
@@ -148,14 +188,35 @@ impl ExtractionRoot {
     async fn open(dest: &Path, allow_overwrites: bool) -> Result<Self, DecodeError> {
         let dest = dest.to_owned();
         let error_path = dest.clone();
-        let path = tokio::task::spawn_blocking(move || open_destination(&dest))
-            .await
-            .map_err(DecodeError::BlockingTask)?
-            .map_err(|source| {
-                DecodeError::filesystem("open destination directory", error_path, source)
-            })?;
+        let directory = tokio::task::spawn_blocking(move || {
+            match std_fs::symlink_metadata(&dest) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    std_fs::create_dir_all(&dest)?;
+                }
+                Err(error) => return Err(error),
+            }
+            let metadata = std_fs::symlink_metadata(&dest)?;
+            if ambient_metadata_is_link(&metadata) || !metadata.is_dir() {
+                return Err(io::Error::other("destination is not a real directory"));
+            }
+            let path = std_fs::canonicalize(dest)?;
+            let directory = Dir::open_ambient_dir(path, ambient_authority())?;
+            let metadata = directory.dir_metadata()?;
+            if metadata_is_link(&metadata) || !metadata.is_dir() {
+                return Err(io::Error::other("destination is not a real directory"));
+            }
+            Ok(Arc::new(directory))
+        })
+        .await
+        .map_err(DecodeError::BlockingTask)?
+        .map_err(|source| {
+            DecodeError::filesystem("open destination directory", error_path, source)
+        })?;
+
         Ok(Self {
-            path,
+            directory,
+            directory_handles: HashMap::new(),
             allow_overwrites,
             entries: HashMap::new(),
             symlink_indices: HashMap::new(),
@@ -192,32 +253,27 @@ impl ExtractionRoot {
     async fn extract_directory(&mut self, path: &Path) -> Result<(), DecodeError> {
         if !path.as_os_str().is_empty() {
             self.ensure_parents(path).await?;
-            self.ensure_directory(path, true).await?;
+            self.ensure_directory(path).await?;
         }
         Ok(())
     }
 
-    async fn create_file(
-        &mut self,
-        path: &Path,
-        executable: bool,
-    ) -> Result<fs::File, DecodeError> {
+    async fn create_file(&mut self, path: &Path, executable: bool) -> Result<File, DecodeError> {
         self.ensure_parents(path).await?;
         if self.symlink_indices.contains_key(path) {
             self.replace_leaf(path).await?;
         }
-        let file = match self.open_file(path, true, false, executable).await {
+        let file = match self
+            .open_file("create file", path, true, false, executable)
+            .await
+        {
             Ok(file) => file,
-            Err(source) => {
+            Err(error) => {
                 if !self.replace_leaf(path).await? {
-                    return Err(DecodeError::filesystem(
-                        "create file",
-                        path.to_owned(),
-                        source,
-                    ));
+                    return Err(error);
                 }
-                let result = self.open_file(path, true, false, executable).await;
-                self.fs("create file", path, result)?
+                self.open_file("create file", path, true, false, executable)
+                    .await?
             }
         };
         self.entries.insert(path.to_owned(), ExtractedEntry::File);
@@ -275,20 +331,19 @@ impl ExtractionRoot {
         }
         self.ensure_parents(&member.path).await?;
         self.replace_leaf(&member.path).await?;
-        let result = fs::hard_link(
-            self.destination_path(&target),
-            self.destination_path(&member.path),
-        )
-        .await;
-        self.fs("create hard link", &member.path, result)?;
+        self.with_root("create hard link", &member.path, move |directory, path| {
+            directory.hard_link(target, directory, path)
+        })
+        .await?;
         self.entries
             .insert(member.path.clone(), ExtractedEntry::File);
         if member.effective_size == 0 {
             payload.skip().await?;
             Ok(())
         } else {
-            let result = self.open_file(&member.path, false, true, false).await;
-            let file = self.fs("truncate file", &member.path, result)?;
+            let file = self
+                .open_file("truncate file", &member.path, false, true, false)
+                .await?;
             write_payload(payload, payload_chunk, &member.path, file).await
         }
     }
@@ -300,56 +355,52 @@ impl ExtractionRoot {
         let mut current = PathBuf::new();
         for component in parent.components() {
             current.push(component.as_os_str());
-            self.ensure_directory(&current, false).await?;
+            self.ensure_directory(&current).await?;
         }
         Ok(())
     }
 
-    async fn ensure_directory(
-        &mut self,
-        path: &Path,
-        archive_member: bool,
-    ) -> Result<(), DecodeError> {
+    async fn ensure_directory(&mut self, path: &Path) -> Result<(), DecodeError> {
         if let Some(entry) = self.entries.get(path).copied()
             && entry.is_directory()
         {
-            if archive_member && entry == ExtractedEntry::ExistingDirectory {
-                self.entries
-                    .insert(path.to_owned(), ExtractedEntry::Directory);
-            }
             return Ok(());
         }
         if self.entries.contains_key(path) {
             self.replace_leaf(path).await?;
         }
         // Missing parents are common, so inspect and replace only after a collision.
-        let create_result = fs::create_dir(self.destination_path(path)).await;
-        if create_result.is_ok() {
-            self.entries
-                .insert(path.to_owned(), ExtractedEntry::Directory);
-            return Ok(());
-        }
+        let create_error = match self.create_directory(path).await {
+            Ok(directory) => {
+                self.directory_handles
+                    .insert(path.to_owned(), Arc::new(directory));
+                self.entries
+                    .insert(path.to_owned(), ExtractedEntry::CreatedDirectory);
+                return Ok(());
+            }
+            Err(error) => error,
+        };
         let metadata = self.metadata(path).await?;
         if metadata
             .as_ref()
-            .is_some_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            .is_some_and(|metadata| metadata.is_dir() && !metadata_is_link(metadata))
         {
-            let entry = if archive_member {
-                ExtractedEntry::Directory
-            } else {
-                ExtractedEntry::ExistingDirectory
-            };
-            self.entries.insert(path.to_owned(), entry);
+            let directory = self.open_directory(path).await?;
+            self.directory_handles
+                .insert(path.to_owned(), Arc::new(directory));
+            self.entries
+                .insert(path.to_owned(), ExtractedEntry::AmbientDirectory);
             return Ok(());
         }
         if metadata.is_none() && !self.entries.contains_key(path) {
-            return self.fs("create directory", path, create_result);
+            return Err(create_error);
         }
         self.replace_leaf(path).await?;
-        let result = fs::create_dir(self.destination_path(path)).await;
-        self.fs("create directory", path, result)?;
+        let directory = self.create_directory(path).await?;
+        self.directory_handles
+            .insert(path.to_owned(), Arc::new(directory));
         self.entries
-            .insert(path.to_owned(), ExtractedEntry::Directory);
+            .insert(path.to_owned(), ExtractedEntry::CreatedDirectory);
         Ok(())
     }
 
@@ -377,33 +428,42 @@ impl ExtractionRoot {
             .any(|candidate| candidate != path && candidate.starts_with(path))
     }
 
-    async fn install_symlinks(&self, allow_dangling_symlinks: bool) -> Result<(), DecodeError> {
+    async fn install_symlinks(
+        &self,
+        target_policy: SymlinkTargetPolicy,
+    ) -> Result<(), DecodeError> {
         let mut links = Vec::with_capacity(self.symlinks.len());
         for (index, link) in self.symlinks.iter().enumerate() {
             if self.symlink_indices.get(&link.path) != Some(&index) {
                 continue;
             }
-            let kind = self
+            let target = self
                 .resolve_terminal(&link.resolved_target)
                 .map_err(|reason| link.error(reason))?;
-            if kind == TerminalKind::Dangling && !allow_dangling_symlinks {
-                return Err(link.error("target was not created by this extraction"));
-            }
+            let kind = match (target, target_policy) {
+                (ResolvedTarget::Known(kind), _) => kind,
+                (ResolvedTarget::Unowned(_), SymlinkTargetPolicy::ArchiveOnly) => {
+                    return Err(link.error("target was not created by this extraction"));
+                }
+                (ResolvedTarget::Unowned(path), SymlinkTargetPolicy::AllowAmbientAndMissing) => {
+                    self.inspect_ambient_target(&path).await?
+                }
+            };
             links.push((link, kind));
         }
         for (link, kind) in links {
-            let result = create_symlink(
-                &link.link_contents,
-                &self.destination_path(&link.path),
-                kind,
+            let contents = link.link_contents.clone();
+            self.with_entry_parent(
+                "create symbolic link",
+                &link.path,
+                move |directory, path| create_symlink(directory, &contents, path, kind),
             )
-            .await;
-            self.fs("create symbolic link", &link.path, result)?;
+            .await?;
         }
         Ok(())
     }
 
-    fn resolve_terminal(&self, path: &Path) -> Result<TerminalKind, &'static str> {
+    fn resolve_terminal(&self, path: &Path) -> Result<ResolvedTarget, &'static str> {
         let mut path = path.to_owned();
         let mut visited = HashSet::new();
         for _ in 0..=MAX_SYMLINK_EXPANSIONS {
@@ -428,120 +488,269 @@ impl ExtractionRoot {
                 path = rewritten;
             } else {
                 return Ok(match self.entries.get(&path) {
-                    _ if path.as_os_str().is_empty() => TerminalKind::Directory,
-                    Some(ExtractedEntry::Directory) => TerminalKind::Directory,
-                    Some(ExtractedEntry::File) => TerminalKind::File,
+                    _ if path.as_os_str().is_empty() => {
+                        ResolvedTarget::Known(TerminalKind::Directory)
+                    }
+                    Some(ExtractedEntry::CreatedDirectory) => {
+                        ResolvedTarget::Known(TerminalKind::Directory)
+                    }
+                    Some(ExtractedEntry::File) => ResolvedTarget::Known(TerminalKind::File),
                     Some(ExtractedEntry::Symlink) => continue,
-                    Some(ExtractedEntry::ExistingDirectory) | None => TerminalKind::Dangling,
+                    Some(ExtractedEntry::AmbientDirectory) | None => ResolvedTarget::Unowned(path),
                 });
             }
         }
         Err("symbolic-link target expansion limit exceeded")
     }
 
-    async fn metadata(&self, path: &Path) -> Result<Option<Metadata>, DecodeError> {
-        match fs::symlink_metadata(self.destination_path(path)).await {
-            Ok(metadata) => Ok(Some(metadata)),
-            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(source) => Err(DecodeError::filesystem("inspect", path.to_owned(), source)),
-        }
+    async fn inspect_ambient_target(&self, path: &Path) -> Result<TerminalKind, DecodeError> {
+        self.with_root("inspect symbolic-link target", path, |directory, path| {
+            if path.as_os_str().is_empty() {
+                return Ok(TerminalKind::Directory);
+            }
+            match directory.metadata(path) {
+                Ok(metadata) if metadata.is_dir() => Ok(TerminalKind::Directory),
+                Ok(_) => Ok(TerminalKind::File),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(TerminalKind::Dangling),
+                Err(error) => Err(error),
+            }
+        })
+        .await
     }
 
-    async fn remove_leaf(&self, path: &Path, metadata: &Metadata) -> Result<(), DecodeError> {
-        let destination = self.destination_path(path);
-        if metadata.is_dir() && !metadata.file_type().is_symlink() {
-            let result = fs::read_dir(&destination).await;
-            let mut entries = self.fs("inspect directory", path, result)?;
-            let result = entries.next_entry().await;
-            if self.fs("inspect directory", path, result)?.is_some() {
+    async fn metadata(&self, path: &Path) -> Result<Option<Metadata>, DecodeError> {
+        self.with_entry_parent("inspect", path, |directory, path| {
+            match directory.symlink_metadata(path) {
+                Ok(metadata) => Ok(Some(metadata)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            }
+        })
+        .await
+    }
+
+    async fn remove_leaf(&mut self, path: &Path, metadata: &Metadata) -> Result<(), DecodeError> {
+        if metadata.is_dir() && !metadata_is_link(metadata) {
+            let is_empty = self
+                .with_entry_parent("inspect directory", path, |root, path| {
+                    let directory = root.open_dir(path)?;
+                    let mut entries = directory.entries()?;
+                    Ok(entries.next().transpose()?.is_none())
+                })
+                .await?;
+            if !is_empty {
                 return Err(DecodeError::PathCollision {
                     path: path.to_owned(),
                 });
             }
-            let result = fs::remove_dir(destination).await;
-            self.fs("remove directory", path, result)
+            // Windows directory handles do not share delete access.
+            self.directory_handles.remove(path);
+            self.with_entry_parent("remove directory", path, |directory, path| {
+                directory.remove_dir(path)
+            })
+            .await
         } else {
-            let result = remove_non_directory(&destination, metadata).await;
-            self.fs("remove file", path, result)
+            let is_link = metadata_is_link(metadata);
+            self.with_entry_parent("remove file", path, move |directory, path| {
+                #[cfg(windows)]
+                if is_link {
+                    // Stable Windows does not expose whether a symlink is file- or
+                    // directory-shaped.
+                    return match directory.remove_file(path) {
+                        Ok(()) => Ok(()),
+                        Err(_) => directory.remove_dir(path),
+                    };
+                }
+                #[cfg(not(windows))]
+                let _ = is_link;
+                directory.remove_file(path)
+            })
+            .await
         }
     }
 
     async fn open_file(
         &self,
+        operation: &'static str,
         path: &Path,
         create_new: bool,
         truncate: bool,
         executable: bool,
-    ) -> io::Result<fs::File> {
-        let mut options = fs::OpenOptions::new();
-        options
-            .write(true)
-            .create_new(create_new)
-            .truncate(truncate);
-        #[cfg(unix)]
-        options.mode(if executable { 0o777 } else { 0o666 });
-        #[cfg(not(unix))]
-        let _ = executable;
-        options.open(self.destination_path(path)).await
+    ) -> Result<File, DecodeError> {
+        let file = self
+            .with_entry_parent(operation, path, move |directory, path| {
+                let mut options = OpenOptions::new();
+                options
+                    .write(true)
+                    .create_new(create_new)
+                    .truncate(truncate);
+                #[cfg(unix)]
+                options.mode(if executable { 0o777 } else { 0o666 });
+                #[cfg(not(unix))]
+                let _ = executable;
+                directory
+                    .open_with(path, &options)
+                    .map(|file| file.into_std())
+            })
+            .await?;
+        Ok(File::from_std(file))
     }
 
-    fn destination_path(&self, path: &Path) -> PathBuf {
-        self.path.join(path)
+    async fn create_directory(&self, path: &Path) -> Result<Dir, DecodeError> {
+        self.with_entry_parent("create directory", path, |directory, path| {
+            directory.create_dir(path)?;
+            directory.open_dir(path)
+        })
+        .await
     }
 
-    fn fs<T>(
+    async fn open_directory(&self, path: &Path) -> Result<Dir, DecodeError> {
+        self.with_entry_parent("open directory", path, |directory, path| {
+            directory.open_dir(path)
+        })
+        .await
+    }
+
+    /// Runs an operation against the extraction root capability.
+    ///
+    /// `path` remains root-relative when passed to `action`. This is used for
+    /// paths whose parent is not necessarily an archive-known directory, such
+    /// as ambient symbolic-link targets.
+    async fn with_root<T, F>(
         &self,
         operation: &'static str,
         path: &Path,
-        result: io::Result<T>,
-    ) -> Result<T, DecodeError> {
-        result.map_err(|source| DecodeError::filesystem(operation, path.to_owned(), source))
+        action: F,
+    ) -> Result<T, DecodeError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Dir, &Path) -> io::Result<T> + Send + 'static,
+    {
+        run_blocking(
+            Arc::clone(&self.directory),
+            operation,
+            path.to_owned(),
+            path.to_owned(),
+            action,
+        )
+        .await
+    }
+
+    /// Runs an operation against the nearest capability for an entry's parent.
+    ///
+    /// When the immediate parent has a cached [`Dir`], `action` receives that
+    /// capability and only the entry's leaf name. Otherwise it receives the
+    /// extraction root and the complete root-relative path. Errors always
+    /// report the complete path regardless of which capability is selected.
+    async fn with_entry_parent<T, F>(
+        &self,
+        operation: &'static str,
+        path: &Path,
+        action: F,
+    ) -> Result<T, DecodeError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Dir, &Path) -> io::Result<T> + Send + 'static,
+    {
+        let (directory, relative_path) = self.entry_capability(path);
+        run_blocking(directory, operation, path.to_owned(), relative_path, action).await
+    }
+
+    fn entry_capability(&self, path: &Path) -> (Arc<Dir>, PathBuf) {
+        if let Some(parent) = path.parent()
+            && let Some(file_name) = path.file_name()
+        {
+            if parent.as_os_str().is_empty() {
+                return (Arc::clone(&self.directory), file_name.into());
+            }
+            if let Some(directory) = self.directory_handles.get(parent) {
+                return (Arc::clone(directory), file_name.into());
+            }
+        }
+        (Arc::clone(&self.directory), path.to_owned())
     }
 }
 
-fn open_destination(dest: &Path) -> io::Result<PathBuf> {
-    match std_fs::symlink_metadata(dest) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => std_fs::create_dir_all(dest)?,
-        Err(error) => return Err(error),
-    }
-    let metadata = std_fs::symlink_metadata(dest)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(io::Error::other("destination is not a real directory"));
-    }
-    std_fs::canonicalize(dest)
+/// Runs one capability-relative filesystem operation on Tokio's blocking pool.
+///
+/// `relative_path` is interpreted beneath `directory` and may be only the leaf
+/// name when a cached parent capability is available. `error_path` is the full
+/// root-relative archive path used for diagnostics; it is never passed to the
+/// filesystem. Keeping the paths separate avoids repeated path traversal
+/// without losing useful [`DecodeError::Filesystem`] context.
+///
+/// Filesystem errors are annotated with `operation` and `error_path`, while a
+/// failure to join the blocking task becomes [`DecodeError::BlockingTask`].
+async fn run_blocking<T, F>(
+    directory: Arc<Dir>,
+    operation: &'static str,
+    error_path: PathBuf,
+    relative_path: PathBuf,
+    action: F,
+) -> Result<T, DecodeError>
+where
+    T: Send + 'static,
+    F: FnOnce(&Dir, &Path) -> io::Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || match action(&directory, &relative_path) {
+        Ok(result) => Ok(result),
+        Err(source) => Err(DecodeError::filesystem(operation, error_path, source)),
+    })
+    .await
+    .map_err(DecodeError::BlockingTask)?
 }
 
-async fn remove_non_directory(path: &Path, metadata: &Metadata) -> io::Result<()> {
-    #[cfg(windows)]
-    if metadata.file_type().is_symlink() {
-        // Stable Windows does not expose whether a symlink is file- or directory-shaped.
-        return match fs::remove_file(path).await {
-            Ok(()) => Ok(()),
-            Err(_) => fs::remove_dir(path).await,
-        };
-    }
-    #[cfg(not(windows))]
-    let _ = metadata;
-    fs::remove_file(path).await
-}
-
-#[cfg(unix)]
-async fn create_symlink(contents: &Path, path: &Path, _kind: TerminalKind) -> io::Result<()> {
-    fs::symlink(contents, path).await
+#[cfg(not(windows))]
+fn ambient_metadata_is_link(metadata: &std_fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 #[cfg(windows)]
-async fn create_symlink(contents: &Path, path: &Path, kind: TerminalKind) -> io::Result<()> {
+fn ambient_metadata_is_link(metadata: &std_fs::Metadata) -> bool {
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_link(metadata: &Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn metadata_is_link(metadata: &Metadata) -> bool {
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(unix)]
+fn create_symlink(
+    directory: &Dir,
+    contents: &Path,
+    path: &Path,
+    _kind: TerminalKind,
+) -> io::Result<()> {
+    directory.symlink(contents, path)
+}
+
+#[cfg(windows)]
+fn create_symlink(
+    directory: &Dir,
+    contents: &Path,
+    path: &Path,
+    kind: TerminalKind,
+) -> io::Result<()> {
     match kind {
-        TerminalKind::File => fs::symlink_file(contents, path).await,
-        TerminalKind::Directory => fs::symlink_dir(contents, path).await,
-        TerminalKind::Dangling => fs::symlink_file(contents, path).await,
+        TerminalKind::File => directory.symlink_file(contents, path),
+        TerminalKind::Directory => directory.symlink_dir(contents, path),
+        TerminalKind::Dangling => directory.symlink_file(contents, path),
     }
 }
 
 #[cfg(not(any(unix, windows)))]
-async fn create_symlink(_contents: &Path, _path: &Path, _kind: TerminalKind) -> io::Result<()> {
+fn create_symlink(
+    _directory: &Dir,
+    _contents: &Path,
+    _path: &Path,
+    _kind: TerminalKind,
+) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "symbolic links are not supported on this platform",

@@ -4,7 +4,7 @@ use std::path::Path;
 
 use support::{ArchiveBuilder, ArchiveFormat, EntryKind, header, pax_record, single_posix_member};
 use tar_codec::decode::{Archive, DecodeError, DecodePolicy};
-use tar_framing::{FrameError, FrameErrorInner, MemberKind};
+use tar_framing::{FrameError, FrameErrorInner, PaxKeyword, UstarKind};
 use tempfile::tempdir;
 
 #[tokio::test]
@@ -108,7 +108,7 @@ async fn rejects_invalid_destinations_unsafe_paths_and_unsupported_members() {
 /// See: <https://github.com/fastzip/malo/tree/3df544f1a2fc498b2a84eb34981deb111cadbf32/tar/malicious>
 #[tokio::test]
 async fn rejects_directory_payload_without_writing_embedded_members() {
-    let embedded_header = header(ArchiveFormat::Posix, "embedded.txt", b'0', 5, "", 0o644);
+    let embedded_header = header(ArchiveFormat::Pax, "embedded.txt", b'0', 5, "", 0o644);
     let mut archive = ArchiveBuilder::new();
     archive.posix("dir/", b'5', &embedded_header, "", 0o755);
     let bytes = archive.finish();
@@ -122,7 +122,7 @@ async fn rejects_directory_payload_without_writing_embedded_members() {
         Err(DecodeError::Framing(FrameError {
             position: 0,
             inner: FrameErrorInner::InvalidMemberSize {
-                kind: MemberKind::Directory,
+                kind: UstarKind::Directory,
                 size: 512,
             },
         }))
@@ -139,7 +139,7 @@ async fn rejects_directory_payload_without_writing_embedded_members() {
 async fn rejects_trailing_separator_on_regular_file_without_writing_members() {
     let mut archive = ArchiveBuilder::new();
     archive
-        .pax(b'x', &pax_record("path", "file.txt/"))
+        .pax(b'x', &pax_record(PaxKeyword::Path, "file.txt/"))
         .posix("ignored", b'0', b"hello", "", 0o644);
     let bytes = archive.finish();
 
@@ -531,4 +531,39 @@ async fn rejects_a_symlink_destination_root_without_modifying_its_target() {
     ));
     assert_eq!(std::fs::read(target.join("keep")).unwrap(), b"keep");
     assert!(!target.join("file").exists());
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn destination_junctions_are_replaced_as_parents_and_rejected_as_roots() {
+    let temp = tempdir().unwrap();
+    let outside = temp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("keep"), b"keep").unwrap();
+
+    let destination = temp.path().join("parent");
+    std::fs::create_dir(&destination).unwrap();
+    junction::create(&outside, destination.join("junction")).unwrap();
+    let bytes = single_posix_member("junction/file", b'0', b"archive", "", 0o644);
+    Archive::new(bytes.as_slice())
+        .extract(&destination, DecodePolicy::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(destination.join("junction/file")).unwrap(),
+        b"archive"
+    );
+    assert!(!outside.join("file").exists());
+
+    let destination = temp.path().join("root-junction");
+    junction::create(&outside, &destination).unwrap();
+    let bytes = single_posix_member("file", b'0', b"archive", "", 0o644);
+    assert!(matches!(
+        Archive::new(bytes.as_slice())
+            .extract(&destination, DecodePolicy::default())
+            .await,
+        Err(DecodeError::Filesystem { .. })
+    ));
+    assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"keep");
+    assert!(!outside.join("file").exists());
 }

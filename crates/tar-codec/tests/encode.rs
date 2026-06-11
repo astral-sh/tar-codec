@@ -12,8 +12,9 @@ use tar_codec::{
     encode::{EncodeError, EncodePolicy, Encoder, EntryMetadata, TraversalError},
 };
 use tar_framing::{
-    MemberKind,
+    UstarKind,
     logical::{MemberExtensions, TarReader},
+    write::FramingWriteError,
 };
 use tempfile::tempdir;
 use tokio::io::AsyncWrite;
@@ -114,6 +115,28 @@ async fn manual_entries_round_trip_and_preserve_archive_names() {
         encoded_paths(&bytes).await,
         ["/absolute", "C:/ambiguous", "nested/../name", r"back\slash",]
     );
+}
+
+#[tokio::test]
+async fn manual_regular_entry_rejects_trailing_separator_before_writing() {
+    let mut encoder = Encoder::new(Vec::new());
+    assert!(matches!(
+        encoder
+            .add_entry("file/", b"rejected", EntryMetadata::default())
+            .await,
+        Err(EncodeError::Framing(
+            FramingWriteError::TrailingPathSeparator {
+                kind: UstarKind::Regular
+            }
+        ))
+    ));
+
+    encoder
+        .add_entry("accepted", b"contents", EntryMetadata::default())
+        .await
+        .unwrap();
+    let bytes = encoder.finish().await.unwrap();
+    assert_eq!(encoded_paths(&bytes).await, ["accepted"]);
 }
 
 #[tokio::test]
@@ -292,7 +315,7 @@ async fn recursive_encoding_preserves_symlinks_and_repeated_inodes() {
     let mut reader = TarReader::new(bytes.as_slice());
     let mut regular_files = 0;
     while let Some(member) = reader.next_frame().await.unwrap() {
-        if member.header.kind == MemberKind::Regular {
+        if member.header.kind == UstarKind::Regular {
             regular_files += 1;
         }
         member.payload.skip().await.unwrap();

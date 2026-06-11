@@ -7,13 +7,15 @@ use std::{
 };
 
 use tar_framing::{
-    ArchiveFormat, FrameError, MemberKind, PaxKind, PaxRecord,
+    ArchiveFormat, FrameError, PaxKeyword, PaxKind, PaxRecord, UstarKind,
     logical::{MemberExtensions, MemberFrame, TarReader},
 };
 use thiserror::Error;
 use tokio::io::AsyncRead;
 
 use crate::{NameValidator, name::NameValidation};
+
+pub use tar_framing::DEFAULT_MAX_PAX_EXTENSION_SIZE;
 
 mod extract;
 
@@ -33,16 +35,29 @@ impl<R> Archive<R> {
 
 /// Controls which otherwise valid archive features extraction may accept.
 ///
-/// See each allow API for its default.
+/// See each configuration API for its default.
 #[derive(Clone, Copy, Debug)]
 pub struct DecodePolicy {
     allow_symlinks: bool,
-    allow_dangling_symlinks: bool,
+    symlink_target_policy: SymlinkTargetPolicy,
     allow_hard_links: bool,
     allow_overwrites: bool,
     allow_gnu: bool,
     pax_policy: PaxDecodePolicy,
     name_validation: NameValidation,
+}
+
+/// Controls which symbolic-link targets extraction may accept.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SymlinkTargetPolicy {
+    /// Allow only the extraction root or entries created by this extraction.
+    #[default]
+    ArchiveOnly,
+    /// Also allow missing targets and existing filesystem entries.
+    ///
+    /// Existing symbolic links are followed only when capability-relative
+    /// resolution remains beneath the extraction root.
+    AllowAmbientAndMissing,
 }
 
 /// Controls which otherwise valid pax features extraction may accept.
@@ -51,6 +66,7 @@ pub struct DecodePolicy {
 /// See each allow API for its default.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PaxDecodePolicy {
+    max_extension_size: u64,
     allow_global_pax_extensions: bool,
     allow_unknown_pax_vendor_records: bool,
     allow_duplicate_pax_records: bool,
@@ -60,6 +76,7 @@ pub struct PaxDecodePolicy {
 impl Default for PaxDecodePolicy {
     fn default() -> Self {
         Self {
+            max_extension_size: DEFAULT_MAX_PAX_EXTENSION_SIZE,
             allow_global_pax_extensions: true,
             allow_unknown_pax_vendor_records: false,
             allow_duplicate_pax_records: false,
@@ -72,7 +89,7 @@ impl Default for DecodePolicy {
     fn default() -> Self {
         Self {
             allow_symlinks: true,
-            allow_dangling_symlinks: true,
+            symlink_target_policy: SymlinkTargetPolicy::default(),
             allow_hard_links: false,
             allow_overwrites: true,
             allow_gnu: true,
@@ -91,13 +108,13 @@ impl DecodePolicy {
         self
     }
 
-    /// Configures whether symbolic links may name safe targets other than
-    /// entries created by this extraction or the extraction root.
+    /// Configures which symbolic-link targets extraction may accept.
     ///
-    /// Dangling symlinks are **allowed by default** as they do not typically
-    /// pose a security risk.
-    pub fn allow_dangling_symlinks(mut self, allow: bool) -> Self {
-        self.allow_dangling_symlinks = allow;
+    /// By default, only the extraction root and entries created by this
+    /// extraction are accepted. See [`SymlinkTargetPolicy`] for the available
+    /// policies.
+    pub fn symlink_target_policy(mut self, policy: SymlinkTargetPolicy) -> Self {
+        self.symlink_target_policy = policy;
         self
     }
 
@@ -163,12 +180,12 @@ impl DecodePolicy {
         Ok(())
     }
 
-    fn check_member_kind(&self, position: u64, kind: MemberKind) -> Result<(), DecodeError> {
+    fn check_member_kind(&self, position: u64, kind: UstarKind) -> Result<(), DecodeError> {
         let violation = match kind {
-            MemberKind::SymbolicLink if !self.allow_symlinks => {
+            UstarKind::SymbolicLink if !self.allow_symlinks => {
                 Some(DecodePolicyViolation::SymbolicLink)
             }
-            MemberKind::HardLink if !self.allow_hard_links => Some(DecodePolicyViolation::HardLink),
+            UstarKind::HardLink if !self.allow_hard_links => Some(DecodePolicyViolation::HardLink),
             _ => None,
         };
         if let Some(violation) = violation {
@@ -241,6 +258,20 @@ impl DecodePolicy {
 }
 
 impl PaxDecodePolicy {
+    /// Configures the maximum payload size in bytes accepted for one pax extension.
+    ///
+    /// The limit applies independently to each local or global extension and
+    /// covers all records in that extension. An extension that declares a
+    /// larger payload is rejected before its payload is consumed.
+    ///
+    /// The default is [`DEFAULT_MAX_PAX_EXTENSION_SIZE`].
+    /// Setting the limit to zero rejects every nonempty pax extension. Setting
+    /// it to [`u64::MAX`] permits unbounded metadata buffering.
+    pub fn max_extension_size(mut self, max_extension_size: u64) -> Self {
+        self.max_extension_size = max_extension_size;
+        self
+    }
+
     /// Configures whether global pax extension headers may be accepted.
     ///
     /// When enabled, [`Self::allow_global_pax_member_metadata`] separately
@@ -318,8 +349,8 @@ impl PaxDecodePolicy {
                     return Err(DecodeError::policy_violation(
                         position,
                         DecodePolicyViolation::PaxVendorExtension {
-                            vendor: vendor.clone(),
-                            name: name.clone(),
+                            vendor: vendor.to_string(),
+                            name: name.to_string(),
                         },
                     ));
                 }
@@ -328,10 +359,10 @@ impl PaxDecodePolicy {
 
         if kind == PaxKind::Global && !self.allow_global_pax_member_metadata {
             for record in records {
-                let keyword = match record {
-                    PaxRecord::Path(_) => Some("path"),
-                    PaxRecord::LinkPath(_) => Some("linkpath"),
-                    PaxRecord::Size(_) => Some("size"),
+                let keyword = match record.keyword() {
+                    PaxKeyword::Path => Some("path"),
+                    PaxKeyword::LinkPath => Some("linkpath"),
+                    PaxKeyword::Size => Some("size"),
                     _ => None,
                 };
                 if let Some(keyword) = keyword {
@@ -346,11 +377,13 @@ impl PaxDecodePolicy {
         if !self.allow_duplicate_pax_records {
             let mut keywords = HashSet::new();
             for record in records {
-                let keyword = record.keyword().into_owned();
+                let keyword = record.keyword();
                 if !keywords.insert(keyword.clone()) {
                     return Err(DecodeError::policy_violation(
                         position,
-                        DecodePolicyViolation::DuplicatePaxRecord { keyword },
+                        DecodePolicyViolation::DuplicatePaxRecord {
+                            keyword: keyword.to_string(),
+                        },
                     ));
                 }
             }
@@ -386,7 +419,7 @@ pub enum DecodePolicyViolation {
     /// A vendor-namespaced POSIX pax record appeared.
     #[error("pax vendor extension {vendor}.{name} is not allowed")]
     PaxVendorExtension {
-        /// Uppercase vendor namespace.
+        /// Vendor namespace.
         vendor: String,
         /// Keyword suffix following the vendor namespace.
         name: String,
@@ -459,7 +492,7 @@ pub enum DecodeError {
         /// Normalized extraction-relative path.
         path: PathBuf,
         /// Unsupported member kind.
-        kind: MemberKind,
+        kind: UstarKind,
     },
     /// A symbolic or hard link cannot be safely resolved.
     #[error("at byte {position}: invalid link {path} -> {target:?}: {reason}")]
@@ -533,7 +566,7 @@ impl DecodeError {
 struct DecodedMember {
     position: u64,
     path: PathBuf,
-    kind: MemberKind,
+    kind: UstarKind,
     link_target: String,
     executable: bool,
     effective_size: u64,
@@ -560,7 +593,7 @@ fn decode_member<R>(
     // with pre-ustar ("v7 tar") behavior, but is ambiguous in a ustar/pax/GNU
     // setting.
     // TODO: Make this configurable through policy?
-    if path_text.ends_with('/') && header.kind != MemberKind::Directory {
+    if path_text.ends_with('/') && header.kind != UstarKind::Directory {
         return Err(DecodeError::unsafe_path(
             header.position,
             "member path",
@@ -569,7 +602,7 @@ fn decode_member<R>(
         ));
     }
     let path = normalize_member_path(header.position, &path_text)?;
-    if path.as_os_str().is_empty() && header.kind != MemberKind::Directory {
+    if path.as_os_str().is_empty() && header.kind != UstarKind::Directory {
         return Err(DecodeError::unsafe_path(
             header.position,
             "member path",
@@ -577,14 +610,14 @@ fn decode_member<R>(
             "only a directory may resolve to the extraction root",
         ));
     }
-    let link_target = if matches!(header.kind, MemberKind::HardLink | MemberKind::SymbolicLink) {
+    let link_target = if matches!(header.kind, UstarKind::HardLink | UstarKind::SymbolicLink) {
         let target = std::str::from_utf8(frame.effective_link_path()?.as_ref())
             .map(str::to_owned)
             .map_err(|_| DecodeError::InvalidUtf8 {
                 position: header.position,
                 field: "linkpath",
             })?;
-        let context = if header.kind == MemberKind::SymbolicLink {
+        let context = if header.kind == UstarKind::SymbolicLink {
             "symbolic-link target"
         } else {
             "hard-link target"

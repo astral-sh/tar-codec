@@ -1,6 +1,11 @@
 //! PAX record parsing, active-global updates, and per-member metadata state.
 
-use std::{borrow::Cow, str::FromStr, sync::Arc};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    fmt,
+    str::FromStr,
+    sync::Arc,
+};
 
 use super::{FrameError, FrameErrorInner, PaxKind};
 
@@ -8,6 +13,111 @@ const UTF8_HDRCHARSET: &str = "ISO-IR 10646 2000 UTF-8";
 const BINARY_HDRCHARSET: &str = "BINARY";
 
 pub(crate) type SharedPaxRecords = Arc<Vec<PaxRecord>>;
+pub(crate) type SharedGlobalPaxRecords = Arc<GlobalPaxRecords>;
+
+/// An owned, hashable pax extended-header keyword.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum PaxKeyword {
+    /// File access time.
+    Atime,
+    /// Encoding of the following member's file data.
+    Charset,
+    /// Uninterpreted archive comment.
+    Comment,
+    /// File status-change time compatibility extension.
+    Ctime,
+    /// Numeric group identifier.
+    Gid,
+    /// Group name.
+    Gname,
+    /// Encoding of pathname and user/group-name values.
+    HdrCharset,
+    /// Link pathname.
+    LinkPath,
+    /// File modification time.
+    Mtime,
+    /// Member pathname.
+    Path,
+    /// Reserved `realtime.*` attribute.
+    Realtime(Arc<str>),
+    /// Reserved `security.*` attribute.
+    Security(Arc<str>),
+    /// Member payload size.
+    Size,
+    /// Numeric user identifier.
+    Uid,
+    /// User name.
+    Uname,
+    /// An implementation extension in a `vendor.keyword` namespace.
+    Vendor {
+        /// Vendor or organization identifier.
+        vendor: Arc<str>,
+        /// Keyword suffix after the vendor namespace.
+        name: Arc<str>,
+    },
+}
+
+impl PaxKeyword {
+    pub(crate) fn components(&self) -> (&str, Option<&str>) {
+        match self {
+            Self::Atime => ("atime", None),
+            Self::Charset => ("charset", None),
+            Self::Comment => ("comment", None),
+            Self::Ctime => ("ctime", None),
+            Self::Gid => ("gid", None),
+            Self::Gname => ("gname", None),
+            Self::HdrCharset => ("hdrcharset", None),
+            Self::LinkPath => ("linkpath", None),
+            Self::Mtime => ("mtime", None),
+            Self::Path => ("path", None),
+            Self::Realtime(name) => ("realtime", Some(name)),
+            Self::Security(name) => ("security", Some(name)),
+            Self::Size => ("size", None),
+            Self::Uid => ("uid", None),
+            Self::Uname => ("uname", None),
+            Self::Vendor { vendor, name } => (vendor, Some(name)),
+        }
+    }
+}
+
+impl fmt::Display for PaxKeyword {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (namespace, name) = self.components();
+        formatter.write_str(namespace)?;
+        if let Some(name) = name {
+            formatter.write_str(".")?;
+            formatter.write_str(name)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct GlobalPaxRecords {
+    records: Vec<PaxRecord>,
+    indices: HashMap<PaxKeyword, usize>,
+}
+
+impl GlobalPaxRecords {
+    fn apply(&mut self, updates: &[PaxRecord]) {
+        for update in updates {
+            match self.indices.entry(update.keyword()) {
+                Entry::Occupied(entry) => self.records[*entry.get()] = update.clone(),
+                Entry::Vacant(entry) => {
+                    let index = self.records.len();
+                    self.records.push(update.clone());
+                    entry.insert(index);
+                }
+            }
+        }
+    }
+
+    fn get(&self, keyword: &PaxKeyword) -> Option<&PaxRecord> {
+        self.indices
+            .get(keyword)
+            .and_then(|index| self.records.get(*index))
+    }
+}
 
 /// One positioned parsed pax extended header.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,14 +151,14 @@ impl PaxExtension {
 /// retains the positioned extension headers newly encountered for this member.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaxState {
-    global_records: Option<SharedPaxRecords>,
+    global_records: Option<SharedGlobalPaxRecords>,
     global_extensions: Vec<PaxExtension>,
     local_extension: Option<PaxExtension>,
 }
 
 impl PaxState {
     pub(crate) fn new(
-        global_records: Option<SharedPaxRecords>,
+        global_records: Option<SharedGlobalPaxRecords>,
         global_extensions: Vec<PaxExtension>,
         local_extension: Option<PaxExtension>,
     ) -> Self {
@@ -70,16 +180,12 @@ impl PaxState {
     }
 
     /// Returns the final applicable record for `keyword`, including deletions.
-    pub fn effective_record(&self, keyword: &str) -> Option<&PaxRecord> {
+    pub fn effective_record(&self, keyword: &PaxKeyword) -> Option<&PaxRecord> {
         let local_records = self
             .local_extension
             .as_ref()
             .map_or(&[] as &[PaxRecord], PaxExtension::records);
-        let global_records = self
-            .global_records
-            .as_deref()
-            .map_or(&[] as &[PaxRecord], Vec::as_slice);
-        effective_record(local_records, global_records, keyword)
+        effective_record(local_records, self.global_records.as_deref(), keyword)
     }
 }
 
@@ -108,9 +214,9 @@ impl FromStr for HdrCharset {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PaxString {
     /// A value declared or defaulted to UTF-8.
-    Utf8(String),
+    Utf8(Arc<str>),
     /// A value declared as unencoded binary bytes.
-    Binary(Vec<u8>),
+    Binary(Arc<[u8]>),
 }
 
 /// A parsed pax value, including an explicit deletion tombstone.
@@ -148,9 +254,9 @@ pub enum PaxRecord {
     /// File access time in integral seconds; fractional seconds are discarded.
     Atime(PaxValue<u64>),
     /// Encoding of the following member's file data.
-    Charset(PaxValue<String>),
+    Charset(PaxValue<Arc<str>>),
     /// An uninterpreted archive comment.
-    Comment(PaxValue<String>),
+    Comment(PaxValue<Arc<str>>),
     /// File status-change time compatibility extension in integral seconds.
     ///
     /// NOTE: newer versions of the pax spec don't include this record.
@@ -175,16 +281,16 @@ pub enum PaxRecord {
     /// A reserved `realtime.*` extended attribute.
     Realtime {
         /// Keyword suffix after `realtime.`.
-        name: String,
+        name: Arc<str>,
         /// Attribute value or deletion tombstone.
-        value: PaxValue<String>,
+        value: PaxValue<Arc<str>>,
     },
     /// A reserved `security.*` extended attribute.
     Security {
         /// Keyword suffix after `security.`.
-        name: String,
+        name: Arc<str>,
         /// Attribute value or deletion tombstone.
-        value: PaxValue<String>,
+        value: PaxValue<Arc<str>>,
     },
     /// Member payload size in octets.
     Size(PaxValue<u64>),
@@ -192,37 +298,40 @@ pub enum PaxRecord {
     Uid(PaxValue<u64>),
     /// User name encoded according to the effective [`HdrCharset`].
     Uname(PaxValue<PaxString>),
-    /// An implementation extension in the `VENDOR.keyword` namespace.
+    /// An implementation extension in a `vendor.keyword` namespace.
     Vendor {
-        /// Uppercase ASCII vendor or organization identifier.
-        vendor: String,
+        /// Vendor or organization identifier.
+        vendor: Arc<str>,
         /// Keyword suffix after the vendor namespace.
-        name: String,
+        name: Arc<str>,
         /// Attribute value or deletion tombstone.
-        value: PaxValue<String>,
+        value: PaxValue<Arc<str>>,
     },
 }
 
 impl PaxRecord {
-    /// Returns this record's PAX keyword exactly as it appears on the wire.
-    pub fn keyword(&self) -> Cow<'_, str> {
+    /// Returns this record's typed pax keyword.
+    pub fn keyword(&self) -> PaxKeyword {
         match self {
-            Self::Atime(_) => Cow::Borrowed("atime"),
-            Self::Charset(_) => Cow::Borrowed("charset"),
-            Self::Comment(_) => Cow::Borrowed("comment"),
-            Self::Ctime(_) => Cow::Borrowed("ctime"),
-            Self::Gid(_) => Cow::Borrowed("gid"),
-            Self::Gname(_) => Cow::Borrowed("gname"),
-            Self::HdrCharset(_) => Cow::Borrowed("hdrcharset"),
-            Self::LinkPath(_) => Cow::Borrowed("linkpath"),
-            Self::Mtime(_) => Cow::Borrowed("mtime"),
-            Self::Path(_) => Cow::Borrowed("path"),
-            Self::Realtime { name, .. } => Cow::Owned(format!("realtime.{name}")),
-            Self::Security { name, .. } => Cow::Owned(format!("security.{name}")),
-            Self::Size(_) => Cow::Borrowed("size"),
-            Self::Uid(_) => Cow::Borrowed("uid"),
-            Self::Uname(_) => Cow::Borrowed("uname"),
-            Self::Vendor { vendor, name, .. } => Cow::Owned(format!("{vendor}.{name}")),
+            Self::Atime(_) => PaxKeyword::Atime,
+            Self::Charset(_) => PaxKeyword::Charset,
+            Self::Comment(_) => PaxKeyword::Comment,
+            Self::Ctime(_) => PaxKeyword::Ctime,
+            Self::Gid(_) => PaxKeyword::Gid,
+            Self::Gname(_) => PaxKeyword::Gname,
+            Self::HdrCharset(_) => PaxKeyword::HdrCharset,
+            Self::LinkPath(_) => PaxKeyword::LinkPath,
+            Self::Mtime(_) => PaxKeyword::Mtime,
+            Self::Path(_) => PaxKeyword::Path,
+            Self::Realtime { name, .. } => PaxKeyword::Realtime(Arc::clone(name)),
+            Self::Security { name, .. } => PaxKeyword::Security(Arc::clone(name)),
+            Self::Size(_) => PaxKeyword::Size,
+            Self::Uid(_) => PaxKeyword::Uid,
+            Self::Uname(_) => PaxKeyword::Uname,
+            Self::Vendor { vendor, name, .. } => PaxKeyword::Vendor {
+                vendor: Arc::clone(vendor),
+                name: Arc::clone(name),
+            },
         }
     }
 }
@@ -361,28 +470,26 @@ fn parse_namespaced_record(
     };
     match namespace {
         "realtime" => Ok(PaxRecord::Realtime {
-            name: name.to_owned(),
+            name: Arc::from(name),
             value: parse_text(position, value)?,
         }),
         "security" => Ok(PaxRecord::Security {
-            name: name.to_owned(),
+            name: Arc::from(name),
             value: parse_text(position, value)?,
         }),
-        vendor if !vendor.is_empty() && vendor.bytes().all(|byte| byte.is_ascii_uppercase()) => {
-            Ok(PaxRecord::Vendor {
-                vendor: vendor.to_owned(),
-                name: name.to_owned(),
-                value: parse_text(position, value)?,
-            })
-        }
+        vendor if !vendor.is_empty() => Ok(PaxRecord::Vendor {
+            vendor: Arc::from(vendor),
+            name: Arc::from(name),
+            value: parse_text(position, value)?,
+        }),
         _ => Err(invalid()),
     }
 }
 
-fn parse_text(position: u64, value: &[u8]) -> Result<PaxValue<String>, FrameError> {
+fn parse_text(position: u64, value: &[u8]) -> Result<PaxValue<Arc<str>>, FrameError> {
     parse_utf8(position, value).map(|value| match value {
         "" => PaxValue::Deleted,
-        value => PaxValue::Value(value.to_owned()),
+        value => PaxValue::Value(Arc::from(value)),
     })
 }
 
@@ -398,10 +505,10 @@ fn parse_pax_string(
     }
     match hdrcharset {
         HdrCharset::Utf8 => parse_utf8(position, value)
-            .map(str::to_owned)
+            .map(Arc::from)
             .map(PaxString::Utf8)
             .map(PaxValue::Value),
-        HdrCharset::Binary => Ok(PaxValue::Value(PaxString::Binary(value.to_vec()))),
+        HdrCharset::Binary => Ok(PaxValue::Value(PaxString::Binary(Arc::from(value)))),
     }
 }
 
@@ -491,24 +598,28 @@ fn parse_time(
 
 fn effective_record<'a>(
     local_records: &'a [PaxRecord],
-    global_records: &'a [PaxRecord],
-    keyword: &str,
+    global_records: Option<&'a GlobalPaxRecords>,
+    keyword: &PaxKeyword,
 ) -> Option<&'a PaxRecord> {
-    record(local_records, keyword).or_else(|| record(global_records, keyword))
+    record(local_records, keyword)
+        .or_else(|| global_records.and_then(|records| records.get(keyword)))
 }
 
 pub(super) fn size<'a>(
     local_records: &'a [PaxRecord],
-    global_records: &'a [PaxRecord],
+    global_records: Option<&'a GlobalPaxRecords>,
 ) -> Option<&'a PaxValue<u64>> {
-    effective_record(local_records, global_records, "size").and_then(|record| match record {
-        PaxRecord::Size(value) => Some(value),
-        _ => None,
+    effective_record(local_records, global_records, &PaxKeyword::Size).and_then(|record| {
+        match record {
+            PaxRecord::Size(value) => Some(value),
+            _ => None,
+        }
     })
 }
 
-pub(super) fn hdrcharset(records: &[PaxRecord]) -> HdrCharset {
-    record(records, "hdrcharset")
+pub(super) fn hdrcharset(records: Option<&GlobalPaxRecords>) -> HdrCharset {
+    records
+        .and_then(|records| records.get(&PaxKeyword::HdrCharset))
         .and_then(|record| match record {
             PaxRecord::HdrCharset(value) => Some(value),
             _ => None,
@@ -519,40 +630,19 @@ pub(super) fn hdrcharset(records: &[PaxRecord]) -> HdrCharset {
         })
 }
 
-pub(super) fn apply_global(active: &mut Option<SharedPaxRecords>, records: &SharedPaxRecords) {
-    if let Some(active) = active {
-        apply_records(Arc::make_mut(active), records);
-    } else if records_have_unique_keywords(records) {
-        *active = Some(Arc::clone(records));
-    } else {
-        let mut effective = Vec::with_capacity(records.len());
-        apply_records(&mut effective, records);
-        *active = Some(Arc::new(effective));
-    }
+pub(super) fn apply_global(
+    active: &mut Option<SharedGlobalPaxRecords>,
+    records: &SharedPaxRecords,
+) {
+    let active = active.get_or_insert_with(|| Arc::new(GlobalPaxRecords::default()));
+    Arc::make_mut(active).apply(records);
 }
 
-fn record<'a>(records: &'a [PaxRecord], keyword: &str) -> Option<&'a PaxRecord> {
+fn record<'a>(records: &'a [PaxRecord], keyword: &PaxKeyword) -> Option<&'a PaxRecord> {
     records
         .iter()
         .rev()
-        .find(|record| record.keyword() == keyword)
-}
-
-fn apply_records(active: &mut Vec<PaxRecord>, records: &[PaxRecord]) {
-    for record in records {
-        let keyword = record.keyword();
-        active.retain(|existing| existing.keyword() != keyword);
-        active.push(record.clone());
-    }
-}
-
-fn records_have_unique_keywords(records: &[PaxRecord]) -> bool {
-    records.iter().enumerate().all(|(index, record)| {
-        let keyword = record.keyword();
-        records[..index]
-            .iter()
-            .all(|existing| existing.keyword() != keyword)
-    })
+        .find(|record| record.keyword() == *keyword)
 }
 
 fn parse_integer(value: &str) -> Option<u64> {
@@ -567,19 +657,41 @@ mod tests {
     use super::*;
     use crate::test_support::{raw_record, record};
 
+    fn text(value: &str) -> Arc<str> {
+        Arc::from(value)
+    }
+
+    fn comment(value: &str) -> PaxRecord {
+        PaxRecord::Comment(PaxValue::Value(text(value)))
+    }
+
+    fn utf8(value: &str) -> PaxString {
+        PaxString::Utf8(text(value))
+    }
+
+    fn binary(value: &[u8]) -> PaxString {
+        PaxString::Binary(Arc::from(value))
+    }
+
     fn vendor(name: &str, value: &str) -> PaxRecord {
         PaxRecord::Vendor {
-            vendor: "ACME".to_owned(),
-            name: name.to_owned(),
-            value: PaxValue::Value(value.to_owned()),
+            vendor: text("Acme"),
+            name: text(name),
+            value: PaxValue::Value(text(value)),
         }
     }
 
     fn security(value: &str) -> PaxRecord {
         PaxRecord::Security {
-            name: "label".to_owned(),
-            value: PaxValue::Value(value.to_owned()),
+            name: text("label"),
+            value: PaxValue::Value(text(value)),
         }
+    }
+
+    fn global_state(records: Vec<PaxRecord>) -> Option<SharedGlobalPaxRecords> {
+        let mut active = None;
+        apply_global(&mut active, &Arc::new(records));
+        active
     }
 
     fn extension(position: u64, kind: PaxKind, records: Vec<PaxRecord>) -> PaxExtension {
@@ -604,42 +716,37 @@ mod tests {
             },
             Case {
                 name: "global",
-                global: vec![PaxRecord::Comment(PaxValue::Value("global".to_owned()))],
+                global: vec![comment("global")],
                 local: None,
-                expected: Some(PaxRecord::Comment(PaxValue::Value("global".to_owned()))),
+                expected: Some(comment("global")),
             },
             Case {
                 name: "local overrides global",
-                global: vec![PaxRecord::Comment(PaxValue::Value("global".to_owned()))],
-                local: Some(vec![PaxRecord::Comment(PaxValue::Value(
-                    "local".to_owned(),
-                ))]),
-                expected: Some(PaxRecord::Comment(PaxValue::Value("local".to_owned()))),
+                global: vec![comment("global")],
+                local: Some(vec![comment("local")]),
+                expected: Some(comment("local")),
             },
             Case {
                 name: "last local duplicate wins",
                 global: Vec::new(),
-                local: Some(vec![
-                    PaxRecord::Comment(PaxValue::Value("first".to_owned())),
-                    PaxRecord::Comment(PaxValue::Value("last".to_owned())),
-                ]),
-                expected: Some(PaxRecord::Comment(PaxValue::Value("last".to_owned()))),
+                local: Some(vec![comment("first"), comment("last")]),
+                expected: Some(comment("last")),
             },
             Case {
                 name: "local deletion suppresses global",
-                global: vec![PaxRecord::Comment(PaxValue::Value("global".to_owned()))],
+                global: vec![comment("global")],
                 local: Some(vec![PaxRecord::Comment(PaxValue::Deleted)]),
                 expected: Some(PaxRecord::Comment(PaxValue::Deleted)),
             },
         ] {
             let state = PaxState::new(
-                (!case.global.is_empty()).then(|| Arc::new(case.global)),
+                global_state(case.global),
                 Vec::new(),
                 case.local
                     .map(|records| extension(0, PaxKind::Local, records)),
             );
             assert_eq!(
-                state.effective_record("comment"),
+                state.effective_record(&PaxKeyword::Comment),
                 case.expected.as_ref(),
                 "{}",
                 case.name
@@ -673,13 +780,10 @@ mod tests {
 
     #[test]
     fn shares_unchanged_global_state_and_copies_on_write() {
-        let initial = Arc::new(vec![PaxRecord::Comment(PaxValue::Value(
-            "initial".to_owned(),
-        ))]);
+        let initial = Arc::new(vec![comment("initial")]);
         let mut active = None;
         apply_global(&mut active, &initial);
         let first_snapshot = active.clone().expect("global state should exist");
-        assert!(Arc::ptr_eq(&initial, &first_snapshot));
 
         let first_state = PaxState::new(Some(first_snapshot.clone()), Vec::new(), None);
         let second_state = PaxState::new(active.clone(), Vec::new(), None);
@@ -694,9 +798,7 @@ mod tests {
                 .expect("global state should exist"),
         ));
 
-        let replacement = Arc::new(vec![PaxRecord::Comment(PaxValue::Value(
-            "replacement".to_owned(),
-        ))]);
+        let replacement = Arc::new(vec![comment("replacement")]);
         apply_global(&mut active, &replacement);
         let final_state = PaxState::new(active, Vec::new(), None);
         assert!(!Arc::ptr_eq(
@@ -707,21 +809,35 @@ mod tests {
                 .expect("global state should exist"),
         ));
         assert_eq!(
-            first_state.effective_record("comment"),
-            Some(&PaxRecord::Comment(PaxValue::Value("initial".to_owned())))
+            first_state.effective_record(&PaxKeyword::Comment),
+            Some(&comment("initial"))
         );
         assert_eq!(
-            final_state.effective_record("comment"),
-            Some(&PaxRecord::Comment(PaxValue::Value(
-                "replacement".to_owned()
-            )))
+            final_state.effective_record(&PaxKeyword::Comment),
+            Some(&comment("replacement"))
         );
+    }
+
+    #[test]
+    fn retaining_physical_records_does_not_copy_effective_global_state() {
+        let physical_records = Arc::new(vec![comment("initial")]);
+        let mut active = None;
+        apply_global(&mut active, &physical_records);
+        let initial_state = Arc::as_ptr(active.as_ref().expect("global state should exist"));
+
+        apply_global(&mut active, &Arc::new(vec![vendor("attribute", "value")]));
+
+        assert_eq!(
+            Arc::as_ptr(active.as_ref().expect("global state should exist")),
+            initial_state
+        );
+        assert_eq!(physical_records.as_slice(), [comment("initial")]);
     }
 
     #[test]
     fn global_deletions_remain_effective_tombstones() {
         let initial = Arc::new(vec![
-            PaxRecord::Path(PaxValue::Value(PaxString::Utf8("global".to_owned()))),
+            PaxRecord::Path(PaxValue::Value(utf8("global"))),
             vendor("kept", "value"),
         ]);
         let deletion = Arc::new(vec![PaxRecord::Path(PaxValue::Deleted)]);
@@ -729,13 +845,11 @@ mod tests {
         apply_global(&mut active, &initial);
         apply_global(&mut active, &deletion);
 
-        assert_eq!(
-            active.as_deref().map(Vec::as_slice),
-            Some([vendor("kept", "value"), PaxRecord::Path(PaxValue::Deleted),].as_slice())
-        );
+        let active_records = active.as_deref().expect("global state should exist");
+        assert_eq!(active_records.records.len(), 2);
         let state = PaxState::new(active, Vec::new(), None);
         assert_eq!(
-            state.effective_record("path"),
+            state.effective_record(&PaxKeyword::Path),
             Some(&PaxRecord::Path(PaxValue::Deleted))
         );
     }
@@ -810,7 +924,7 @@ mod tests {
             ("size", "0"),
             ("uid", "8"),
             ("uname", "user"),
-            ("ACME.attribute", "custom"),
+            ("Acme.attribute", "custom"),
         ];
         let mut payload = Vec::new();
         for (keyword, value) in fields {
@@ -824,23 +938,23 @@ mod tests {
             records,
             [
                 PaxRecord::Atime(PaxValue::Value(12)),
-                PaxRecord::Charset(PaxValue::Value("BINARY".to_owned())),
-                PaxRecord::Comment(PaxValue::Value("a=b".to_owned())),
+                PaxRecord::Charset(PaxValue::Value(text("BINARY"))),
+                comment("a=b"),
                 PaxRecord::Ctime(PaxValue::Value(17)),
                 PaxRecord::Gid(PaxValue::Value(7)),
-                PaxRecord::Gname(PaxValue::Value(PaxString::Utf8("group".to_owned()))),
+                PaxRecord::Gname(PaxValue::Value(utf8("group"))),
                 PaxRecord::HdrCharset(PaxValue::Value(HdrCharset::Utf8)),
-                PaxRecord::LinkPath(PaxValue::Value(PaxString::Utf8("target".to_owned()))),
+                PaxRecord::LinkPath(PaxValue::Value(utf8("target"))),
                 PaxRecord::Mtime(PaxValue::Value(42)),
-                PaxRecord::Path(PaxValue::Value(PaxString::Utf8("file".to_owned()))),
+                PaxRecord::Path(PaxValue::Value(utf8("file"))),
                 PaxRecord::Realtime {
-                    name: "deadline".to_owned(),
-                    value: PaxValue::Value("soon".to_owned()),
+                    name: text("deadline"),
+                    value: PaxValue::Value(text("soon")),
                 },
                 security("secure"),
                 PaxRecord::Size(PaxValue::Value(0)),
                 PaxRecord::Uid(PaxValue::Value(8)),
-                PaxRecord::Uname(PaxValue::Value(PaxString::Utf8("user".to_owned()))),
+                PaxRecord::Uname(PaxValue::Value(utf8("user"))),
                 vendor("attribute", "custom"),
             ]
         );
@@ -848,7 +962,7 @@ mod tests {
             records
                 .iter()
                 .zip(fields)
-                .all(|(record, (keyword, _))| record.keyword() == keyword)
+                .all(|(record, (keyword, _))| record.keyword().to_string() == keyword)
         );
     }
 
@@ -886,15 +1000,7 @@ mod tests {
             })
         ));
 
-        for keyword in [
-            "unknown",
-            "lowercase.extension",
-            "Vendor.attribute",
-            "VENDOR",
-            "VENDOR.",
-            "realtime.",
-            "security.",
-        ] {
+        for keyword in ["unknown", "VENDOR", "VENDOR.", "realtime.", "security."] {
             assert!(matches!(
                 parse_record(29, keyword, b"value", HdrCharset::Utf8),
                 Err(FrameError {
@@ -907,23 +1013,25 @@ mod tests {
 
     #[test]
     fn applies_namespaced_globals_and_accepts_supported_hdrcharset_records() {
-        let mut active = Some(Arc::new(vec![
+        let mut active = global_state(vec![
             vendor("first", "old"),
             vendor("second", "kept"),
             security("old"),
-        ]));
+        ]);
         let update = Arc::new(vec![vendor("first", "new"), security("new")]);
         apply_global(&mut active, &update);
+        let active = active.as_deref().expect("global state should exist");
+        assert_eq!(active.records.len(), 3);
         assert_eq!(
-            active.as_deref().map(Vec::as_slice),
-            Some(
-                [
-                    vendor("second", "kept"),
-                    vendor("first", "new"),
-                    security("new"),
-                ]
-                .as_slice()
-            )
+            active.get(&PaxKeyword::Vendor {
+                vendor: text("Acme"),
+                name: text("first"),
+            }),
+            Some(&vendor("first", "new"))
+        );
+        assert_eq!(
+            active.get(&PaxKeyword::Security(text("label"))),
+            Some(&security("new"))
         );
 
         for (case, payload) in [
@@ -956,10 +1064,10 @@ mod tests {
             binary_records,
             [
                 PaxRecord::HdrCharset(PaxValue::Value(HdrCharset::Binary)),
-                PaxRecord::Gname(PaxValue::Value(PaxString::Binary(vec![0xfc]))),
-                PaxRecord::LinkPath(PaxValue::Value(PaxString::Binary(vec![0xfd]))),
-                PaxRecord::Path(PaxValue::Value(PaxString::Binary(vec![0xfe]))),
-                PaxRecord::Uname(PaxValue::Value(PaxString::Binary(vec![0xff]))),
+                PaxRecord::Gname(PaxValue::Value(binary(&[0xfc]))),
+                PaxRecord::LinkPath(PaxValue::Value(binary(&[0xfd]))),
+                PaxRecord::Path(PaxValue::Value(binary(&[0xfe]))),
+                PaxRecord::Uname(PaxValue::Value(binary(&[0xff]))),
             ]
         );
         let inherited_binary_path = raw_record(b"path", &[0xfe]);
@@ -969,9 +1077,7 @@ mod tests {
         };
         assert_eq!(
             inherited_records,
-            [PaxRecord::Path(PaxValue::Value(PaxString::Binary(vec![
-                0xfe
-            ])))]
+            [PaxRecord::Path(PaxValue::Value(binary(&[0xfe])))]
         );
         let mut reset_to_utf8 = record("hdrcharset", "");
         reset_to_utf8.extend_from_slice(&raw_record(b"path", &[0xfd]));

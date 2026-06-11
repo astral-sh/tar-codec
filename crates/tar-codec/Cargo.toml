@@ -11,11 +11,17 @@ license = { workspace = true }
 readme = { workspace = true }
 
 [dependencies]
+cap-std = { workspace = true }
 tar-framing = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync"] }
-tokio-stream = { workspace = true }
 walkdir = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+junction = { workspace = true }
 
 [dev-dependencies]
 astral-tokio-tar = { workspace = true }
@@ -27,3 +33,6 @@ tokio = { workspace = true, features = ["macros", "rt"] }
 [[bench]]
 name = "comparison"
 harness = false
+
+[lib]
+doctest = false

@@ -47,6 +47,14 @@
 //! - tar-framing silently removes fractional components from parsed timestamps. Timestamps
 //!   are truncated to second precision.
 //!
+//! - tar-framing rejects typeflags that are not explicitly defined in pax. pax says to handle
+//!   these as regular files (i.e. assuming their size is a physical size), but this has marginal
+//!   benefit in practice.
+//!
+//! - tar-framing rejects `hdrcharset` pax records that aren't UTF-8 or `BINARY`. pax says
+//!   that "additional names may be agreed between the originator and the recipient," but
+//!   we are the recipient and we don't accept any other `hdrcharset` names.
+//!
 //! ## GNU compatibility
 //!
 //! When decoding GNU-formatted tar streams, tar-framing attempts to follow the
@@ -84,7 +92,7 @@
 //! ["Basic Tar Format"]: https://www.gnu.org/software/tar/manual/html_node/Standard.html
 
 mod error;
-mod header;
+pub mod header;
 pub mod logical;
 mod pax;
 pub mod stream;
@@ -93,10 +101,15 @@ mod test_support;
 pub mod write;
 
 pub use error::{FrameError, FrameErrorInner};
-pub use pax::{HdrCharset, PaxExtension, PaxRecord, PaxState, PaxString, PaxValue};
+pub use pax::{HdrCharset, PaxExtension, PaxKeyword, PaxRecord, PaxState, PaxString, PaxValue};
 
 /// The size of a logical tar record.
 pub const BLOCK_SIZE: usize = 512;
+
+/// The default maximum size in bytes of one local or global pax extension.
+///
+/// This is 1 MiB.
+pub const DEFAULT_MAX_PAX_EXTENSION_SIZE: u64 = 1024 * 1024;
 
 /// A single tar block.
 pub type Block = [u8; BLOCK_SIZE];
@@ -132,7 +145,7 @@ pub enum GnuKind {
 ///
 /// These are shared across both pax and GNU tar streams.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MemberKind {
+pub enum UstarKind {
     /// A regular file (`'0'` or NUL).
     Regular,
     /// A hard link (`'1'`).
