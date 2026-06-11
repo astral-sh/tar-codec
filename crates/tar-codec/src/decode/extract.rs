@@ -107,6 +107,11 @@ impl<R: AsyncRead + Unpin> Archive<R> {
     ///
     /// **IMPORTANT**: `dest` **MUST NOT** be concurrently modified during extraction.
     /// No correctness/isolation guarantees are made if `dest` is externally modified.
+    ///
+    /// **IMPORTANT**: extraction occurs in a streamwise fashion, meaning that a late
+    /// error can leave a partially extracted state under `dest`. Users that require
+    /// "all or nothing" behavior should attempt extraction in a new temporary
+    /// directory, and then atomically rename that directory to `dest`.
     pub async fn extract<P: AsRef<Path>>(
         mut self,
         dest: P,

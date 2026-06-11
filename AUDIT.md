@@ -29,7 +29,7 @@ The remaining findings are correctness, interoperability, platform-hardening, or
 | AUD-09 | Medium | Out of scope | PAX metadata | Timestamp precision is intentionally limited to nonnegative whole seconds |
 | AUD-10 | Low | Remediated | PAX interoperability | Mixed-case vendor namespaces are rejected in the physical layer |
 | AUD-11 | Low | Out of scope | PAX compatibility | Unsupported `hdrcharset` records are intentionally rejected even when overridden |
-| AUD-12 | Low | Open | Operational safety | Extraction errors leave earlier output and overwrites in place |
+| AUD-12 | Low | Remediated | Operational safety | Extraction errors leave earlier output and overwrites in place |
 
 Severity reflects the impact assessed against the reviewed revision when processing an untrusted archive in a service or developer-tool context. Status records the current disposition independently of that original severity.
 
@@ -231,9 +231,9 @@ Class: operational safety / API contract
 
 Extraction applies each member immediately (`decode/extract.rs:87-123`). A later framing or policy error returns without rollback. Existing integration tests explicitly assert that earlier files remain after later PAX-policy and framing failures (`tests/metadata.rs`). An attacker can therefore place or overwrite earlier files and deliberately trigger a late error.
 
-This is common for streaming extractors and is not inherently incorrect, but the public `extract` documentation does not prominently state the partial-output contract. Callers may incorrectly treat `Err` as “nothing was extracted.”
+This is common for streaming extractors and is not inherently incorrect, but the public `extract` documentation on the reviewed revision did not prominently state the partial-output contract. Callers could incorrectly treat `Err` as “nothing was extracted.”
 
-Document the behavior and recommend extraction into a newly created staging directory followed by an atomic commit/rename. A transactional convenience API would make the safer pattern easier to use.
+This was remediated by documenting the streamwise partial-output behavior directly on `Archive::extract` and recommending extraction into a new temporary directory followed by an atomic rename for callers that require all-or-nothing behavior.
 
 ## Verified protections and non-findings
 
@@ -264,7 +264,7 @@ The following controls were specifically traced and, where applicable, covered b
 - [x] Close ambient-target resolution under the default symlink policy (AUD-03).
 - [x] Reject encoder inputs that create member/type ambiguity before writing bytes (AUD-08).
 - [x] Accept mixed-case vendor namespaces while retaining higher-level policy enforcement (AUD-10).
-- [ ] Document partial extraction and offer a staging/transactional workflow (AUD-12).
+- [x] Document partial extraction and recommend a staging/atomic-rename workflow (AUD-12).
 
 ## Suggested test expansion
 
