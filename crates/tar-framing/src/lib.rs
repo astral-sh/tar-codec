@@ -51,6 +51,10 @@
 //!   these as regular files (i.e. assuming their size is a physical size), but this has marginal
 //!   benefit in practice.
 //!
+//! - tar-framing rejects `hdrcharset` pax records that aren't UTF-8 or `BINARY`. pax says
+//!   that "additional names may be agreed between the originator and the recipient," but
+//!   we are the recipient and we don't accept any other `hdrcharset` names.
+//!
 //! ## GNU compatibility
 //!
 //! When decoding GNU-formatted tar streams, tar-framing attempts to follow the

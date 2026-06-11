@@ -22,6 +22,8 @@ const END_MARKER_BYTES: [u8; BLOCK_SIZE * 2] = [0; BLOCK_SIZE * 2];
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PaxMember<'a> {
     /// The UTF-8 member path written into the local pax header.
+    ///
+    /// Non-directory paths cannot end in `/`.
     pub path: &'a str,
     /// The supported ordinary member kind.
     pub kind: MemberKind,
@@ -64,6 +66,12 @@ pub enum FramingWriteError {
     InvalidText {
         /// The affected metadata field.
         field: &'static str,
+    },
+    /// A non-directory member path has a trailing archive separator.
+    #[error("member type {kind:?} cannot have a trailing path separator")]
+    TrailingPathSeparator {
+        /// The affected member kind.
+        kind: MemberKind,
     },
     /// The local pax extended header payload cannot fit its ustar size field.
     #[error("pax extended header payload is too large: {size} bytes")]
@@ -185,6 +193,12 @@ pub fn payload_padding(size: u64) -> &'static [u8] {
 
 fn validate_member(member: PaxMember<'_>) -> Result<(), FramingWriteError> {
     validate_text("path", member.path)?;
+    // Defensive: our own decoder rejects non-directories that end with trailing
+    // slashes, so we should never encode one.
+    // TODO: Single-source this check, maybe in name validation?
+    if member.path.ends_with('/') && !matches!(member.kind, MemberKind::Directory) {
+        return Err(FramingWriteError::TrailingPathSeparator { kind: member.kind });
+    }
     match member.kind {
         MemberKind::Regular | MemberKind::Directory if member.link_path.is_some() => {
             Err(FramingWriteError::UnexpectedLinkPath { kind: member.kind })
