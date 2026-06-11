@@ -532,3 +532,38 @@ async fn rejects_a_symlink_destination_root_without_modifying_its_target() {
     assert_eq!(std::fs::read(target.join("keep")).unwrap(), b"keep");
     assert!(!target.join("file").exists());
 }
+
+#[cfg(windows)]
+#[tokio::test]
+async fn destination_junctions_are_replaced_as_parents_and_rejected_as_roots() {
+    let temp = tempdir().unwrap();
+    let outside = temp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("keep"), b"keep").unwrap();
+
+    let destination = temp.path().join("parent");
+    std::fs::create_dir(&destination).unwrap();
+    junction::create(&outside, destination.join("junction")).unwrap();
+    let bytes = single_posix_member("junction/file", b'0', b"archive", "", 0o644);
+    Archive::new(bytes.as_slice())
+        .extract(&destination, DecodePolicy::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(destination.join("junction/file")).unwrap(),
+        b"archive"
+    );
+    assert!(!outside.join("file").exists());
+
+    let destination = temp.path().join("root-junction");
+    junction::create(&outside, &destination).unwrap();
+    let bytes = single_posix_member("file", b'0', b"archive", "", 0o644);
+    assert!(matches!(
+        Archive::new(bytes.as_slice())
+            .extract(&destination, DecodePolicy::default())
+            .await,
+        Err(DecodeError::Filesystem { .. })
+    ));
+    assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"keep");
+    assert!(!outside.join("file").exists());
+}
