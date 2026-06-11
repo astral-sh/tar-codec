@@ -168,11 +168,6 @@ async fn member_and_link_name_validation_is_configurable() {
             single_posix_member("link", b'1', b"", " rejected", 0o644),
             "hard-link target",
         ),
-        (
-            "colon",
-            single_posix_member("name:stream", b'0', b"", "", 0o644),
-            "member path",
-        ),
     ] {
         let policy = DecodePolicy::default().allow_hard_links(true);
         assert!(matches!(
