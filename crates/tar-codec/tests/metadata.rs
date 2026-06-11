@@ -504,7 +504,7 @@ async fn binary_names_are_rejected_and_streaming_failures_preserve_prior_output(
     ));
 
     let destination = temp.path().join("partial");
-    let mut invalid = header(ArchiveFormat::Posix, "bad", b'0', 0, "", 0o644);
+    let mut invalid = header(ArchiveFormat::Pax, "bad", b'0', 0, "", 0o644);
     set_identity_byte(&mut invalid, 0, b'!');
     set_checksum(&mut invalid);
     let mut archive = ArchiveBuilder::new();

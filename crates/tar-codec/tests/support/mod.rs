@@ -12,7 +12,7 @@ const GNU_IDENTITY: &[u8; 8] = b"ustar  \0";
 
 #[derive(Clone, Copy)]
 pub enum ArchiveFormat {
-    Posix,
+    Pax,
     Gnu,
 }
 
@@ -42,14 +42,7 @@ impl ArchiveBuilder {
         link_name: &str,
         mode: u32,
     ) -> &mut Self {
-        self.member(
-            ArchiveFormat::Posix,
-            name,
-            typeflag,
-            payload,
-            link_name,
-            mode,
-        )
+        self.member(ArchiveFormat::Pax, name, typeflag, payload, link_name, mode)
     }
 
     pub fn gnu(
@@ -142,7 +135,7 @@ pub fn header(
     block[TYPEFLAG_OFFSET] = typeflag;
     set_text(&mut block[LINK_NAME_RANGE], link_name);
     block[IDENTITY_RANGE].copy_from_slice(match format {
-        ArchiveFormat::Posix => POSIX_IDENTITY,
+        ArchiveFormat::Pax => POSIX_IDENTITY,
         ArchiveFormat::Gnu => GNU_IDENTITY,
     });
     set_checksum(&mut block);

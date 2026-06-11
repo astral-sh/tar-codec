@@ -108,7 +108,7 @@ async fn rejects_invalid_destinations_unsafe_paths_and_unsupported_members() {
 /// See: <https://github.com/fastzip/malo/tree/3df544f1a2fc498b2a84eb34981deb111cadbf32/tar/malicious>
 #[tokio::test]
 async fn rejects_directory_payload_without_writing_embedded_members() {
-    let embedded_header = header(ArchiveFormat::Posix, "embedded.txt", b'0', 5, "", 0o644);
+    let embedded_header = header(ArchiveFormat::Pax, "embedded.txt", b'0', 5, "", 0o644);
     let mut archive = ArchiveBuilder::new();
     archive.posix("dir/", b'5', &embedded_header, "", 0o755);
     let bytes = archive.finish();
