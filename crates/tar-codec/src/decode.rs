@@ -15,6 +15,8 @@ use tokio::io::AsyncRead;
 
 use crate::{NameValidator, name::NameValidation};
 
+pub use tar_framing::DEFAULT_MAX_PAX_EXTENSION_SIZE;
+
 mod extract;
 
 /// A one-pass reader for a validated pax or GNU tar archive.
@@ -51,6 +53,7 @@ pub struct DecodePolicy {
 /// See each allow API for its default.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PaxDecodePolicy {
+    max_extension_size: u64,
     allow_global_pax_extensions: bool,
     allow_unknown_pax_vendor_records: bool,
     allow_duplicate_pax_records: bool,
@@ -60,6 +63,7 @@ pub struct PaxDecodePolicy {
 impl Default for PaxDecodePolicy {
     fn default() -> Self {
         Self {
+            max_extension_size: DEFAULT_MAX_PAX_EXTENSION_SIZE,
             allow_global_pax_extensions: true,
             allow_unknown_pax_vendor_records: false,
             allow_duplicate_pax_records: false,
@@ -241,6 +245,20 @@ impl DecodePolicy {
 }
 
 impl PaxDecodePolicy {
+    /// Configures the maximum payload size in bytes accepted for one pax extension.
+    ///
+    /// The limit applies independently to each local or global extension and
+    /// covers all records in that extension. An extension that declares a
+    /// larger payload is rejected before its payload is consumed.
+    ///
+    /// The default is [`DEFAULT_MAX_PAX_EXTENSION_SIZE`].
+    /// Setting the limit to zero rejects every nonempty pax extension. Setting
+    /// it to [`u64::MAX`] permits unbounded metadata buffering.
+    pub fn max_extension_size(mut self, max_extension_size: u64) -> Self {
+        self.max_extension_size = max_extension_size;
+        self
+    }
+
     /// Configures whether global pax extension headers may be accepted.
     ///
     /// When enabled, [`Self::allow_global_pax_member_metadata`] separately

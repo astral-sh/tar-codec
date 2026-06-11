@@ -89,6 +89,8 @@ impl<R: AsyncRead + Unpin> Archive<R> {
         dest: P,
         policy: DecodePolicy,
     ) -> Result<(), DecodeError> {
+        self.reader
+            .set_max_pax_extension_size(policy.pax_policy.max_extension_size);
         let mut root = ExtractionRoot::open(dest.as_ref(), policy.allow_overwrites).await?;
         let mut payload_chunk = Vec::new();
         while let Some(frame) = self.reader.next_frame().await? {

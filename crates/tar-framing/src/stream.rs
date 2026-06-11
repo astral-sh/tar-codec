@@ -82,8 +82,8 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio_stream::Stream;
 
 use crate::{
-    ArchiveFormat, BLOCK_SIZE, Block, FrameError, FrameErrorInner, GnuKind, MemberKind, PaxKind,
-    PaxRecord, PaxValue,
+    ArchiveFormat, BLOCK_SIZE, Block, DEFAULT_MAX_PAX_EXTENSION_SIZE, FrameError, FrameErrorInner,
+    GnuKind, MemberKind, PaxKind, PaxRecord, PaxValue,
     header::{
         CHECKSUM_RANGE, GNU_IDENTITY, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE, NAME_RANGE,
         POSIX_IDENTITY, PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, checksum, parse_number,
@@ -282,12 +282,24 @@ pub struct TarStream<R> {
     pub(super) block_len: usize,
     pub(super) format: Option<ArchiveFormat>,
     pub(super) global_pax_records: Option<SharedPaxRecords>,
+    pub(super) max_pax_extension_size: u64,
     pub(super) state: State,
 }
 
 impl<R> TarStream<R> {
     /// Creates a new [`TarStream`] from the given reader.
     pub fn new(reader: R) -> Self {
+        Self::with_max_pax_extension_size(reader, DEFAULT_MAX_PAX_EXTENSION_SIZE)
+    }
+
+    /// Creates a new [`TarStream`] with a maximum size for each pax extension.
+    ///
+    /// A local or global pax header that declares a larger payload is rejected
+    /// before any of its payload blocks are consumed.
+    ///
+    /// Setting this to zero rejects every nonempty pax extension. Setting it to
+    /// [`u64::MAX`] removes the bound and permits unbounded metadata buffering.
+    pub fn with_max_pax_extension_size(reader: R, max_pax_extension_size: u64) -> Self {
         Self {
             position: 0,
             inner: reader,
@@ -295,6 +307,7 @@ impl<R> TarStream<R> {
             block_len: 0,
             format: None,
             global_pax_records: None,
+            max_pax_extension_size,
             state: State::AwaitingHeader,
         }
     }
@@ -758,6 +771,15 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         payload_size: u64,
         kind: PaxKind,
     ) -> Result<Frame, FrameError> {
+        if payload_size > self.max_pax_extension_size {
+            return Err(FrameError::at(
+                position,
+                FrameErrorInner::PaxExtensionTooLarge {
+                    size: payload_size,
+                    limit: self.max_pax_extension_size,
+                },
+            ));
+        }
         if payload_size == 0 {
             return Err(FrameError::invalid_pax_records(
                 position,
@@ -1072,10 +1094,13 @@ fn validate_payload_free_size(
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::Cell,
         pin::Pin,
+        rc::Rc,
         task::{Context, Poll},
     };
 
+    use tokio::io::ReadBuf;
     use tokio_stream::{Stream, StreamExt};
 
     use super::*;
@@ -1089,6 +1114,20 @@ mod tests {
 
     fn collect(bytes: Vec<u8>, max_chunk: usize) -> Vec<Result<Frame, FrameError>> {
         ready(TarStream::new(ChunkedReader::new(bytes, max_chunk)).collect())
+    }
+
+    fn collect_with_max_pax_extension_size(
+        bytes: Vec<u8>,
+        max_chunk: usize,
+        max_pax_extension_size: u64,
+    ) -> Vec<Result<Frame, FrameError>> {
+        ready(
+            TarStream::with_max_pax_extension_size(
+                ChunkedReader::new(bytes, max_chunk),
+                max_pax_extension_size,
+            )
+            .collect(),
+        )
     }
 
     fn header_frame(frames: &[Result<Frame, FrameError>], index: usize) -> &HeaderFrame {
@@ -1115,6 +1154,29 @@ mod tests {
 
     fn last_error_inner(frames: &[Result<Frame, FrameError>]) -> &FrameErrorInner {
         &last_error(frames).inner
+    }
+
+    struct CountingReader {
+        bytes: Vec<u8>,
+        position: usize,
+        consumed: Rc<Cell<usize>>,
+    }
+
+    impl AsyncRead for CountingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let len = buffer
+                .remaining()
+                .min(self.bytes.len().saturating_sub(self.position));
+            let end = self.position + len;
+            buffer.put_slice(&self.bytes[self.position..end]);
+            self.position = end;
+            self.consumed.set(self.consumed.get() + len);
+            Poll::Ready(Ok(()))
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -1244,6 +1306,91 @@ mod tests {
         assert_eq!(header.effective_size, 513);
         let last = data_frame(&frames, 5);
         assert_eq!(last.len, 1);
+    }
+
+    #[test]
+    fn rejects_oversized_pax_extensions_before_consuming_payload() {
+        let mut payload = record("comment", "metadata");
+        payload.extend_from_slice(&record("mtime", "1"));
+        let declared_size = u64::try_from(payload.len()).expect("payload size should fit u64");
+        for (case, typeflag) in [("local", b'x'), ("global", b'g')] {
+            let mut bytes = Vec::new();
+            append_posix(&mut bytes, typeflag, &payload);
+            let frames = collect_with_max_pax_extension_size(bytes, BLOCK_SIZE, declared_size - 1);
+            assert_eq!(frames.len(), 1, "{case}");
+            assert!(matches!(
+                last_error(&frames),
+                FrameError {
+                    position: 0,
+                    inner: FrameErrorInner::PaxExtensionTooLarge {
+                        size,
+                        limit,
+                    },
+                } if *size == declared_size && *limit == declared_size - 1
+            ));
+        }
+
+        let frames = collect(
+            header(b'x', DEFAULT_MAX_PAX_EXTENSION_SIZE + 1).to_vec(),
+            BLOCK_SIZE,
+        );
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(
+            last_error(&frames),
+            FrameError {
+                position: 0,
+                inner: FrameErrorInner::PaxExtensionTooLarge {
+                    size,
+                    limit: DEFAULT_MAX_PAX_EXTENSION_SIZE,
+                },
+            } if *size == DEFAULT_MAX_PAX_EXTENSION_SIZE + 1
+        ));
+    }
+
+    #[test]
+    fn oversized_pax_extension_does_not_read_its_payload_block() {
+        let mut bytes = header(b'x', 1).to_vec();
+        bytes.resize(BLOCK_SIZE * 2, 0);
+        let consumed = Rc::new(Cell::new(0));
+        let reader = CountingReader {
+            bytes,
+            position: 0,
+            consumed: Rc::clone(&consumed),
+        };
+        let mut stream = TarStream::with_max_pax_extension_size(reader, 0);
+
+        assert!(matches!(
+            ready(stream.next()),
+            Some(Err(FrameError {
+                position: 0,
+                inner: FrameErrorInner::PaxExtensionTooLarge { size: 1, limit: 0 },
+            }))
+        ));
+        assert_eq!(consumed.get(), BLOCK_SIZE);
+    }
+
+    #[test]
+    fn accepts_pax_extensions_at_the_configured_limit() {
+        let mut payload = record("comment", "metadata");
+        payload.extend_from_slice(&record("ACME.attribute", "value"));
+        for (case, typeflag) in [("local", b'x'), ("global", b'g')] {
+            let mut bytes = Vec::new();
+            append_posix(&mut bytes, typeflag, &payload);
+            if typeflag == b'x' {
+                append_block(&mut bytes, &header(b'0', 0));
+            }
+            append_terminator(&mut bytes);
+
+            let frames = collect_with_max_pax_extension_size(
+                bytes,
+                7,
+                payload
+                    .len()
+                    .try_into()
+                    .expect("payload size should fit u64"),
+            );
+            assert!(frames.iter().all(Result::is_ok), "{case}");
+        }
     }
 
     #[test]

@@ -10,8 +10,8 @@ use tokio::io::AsyncRead;
 use tokio_stream::StreamExt;
 
 use crate::{
-    ArchiveFormat, Block, FrameError, FrameErrorInner, GnuKind, MemberKind, PaxKind, PaxRecord,
-    PaxString, PaxValue,
+    ArchiveFormat, Block, DEFAULT_MAX_PAX_EXTENSION_SIZE, FrameError, FrameErrorInner, GnuKind,
+    MemberKind, PaxKind, PaxRecord, PaxString, PaxValue,
     header::parse_number,
     stream::{DataOwner, Frame, GnuFrame, HeaderFrame, PaxFrame, TarStream},
 };
@@ -201,14 +201,32 @@ impl HeaderStorage {
 impl<R> TarReader<R> {
     /// Creates a new logical reader from an uncompressed tar reader.
     pub fn new(reader: R) -> Self {
+        Self::with_max_pax_extension_size(reader, DEFAULT_MAX_PAX_EXTENSION_SIZE)
+    }
+
+    /// Creates a logical reader with a maximum size for each pax extension.
+    ///
+    /// Setting the maximum to [`u64::MAX`] permits unbounded metadata
+    /// buffering.
+    pub fn with_max_pax_extension_size(reader: R, max_pax_extension_size: u64) -> Self {
         Self {
             payload: PayloadReader {
-                stream: TarStream::new(reader),
+                stream: TarStream::with_max_pax_extension_size(reader, max_pax_extension_size),
                 remaining: 0,
                 drain_buffer: Vec::new(),
             },
             header_storage: HeaderStorage::default(),
         }
+    }
+
+    /// Sets the maximum size accepted for each subsequent pax extension.
+    ///
+    /// A local or global pax header that declares a larger payload is rejected
+    /// before any of its payload blocks are consumed.
+    /// Setting the maximum to [`u64::MAX`] permits unbounded metadata
+    /// buffering.
+    pub fn set_max_pax_extension_size(&mut self, max_pax_extension_size: u64) {
+        self.payload.stream.max_pax_extension_size = max_pax_extension_size;
     }
 }
 

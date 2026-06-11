@@ -323,6 +323,52 @@ async fn duplicate_pax_records_are_rejected_by_default_and_can_use_last_value() 
 }
 
 #[tokio::test]
+async fn pax_extension_size_limit_is_configurable_for_extraction() {
+    let temp = tempdir().expect("temporary directory should be created");
+    let mut payload = pax_record("comment", "metadata");
+    payload.extend_from_slice(&pax_record("mtime", "1"));
+    let mut archive = ArchiveBuilder::new();
+    archive
+        .pax(b'x', &payload)
+        .posix("file", b'0', b"contents", "", 0o644);
+    let bytes = archive.finish();
+    let payload_size = u64::try_from(payload.len()).expect("payload size should fit u64");
+
+    let destination = temp.path().join("rejected");
+    let policy = DecodePolicy::default()
+        .pax_policy(PaxDecodePolicy::default().max_extension_size(payload_size - 1));
+    assert!(matches!(
+        Archive::new(bytes.as_slice())
+            .extract(&destination, policy)
+            .await,
+        Err(DecodeError::Framing(FrameError {
+            position: 0,
+            inner: FrameErrorInner::PaxExtensionTooLarge { size, limit },
+        })) if size == payload_size && limit == payload_size - 1
+    ));
+    assert!(destination.is_dir());
+    assert!(
+        std::fs::read_dir(destination)
+            .expect("rejected destination should be readable")
+            .next()
+            .is_none()
+    );
+
+    let destination = temp.path().join("accepted");
+    let policy = DecodePolicy::default()
+        .pax_policy(PaxDecodePolicy::default().max_extension_size(payload_size));
+    Archive::new(bytes.as_slice())
+        .extract(&destination, policy)
+        .await
+        .expect("extension at configured limit should extract");
+    assert_eq!(
+        std::fs::read_to_string(destination.join("file"))
+            .expect("extracted file should be readable"),
+        "contents"
+    );
+}
+
+#[tokio::test]
 async fn global_pax_headers_support_opt_out_and_ignore_trailing_updates() {
     let temp = tempdir().unwrap();
     let mut archive = ArchiveBuilder::new();

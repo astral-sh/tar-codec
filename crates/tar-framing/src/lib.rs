@@ -98,6 +98,11 @@ pub use pax::{HdrCharset, PaxExtension, PaxRecord, PaxState, PaxString, PaxValue
 /// The size of a logical tar record.
 pub const BLOCK_SIZE: usize = 512;
 
+/// The default maximum size in bytes of one local or global pax extension.
+///
+/// This is 1 MiB.
+pub const DEFAULT_MAX_PAX_EXTENSION_SIZE: u64 = 1024 * 1024;
+
 /// A single tar block.
 pub type Block = [u8; BLOCK_SIZE];
 
