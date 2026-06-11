@@ -9,13 +9,13 @@ There are three abstraction layers in the tar-codec repository:
 two live in the `tar-framing` crate, and one lives in the `tar-codec` crate.
 In order of abstraction, lowest to highest:
 
-- The _physical_ layer turns an asynchronous input source into a
+- tar-framing: the _physical_ layer turns an asynchronous input source into a
   stream of tar blocks according to the pax or GNU tar state machine.
   This is the lowest level of abstraction.
-- The _logical_ layer turns a stream of blocks from the physical layer
+- tar-framing: the _logical_ layer turns a stream of blocks from the physical layer
   into a stream of _assembled members_, i.e. tar entries along with
   their relevant pax or GNU metadata.
-- The _decode and extract_ layer turns a stream of _assembled members_
+- tar-codec: the _decode and extract_ layer turns a stream of _assembled members_
   into an extracted set of files, directories, etc. on disk.
 
 These layers/concerns should be preserved when making changes.
