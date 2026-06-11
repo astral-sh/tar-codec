@@ -3,6 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{self as std_fs, Metadata},
+    sync::Arc,
 };
 
 use super::*;
@@ -70,7 +71,7 @@ struct ExtractionRoot {
     /// The root's path.
     path: PathBuf,
     /// An open handle anchoring capability-relative target inspection.
-    handle: std_fs::File,
+    handle: Arc<std_fs::File>,
     /// Whether overwrites are allowed during extraction.
     allow_overwrites: bool,
     entries: HashMap<PathBuf, ExtractedEntry>,
@@ -465,12 +466,10 @@ impl ExtractionRoot {
     }
 
     async fn inspect_ambient_target(&self, path: &Path) -> Result<TerminalKind, DecodeError> {
-        let handle = self.handle.try_clone().map_err(|source| {
-            DecodeError::filesystem("inspect symbolic-link target", path.to_owned(), source)
-        })?;
+        let handle = Arc::clone(&self.handle);
         let target = path.to_owned();
         let error_path = target.clone();
-        tokio::task::spawn_blocking(move || inspect_ambient_target(handle, &target))
+        tokio::task::spawn_blocking(move || inspect_ambient_target(&handle, &target))
             .await
             .map_err(DecodeError::BlockingTask)?
             .map_err(|source| {
@@ -538,7 +537,7 @@ impl ExtractionRoot {
     }
 }
 
-fn open_destination(dest: &Path) -> io::Result<(PathBuf, std_fs::File)> {
+fn open_destination(dest: &Path) -> io::Result<(PathBuf, Arc<std_fs::File>)> {
     match std_fs::symlink_metadata(dest) {
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => std_fs::create_dir_all(dest)?,
@@ -554,14 +553,14 @@ fn open_destination(dest: &Path) -> io::Result<(PathBuf, std_fs::File)> {
     if capability_metadata_is_link(&metadata) || !metadata.is_dir() {
         return Err(io::Error::other("destination is not a real directory"));
     }
-    Ok((path, handle))
+    Ok((path, Arc::new(handle)))
 }
 
-fn inspect_ambient_target(root: std_fs::File, path: &Path) -> io::Result<TerminalKind> {
+fn inspect_ambient_target(root: &std_fs::File, path: &Path) -> io::Result<TerminalKind> {
     if path.as_os_str().is_empty() {
         return Ok(TerminalKind::Directory);
     }
-    match stat(&root, path, FollowSymlinks::Yes) {
+    match stat(root, path, FollowSymlinks::Yes) {
         Ok(metadata) if metadata.is_dir() => Ok(TerminalKind::Directory),
         Ok(_) => Ok(TerminalKind::File),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(TerminalKind::Dangling),
