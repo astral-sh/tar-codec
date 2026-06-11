@@ -424,7 +424,7 @@ mod tests {
                 .expect("local pax records");
             assert!(
                 records.contains(&PaxRecord::Path(PaxValue::Value(PaxString::Utf8(
-                    member.path.to_owned()
+                    member.path.to_owned().into()
                 ))))
             );
         }

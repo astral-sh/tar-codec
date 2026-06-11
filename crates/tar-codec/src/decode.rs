@@ -7,7 +7,7 @@ use std::{
 };
 
 use tar_framing::{
-    ArchiveFormat, FrameError, MemberKind, PaxKind, PaxRecord,
+    ArchiveFormat, FrameError, MemberKind, PaxKeyword, PaxKind, PaxRecord,
     logical::{MemberExtensions, MemberFrame, TarReader},
 };
 use thiserror::Error;
@@ -336,8 +336,8 @@ impl PaxDecodePolicy {
                     return Err(DecodeError::policy_violation(
                         position,
                         DecodePolicyViolation::PaxVendorExtension {
-                            vendor: vendor.clone(),
-                            name: name.clone(),
+                            vendor: vendor.to_string(),
+                            name: name.to_string(),
                         },
                     ));
                 }
@@ -346,10 +346,10 @@ impl PaxDecodePolicy {
 
         if kind == PaxKind::Global && !self.allow_global_pax_member_metadata {
             for record in records {
-                let keyword = match record {
-                    PaxRecord::Path(_) => Some("path"),
-                    PaxRecord::LinkPath(_) => Some("linkpath"),
-                    PaxRecord::Size(_) => Some("size"),
+                let keyword = match record.keyword() {
+                    PaxKeyword::Path => Some("path"),
+                    PaxKeyword::LinkPath => Some("linkpath"),
+                    PaxKeyword::Size => Some("size"),
                     _ => None,
                 };
                 if let Some(keyword) = keyword {
@@ -364,11 +364,13 @@ impl PaxDecodePolicy {
         if !self.allow_duplicate_pax_records {
             let mut keywords = HashSet::new();
             for record in records {
-                let keyword = record.keyword().into_owned();
+                let keyword = record.keyword();
                 if !keywords.insert(keyword.clone()) {
                     return Err(DecodeError::policy_violation(
                         position,
-                        DecodePolicyViolation::DuplicatePaxRecord { keyword },
+                        DecodePolicyViolation::DuplicatePaxRecord {
+                            keyword: keyword.to_string(),
+                        },
                     ));
                 }
             }

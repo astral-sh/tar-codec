@@ -90,8 +90,8 @@ use crate::{
         parse_octal,
     },
     pax::{
-        SharedPaxRecords, apply_global as apply_global_pax_records, hdrcharset as pax_hdrcharset,
-        parse_records as parse_pax_records, size as pax_size,
+        SharedGlobalPaxRecords, SharedPaxRecords, apply_global as apply_global_pax_records,
+        hdrcharset as pax_hdrcharset, parse_records as parse_pax_records, size as pax_size,
     },
 };
 
@@ -281,7 +281,7 @@ pub struct TarStream<R> {
     pub(super) block: Block,
     pub(super) block_len: usize,
     pub(super) format: Option<ArchiveFormat>,
-    pub(super) global_pax_records: Option<SharedPaxRecords>,
+    pub(super) global_pax_records: Option<SharedGlobalPaxRecords>,
     pub(super) max_pax_extension_size: u64,
     pub(super) state: State,
 }
@@ -321,7 +321,7 @@ impl<R> TarStream<R> {
         self.position
     }
 
-    pub(crate) fn global_pax_records(&self) -> Option<SharedPaxRecords> {
+    pub(crate) fn global_pax_records(&self) -> Option<SharedGlobalPaxRecords> {
         self.global_pax_records.clone()
     }
 }
@@ -583,14 +583,10 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 payload.extend_from_slice(&block[..len]);
                 remaining -= len as u64;
                 let completed_pax_records = if remaining == 0 {
-                    let global_records = self
-                        .global_pax_records
-                        .as_deref()
-                        .map_or(&[] as &[PaxRecord], Vec::as_slice);
                     let records = Arc::new(parse_pax_records(
                         header_position,
                         &payload,
-                        pax_hdrcharset(global_records),
+                        pax_hdrcharset(self.global_pax_records.as_deref()),
                     )?);
                     match kind {
                         PaxKind::Local => {
@@ -816,15 +812,13 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         let local_records = local_pax_records
             .as_deref()
             .map_or(&[] as &[PaxRecord], Vec::as_slice);
-        let global_records = self
-            .global_pax_records
-            .as_deref()
-            .map_or(&[] as &[PaxRecord], Vec::as_slice);
-        let effective_size =
-            pax_size(local_records, global_records).map_or(Ok(parsed.size), |size| match size {
+        let effective_size = pax_size(local_records, self.global_pax_records.as_deref()).map_or(
+            Ok(parsed.size),
+            |size| match size {
                 PaxValue::Value(size) => Ok(*size),
                 PaxValue::Deleted => Err(FrameError::deleted_pax_metadata(position, "size")),
-            })?;
+            },
+        )?;
         validate_posix_member_size(position, kind, parsed.size, effective_size)?;
         self.state = member_payload_state(effective_size);
         Ok(Frame::Header(HeaderFrame {
@@ -1473,7 +1467,7 @@ mod tests {
 
     fn local_records(comment: &str, size: u64) -> Vec<PaxRecord> {
         vec![
-            PaxRecord::Comment(PaxValue::Value(comment.to_owned())),
+            PaxRecord::Comment(PaxValue::Value(comment.into())),
             PaxRecord::Size(PaxValue::Value(size)),
         ]
     }
@@ -1820,7 +1814,9 @@ mod tests {
             Some(
                 [
                     PaxRecord::HdrCharset(PaxValue::Value(HdrCharset::Binary)),
-                    PaxRecord::Path(PaxValue::Value(PaxString::Binary(b"global".to_vec()))),
+                    PaxRecord::Path(PaxValue::Value(PaxString::Binary(
+                        b"global".to_vec().into(),
+                    ))),
                 ]
                 .as_slice()
             )
@@ -1829,7 +1825,7 @@ mod tests {
             data_frame(&frames, 3).completed_pax_records(),
             Some(
                 [PaxRecord::Path(PaxValue::Value(PaxString::Binary(
-                    b"local".to_vec()
+                    b"local".to_vec().into()
                 )))]
                 .as_slice()
             )

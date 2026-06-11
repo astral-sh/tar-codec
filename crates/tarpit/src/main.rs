@@ -214,7 +214,7 @@ fn render_pax_records(
 ) -> io::Result<()> {
     for record in records {
         let keyword = record.keyword();
-        write!(output, "        {scope} pax: {}=", keyword.escape_default())?;
+        write!(output, "        {scope} pax: {keyword}=")?;
         match record {
             PaxRecord::Atime(value)
             | PaxRecord::Ctime(value)

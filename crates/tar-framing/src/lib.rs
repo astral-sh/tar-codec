@@ -93,7 +93,7 @@ mod test_support;
 pub mod write;
 
 pub use error::{FrameError, FrameErrorInner};
-pub use pax::{HdrCharset, PaxExtension, PaxRecord, PaxState, PaxString, PaxValue};
+pub use pax::{HdrCharset, PaxExtension, PaxKeyword, PaxRecord, PaxState, PaxString, PaxValue};
 
 /// The size of a logical tar record.
 pub const BLOCK_SIZE: usize = 512;

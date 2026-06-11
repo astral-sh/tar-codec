@@ -11,7 +11,7 @@ use tokio_stream::StreamExt;
 
 use crate::{
     ArchiveFormat, Block, DEFAULT_MAX_PAX_EXTENSION_SIZE, FrameError, FrameErrorInner, GnuKind,
-    MemberKind, PaxKind, PaxRecord, PaxString, PaxValue,
+    MemberKind, PaxKeyword, PaxKind, PaxRecord, PaxString, PaxValue,
     header::parse_number,
     stream::{DataOwner, Frame, GnuFrame, HeaderFrame, PaxFrame, TarStream},
 };
@@ -130,6 +130,7 @@ impl<R> MemberFrame<'_, R> {
             MemberExtensions::Pax(state) => resolve_pax_text(
                 self.header.position,
                 state,
+                &PaxKeyword::LinkPath,
                 "linkpath",
                 Cow::Borrowed(self.header.link_name),
                 |record| match record {
@@ -475,6 +476,7 @@ fn effective_member_path<'a>(
         MemberExtensions::Pax(state) => resolve_pax_text(
             header.position,
             state,
+            &PaxKeyword::Path,
             "path",
             Cow::Borrowed(header.header_path),
             |record| match record {
@@ -505,12 +507,13 @@ fn reject_nul(position: u64, field: &'static str, value: &[u8]) -> Result<(), Fr
 fn resolve_pax_text<'a>(
     position: u64,
     state: &'a PaxState,
-    keyword: &'static str,
+    keyword: &PaxKeyword,
+    field: &'static str,
     header_value: Cow<'a, [u8]>,
     select: fn(&PaxRecord) -> Option<&PaxValue<PaxString>>,
 ) -> Result<Cow<'a, [u8]>, FrameError> {
     if let Some(value) = state.effective_record(keyword).and_then(select) {
-        return pax_value(position, keyword, value);
+        return pax_value(position, field, value);
     }
     Ok(header_value)
 }
@@ -524,7 +527,7 @@ fn pax_value<'a>(
 ) -> Result<Cow<'a, [u8]>, FrameError> {
     match value {
         PaxValue::Value(PaxString::Utf8(value)) => Ok(Cow::Borrowed(value.as_bytes())),
-        PaxValue::Value(PaxString::Binary(value)) => Ok(Cow::Borrowed(value)),
+        PaxValue::Value(PaxString::Binary(value)) => Ok(Cow::Borrowed(value.as_ref())),
         // A pax value that has been explicitly deleted does *not*
         // result in a fallthrough to the corresponding ustar header value:
         //
@@ -883,7 +886,7 @@ mod tests {
             ));
             let state = pax_state(&member).expect("expected pax member metadata");
             assert_eq!(
-                state.effective_record("path"),
+                state.effective_record(&PaxKeyword::Path),
                 Some(&PaxRecord::Path(PaxValue::Deleted))
             );
             let extensions = state.extensions().collect::<Vec<_>>();
@@ -964,7 +967,8 @@ mod tests {
 
     #[test]
     fn groups_pax_metadata_and_streams_member_payload() {
-        let global = record("comment", "global");
+        let mut global = record("comment", "first");
+        global.extend_from_slice(&record("comment", "last"));
         let mut local = record("path", "renamed");
         local.extend_from_slice(&record("size", "513"));
         let mut bytes = Vec::new();
@@ -987,13 +991,20 @@ mod tests {
                 assert_eq!(extensions[0].kind, PaxKind::Global);
                 assert_eq!(
                     extensions[0].records(),
-                    [PaxRecord::Comment(PaxValue::Value("global".to_owned()))]
+                    [
+                        PaxRecord::Comment(PaxValue::Value("first".into())),
+                        PaxRecord::Comment(PaxValue::Value("last".into())),
+                    ]
                 );
                 assert_eq!(extensions[1].position, (BLOCK_SIZE * 2) as u64);
                 assert_eq!(extensions[1].kind, PaxKind::Local);
                 assert_eq!(
-                    state.effective_record("size"),
+                    state.effective_record(&PaxKeyword::Size),
                     Some(&PaxRecord::Size(PaxValue::Value(513)))
+                );
+                assert_eq!(
+                    state.effective_record(&PaxKeyword::Comment),
+                    Some(&PaxRecord::Comment(PaxValue::Value("last".into())))
                 );
                 let Some(first) = member.payload.next_block().await? else {
                     panic!("expected first member payload block");
@@ -1034,8 +1045,8 @@ mod tests {
                 assert_eq!(extensions[0].position, 0);
                 assert_eq!(extensions[1].position, (BLOCK_SIZE * 2) as u64);
                 assert_eq!(
-                    state.effective_record("comment"),
-                    Some(&PaxRecord::Comment(PaxValue::Value("first".to_owned())))
+                    state.effective_record(&PaxKeyword::Comment),
+                    Some(&PaxRecord::Comment(PaxValue::Value("first".into())))
                 );
                 state.clone()
             };
@@ -1043,8 +1054,8 @@ mod tests {
             let state = pax_state(&member).expect("expected pax member metadata");
             assert_eq!(state.extensions().count(), 0);
             assert_eq!(
-                state.effective_record("comment"),
-                Some(&PaxRecord::Comment(PaxValue::Value("first".to_owned())))
+                state.effective_record(&PaxKeyword::Comment),
+                Some(&PaxRecord::Comment(PaxValue::Value("first".into())))
             );
             drop(member);
 
@@ -1054,14 +1065,12 @@ mod tests {
             assert_eq!(extensions.len(), 1);
             assert_eq!(extensions[0].kind, PaxKind::Global);
             assert_eq!(
-                state.effective_record("comment"),
-                Some(&PaxRecord::Comment(PaxValue::Value(
-                    "replacement".to_owned()
-                )))
+                state.effective_record(&PaxKeyword::Comment),
+                Some(&PaxRecord::Comment(PaxValue::Value("replacement".into())))
             );
             assert_eq!(
-                first_state.effective_record("comment"),
-                Some(&PaxRecord::Comment(PaxValue::Value("first".to_owned())))
+                first_state.effective_record(&PaxKeyword::Comment),
+                Some(&PaxRecord::Comment(PaxValue::Value("first".into())))
             );
             Ok(())
         });
