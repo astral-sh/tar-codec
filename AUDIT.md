@@ -8,30 +8,30 @@ Primary reference: local POSIX.1-2024 `pax` specification at `~/Downloads/specs/
 
 The implementation has a strong security-oriented structure. It separates physical framing, logical member assembly, and extraction; validates effective PAX names rather than the fallback ustar names; rejects mixed PAX/GNU framing; defers archive-created symlinks until all ordinary payload writes are complete; and does not follow existing destination symlinks while creating files or directories. I did not find a path by which archive payload bytes are written outside the extraction root under the documented no-concurrent-mutation assumption.
 
-The audit did find three high-priority issues:
+The audit did find three high-priority issues, all of which have since been remediated:
 
 1. PAX extension payloads are buffered without a byte or record limit, allowing allocator exhaustion before extraction policy can inspect the records.
 2. Applying global PAX state is quadratic in the number of records, with additional allocation for namespaced keywords, allowing disproportionate CPU consumption on the async executor thread.
 3. Default extraction can create a symlink whose text is lexically contained but whose actual filesystem resolution escapes through a symlink already present inside the destination. This does not write archive payload outside the root during extraction, but it leaves an attacker-created path that resolves outside the root and can expose outside content to a subsequent consumer.
 
-The remaining findings are correctness, interoperability, platform-hardening, or operational issues. Several are deliberate fail-closed choices already documented by the crate. They are still recorded because the stated goals include POSIX correctness and avoidance of parser differentials.
+The remaining findings are correctness, interoperability, platform-hardening, or operational issues. Several are deliberate fail-closed choices already documented by the crate. They are still recorded because the stated goals include POSIX correctness and avoidance of parser differentials. AUD-04 and AUD-05 are retained as out-of-scope observations under the project's exclusion for purely OS/filesystem-specific behavior. AUD-06, AUD-07, AUD-09, and AUD-11 are likewise out of scope because they describe deliberate compatibility or precision boundaries documented by `tar-framing` rather than unintended behavior. The status column tracks work after the reviewed revision; the detailed findings retain the original analysis.
 
-| ID | Severity | Area | Summary |
-| --- | --- | --- | --- |
-| AUD-01 | High | Availability / PAX | Extension payloads are buffered without resource limits |
-| AUD-02 | High | Availability / PAX | Global PAX state updates have quadratic behavior |
-| AUD-03 | High | Extraction | Ambient destination symlinks can redirect an emitted symlink outside the root |
-| AUD-04 | Medium | Windows extraction | NTFS alternate-data-stream names bypass the intended path/collision model |
-| AUD-05 | Medium | Platform correctness | Symlink graph identity does not match case/normalization-insensitive filesystems |
-| AUD-06 | Medium | Framing correctness | Unknown POSIX data-bearing typeflags are rejected despite unambiguous framing |
-| AUD-07 | Medium | PAX/ustar correctness | Valid payload-free entries are rejected based on metadata-only sizes |
-| AUD-08 | Medium | PAX encoding | The encoder can emit a regular member that its decoder rejects as ambiguous |
-| AUD-09 | Medium | PAX metadata | Fractional timestamps are irreversibly discarded |
-| AUD-10 | Low | PAX interoperability | Structurally valid implementation extensions are rejected in the physical layer |
-| AUD-11 | Low | PAX interoperability | An overridden unsupported `hdrcharset` still rejects the header |
-| AUD-12 | Low | Operational safety | Extraction errors leave earlier output and overwrites in place |
+| ID | Severity | Status | Area | Summary |
+| --- | --- | --- | --- | --- |
+| AUD-01 | High | Remediated | Availability / PAX | Extension payloads are buffered without resource limits |
+| AUD-02 | High | Remediated | Availability / PAX | Global PAX state updates have quadratic behavior |
+| AUD-03 | High | Remediated | Extraction | Ambient destination symlinks can redirect an emitted symlink outside the root |
+| AUD-04 | Medium | Out of scope | Windows extraction | NTFS interprets colon-containing names as alternate data streams |
+| AUD-05 | Medium | Out of scope | Platform correctness | Symlink graph identity differs from case/normalization-insensitive filesystem identity |
+| AUD-06 | Medium | Out of scope | Framing compatibility | Unknown POSIX typeflags are intentionally unsupported |
+| AUD-07 | Medium | Out of scope | Framing compatibility | Metadata-only sizes on payload-free entries are intentionally rejected |
+| AUD-08 | Medium | Remediated | PAX encoding | The encoder can emit a regular member that its decoder rejects as ambiguous |
+| AUD-09 | Medium | Out of scope | PAX metadata | Timestamp precision is intentionally limited to nonnegative whole seconds |
+| AUD-10 | Low | Open | PAX interoperability | Structurally valid implementation extensions are rejected in the physical layer |
+| AUD-11 | Low | Out of scope | PAX compatibility | Unsupported `hdrcharset` records are intentionally rejected even when overridden |
+| AUD-12 | Low | Open | Operational safety | Extraction errors leave earlier output and overwrites in place |
 
-Severity reflects impact when processing an untrusted archive in a service or developer-tool context. Platform-specific findings are still ranked by practical impact, but `SECURITY.md` explicitly excludes purely OS/filesystem-specific differentials from the project's vulnerability definition.
+Severity reflects the impact assessed against the reviewed revision when processing an untrusted archive in a service or developer-tool context. Status records the current disposition independently of that original severity.
 
 ## Scope and methodology
 
@@ -115,9 +115,10 @@ Recommended remediation:
 
 Add integration tests with both an intermediate and leaf ambient symlink, using PAX `linkpath`, and add Windows junction/reparse-point coverage.
 
-### AUD-04 — NTFS alternate-data-stream names bypass the intended path and collision model
+### AUD-04 — NTFS interprets colon-containing names as alternate data streams
 
-Severity: Medium  
+Disposition: Out of scope
+
 Class: Windows-specific extraction hardening
 
 The default name validator permits interior colons (`name.rs:11-16`). Extraction rejects backslashes, leading `/`, and platform prefixes, but otherwise accepts normal components (`decode.rs:616-649`, `733-757`). On Windows, `victim:payload` is not a drive prefix; it names an NTFS alternate data stream on `victim`.
@@ -126,28 +127,28 @@ The default name validator permits interior colons (`name.rs:11-16`). Extraction
 
 This finding is code-confirmed but was not runtime-tested on Windows. The repository's colon-path extraction test is Unix-only and therefore does not cover NTFS semantics.
 
-Recommended remediation:
+This behavior does not escape the extraction root: it is a filesystem-specific interpretation of an otherwise valid archive pathname. `SECURITY.md` expressly excludes differentials caused purely by OS or filesystem behavior, and the default name validator is not intended to impose a portable filename subset or encode every destination filesystem's naming rules. Rejecting `:` unconditionally would also reject ordinary filenames supported by non-Windows filesystems.
 
-- On Windows, reject `:` in every member-path and link-target component.
-- Add a Windows-specific safe-name layer covering device names, trailing dots/spaces, reparse points, and other Win32/NT path aliases.
-- Add a Windows test with an existing `victim`, PAX `path=victim:payload`, and both overwrite policy settings; assert rejection and absence of the stream.
+No library remediation is planned. Applications that require portable names or Windows-specific restrictions can supply a custom name validator, which is applied to member paths and link targets.
 
-### AUD-05 — Symlink graph identity does not match case/normalization-insensitive filesystems
+### AUD-05 — Filesystem name equivalence differs from symlink graph identity
 
-Severity: Medium  
+Disposition: Out of scope
+
 Class: platform-specific correctness / link-cycle detection
 
 The extraction graph keys `entries`, `symlink_indices`, and the visited set by exact `PathBuf` equality (`decode/extract.rs:60-67`, `406-435`). On a case-insensitive filesystem, the archive paths `A` and `B` can be distinct map keys even though link targets `a` and `b` resolve to those same filesystem objects.
 
-This was reproduced on a case-insensitive macOS filesystem with PAX symlinks `A -> b` and `B -> a`. The graph classified both targets as dangling and default extraction succeeded, but the installed links form a real filesystem cycle and path resolution fails with `ELOOP`. Canonically equivalent Unicode spellings create the same class on normalization-insensitive filesystems.
+This was reproduced on the reviewed revision on a case-insensitive macOS filesystem with PAX symlinks `A -> b` and `B -> a`. The graph classified both targets as dangling, installed the links, and produced a real filesystem cycle whose resolution fails with `ELOOP`. Canonically equivalent Unicode spellings create the same class on normalization-insensitive filesystems.
 
-This is not classified as a project security vulnerability under the current `SECURITY.md` exclusion for purely filesystem-specific differentials. It is nevertheless a correctness gap in the cycle-checking guarantee.
+The AUD-03 remediation subsequently made `ArchiveOnly` the default symbolic-link target policy. Under that policy, a filesystem-equivalent target missed by exact `PathBuf` lookup is treated as unowned and rejected before links are installed. The default therefore fails closed rather than creating the cycle. `AllowAmbientAndMissing` may still install such a cycle, but that non-default policy explicitly permits targets outside the archive-created graph.
 
-Recommended remediation is to make graph identity reflect the destination filesystem. Inode/directory-handle-aware resolution is preferable. Simple Unicode lowercasing is not sufficient for filesystem normalization, Windows aliases, or volume-specific case rules. Add platform-gated case and Unicode-normalization tests on filesystems detected to have the relevant behavior.
+`SECURITY.md` expressly excludes filesystem-specific coalescing caused by case or Unicode normalization, and also excludes fail-closed differentials. Making graph identity reflect the destination filesystem would require platform-specific file identities and materializing or otherwise representing pending symlinks in the filesystem; simple Unicode lowercasing would not cover normalization, Windows aliases, or volume-specific case rules. That complexity is not justified within the current threat model, so no library remediation is planned.
 
-### AUD-06 — Unknown POSIX data-bearing typeflags are rejected despite unambiguous framing
+### AUD-06 — Unknown POSIX typeflags are intentionally unsupported
 
-Severity: Medium  
+Disposition: Out of scope
+
 Class: POSIX correctness / fail-closed differential
 
 Every ordinary PAX/ustar member is converted through `MemberKind::try_from_framed`, which accepts only typeflags `0` through `7` (`stream.rs:786-806`, `997-1012`).
@@ -156,11 +157,12 @@ The POSIX ustar section says that, for types other than the special payload-free
 
 A POSIX header with typeflag `A`, size 3, payload `abc`, and a following member is currently rejected rather than framed. This is safe failure, but it prevents the logical/extraction layer from applying a strict policy or the POSIX regular-file fallback.
 
-Recommended remediation is to retain the raw typeflag in an opaque/custom member kind and frame it using effective PAX size. Extraction may then reject it by default or explicitly convert it to a regular file with a diagnostic. GNU-family policy can remain separate.
+The `tar-framing` crate-level PAX compatibility notes explicitly document this deviation: undefined typeflags are rejected rather than treated as regular files because the compatibility benefit is marginal. This is a deliberate supported-format boundary, not an accidental parser limitation, and rejection is fail-closed. No remediation is planned.
 
-### AUD-07 — Valid payload-free entries are rejected based on metadata-only sizes
+### AUD-07 — Metadata-only sizes on payload-free entries are intentionally rejected
 
-Severity: Medium  
+Disposition: Out of scope
+
 Class: POSIX/PAX correctness / intentional fail-closed differential
 
 PAX `size` deletion is rejected before member-kind handling (`stream.rs:801-805`). `validate_posix_member_size` also rejects every nonzero declared or effective size for directories, FIFOs, character devices, and block devices (`stream.rs:1016-1041`). Tests intentionally lock in these rejections.
@@ -172,9 +174,9 @@ POSIX specifies that:
 - Character/block-device size has unspecified metadata meaning, but no data records are stored.
 - A zero-length PAX value deletes the corresponding field.
 
-For those types, a deleted or nonzero `size` does not make physical framing ambiguous: zero payload blocks follow. The current directory rule is documented as an intentional anti-differential choice in `tar-framing/src/lib.rs`. That choice fails closed, but it rejects conforming archives and places extraction policy in the physical layer.
+For those types, a deleted or nonzero `size` does not make physical framing ambiguous under a pedantic POSIX reading: zero payload blocks follow. The current directory rule is documented as an intentional anti-differential choice in `tar-framing/src/lib.rs` because real-world readers disagree about whether the declared size is metadata or physical payload. The implementation applies the same conservative payload-free invariant to FIFOs and device entries.
 
-Recommended remediation is to separate metadata size from physical payload length. Frame zero payload bytes for types 3, 4, 5, and 6 while retaining the metadata for inspection, then expose a strict extraction policy if these archives should remain rejected by default. A nonzero symlink size remains invalid; hard links retain their PAX `linkdata` handling.
+This is a deliberate framing policy that rejects potentially differential archive shapes before choosing an interpretation. It is documented, tested, and fail-closed, so no remediation is planned.
 
 ### AUD-08 — The encoder can emit a regular member that its decoder rejects as ambiguous
 
@@ -189,16 +191,17 @@ The behavior was reproduced on the reviewed revision: `Encoder::add_entry("file/
 
 Reject trailing `/` for every non-directory `PaxMember` in the framing writer, and preferably return a more specific high-level encode error before writing any bytes. Add an integration test that exercises the public encoder and extractor together. Manual archive names that are absolute or contain parent components are an intentional API choice documented by `EncodePolicy`; this finding is narrower and concerns a wire-level member/type ambiguity.
 
-### AUD-09 — Fractional timestamps are irreversibly discarded
+### AUD-09 — Timestamp precision is intentionally limited to nonnegative whole seconds
 
-Severity: Medium  
-Class: PAX metadata correctness; known/documented limitation
+Disposition: Out of scope
+
+Class: PAX metadata compatibility / precision limitation
 
 `PaxRecord::Atime` and `Mtime` store only `u64` seconds (`pax.rs:147-172`). `parse_time` validates fractional digits and then discards them (`pax.rs:458-489`). Tests explicitly assert that `12.034` becomes `12`, and `tar-framing/src/lib.rs` documents the deviation.
 
-The PAX file-time section defines fractional digits as subsecond precision and requires restoration to the greatest representable time not greater than the archived time. On a nanosecond-capable filesystem, unconditional whole-second truncation is not the greatest representable value. The framing API's information loss also prevents a future higher layer from restoring accurate timestamps.
+The PAX file-time section defines fractional digits as subsecond precision and requires restoration to the greatest representable time not greater than the archived time. On a nanosecond-capable filesystem, unconditional whole-second truncation is not the greatest representable value. The framing API consequently exposes a deliberately narrower timestamp model than the full PAX representation.
 
-Preserve either the exact validated decimal or a structured signed-seconds/fraction representation, and round downward only when applying a destination filesystem's actual resolution. Negative timestamps are also valid PAX input but are intentionally rejected and should be addressed by the same representation.
+The `tar-framing` crate-level PAX compatibility notes explicitly document both whole-second truncation and rejection of negative or out-of-range timestamps. These are intentional API and compatibility boundaries rather than accidental information loss, so no remediation is planned.
 
 ### AUD-10 — Structurally valid implementation extensions are rejected in the physical layer
 
@@ -211,14 +214,15 @@ The PAX normative text permits listed keywords or implementation extensions and 
 
 Add an opaque record variant in the physical layer, preserve its bytes/UTF-8 text, and let extraction policy reject unknown semantics by default. Continue interpreting framing-sensitive standard records strictly.
 
-### AUD-11 — An overridden unsupported `hdrcharset` still rejects the header
+### AUD-11 — Unsupported `hdrcharset` records are intentionally rejected even when overridden
 
-Severity: Low  
-Class: PAX precedence interoperability
+Disposition: Out of scope
+
+Class: PAX charset compatibility / precedence interoperability
 
 `record_hdrcharset` parses every repeated charset and errors immediately on an unsupported value (`pax.rs:415-429`). The later typed-record pass also requires every occurrence to fit the closed enum (`pax.rs:315-318`, `408-413`). Thus `hdrcharset=PRIVATE` followed by `hdrcharset=BINARY` is rejected even though PAX duplicate precedence makes the final, supported value effective.
 
-The PAX specification permits additional charset names by agreement and says the last conflicting local record wins. Preserve overridden unsupported records opaquely, determine the effective charset from the last record, and fail only when the effective charset must be interpreted but is unsupported.
+The PAX specification permits additional charset names by agreement and says the last conflicting local record wins. The `tar-framing` crate-level compatibility notes now explicitly state that this implementation, as the recipient, accepts only UTF-8 and `BINARY` and rejects every other `hdrcharset` record. Rejecting an unsupported occurrence before applying duplicate precedence is therefore a deliberate supported-format boundary rather than unintended behavior. No remediation is planned.
 
 ### AUD-12 — Extraction errors leave earlier output and overwrites in place
 
@@ -253,15 +257,14 @@ The following controls were specifically traced and, where applicable, covered b
 - Nonempty directories are not recursively replaced.
 - The PAX writer's record-length convergence, header ordering, octal fallback, checksums, padding, and two-block terminator appear correct. No writer-side length or checksum defect was found.
 
-## Recommended remediation order
+## Remediation progress
 
-1. Add PAX/GNU metadata resource limits and make global-state updates linear (AUD-01 and AUD-02). These are reachable before higher-layer policy and are the clearest service-level denial-of-service risks.
-2. Decide and document the symlink containment contract, then close ambient-target resolution under the default policy (AUD-03). The conservative default is to permit only root/archive-created targets.
-3. Add platform-specific safe-name and path-identity handling, beginning with NTFS alternate streams and reparse points (AUD-04 and AUD-05).
-4. Reject encoder inputs that create member/type ambiguity, before any bytes are written (AUD-08).
-5. Move unambiguous but unsupported POSIX cases out of the physical rejection layer so extraction policy can make the strictness decision (AUD-06, AUD-07, and AUD-10).
-6. Preserve PAX time and charset information losslessly (AUD-09 and AUD-11).
-7. Document partial extraction and offer a staging/transactional workflow (AUD-12).
+- [x] Add PAX metadata resource limits (AUD-01).
+- [x] Make global PAX state updates linear (AUD-02).
+- [x] Close ambient-target resolution under the default symlink policy (AUD-03).
+- [x] Reject encoder inputs that create member/type ambiguity before writing bytes (AUD-08).
+- [ ] Preserve structurally valid implementation extensions so extraction policy can make the strictness decision (AUD-10).
+- [ ] Document partial extraction and offer a staging/transactional workflow (AUD-12).
 
 ## Suggested test expansion
 
@@ -270,11 +273,6 @@ After fixes are designed, prefer integration tests in `crates/tar-codec/tests` f
 - Resource-limit boundary archives for PAX `x`/`g` and GNU `L`/`K`.
 - Complexity regression coverage for many unique and repeatedly updated global keys.
 - Ambient symlink/junction targets using effective PAX `linkpath`.
-- Windows ADS, reserved-name, trailing-dot/space, and reparse-point cases.
-- Case-insensitive and Unicode-normalization symlink graph aliases where supported.
-- Unknown POSIX typeflags followed by another member to prove correct alignment.
-- Directory/FIFO/device sizes and PAX `size` deletions with no physical payload.
 - Public encoder rejection of trailing-separator regular members, with no partial output.
-- Exact fractional and negative PAX time preservation.
-- Opaque implementation extensions and overridden unsupported `hdrcharset` values.
+- Opaque implementation extensions.
 - Differential fixtures produced by GNU tar, bsdtar/libarchive, Python `tarfile`, and Go's `archive/tar`, especially for duplicates, deletions, global state, binary names, and hard-link data.
