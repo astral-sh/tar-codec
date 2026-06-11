@@ -188,12 +188,32 @@ impl ExtractionRoot {
     async fn open(dest: &Path, allow_overwrites: bool) -> Result<Self, DecodeError> {
         let dest = dest.to_owned();
         let error_path = dest.clone();
-        let directory = tokio::task::spawn_blocking(move || open_destination(&dest))
-            .await
-            .map_err(DecodeError::BlockingTask)?
-            .map_err(|source| {
-                DecodeError::filesystem("open destination directory", error_path, source)
-            })?;
+        let directory = tokio::task::spawn_blocking(move || {
+            match std_fs::symlink_metadata(&dest) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    std_fs::create_dir_all(&dest)?;
+                }
+                Err(error) => return Err(error),
+            }
+            let metadata = std_fs::symlink_metadata(&dest)?;
+            if ambient_metadata_is_link(&metadata) || !metadata.is_dir() {
+                return Err(io::Error::other("destination is not a real directory"));
+            }
+            let path = std_fs::canonicalize(dest)?;
+            let directory = Dir::open_ambient_dir(path, ambient_authority())?;
+            let metadata = directory.dir_metadata()?;
+            if metadata_is_link(&metadata) || !metadata.is_dir() {
+                return Err(io::Error::other("destination is not a real directory"));
+            }
+            Ok(Arc::new(directory))
+        })
+        .await
+        .map_err(DecodeError::BlockingTask)?
+        .map_err(|source| {
+            DecodeError::filesystem("open destination directory", error_path, source)
+        })?;
+
         Ok(Self {
             directory,
             directory_handles: HashMap::new(),
@@ -311,7 +331,7 @@ impl ExtractionRoot {
         }
         self.ensure_parents(&member.path).await?;
         self.replace_leaf(&member.path).await?;
-        self.filesystem("create hard link", &member.path, move |directory, path| {
+        self.with_root("create hard link", &member.path, move |directory, path| {
             directory.hard_link(target, directory, path)
         })
         .await?;
@@ -433,7 +453,7 @@ impl ExtractionRoot {
         }
         for (link, kind) in links {
             let contents = link.link_contents.clone();
-            self.entry_filesystem(
+            self.with_entry_parent(
                 "create symbolic link",
                 &link.path,
                 move |directory, path| create_symlink(directory, &contents, path, kind),
@@ -484,12 +504,22 @@ impl ExtractionRoot {
     }
 
     async fn inspect_ambient_target(&self, path: &Path) -> Result<TerminalKind, DecodeError> {
-        self.filesystem("inspect symbolic-link target", path, inspect_ambient_target)
-            .await
+        self.with_root("inspect symbolic-link target", path, |directory, path| {
+            if path.as_os_str().is_empty() {
+                return Ok(TerminalKind::Directory);
+            }
+            match directory.metadata(path) {
+                Ok(metadata) if metadata.is_dir() => Ok(TerminalKind::Directory),
+                Ok(_) => Ok(TerminalKind::File),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(TerminalKind::Dangling),
+                Err(error) => Err(error),
+            }
+        })
+        .await
     }
 
     async fn metadata(&self, path: &Path) -> Result<Option<Metadata>, DecodeError> {
-        self.entry_filesystem("inspect", path, |directory, path| {
+        self.with_entry_parent("inspect", path, |directory, path| {
             match directory.symlink_metadata(path) {
                 Ok(metadata) => Ok(Some(metadata)),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -502,7 +532,7 @@ impl ExtractionRoot {
     async fn remove_leaf(&mut self, path: &Path, metadata: &Metadata) -> Result<(), DecodeError> {
         if metadata.is_dir() && !metadata_is_link(metadata) {
             let is_empty = self
-                .entry_filesystem("inspect directory", path, |root, path| {
+                .with_entry_parent("inspect directory", path, |root, path| {
                     let directory = root.open_dir(path)?;
                     let mut entries = directory.entries()?;
                     Ok(entries.next().transpose()?.is_none())
@@ -515,14 +545,25 @@ impl ExtractionRoot {
             }
             // Windows directory handles do not share delete access.
             self.directory_handles.remove(path);
-            self.entry_filesystem("remove directory", path, |directory, path| {
+            self.with_entry_parent("remove directory", path, |directory, path| {
                 directory.remove_dir(path)
             })
             .await
         } else {
             let is_link = metadata_is_link(metadata);
-            self.entry_filesystem("remove file", path, move |directory, path| {
-                remove_non_directory(directory, path, is_link)
+            self.with_entry_parent("remove file", path, move |directory, path| {
+                #[cfg(windows)]
+                if is_link {
+                    // Stable Windows does not expose whether a symlink is file- or
+                    // directory-shaped.
+                    return match directory.remove_file(path) {
+                        Ok(()) => Ok(()),
+                        Err(_) => directory.remove_dir(path),
+                    };
+                }
+                #[cfg(not(windows))]
+                let _ = is_link;
+                directory.remove_file(path)
             })
             .await
         }
@@ -537,7 +578,7 @@ impl ExtractionRoot {
         executable: bool,
     ) -> Result<File, DecodeError> {
         let file = self
-            .entry_filesystem(operation, path, move |directory, path| {
+            .with_entry_parent(operation, path, move |directory, path| {
                 let mut options = OpenOptions::new();
                 options
                     .write(true)
@@ -556,7 +597,7 @@ impl ExtractionRoot {
     }
 
     async fn create_directory(&self, path: &Path) -> Result<Dir, DecodeError> {
-        self.entry_filesystem("create directory", path, |directory, path| {
+        self.with_entry_parent("create directory", path, |directory, path| {
             directory.create_dir(path)?;
             directory.open_dir(path)
         })
@@ -564,13 +605,18 @@ impl ExtractionRoot {
     }
 
     async fn open_directory(&self, path: &Path) -> Result<Dir, DecodeError> {
-        self.entry_filesystem("open directory", path, |directory, path| {
+        self.with_entry_parent("open directory", path, |directory, path| {
             directory.open_dir(path)
         })
         .await
     }
 
-    async fn filesystem<T, F>(
+    /// Runs an operation against the extraction root capability.
+    ///
+    /// `path` remains root-relative when passed to `action`. This is used for
+    /// paths whose parent is not necessarily an archive-known directory, such
+    /// as ambient symbolic-link targets.
+    async fn with_root<T, F>(
         &self,
         operation: &'static str,
         path: &Path,
@@ -580,7 +626,7 @@ impl ExtractionRoot {
         T: Send + 'static,
         F: FnOnce(&Dir, &Path) -> io::Result<T> + Send + 'static,
     {
-        filesystem_at(
+        run_blocking(
             Arc::clone(&self.directory),
             operation,
             path.to_owned(),
@@ -590,7 +636,13 @@ impl ExtractionRoot {
         .await
     }
 
-    async fn entry_filesystem<T, F>(
+    /// Runs an operation against the nearest capability for an entry's parent.
+    ///
+    /// When the immediate parent has a cached [`Dir`], `action` receives that
+    /// capability and only the entry's leaf name. Otherwise it receives the
+    /// extraction root and the complete root-relative path. Errors always
+    /// report the complete path regardless of which capability is selected.
+    async fn with_entry_parent<T, F>(
         &self,
         operation: &'static str,
         path: &Path,
@@ -601,7 +653,7 @@ impl ExtractionRoot {
         F: FnOnce(&Dir, &Path) -> io::Result<T> + Send + 'static,
     {
         let (directory, relative_path) = self.entry_capability(path);
-        filesystem_at(directory, operation, path.to_owned(), relative_path, action).await
+        run_blocking(directory, operation, path.to_owned(), relative_path, action).await
     }
 
     fn entry_capability(&self, path: &Path) -> (Arc<Dir>, PathBuf) {
@@ -619,7 +671,17 @@ impl ExtractionRoot {
     }
 }
 
-async fn filesystem_at<T, F>(
+/// Runs one capability-relative filesystem operation on Tokio's blocking pool.
+///
+/// `relative_path` is interpreted beneath `directory` and may be only the leaf
+/// name when a cached parent capability is available. `error_path` is the full
+/// root-relative archive path used for diagnostics; it is never passed to the
+/// filesystem. Keeping the paths separate avoids repeated path traversal
+/// without losing useful [`DecodeError::Filesystem`] context.
+///
+/// Filesystem errors are annotated with `operation` and `error_path`, while a
+/// failure to join the blocking task becomes [`DecodeError::BlockingTask`].
+async fn run_blocking<T, F>(
     directory: Arc<Dir>,
     operation: &'static str,
     error_path: PathBuf,
@@ -638,37 +700,6 @@ where
     .map_err(DecodeError::BlockingTask)?
 }
 
-fn open_destination(dest: &Path) -> io::Result<Arc<Dir>> {
-    match std_fs::symlink_metadata(dest) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => std_fs::create_dir_all(dest)?,
-        Err(error) => return Err(error),
-    }
-    let metadata = std_fs::symlink_metadata(dest)?;
-    if ambient_metadata_is_link(&metadata) || !metadata.is_dir() {
-        return Err(io::Error::other("destination is not a real directory"));
-    }
-    let path = std_fs::canonicalize(dest)?;
-    let directory = Dir::open_ambient_dir(&path, ambient_authority())?;
-    let metadata = directory.dir_metadata()?;
-    if metadata_is_link(&metadata) || !metadata.is_dir() {
-        return Err(io::Error::other("destination is not a real directory"));
-    }
-    Ok(Arc::new(directory))
-}
-
-fn inspect_ambient_target(root: &Dir, path: &Path) -> io::Result<TerminalKind> {
-    if path.as_os_str().is_empty() {
-        return Ok(TerminalKind::Directory);
-    }
-    match root.metadata(path) {
-        Ok(metadata) if metadata.is_dir() => Ok(TerminalKind::Directory),
-        Ok(_) => Ok(TerminalKind::File),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(TerminalKind::Dangling),
-        Err(error) => Err(error),
-    }
-}
-
 #[cfg(not(windows))]
 fn ambient_metadata_is_link(metadata: &std_fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
@@ -687,20 +718,6 @@ fn metadata_is_link(metadata: &Metadata) -> bool {
 #[cfg(windows)]
 fn metadata_is_link(metadata: &Metadata) -> bool {
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-fn remove_non_directory(directory: &Dir, path: &Path, is_link: bool) -> io::Result<()> {
-    #[cfg(windows)]
-    if is_link {
-        // Stable Windows does not expose whether a symlink is file- or directory-shaped.
-        return match directory.remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(_) => directory.remove_dir(path),
-        };
-    }
-    #[cfg(not(windows))]
-    let _ = is_link;
-    directory.remove_file(path)
 }
 
 #[cfg(unix)]
