@@ -1,18 +1,23 @@
 use crate::{ArchiveFormat, Block};
 
-pub(crate) const NAME_RANGE: std::ops::Range<usize> = 0..100;
-pub(crate) const MODE_RANGE: std::ops::Range<usize> = 100..108;
-pub(crate) const UID_RANGE: std::ops::Range<usize> = 108..116;
-pub(crate) const GID_RANGE: std::ops::Range<usize> = 116..124;
-pub(crate) const SIZE_RANGE: std::ops::Range<usize> = 124..136;
-pub(crate) const MTIME_RANGE: std::ops::Range<usize> = 136..148;
-pub(crate) const CHECKSUM_RANGE: std::ops::Range<usize> = 148..156;
-pub(crate) const TYPEFLAG_OFFSET: usize = 156;
-pub(crate) const LINK_NAME_RANGE: std::ops::Range<usize> = 157..257;
-pub(crate) const IDENTITY_RANGE: std::ops::Range<usize> = 257..265;
-pub(crate) const PREFIX_RANGE: std::ops::Range<usize> = 345..500;
-pub(crate) const POSIX_IDENTITY: &[u8; 8] = b"ustar\x0000";
-pub(crate) const GNU_IDENTITY: &[u8; 8] = b"ustar  \0";
+pub const NAME_RANGE: std::ops::Range<usize> = 0..100;
+pub const MODE_RANGE: std::ops::Range<usize> = 100..108;
+pub const UID_RANGE: std::ops::Range<usize> = 108..116;
+pub const GID_RANGE: std::ops::Range<usize> = 116..124;
+pub const SIZE_RANGE: std::ops::Range<usize> = 124..136;
+pub const MTIME_RANGE: std::ops::Range<usize> = 136..148;
+pub const CHECKSUM_RANGE: std::ops::Range<usize> = 148..156;
+pub const TYPEFLAG_OFFSET: usize = 156;
+pub const LINK_NAME_RANGE: std::ops::Range<usize> = 157..257;
+pub const IDENTITY_RANGE: std::ops::Range<usize> = 257..265;
+pub const PREFIX_RANGE: std::ops::Range<usize> = 345..500;
+/// The magic and version bytes for a ustar tar block.
+/// ustar blocks form the baseline for pax, since every pax block is
+/// a well-formed ustar block (and what makes it pax is whether
+/// it uses a pax typeflag).
+pub const USTAR_IDENTITY: &[u8; 8] = b"ustar\x0000";
+/// The magic and version bytes for a GNU tar block.
+pub const GNU_IDENTITY: &[u8; 8] = b"ustar  \0";
 
 /// A tar header block (pax, ustar, or GNU) is exactly 512 bytes,
 /// so the logical maximum checksum is `255*512 = 130,560`. However,

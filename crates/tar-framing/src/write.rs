@@ -8,7 +8,7 @@ use crate::{
     BLOCK_SIZE, Block, MemberKind, PaxKeyword,
     header::{
         GID_RANGE, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE, MTIME_RANGE, NAME_RANGE,
-        POSIX_IDENTITY, PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, UID_RANGE, encode_checksum,
+        PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, UID_RANGE, USTAR_IDENTITY, encode_checksum,
         encode_octal,
     },
 };
@@ -313,7 +313,7 @@ fn build_header_into(
         return Err(FramingWriteError::ExtendedHeaderTooLarge { size });
     }
     block[TYPEFLAG_OFFSET] = typeflag;
-    block[IDENTITY_RANGE].copy_from_slice(POSIX_IDENTITY);
+    block[IDENTITY_RANGE].copy_from_slice(USTAR_IDENTITY);
     encode_checksum(block);
     Ok(())
 }

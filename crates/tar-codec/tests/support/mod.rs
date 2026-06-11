@@ -1,14 +1,11 @@
-use tar_framing::{BLOCK_SIZE, Block, PaxKeyword, write::append_pax_record};
-
-const NAME_RANGE: std::ops::Range<usize> = 0..100;
-const MODE_RANGE: std::ops::Range<usize> = 100..108;
-const SIZE_RANGE: std::ops::Range<usize> = 124..136;
-const CHECKSUM_RANGE: std::ops::Range<usize> = 148..156;
-const TYPEFLAG_OFFSET: usize = 156;
-const LINK_NAME_RANGE: std::ops::Range<usize> = 157..257;
-const IDENTITY_RANGE: std::ops::Range<usize> = 257..265;
-const POSIX_IDENTITY: &[u8; 8] = b"ustar\x0000";
-const GNU_IDENTITY: &[u8; 8] = b"ustar  \0";
+use tar_framing::{
+    BLOCK_SIZE, Block, PaxKeyword,
+    header::{
+        CHECKSUM_RANGE, GNU_IDENTITY, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE, NAME_RANGE,
+        SIZE_RANGE, TYPEFLAG_OFFSET, USTAR_IDENTITY,
+    },
+    write::append_pax_record,
+};
 
 #[derive(Clone, Copy)]
 pub enum ArchiveFormat {
@@ -135,7 +132,7 @@ pub fn header(
     block[TYPEFLAG_OFFSET] = typeflag;
     set_text(&mut block[LINK_NAME_RANGE], link_name);
     block[IDENTITY_RANGE].copy_from_slice(match format {
-        ArchiveFormat::Pax => POSIX_IDENTITY,
+        ArchiveFormat::Pax => USTAR_IDENTITY,
         ArchiveFormat::Gnu => GNU_IDENTITY,
     });
     set_checksum(&mut block);

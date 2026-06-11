@@ -92,7 +92,7 @@
 //! ["Basic Tar Format"]: https://www.gnu.org/software/tar/manual/html_node/Standard.html
 
 mod error;
-mod header;
+pub mod header;
 pub mod logical;
 mod pax;
 pub mod stream;

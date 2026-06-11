@@ -86,7 +86,7 @@ use crate::{
     GnuKind, MemberKind, PaxKind, PaxRecord, PaxValue,
     header::{
         CHECKSUM_RANGE, GNU_IDENTITY, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE, NAME_RANGE,
-        POSIX_IDENTITY, PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, checksum, parse_number,
+        PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, USTAR_IDENTITY, checksum, parse_number,
         parse_octal,
     },
     pax::{
@@ -973,7 +973,7 @@ fn checked_position(position: u64, len: usize) -> Result<u64, FrameError> {
 impl TryFromFramed<&Block> for ParsedHeader {
     fn try_from_framed(position: u64, block: &Block) -> Result<Self, FrameError> {
         let format = match &block[IDENTITY_RANGE] {
-            identity if identity == POSIX_IDENTITY => ArchiveFormat::Pax,
+            identity if identity == USTAR_IDENTITY => ArchiveFormat::Pax,
             identity if identity == GNU_IDENTITY => ArchiveFormat::Gnu,
             identity => {
                 return Err(FrameError::at(
