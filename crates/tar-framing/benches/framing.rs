@@ -2,7 +2,7 @@ use std::{hint::black_box, sync::Arc, time::Duration};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tar_framing::{
-    BLOCK_SIZE, UstarKind, PaxKeyword,
+    BLOCK_SIZE, PaxKeyword, UstarKind,
     logical::TarReader,
     write::{PaxMember, append_pax_record, end_marker_bytes, frame_pax_member_into},
 };

@@ -4,7 +4,7 @@ use std::path::Path;
 
 use support::{ArchiveBuilder, ArchiveFormat, EntryKind, header, pax_record, single_posix_member};
 use tar_codec::decode::{Archive, DecodeError, DecodePolicy};
-use tar_framing::{FrameError, FrameErrorInner, UstarKind, PaxKeyword};
+use tar_framing::{FrameError, FrameErrorInner, PaxKeyword, UstarKind};
 use tempfile::tempdir;
 
 #[tokio::test]

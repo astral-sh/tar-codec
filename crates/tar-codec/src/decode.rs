@@ -7,7 +7,7 @@ use std::{
 };
 
 use tar_framing::{
-    ArchiveFormat, FrameError, UstarKind, PaxKeyword, PaxKind, PaxRecord,
+    ArchiveFormat, FrameError, PaxKeyword, PaxKind, PaxRecord, UstarKind,
     logical::{MemberExtensions, MemberFrame, TarReader},
 };
 use thiserror::Error;

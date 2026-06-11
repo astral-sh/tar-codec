@@ -5,7 +5,7 @@
 //! deciding which filesystem entries are appropriate to archive.
 
 use crate::{
-    BLOCK_SIZE, Block, UstarKind, PaxKeyword,
+    BLOCK_SIZE, Block, PaxKeyword, UstarKind,
     header::{
         GID_RANGE, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE, MTIME_RANGE, NAME_RANGE,
         PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, UID_RANGE, USTAR_IDENTITY, encode_checksum,
@@ -430,13 +430,7 @@ mod tests {
         let members = [
             pax_member("bin/tool", UstarKind::Regular, 3, None, true),
             pax_member("bin", UstarKind::Directory, 0, None, false),
-            pax_member(
-                "alias",
-                UstarKind::SymbolicLink,
-                0,
-                Some("bin/tool"),
-                false,
-            ),
+            pax_member("alias", UstarKind::SymbolicLink, 0, Some("bin/tool"), false),
         ];
         for (sequence, member) in members.into_iter().enumerate() {
             let payload: &[u8] = if member.kind == UstarKind::Regular {
