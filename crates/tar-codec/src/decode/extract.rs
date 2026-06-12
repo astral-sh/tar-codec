@@ -69,6 +69,19 @@ impl ExtractedEntry {
     }
 }
 
+/// Why extraction requires a directory at a particular path.
+///
+/// Explicit directory members participate in normal exact-path overwrite
+/// handling. Implicit parents may create or reuse directories, but must never
+/// replace a non-directory entry.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DirectoryPurpose {
+    /// The archive contains a directory member at this exact path.
+    ExplicitMember,
+    /// A descendant member requires this path to be a directory.
+    ImplicitParent,
+}
+
 /// Represents a root directory for an extraction operation.
 struct ExtractionRoot {
     /// The capability anchoring all extraction filesystem operations.
@@ -261,7 +274,8 @@ impl ExtractionRoot {
     async fn extract_directory(&mut self, path: &Path) -> Result<(), DecodeError> {
         if !path.as_os_str().is_empty() {
             self.ensure_parents(path).await?;
-            self.ensure_directory(path).await?;
+            self.ensure_directory(path, DirectoryPurpose::ExplicitMember)
+                .await?;
         }
         Ok(())
     }
@@ -364,18 +378,28 @@ impl ExtractionRoot {
         let mut current = PathBuf::new();
         for component in parent.components() {
             current.push(component.as_os_str());
-            self.ensure_directory(&current).await?;
+            self.ensure_directory(&current, DirectoryPurpose::ImplicitParent)
+                .await?;
         }
         Ok(())
     }
 
-    async fn ensure_directory(&mut self, path: &Path) -> Result<(), DecodeError> {
+    async fn ensure_directory(
+        &mut self,
+        path: &Path,
+        purpose: DirectoryPurpose,
+    ) -> Result<(), DecodeError> {
         if let Some(entry) = self.entries.get(path).copied()
             && entry.is_directory()
         {
             return Ok(());
         }
         if self.entries.contains_key(path) {
+            if purpose == DirectoryPurpose::ImplicitParent {
+                return Err(DecodeError::PathCollision {
+                    path: path.to_owned(),
+                });
+            }
             self.replace_leaf(path).await?;
         }
         // Missing parents are common, so inspect and replace only after a collision.
@@ -403,6 +427,11 @@ impl ExtractionRoot {
         }
         if metadata.is_none() && !self.entries.contains_key(path) {
             return Err(create_error);
+        }
+        if purpose == DirectoryPurpose::ImplicitParent {
+            return Err(DecodeError::PathCollision {
+                path: path.to_owned(),
+            });
         }
         self.replace_leaf(path).await?;
         let directory = self.create_directory(path).await?;

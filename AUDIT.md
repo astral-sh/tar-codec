@@ -22,13 +22,13 @@ Six findings needed a decision or remediation at the reviewed revision because d
 
 The link and `/.` cases change object reachability or type. Parent promotion discards an earlier archive member and chooses a third filesystem interpretation rather than rejecting an ambiguous sequence. DIF-01 is an intentional consequence of the crate's portable permission model rather than a failure to enforce archive-provided access control.
 
-DIF-01 has since been accepted and documented. DIF-02 and DIF-04 have been remediated with exact-or-reject link handling and directory-required member-suffix validation respectively.
+DIF-01 has since been accepted and documented. DIF-02, DIF-03, and DIF-04 have been remediated with exact-or-reject link handling, fail-closed implicit parent creation, and directory-required member-suffix validation respectively.
 
 | ID | Severity | Disposition | Differential |
 | --- | --- | --- | --- |
 | DIF-01 | Informational | Accepted / documented | Archived modes are normalized rather than restored |
 | DIF-02 | Medium | Remediated | Symlink normalization changes installed text and reachability |
-| DIF-03 | Medium | Needs remediation | Non-directory archive ancestors are promoted to directories |
+| DIF-03 | Medium | Remediated | Non-directory archive ancestors are promoted to directories |
 | DIF-04 | Medium | Remediated | `/.` bypasses regular-file trailing-separator rejection |
 | DIF-05 | Medium | Needs decision | PAX ownership is accepted but not applied |
 | DIF-06 | Low | Needs decision | PAX timestamps are accepted but not applied |
@@ -113,7 +113,7 @@ GNU tar and libarchive retain regular file `parent`, reject the child with `ENOT
 
 A symlink variant is three-way: after `alias -> real`, a later `alias/child` makes GNU write through the link, libarchive retain the link and reject, and `tar-codec` discard its pending link and create a real `alias` directory. GNU's behavior is unsuitable for secure extraction, but `tar-codec` should fail closed like libarchive rather than select a third tree.
 
-Reject implicit parent creation through any earlier non-directory archive entry. Add regular-file, hard-link, and pending-symlink ancestor tests.
+This was remediated by separating implicit parent synthesis from explicit directory extraction. An implicit parent now reuses only a real directory; an earlier archive file, hard link, pending symlink, or ambient non-directory produces `PathCollision` without replacing that object. Explicit directory members retain the normal exact-path overwrite behavior. Integration tests cover all three archive-created ancestor kinds, an ambient file, PAX-renamed descendants, destination symlink and junction parents, and exact-path cross-kind replacement.
 
 ### DIF-04 — `/.` bypasses regular-file trailing-separator rejection
 
@@ -230,8 +230,7 @@ The count excludes prior-audit behavior: unknown typeflags; nonzero sizes on dir
 
 ## Recommended remediation order
 
-1. Reject implicit parent creation through earlier non-directories (DIF-03).
-2. Decide whether ownership/timestamps are restored or rejected (DIF-05/06).
-3. Keep the remaining strict defaults; they are useful responses to real parser splits.
+1. Decide whether ownership/timestamps are restored or rejected (DIF-05/06).
+2. Keep the remaining strict defaults; they are useful responses to real parser splits.
 
 Behavioral fixes should receive focused integration tests under `crates/tar-codec/tests`, asserting both the result and final object type/content/link text so partial-error extraction cannot masquerade as a match.
