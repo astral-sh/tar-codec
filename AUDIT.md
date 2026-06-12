@@ -20,13 +20,13 @@ Six findings needed a decision or remediation at the reviewed revision because d
 5. PAX ownership is accepted but ignored, potentially leaving untrusted archive output owned by a privileged extracting identity.
 6. PAX access and modification times are accepted but ignored.
 
-The first four are the strongest security-differential results. Mode widening can expose private data. The link and `/.` cases change object reachability or type. Parent promotion discards an earlier archive member and chooses a third filesystem interpretation rather than rejecting an ambiguous sequence.
+The link and `/.` cases change object reachability or type. Parent promotion discards an earlier archive member and chooses a third filesystem interpretation rather than rejecting an ambiguous sequence. DIF-01 is an intentional consequence of the crate's portable permission model rather than a failure to enforce archive-provided access control.
 
-DIF-04 has since been remediated by rejecting directory-required suffixes on non-directory members before path normalization.
+DIF-01 has since been accepted and documented. DIF-04 has been remediated by rejecting directory-required suffixes on non-directory members before path normalization.
 
 | ID | Severity | Disposition | Differential |
 | --- | --- | --- | --- |
-| DIF-01 | High | Needs remediation | Archived modes can be widened |
+| DIF-01 | Informational | Accepted / documented | Archived modes are normalized rather than restored |
 | DIF-02 | Medium | Needs remediation | Symlink normalization changes installed text and reachability |
 | DIF-03 | Medium | Needs remediation | Non-directory archive ancestors are promoted to directories |
 | DIF-04 | Medium | Remediated | `/.` bypasses regular-file trailing-separator rejection |
@@ -67,14 +67,15 @@ This was directed differential testing, not fuzzing. Windows, ACLs, extended att
 
 ### DIF-01 — Archived modes can be widened
 
-Severity: High  
-Class: default fail-open metadata differential
+Severity: Informational
+
+Class: accepted portable metadata-model differential
 
 For ordinary members `file("private", 0600)` and `directory("private-dir", 0700)`, GNU tar and libarchive preserve `0600` and `0700`. With umask `022`, `tar-codec` creates `0644` and `0755`.
 
-`decode_member` reduces the entire mode to `mode & 0o111 != 0` (`decode.rs:579-581`). Files are created with `0666` or `0777` (`decode/extract.rs:572-590`), directories use ordinary creation defaults, and no final pass narrows permissions. A private `0600` payload can therefore become readable by other local users.
+`decode_member` deliberately reduces the mode to portable executable intent using `mode & 0o111 != 0` (`decode.rs:579-581`). Files are created with `0666` or `0777` (`decode/extract.rs:572-590`), filtered by the process umask; directories use platform creation defaults. Exact owner/group permissions and special mode bits are outside this extraction model.
 
-Carry permission bits through decoding, create payloads with restrictive temporary modes, and apply final file and deferred directory modes after writing. Decide explicitly how set-id, sticky, and unsupported bits are handled. Add Unix integration cases for `0000`, `0600`, `0640`, `0700`, and asymmetric execute bits under a controlled umask.
+This differential is accepted. Restoring arbitrary archive modes would add Unix-specific policy, special-bit handling, deferred directory metadata, and cross-platform behavior that the high-level encoder does not model either. `Archive::extract` now documents the normalization and recommends pre-creating a restrictive destination for sensitive contents. Exact backup-style permission restoration can be considered later as an explicit opt-in policy rather than default behavior.
 
 ### DIF-02 — Symlink normalization changes link contents and reachability
 
@@ -230,9 +231,8 @@ The count excludes prior-audit behavior: unknown typeflags; nonzero sizes on dir
 ## Recommended remediation order
 
 1. Preserve installed symlink text while separately normalizing its graph target (DIF-02).
-2. Prevent permission widening (DIF-01).
-3. Reject implicit parent creation through earlier non-directories (DIF-03).
-4. Decide whether ownership/timestamps are restored or rejected (DIF-05/06).
-5. Keep the remaining strict defaults; they are useful responses to real parser splits.
+2. Reject implicit parent creation through earlier non-directories (DIF-03).
+3. Decide whether ownership/timestamps are restored or rejected (DIF-05/06).
+4. Keep the remaining strict defaults; they are useful responses to real parser splits.
 
-The first four fixes should receive focused integration tests under `crates/tar-codec/tests`, asserting both the result and final object type/content/link text so partial-error extraction cannot masquerade as a match.
+Behavioral fixes should receive focused integration tests under `crates/tar-codec/tests`, asserting both the result and final object type/content/link text so partial-error extraction cannot masquerade as a match.

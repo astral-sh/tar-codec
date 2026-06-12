@@ -115,6 +115,13 @@ impl<R: AsyncRead + Unpin> Archive<R> {
     /// `policy` controls extraction semantics, including overwrite behavior.
     /// See [`DecodePolicy`] for information about each option and its default.
     ///
+    /// Archived Unix permission modes are normalized rather than restored. New
+    /// regular files are created with mode `0o777` when any archived execute bit
+    /// is set and `0o666` otherwise, in both cases filtered by the process umask.
+    /// Directories use the platform's default creation mode, and special mode
+    /// bits are not restored. Callers extracting sensitive contents should
+    /// pre-create `dest` and its ancestors with suitably restrictive permissions.
+    ///
     /// **IMPORTANT**: `dest` **MUST NOT** be concurrently modified during extraction.
     /// No correctness/isolation guarantees are made if `dest` is externally modified.
     ///
