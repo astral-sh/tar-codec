@@ -587,18 +587,23 @@ fn decode_member<R>(
         })?;
     policy.check_name(header.position, "member path", &path_text)?;
 
-    // This is a conservative choice: some other decoders treat a trailing slash
-    // on a regular file as a signal to make a directory, while others silently
-    // strip it and create a regular file instead. The former is consistent
-    // with pre-ustar ("v7 tar") behavior, but is ambiguous in a ustar/pax/GNU
-    // setting.
+    // This is a conservative choice: some other decoders treat directory-required
+    // suffixes on a regular file as a signal to make a directory, while others
+    // silently strip them and create a regular file instead. The former is
+    // consistent with pre-ustar ("v7 tar") behavior, but is ambiguous in a
+    // ustar/pax/GNU setting.
     // TODO: Make this configurable through policy?
-    if path_text.ends_with('/') && header.kind != UstarKind::Directory {
+    if header.kind != UstarKind::Directory
+        && (path_text.ends_with('/')
+            || path_text
+                .rsplit_once('/')
+                .is_some_and(|(_, component)| matches!(component, "." | "..")))
+    {
         return Err(DecodeError::unsafe_path(
             header.position,
             "member path",
             &path_text,
-            "only a directory may have a trailing separator",
+            "only a directory may have a directory-required path suffix",
         ));
     }
     let path = normalize_member_path(header.position, &path_text)?;

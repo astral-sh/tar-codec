@@ -11,7 +11,7 @@ This audit compared default `tar-codec` extraction with GNU tar 1.35 and bsdtar/
 
 Most differentials are desirable fail-closed behavior. `tar-codec` is safer than the comparison tools for duplicate or unknown PAX records, malformed extension ordering, embedded NULs, deleted required fields, absolute paths, and incomplete end markers. Some results are comparison-tool bugs: libarchive ignores global PAX state and deletion tombstones, while GNU tar mishandles PAX hard-link data.
 
-Six findings need a decision or remediation because default extraction succeeds with a materially different tree or metadata rather than failing closed:
+Six findings needed a decision or remediation at the reviewed revision because default extraction succeeded with a materially different tree or metadata rather than failing closed:
 
 1. Archived modes can widen from `0600` to `0644` or `0700` to `0755`.
 2. Symlink text is simplified before installation; `target/` and `target/.` become `target`, turning a dangling link into a live link to a regular file.
@@ -22,12 +22,14 @@ Six findings need a decision or remediation because default extraction succeeds 
 
 The first four are the strongest security-differential results. Mode widening can expose private data. The link and `/.` cases change object reachability or type. Parent promotion discards an earlier archive member and chooses a third filesystem interpretation rather than rejecting an ambiguous sequence.
 
+DIF-04 has since been remediated by rejecting directory-required suffixes on non-directory members before path normalization.
+
 | ID | Severity | Disposition | Differential |
 | --- | --- | --- | --- |
 | DIF-01 | High | Needs remediation | Archived modes can be widened |
 | DIF-02 | Medium | Needs remediation | Symlink normalization changes installed text and reachability |
 | DIF-03 | Medium | Needs remediation | Non-directory archive ancestors are promoted to directories |
-| DIF-04 | Medium | Needs remediation | `/.` bypasses regular-file trailing-separator rejection |
+| DIF-04 | Medium | Remediated | `/.` bypasses regular-file trailing-separator rejection |
 | DIF-05 | Medium | Needs decision | PAX ownership is accepted but not applied |
 | DIF-06 | Low | Needs decision | PAX timestamps are accepted but not applied |
 | DIF-07 | Medium | Documented opt-in risk | Unknown vendor records can hide path/sparse semantics |
@@ -119,9 +121,9 @@ Class: default PAX path type differential
 
 For `x{path=thing/.} -> regular("raw", "X")`, `tar-codec` succeeds and creates regular file `thing`. Libarchive 3.7.4 does likewise. GNU tar treats the name as directory-shaped, creates directory `thing`, then fails to open `thing/.` as regular output.
 
-The ambiguity check only tests `path_text.ends_with('/')` (`decode.rs:590-603`). Normalization then discards terminal `Component::CurDir` (`decode.rs:649-682`). This bypasses the same type ambiguity that motivated rejecting `file/`.
+At the reviewed revision, the ambiguity check only tested `path_text.ends_with('/')` (`decode.rs:590-603`). Normalization then discarded terminal `Component::CurDir` (`decode.rs:649-682`). This bypassed the same type ambiguity that motivated rejecting `file/`.
 
-Reject non-directory members whose original path has directory-required terminal syntax, including a final `.` component. Test `file/.`, `file//.`, and directory members with the same spellings.
+This was remediated by rejecting non-directory members whose original path has directory-required terminal syntax, including final `.` and `..` components. Decoding and encoding integration tests cover `file/.`, `file//.`, repeated `./` components, `foo/bar/..` with and without a trailing separator, and directory members with safe final-dot spellings.
 
 ### DIF-05 — PAX ownership is accepted but not applied
 
@@ -230,8 +232,7 @@ The count excludes prior-audit behavior: unknown typeflags; nonzero sizes on dir
 1. Preserve installed symlink text while separately normalizing its graph target (DIF-02).
 2. Prevent permission widening (DIF-01).
 3. Reject implicit parent creation through earlier non-directories (DIF-03).
-4. Close the `/.` path ambiguity (DIF-04).
-5. Decide whether ownership/timestamps are restored or rejected (DIF-05/06).
-6. Keep the remaining strict defaults; they are useful responses to real parser splits.
+4. Decide whether ownership/timestamps are restored or rejected (DIF-05/06).
+5. Keep the remaining strict defaults; they are useful responses to real parser splits.
 
 The first four fixes should receive focused integration tests under `crates/tar-codec/tests`, asserting both the result and final object type/content/link text so partial-error extraction cannot masquerade as a match.

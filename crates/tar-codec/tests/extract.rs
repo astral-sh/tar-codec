@@ -131,33 +131,72 @@ async fn rejects_directory_payload_without_writing_embedded_members() {
     assert!(std::fs::read_dir(destination).unwrap().next().is_none());
 }
 
-/// Ensures that we reject a regular file that ends with a trailing slash.
+/// Ensures that we reject a regular file with a directory-required path suffix.
 /// See malo's `malicious/pax_path_trailoing_slash_file.tar` for the case
 /// that this was derived from.
 /// See: <https://github.com/fastzip/malo/tree/3df544f1a2fc498b2a84eb34981deb111cadbf32/tar/malicious>
 #[tokio::test]
-async fn rejects_trailing_separator_on_regular_file_without_writing_members() {
-    let mut archive = ArchiveBuilder::new();
-    archive
-        .pax(b'x', &pax_record(PaxKeyword::Path, "file.txt/"))
-        .posix("ignored", b'0', b"hello", "", 0o644);
-    let bytes = archive.finish();
+async fn rejects_directory_required_suffix_on_regular_file_without_writing_members() {
+    for path in [
+        "file.txt/",
+        "file.txt/.",
+        "file.txt//.",
+        "file.txt/././.",
+        "file.txt/./././",
+        "foo/bar/..",
+        "foo/bar/../",
+    ] {
+        let mut archive = ArchiveBuilder::new();
+        archive
+            .pax(b'x', &pax_record(PaxKeyword::Path, path))
+            .posix("ignored", b'0', b"hello", "", 0o644);
+        let bytes = archive.finish();
 
-    let temp = tempdir().unwrap();
-    let destination = temp.path().join("out");
-    assert!(matches!(
+        let temp = tempdir().expect("temporary directory should be created");
+        let destination = temp.path().join("out");
+        assert!(matches!(
+            Archive::new(bytes.as_slice())
+                .extract(&destination, DecodePolicy::default())
+                .await,
+            Err(DecodeError::UnsafePath {
+                position: 1024,
+                context: "member path",
+                value,
+                reason: "only a directory may have a directory-required path suffix",
+            }) if value == path
+        ));
+        assert!(destination.is_dir());
+        assert!(
+            std::fs::read_dir(destination)
+                .expect("destination should be readable")
+                .next()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn accepts_directory_required_suffix_on_directory_members() {
+    for path in [
+        "directory/.",
+        "directory//.",
+        "directory/././.",
+        "directory/./././",
+    ] {
+        let mut archive = ArchiveBuilder::new();
+        archive
+            .pax(b'x', &pax_record(PaxKeyword::Path, path))
+            .posix("ignored", b'5', b"", "", 0o755);
+        let bytes = archive.finish();
+
+        let temp = tempdir().expect("temporary directory should be created");
+        let destination = temp.path().join("out");
         Archive::new(bytes.as_slice())
             .extract(&destination, DecodePolicy::default())
-            .await,
-        Err(DecodeError::UnsafePath {
-            position: 1024,
-            context: "member path",
-            value,
-            reason: "only a directory may have a trailing separator",
-        }) if value == "file.txt/"
-    ));
-    assert!(destination.is_dir());
-    assert!(std::fs::read_dir(destination).unwrap().next().is_none());
+            .await
+            .expect("directory member should be extracted");
+        assert!(destination.join("directory").is_dir());
+    }
 }
 
 #[tokio::test]
