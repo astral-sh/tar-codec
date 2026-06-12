@@ -22,12 +22,12 @@ Six findings needed a decision or remediation at the reviewed revision because d
 
 The link and `/.` cases change object reachability or type. Parent promotion discards an earlier archive member and chooses a third filesystem interpretation rather than rejecting an ambiguous sequence. DIF-01 is an intentional consequence of the crate's portable permission model rather than a failure to enforce archive-provided access control.
 
-DIF-01 has since been accepted and documented. DIF-04 has been remediated by rejecting directory-required suffixes on non-directory members before path normalization.
+DIF-01 has since been accepted and documented. DIF-02 and DIF-04 have been remediated with exact-or-reject link handling and directory-required member-suffix validation respectively.
 
 | ID | Severity | Disposition | Differential |
 | --- | --- | --- | --- |
 | DIF-01 | Informational | Accepted / documented | Archived modes are normalized rather than restored |
-| DIF-02 | Medium | Needs remediation | Symlink normalization changes installed text and reachability |
+| DIF-02 | Medium | Remediated | Symlink normalization changes installed text and reachability |
 | DIF-03 | Medium | Needs remediation | Non-directory archive ancestors are promoted to directories |
 | DIF-04 | Medium | Remediated | `/.` bypasses regular-file trailing-separator rejection |
 | DIF-05 | Medium | Needs decision | PAX ownership is accepted but not applied |
@@ -91,9 +91,9 @@ x{path=link, linkpath=target/.} -> symlink
 
 The same occurs for `linkpath=target/`. GNU tar and libarchive preserve the exact archived link text. Because `target` is regular, their links fail to resolve with directory-required suffixes. `tar-codec` installs `link -> target`, which is live and reads `X`.
 
-`normalize_symlink_target` discards `CurDir`, trailing separators, and cancellable components (`decode.rs:705-763`). `reserve_symlink` stores that rewritten value as `link_contents` (`decode/extract.rs:283-297`), and installation writes it. POSIX defines `linkpath` as the link's contents, not just a lexically similar destination. The transformation is not resolution-preserving: `regular/../other` can likewise erase `ENOTDIR`.
+At the reviewed revision, `normalize_symlink_target` discarded `CurDir`, trailing separators, and cancellable components (`decode.rs:705-763`). `reserve_symlink` stored that rewritten value as `link_contents` (`decode/extract.rs:283-297`), and installation wrote it. POSIX defines `linkpath` as the link's contents, not just a lexically similar destination. The transformation was not resolution-preserving: `regular/../other` could likewise erase `ENOTDIR`.
 
-Preserve the original validated relative target for installation and keep a separate normalized root-relative target for containment/graph checks. If the graph cannot model a spelling safely, reject it. Test `target/`, `target/.`, `directory/.`, and `regular/../other`.
+This was remediated with an exact-or-reject invariant. Extraction now preserves the archive-provided link contents separately from its normalized graph target, validates directory-required suffixes against the terminal target kind, and rejects normal-component/parent-component cancellation whose filesystem resolution can differ from lexical normalization. Integration tests cover exact `./target`, `target/`, and `target/.` text, file-versus-directory suffix behavior, and rejection of `regular/../other`.
 
 ### DIF-03 — Non-directory ancestors are silently promoted to directories
 
@@ -230,9 +230,8 @@ The count excludes prior-audit behavior: unknown typeflags; nonzero sizes on dir
 
 ## Recommended remediation order
 
-1. Preserve installed symlink text while separately normalizing its graph target (DIF-02).
-2. Reject implicit parent creation through earlier non-directories (DIF-03).
-3. Decide whether ownership/timestamps are restored or rejected (DIF-05/06).
-4. Keep the remaining strict defaults; they are useful responses to real parser splits.
+1. Reject implicit parent creation through earlier non-directories (DIF-03).
+2. Decide whether ownership/timestamps are restored or rejected (DIF-05/06).
+3. Keep the remaining strict defaults; they are useful responses to real parser splits.
 
 Behavioral fixes should receive focused integration tests under `crates/tar-codec/tests`, asserting both the result and final object type/content/link text so partial-error extraction cannot masquerade as a match.

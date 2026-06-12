@@ -10,14 +10,14 @@ use tar_framing::PaxKeyword;
 use tempfile::tempdir;
 
 #[tokio::test]
-async fn creates_safe_normalized_and_opt_in_dangling_symlink_chains() {
+async fn creates_safe_exact_and_opt_in_dangling_symlink_chains() {
     let temp = tempdir().unwrap();
     let destination = temp.path().join("safe");
     let mut archive = ArchiveBuilder::new();
     archive
         .posix("dir/file", b'0', b"ok", "", 0o644)
         .posix("dir/one", b'2', b"", "file", 0o644)
-        .posix("dir/normalized", b'2', b"", "./sub/../file", 0o644)
+        .posix("dir/exact", b'2', b"", "./file", 0o644)
         .posix("two", b'2', b"", "dir/one", 0o644);
     let bytes = archive.finish();
     Archive::new(bytes.as_slice())
@@ -29,8 +29,8 @@ async fn creates_safe_normalized_and_opt_in_dangling_symlink_chains() {
         "ok"
     );
     assert_eq!(
-        std::fs::read_link(destination.join("dir/normalized")).unwrap(),
-        Path::new("file")
+        std::fs::read_link(destination.join("dir/exact")).unwrap(),
+        Path::new("./file")
     );
 
     let destination = temp.path().join("dangling");
@@ -71,6 +71,79 @@ async fn creates_safe_normalized_and_opt_in_dangling_symlink_chains() {
         std::fs::read_link(destination.join("two")).unwrap(),
         Path::new("missing")
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn preserves_directory_required_symlink_targets_and_rejects_file_targets() {
+    let temp = tempdir().expect("temporary directory should be created");
+    for (case, target) in [("separator", "target/"), ("dot", "target/.")] {
+        let destination = temp.path().join(format!("directory-{case}"));
+        let mut archive = ArchiveBuilder::new();
+        archive
+            .posix("target", b'5', b"", "", 0o755)
+            .pax(b'x', &pax_record(PaxKeyword::LinkPath, target))
+            .posix("link", b'2', b"", "ignored", 0o644);
+        let bytes = archive.finish();
+        Archive::new(bytes.as_slice())
+            .extract(&destination, DecodePolicy::default())
+            .await
+            .expect("directory-required target should resolve to a directory");
+        assert_eq!(
+            std::fs::read_link(destination.join("link"))
+                .expect("symbolic link should be readable")
+                .as_os_str(),
+            Path::new(target).as_os_str()
+        );
+
+        let destination = temp.path().join(format!("file-{case}"));
+        let mut archive = ArchiveBuilder::new();
+        archive
+            .posix("target", b'0', b"contents", "", 0o644)
+            .pax(b'x', &pax_record(PaxKeyword::LinkPath, target))
+            .posix("link", b'2', b"", "ignored", 0o644);
+        let bytes = archive.finish();
+        assert!(matches!(
+            Archive::new(bytes.as_slice())
+                .extract(&destination, DecodePolicy::default())
+                .await,
+            Err(DecodeError::InvalidLink {
+                reason: "target path suffix requires a directory",
+                ..
+            })
+        ));
+        assert!(!destination.join("link").exists());
+        assert_eq!(
+            std::fs::read(destination.join("target"))
+                .expect("previous target payload should remain"),
+            b"contents"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rejects_ambiguous_parent_directory_traversal_in_pax_symlink_targets() {
+    let temp = tempdir().expect("temporary directory should be created");
+    let destination = temp.path().join("out");
+    let mut archive = ArchiveBuilder::new();
+    archive
+        .posix("regular", b'0', b"regular", "", 0o644)
+        .posix("secret", b'0', b"secret", "", 0o600)
+        .pax(b'x', &pax_record(PaxKeyword::LinkPath, "regular/../secret"))
+        .posix("link", b'2', b"", "ignored", 0o644);
+    let bytes = archive.finish();
+
+    assert!(matches!(
+        Archive::new(bytes.as_slice())
+            .extract(&destination, DecodePolicy::default())
+            .await,
+        Err(DecodeError::UnsafePath {
+            context: "symbolic-link target",
+            reason: "contains ambiguous parent-directory traversal",
+            ..
+        })
+    ));
+    assert!(!destination.join("link").exists());
 }
 
 #[tokio::test]

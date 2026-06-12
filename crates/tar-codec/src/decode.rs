@@ -689,33 +689,37 @@ fn normalize_member_path(position: u64, value: &str) -> Result<PathBuf, DecodeEr
 
 /// A validated symbolic-link target represented in both coordinate systems
 /// needed during extraction.
-struct NormalizedSymlinkTarget {
-    /// Normalized contents interpreted by the filesystem relative to the
-    /// symbolic link's parent.
+struct ValidatedSymlinkTarget {
+    /// Exact archive-provided contents written into the symbolic link.
     link_contents: PathBuf,
-    /// The same target resolved relative to the extraction root, used for
+    /// The target resolved relative to the extraction root, used for
     /// containment and symbolic-link graph validation.
     resolved_target: PathBuf,
+    /// Whether the target's suffix requires its terminal object to be a directory.
+    requires_directory: bool,
 }
 
-/// Normalizes and resolves a symbolic-link target without changing its base.
+/// Validates and resolves a symbolic-link target without changing its contents.
 ///
-/// [`NormalizedSymlinkTarget::link_contents`] preserves the target as a
-/// parent-relative link value, while [`NormalizedSymlinkTarget::resolved_target`]
+/// [`ValidatedSymlinkTarget::link_contents`] preserves the exact archive-provided
+/// value, while [`ValidatedSymlinkTarget::resolved_target`]
 /// identifies its destination relative to the extraction root. For example,
 /// `../file` on a link at `dir/link` remains `../file` as link contents and
 /// resolves to `file`.
 ///
-/// Absolute, platform-prefixed, and escaping targets are rejected.
-fn normalize_symlink_target(
+/// Absolute, platform-prefixed, escaping, and lexically ambiguous targets are
+/// rejected. In particular, a parent component following a normal component
+/// could resolve differently if that component is a symbolic link or not a
+/// directory, so accepting it would make lexical graph validation unsound.
+fn validate_symlink_target(
     position: u64,
     path: &Path,
     value: &str,
-) -> Result<NormalizedSymlinkTarget, DecodeError> {
+) -> Result<ValidatedSymlinkTarget, DecodeError> {
     validate_extraction_path(position, "symbolic-link target", value)?;
     let base = path.parent().unwrap_or_else(|| Path::new(""));
-    let mut contents = PathBuf::new();
     let mut resolved = base.to_owned();
+    let mut normal_component_seen = false;
     for component in Path::new(value).components() {
         match component {
             Component::Prefix(_) => {
@@ -736,13 +740,13 @@ fn normalize_symlink_target(
             }
             Component::CurDir => {}
             Component::ParentDir => {
-                if matches!(
-                    contents.components().next_back(),
-                    Some(Component::Normal(_))
-                ) {
-                    contents.pop();
-                } else {
-                    contents.push("..");
+                if normal_component_seen {
+                    return Err(DecodeError::unsafe_path(
+                        position,
+                        "symbolic-link target",
+                        value,
+                        "contains ambiguous parent-directory traversal",
+                    ));
                 }
                 if !resolved.pop() {
                     return Err(DecodeError::unsafe_path(
@@ -754,17 +758,16 @@ fn normalize_symlink_target(
                 }
             }
             Component::Normal(component) => {
-                contents.push(component);
+                normal_component_seen = true;
                 resolved.push(component);
             }
         }
     }
-    if contents.as_os_str().is_empty() {
-        contents.push(".");
-    }
-    Ok(NormalizedSymlinkTarget {
-        link_contents: contents,
+    Ok(ValidatedSymlinkTarget {
+        link_contents: value.into(),
         resolved_target: resolved,
+        requires_directory: value.ends_with('/')
+            || matches!(value.rsplit('/').next(), Some("." | "..")),
     })
 }
 
@@ -863,18 +866,50 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_symlink_contents_and_resolves_targets() {
-        for (link, target, expected_contents, expected_resolved) in [
-            ("link", "target", "target", "target"),
-            ("nested/link", "../target", "../target", "target"),
-            ("nested/link", "./target", "target", "nested/target"),
-            ("a/b/link", "../c/target", "../c/target", "a/c/target"),
-            ("nested/link", ".", ".", "nested"),
-            ("nested/link", "a/../target", "target", "nested/target"),
+    fn preserves_symlink_contents_and_resolves_targets() {
+        for (link, target, expected_contents, expected_resolved, requires_directory) in [
+            ("link", "target", "target", "target", false),
+            ("nested/link", "../target", "../target", "target", false),
+            (
+                "nested/link",
+                "./target",
+                "./target",
+                "nested/target",
+                false,
+            ),
+            (
+                "a/b/link",
+                "../c/target",
+                "../c/target",
+                "a/c/target",
+                false,
+            ),
+            ("nested/link", ".", ".", "nested", true),
+            ("nested/link", "target/", "target/", "nested/target", true),
+            ("nested/link", "target/.", "target/.", "nested/target", true),
         ] {
-            let normalized = normalize_symlink_target(0, Path::new(link), target).unwrap();
-            assert_eq!(normalized.link_contents, Path::new(expected_contents));
-            assert_eq!(normalized.resolved_target, Path::new(expected_resolved));
+            let validated = validate_symlink_target(0, Path::new(link), target)
+                .expect("symlink target should be valid");
+            assert_eq!(
+                validated.link_contents.as_os_str(),
+                Path::new(expected_contents).as_os_str()
+            );
+            assert_eq!(validated.resolved_target, Path::new(expected_resolved));
+            assert_eq!(validated.requires_directory, requires_directory);
+        }
+    }
+
+    #[test]
+    fn rejects_ambiguous_parent_directory_traversal_in_symlink_targets() {
+        for target in ["a/..", "a/../target", "../a/../target"] {
+            assert!(matches!(
+                validate_symlink_target(0, Path::new("nested/link"), target),
+                Err(DecodeError::UnsafePath {
+                    context: "symbolic-link target",
+                    reason: "contains ambiguous parent-directory traversal",
+                    ..
+                })
+            ));
         }
     }
 }

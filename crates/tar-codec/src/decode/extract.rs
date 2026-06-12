@@ -33,6 +33,7 @@ struct PendingSymlink {
     target_text: String,
     link_contents: PathBuf,
     resolved_target: PathBuf,
+    requires_directory: bool,
 }
 
 impl PendingSymlink {
@@ -289,7 +290,7 @@ impl ExtractionRoot {
 
     async fn reserve_symlink(&mut self, member: &DecodedMember) -> Result<(), DecodeError> {
         let target_text = member.link_target.clone();
-        let target = normalize_symlink_target(member.position, &member.path, &target_text)?;
+        let target = validate_symlink_target(member.position, &member.path, &target_text)?;
         self.ensure_parents(&member.path).await?;
         self.replace_leaf(&member.path).await?;
         let path = member.path.clone();
@@ -302,6 +303,7 @@ impl ExtractionRoot {
             target_text,
             link_contents: target.link_contents,
             resolved_target: target.resolved_target,
+            requires_directory: target.requires_directory,
         });
         Ok(())
     }
@@ -455,6 +457,13 @@ impl ExtractionRoot {
                 (ResolvedTarget::Unowned(path), SymlinkTargetPolicy::AllowAmbientAndMissing) => {
                     self.inspect_ambient_target(&path).await?
                 }
+            };
+            let kind = match (kind, link.requires_directory) {
+                (TerminalKind::File, true) => {
+                    return Err(link.error("target path suffix requires a directory"));
+                }
+                (TerminalKind::Dangling, true) => TerminalKind::Directory,
+                (kind, _) => kind,
             };
             links.push((link, kind));
         }
