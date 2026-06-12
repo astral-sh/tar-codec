@@ -135,6 +135,9 @@ impl<R: AsyncRead + Unpin> Archive<R> {
     /// Directories use the platform's default creation mode, and special mode
     /// bits are not restored. Callers extracting sensitive contents should
     /// pre-create `dest` and its ancestors with suitably restrictive permissions.
+    /// Archived owner and group metadata, including PAX `uid`, `gid`, `uname`,
+    /// and `gname` records, is not restored. Filesystem ownership is instead
+    /// determined by the extracting process and destination directory.
     ///
     /// **IMPORTANT**: `dest` **MUST NOT** be concurrently modified during extraction.
     /// No correctness/isolation guarantees are made if `dest` is externally modified.

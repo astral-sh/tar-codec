@@ -22,7 +22,7 @@ Six findings needed a decision or remediation at the reviewed revision because d
 
 The link and `/.` cases change object reachability or type. Parent promotion discards an earlier archive member and chooses a third filesystem interpretation rather than rejecting an ambiguous sequence. DIF-01 is an intentional consequence of the crate's portable permission model rather than a failure to enforce archive-provided access control.
 
-DIF-01 has since been accepted and documented. DIF-02, DIF-03, and DIF-04 have been remediated with exact-or-reject link handling, fail-closed implicit parent creation, and directory-required member-suffix validation respectively.
+DIF-01 and DIF-05 have since been accepted and documented as intentional metadata-model differentials. DIF-02, DIF-03, and DIF-04 have been remediated with exact-or-reject link handling, fail-closed implicit parent creation, and directory-required member-suffix validation respectively.
 
 | ID | Severity | Disposition | Differential |
 | --- | --- | --- | --- |
@@ -30,7 +30,7 @@ DIF-01 has since been accepted and documented. DIF-02, DIF-03, and DIF-04 have b
 | DIF-02 | Medium | Remediated | Symlink normalization changes installed text and reachability |
 | DIF-03 | Medium | Remediated | Non-directory archive ancestors are promoted to directories |
 | DIF-04 | Medium | Remediated | `/.` bypasses regular-file trailing-separator rejection |
-| DIF-05 | Medium | Needs decision | PAX ownership is accepted but not applied |
+| DIF-05 | Informational | Accepted / documented | PAX ownership is accepted but not applied |
 | DIF-06 | Low | Needs decision | PAX timestamps are accepted but not applied |
 | DIF-07 | Medium | Documented opt-in risk | Unknown vendor records can hide path/sparse semantics |
 | DIF-08 | Informational | Expected fail-closed | Duplicate local PAX records are rejected by default |
@@ -128,14 +128,14 @@ This was remediated by rejecting non-directory members whose original path has d
 
 ### DIF-05 — PAX ownership is accepted but not applied
 
-Severity: Medium  
-Class: metadata differential / possible privilege confusion
+Severity: Informational
+Class: accepted portable metadata-model differential
 
 For `x{uid=1234, gid=2345} -> file("owned", "X")`, GNU tar and libarchive restore `1234:2345` when privileged. `tar-codec` accepts both records but leaves extractor ownership.
 
-`uid`, `gid`, `uname`, and `gname` are typed (`pax.rs:430-450`) but never enter `DecodedMember`, and extraction performs no ownership operation. In a privileged service, attacker-controlled content can consequently appear service- or root-owned and mislead later ownership-based trust decisions.
+`uid`, `gid`, `uname`, and `gname` are typed (`pax.rs:430-450`) but never enter `DecodedMember`, and extraction performs no ownership operation. Ownership is instead determined by the extracting process and destination directory, consistently with ignored ownership fields in ordinary tar headers.
 
-Either restore ownership behind an explicit privileged policy, including name-over-numeric precedence, or reject ownership records when they will not be honored. “Extract as caller” should be explicit rather than silent.
+This differential is accepted. Numeric identities are host-specific, ownership changes are privileged and platform-dependent, and an untrusted archive should not select a local identity for extracted objects by default. `Archive::extract` now documents this behavior. Privileged callers must not treat the resulting service or root ownership as evidence that archive contents are trusted.
 
 ### DIF-06 — PAX timestamps are accepted but not applied
 
@@ -230,7 +230,7 @@ The count excludes prior-audit behavior: unknown typeflags; nonzero sizes on dir
 
 ## Recommended remediation order
 
-1. Decide whether ownership/timestamps are restored or rejected (DIF-05/06).
+1. Decide whether timestamps are restored or rejected (DIF-06).
 2. Keep the remaining strict defaults; they are useful responses to real parser splits.
 
 Behavioral fixes should receive focused integration tests under `crates/tar-codec/tests`, asserting both the result and final object type/content/link text so partial-error extraction cannot masquerade as a match.
