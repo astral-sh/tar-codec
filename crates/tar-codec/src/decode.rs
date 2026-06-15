@@ -690,8 +690,8 @@ fn normalize_member_path(position: u64, value: &str) -> Result<PathBuf, DecodeEr
 /// A validated symbolic-link target represented in both coordinate systems
 /// needed during extraction.
 struct ValidatedSymlinkTarget {
-    /// Exact archive-provided contents written into the symbolic link.
-    link_contents: PathBuf,
+    /// Exact archive-provided contents, before platform-specific installation.
+    link_contents: String,
     /// The target resolved relative to the extraction root, used for
     /// containment and symbolic-link graph validation.
     resolved_target: PathBuf,
@@ -764,7 +764,7 @@ fn validate_symlink_target(
         }
     }
     Ok(ValidatedSymlinkTarget {
-        link_contents: value.into(),
+        link_contents: value.to_owned(),
         resolved_target: resolved,
         requires_directory: value.ends_with('/')
             || matches!(value.rsplit('/').next(), Some("." | "..")),
@@ -890,10 +890,7 @@ mod tests {
         ] {
             let validated = validate_symlink_target(0, Path::new(link), target)
                 .expect("symlink target should be valid");
-            assert_eq!(
-                validated.link_contents.as_os_str(),
-                Path::new(expected_contents).as_os_str()
-            );
+            assert_eq!(validated.link_contents, expected_contents);
             assert_eq!(validated.resolved_target, Path::new(expected_resolved));
             assert_eq!(validated.requires_directory, requires_directory);
         }

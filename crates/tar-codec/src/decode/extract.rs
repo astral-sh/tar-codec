@@ -23,15 +23,16 @@ use {
 
 /// A symbolic link awaiting graph validation and filesystem installation.
 ///
-/// [`PendingSymlink::link_contents`] is written to the filesystem, while
-/// [`PendingSymlink::resolved_target`] is used to validate the archive's
-/// symbolic-link graph relative to the extraction root.
+/// [`PendingSymlink::link_contents`] preserves the archive text for filesystem
+/// installation, while [`PendingSymlink::resolved_target`] is used to validate
+/// the archive's symbolic-link graph relative to the extraction root. Windows
+/// installation translates archive `/` separators to native separators.
 #[derive(Clone, Debug)]
 struct PendingSymlink {
     path: PathBuf,
     position: u64,
     target_text: String,
-    link_contents: PathBuf,
+    link_contents: String,
     resolved_target: PathBuf,
     requires_directory: bool,
 }
@@ -773,7 +774,7 @@ fn metadata_is_link(metadata: &Metadata) -> bool {
 #[cfg(unix)]
 fn create_symlink(
     directory: &Dir,
-    contents: &Path,
+    contents: &str,
     path: &Path,
     _kind: TerminalKind,
 ) -> io::Result<()> {
@@ -783,21 +784,24 @@ fn create_symlink(
 #[cfg(windows)]
 fn create_symlink(
     directory: &Dir,
-    contents: &Path,
+    contents: &str,
     path: &Path,
     kind: TerminalKind,
 ) -> io::Result<()> {
+    // Tar link targets use `/`, but Windows stores the supplied target text in
+    // a reparse point without making it usable as a native relative path.
+    let contents = contents.replace('/', "\\");
     match kind {
-        TerminalKind::File => directory.symlink_file(contents, path),
-        TerminalKind::Directory => directory.symlink_dir(contents, path),
-        TerminalKind::Dangling => directory.symlink_file(contents, path),
+        TerminalKind::File => directory.symlink_file(&contents, path),
+        TerminalKind::Directory => directory.symlink_dir(&contents, path),
+        TerminalKind::Dangling => directory.symlink_file(&contents, path),
     }
 }
 
 #[cfg(not(any(unix, windows)))]
 fn create_symlink(
     _directory: &Dir,
-    _contents: &Path,
+    _contents: &str,
     _path: &Path,
     _kind: TerminalKind,
 ) -> io::Result<()> {

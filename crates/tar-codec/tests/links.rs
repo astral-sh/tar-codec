@@ -1,6 +1,6 @@
 pub mod support;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use support::{ArchiveBuilder, pax_record, single_posix_member};
 use tar_codec::decode::{
@@ -8,6 +8,16 @@ use tar_codec::decode::{
 };
 use tar_framing::PaxKeyword;
 use tempfile::tempdir;
+
+#[cfg(not(windows))]
+fn installed_link_contents(contents: &str) -> PathBuf {
+    contents.into()
+}
+
+#[cfg(windows)]
+fn installed_link_contents(contents: &str) -> PathBuf {
+    contents.replace('/', "\\").into()
+}
 
 #[tokio::test]
 async fn creates_safe_exact_and_opt_in_dangling_symlink_chains() {
@@ -30,7 +40,7 @@ async fn creates_safe_exact_and_opt_in_dangling_symlink_chains() {
     );
     assert_eq!(
         std::fs::read_link(destination.join("dir/exact")).unwrap(),
-        Path::new("./file")
+        installed_link_contents("./file")
     );
 
     let destination = temp.path().join("dangling");
@@ -46,7 +56,7 @@ async fn creates_safe_exact_and_opt_in_dangling_symlink_chains() {
         .unwrap();
     assert_eq!(
         std::fs::read_link(destination.join("link")).unwrap(),
-        Path::new("ambient/missing")
+        installed_link_contents("ambient/missing")
     );
 
     let destination = temp.path().join("dangling-chain");
@@ -65,11 +75,11 @@ async fn creates_safe_exact_and_opt_in_dangling_symlink_chains() {
         .unwrap();
     assert_eq!(
         std::fs::read_link(destination.join("one")).unwrap(),
-        Path::new("two")
+        installed_link_contents("two")
     );
     assert_eq!(
         std::fs::read_link(destination.join("two")).unwrap(),
-        Path::new("missing")
+        installed_link_contents("missing")
     );
 }
 
@@ -159,7 +169,7 @@ async fn default_symlink_target_policy_accepts_the_root_but_rejects_missing_targ
             result.unwrap();
             assert_eq!(
                 std::fs::read_link(destination.join("link")).unwrap(),
-                Path::new(target)
+                installed_link_contents(target)
             );
         } else {
             assert!(matches!(result, Err(DecodeError::InvalidLink { .. })));
@@ -199,7 +209,7 @@ async fn ambient_file_and_directory_targets_require_explicit_opt_in() {
                 result.unwrap();
                 assert_eq!(
                     std::fs::read_link(destination.join("link")).unwrap(),
-                    Path::new("ambient")
+                    installed_link_contents("ambient")
                 );
             } else {
                 assert!(matches!(
@@ -235,7 +245,7 @@ async fn ambient_link_components_must_resolve_beneath_the_root() {
         .unwrap();
     assert_eq!(
         std::fs::read_link(destination.join("alias")).unwrap(),
-        Path::new("ambient-link")
+        installed_link_contents("ambient-link")
     );
 
     let destination = temp.path().join("contained-intermediate");
@@ -249,7 +259,7 @@ async fn ambient_link_components_must_resolve_beneath_the_root() {
         .unwrap();
     assert_eq!(
         std::fs::read_link(destination.join("alias")).unwrap(),
-        Path::new("ambient-link/file")
+        installed_link_contents("ambient-link/file")
     );
 
     let destination = temp.path().join("leaf");
