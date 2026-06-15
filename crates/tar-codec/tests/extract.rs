@@ -2,8 +2,12 @@ pub mod support;
 
 use std::path::Path;
 
-use support::{ArchiveBuilder, ArchiveFormat, EntryKind, header, pax_record, single_posix_member};
-use tar_codec::decode::{Archive, DecodeError, DecodePolicy, LinkPolicy};
+#[cfg(unix)]
+use support::EntryKind;
+use support::{ArchiveBuilder, ArchiveFormat, header, pax_record, single_posix_member};
+#[cfg(unix)]
+use tar_codec::decode::LinkPolicy;
+use tar_codec::decode::{Archive, DecodeError, DecodePolicy};
 use tar_framing::{FrameError, FrameErrorInner, PaxKeyword, UstarKind};
 use tempfile::tempdir;
 
@@ -257,6 +261,7 @@ async fn ambient_file_replacement_unlinks_the_inode_and_applies_mode() {
     assert_ne!(replaced.permissions().mode() & 0o111, 0);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn later_entries_replace_representative_cross_kind_paths() {
     let temp = tempdir().unwrap();
@@ -299,11 +304,10 @@ async fn later_entries_replace_representative_cross_kind_paths() {
             EntryKind::Directory => assert!(destination.join("same").is_dir(), "{case}"),
             EntryKind::SymbolicLink => {
                 assert_eq!(
-                    std::fs::read(destination.join("same")).unwrap(),
-                    b"target",
+                    std::fs::read_link(destination.join("same")).unwrap(),
+                    Path::new("target"),
                     "{case}"
                 );
-                assert!(destination.join("same").is_file(), "{case}");
             }
             EntryKind::HardLink => {
                 std::fs::write(destination.join("target"), b"updated").unwrap();
@@ -323,6 +327,7 @@ async fn later_entries_replace_representative_cross_kind_paths() {
 /// The ancestor cases cover archive-created regular files, hard links, and
 /// pending symbolic links, as well as an ambient regular file. The descendant
 /// uses a PAX `path` override so the check applies to the effective member path.
+#[cfg(unix)]
 #[tokio::test]
 async fn extraction_replaces_empty_leaves_but_rejects_non_directory_parents() {
     let temp = tempdir().unwrap();
@@ -357,8 +362,10 @@ async fn extraction_replaces_empty_leaves_but_rejects_non_directory_parents() {
             }
             EntryKind::Directory => assert!(destination.join("same").is_dir()),
             EntryKind::SymbolicLink => {
-                assert_eq!(std::fs::read(destination.join("same")).unwrap(), b"target");
-                assert!(destination.join("same").is_file());
+                assert_eq!(
+                    std::fs::read_link(destination.join("same")).unwrap(),
+                    Path::new("target")
+                );
             }
             EntryKind::HardLink => {
                 std::fs::write(destination.join("target"), b"updated").unwrap();
@@ -420,6 +427,7 @@ async fn extraction_replaces_empty_leaves_but_rejects_non_directory_parents() {
     assert_eq!(std::fs::read(destination.join("parent")).unwrap(), b"old");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn disabled_overwrites_reject_replacements_but_reuse_directories() {
     let temp = tempdir().unwrap();
@@ -500,6 +508,7 @@ async fn disabled_overwrites_reject_replacements_but_reuse_directories() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn non_empty_directories_are_never_replaced() {
     let temp = tempdir().unwrap();

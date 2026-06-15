@@ -1,18 +1,21 @@
 pub mod support;
 
-use std::path::Path;
 #[cfg(unix)]
-use std::{io, os::unix::net::UnixListener};
+use std::{io, os::unix::net::UnixListener, path::Path};
 
+use support::{ArchiveBuilder, single_posix_member};
 #[cfg(unix)]
-use support::symlink_file;
-use support::{ArchiveBuilder, pax_record, single_posix_member};
-use tar_codec::decode::{Archive, DecodeError, DecodePolicy, DecodePolicyViolation, LinkPolicy};
+use support::{pax_record, symlink_file};
+use tar_codec::decode::{
+    Archive, DecodeError, DecodePolicy, DecodePolicyViolation, LinkPolicy, SymlinkPolicy,
+};
+#[cfg(unix)]
 use tar_framing::PaxKeyword;
 use tempfile::tempdir;
 
+#[cfg(unix)]
 #[tokio::test]
-async fn materializes_safe_symlink_chains_and_forward_references() {
+async fn preserves_safe_symlink_chains_and_forward_references() {
     let temp = tempdir().unwrap();
     let destination = temp.path().join("out");
     let mut archive = ArchiveBuilder::new();
@@ -28,52 +31,35 @@ async fn materializes_safe_symlink_chains_and_forward_references() {
         .extract(&destination, DecodePolicy::default())
         .await
         .unwrap();
-    for path in ["dir/one", "dir/exact", "two"] {
-        assert_eq!(std::fs::read(destination.join(path)).unwrap(), b"ok");
-        assert!(
-            std::fs::symlink_metadata(destination.join(path))
-                .unwrap()
-                .is_file()
+    for (path, target) in [
+        ("dir/one", "file"),
+        ("dir/exact", "./file"),
+        ("two", "dir/one"),
+        ("forward", "later"),
+    ] {
+        assert_eq!(
+            std::fs::read_link(destination.join(path)).unwrap(),
+            Path::new(target)
         );
     }
+    assert_eq!(std::fs::read(destination.join("two")).unwrap(), b"ok");
     assert_eq!(
         std::fs::read(destination.join("forward")).unwrap(),
         b"later"
     );
     std::fs::write(destination.join("dir/file"), b"changed").unwrap();
-    assert_eq!(std::fs::read(destination.join("two")).unwrap(), b"ok");
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-
-        assert_ne!(
-            std::fs::metadata(destination.join("dir/file"))
-                .unwrap()
-                .ino(),
-            std::fs::metadata(destination.join("dir/one"))
-                .unwrap()
-                .ino()
-        );
-    }
+    assert_eq!(std::fs::read(destination.join("two")).unwrap(), b"changed");
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn creates_exact_and_opt_in_dangling_native_symlink_chains() {
+async fn preserves_dangling_symlink_chains_by_default() {
     let temp = tempdir().unwrap();
     let destination = temp.path().join("dangling");
     std::fs::create_dir_all(destination.join("ambient")).unwrap();
     let bytes = single_posix_member("link", b'2', b"", "ambient/missing", 0o644);
     Archive::new(bytes.as_slice())
-        .extract(
-            &destination,
-            DecodePolicy::default().link_policy(
-                LinkPolicy::default()
-                    .create_symlinks(true)
-                    .allow_missing_targets(true),
-            ),
-        )
+        .extract(&destination, DecodePolicy::default())
         .await
         .unwrap();
     assert_eq!(
@@ -88,14 +74,7 @@ async fn creates_exact_and_opt_in_dangling_native_symlink_chains() {
         .posix("two", b'2', b"", "missing", 0o644);
     let bytes = archive.finish();
     Archive::new(bytes.as_slice())
-        .extract(
-            &destination,
-            DecodePolicy::default().link_policy(
-                LinkPolicy::default()
-                    .create_symlinks(true)
-                    .allow_missing_targets(true),
-            ),
-        )
+        .extract(&destination, DecodePolicy::default())
         .await
         .unwrap();
     assert_eq!(
@@ -112,7 +91,7 @@ async fn creates_exact_and_opt_in_dangling_native_symlink_chains() {
 #[tokio::test]
 async fn preserves_directory_required_symlink_targets_and_rejects_file_targets() {
     let temp = tempdir().expect("temporary directory should be created");
-    let policy = DecodePolicy::default().link_policy(LinkPolicy::default().create_symlinks(true));
+    let policy = DecodePolicy::default();
     for (case, target) in [("separator", "target/"), ("dot", "target/.")] {
         let destination = temp.path().join(format!("directory-{case}"));
         let mut archive = ArchiveBuilder::new();
@@ -157,6 +136,7 @@ async fn preserves_directory_required_symlink_targets_and_rejects_file_targets()
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn rejects_ambiguous_parent_directory_traversal_in_pax_symlink_targets() {
     let temp = tempdir().expect("temporary directory should be created");
@@ -182,8 +162,9 @@ async fn rejects_ambiguous_parent_directory_traversal_in_pax_symlink_targets() {
     assert!(!destination.join("link").exists());
 }
 
+#[cfg(unix)]
 #[tokio::test]
-async fn default_materialization_rejects_non_file_targets() {
+async fn default_preserves_links_to_missing_root_and_directory_targets() {
     let temp = tempdir().unwrap();
     for (case, target, directory_target) in [
         ("missing", "missing", false),
@@ -200,13 +181,14 @@ async fn default_materialization_rejects_non_file_targets() {
         } else {
             single_posix_member("link", b'2', b"", target, 0o644)
         };
-        assert!(matches!(
-            Archive::new(bytes.as_slice())
-                .extract(&destination, DecodePolicy::default())
-                .await,
-            Err(DecodeError::InvalidLink { .. })
-        ));
-        assert!(!destination.join("link").exists());
+        Archive::new(bytes.as_slice())
+            .extract(&destination, DecodePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_link(destination.join("link")).unwrap(),
+            Path::new(target)
+        );
     }
 
     let destination = temp.path().join("directory-required-file");
@@ -226,8 +208,46 @@ async fn default_materialization_rejects_non_file_targets() {
     ));
 }
 
+#[cfg(unix)]
 #[tokio::test]
-async fn missing_targets_cannot_be_materialized() {
+async fn targets_blocked_by_archive_files_are_dangling() {
+    let temp = tempdir().unwrap();
+    let mut archive = ArchiveBuilder::new();
+    archive.posix("file", b'0', b"contents", "", 0o644).posix(
+        "link",
+        b'2',
+        b"",
+        "file/child",
+        0o644,
+    );
+    let bytes = archive.finish();
+    Archive::new(bytes.as_slice())
+        .extract(temp.path().join("allow"), DecodePolicy::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_link(temp.path().join("allow/link")).unwrap(),
+        Path::new("file/child")
+    );
+
+    assert!(matches!(
+        Archive::new(bytes.as_slice())
+            .extract(
+                temp.path().join("deny"),
+                DecodePolicy::default()
+                    .link_policy(LinkPolicy::default().allow_missing_targets(false)),
+            )
+            .await,
+        Err(DecodeError::InvalidLink {
+            reason: "target does not exist",
+            ..
+        })
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn missing_targets_can_be_forbidden() {
     let temp = tempdir().unwrap();
     let bytes = single_posix_member("link", b'2', b"", "missing", 0o644);
     assert!(matches!(
@@ -235,11 +255,11 @@ async fn missing_targets_cannot_be_materialized() {
             .extract(
                 temp.path(),
                 DecodePolicy::default()
-                    .link_policy(LinkPolicy::default().allow_missing_targets(true)),
+                    .link_policy(LinkPolicy::default().allow_missing_targets(false)),
             )
             .await,
         Err(DecodeError::InvalidLink {
-            reason: "materialization target does not exist",
+            reason: "target was not created by this extraction",
             ..
         })
     ));
@@ -254,11 +274,7 @@ async fn native_target_controls_are_independent() {
     std::fs::create_dir(&destination).unwrap();
     std::fs::write(destination.join("ambient"), b"ambient").unwrap();
     let bytes = single_posix_member("link", b'2', b"", "ambient", 0o644);
-    let policy = DecodePolicy::default().link_policy(
-        LinkPolicy::default()
-            .create_symlinks(true)
-            .allow_missing_targets(true),
-    );
+    let policy = DecodePolicy::default();
     assert!(matches!(
         Archive::new(bytes.as_slice())
             .extract(&destination, policy)
@@ -275,8 +291,8 @@ async fn native_target_controls_are_independent() {
     let bytes = single_posix_member("link", b'2', b"", "ambient", 0o644);
     let policy = DecodePolicy::default().link_policy(
         LinkPolicy::default()
-            .create_symlinks(true)
-            .allow_ambient_targets(true),
+            .allow_ambient_targets(true)
+            .allow_missing_targets(false),
     );
     Archive::new(bytes.as_slice())
         .extract(&destination, policy)
@@ -317,11 +333,7 @@ async fn missing_target_opt_in_does_not_allow_dangling_targets_through_ambient_s
         }
         symlink_file(ambient_target, destination.join("ambient-link")).unwrap();
         let bytes = single_posix_member("link", b'2', b"", archive_target, 0o644);
-        let policy = DecodePolicy::default().link_policy(
-            LinkPolicy::default()
-                .create_symlinks(true)
-                .allow_missing_targets(true),
-        );
+        let policy = DecodePolicy::default();
 
         assert!(matches!(
             Archive::new(bytes.as_slice())
@@ -343,39 +355,13 @@ async fn missing_target_opt_in_does_not_allow_dangling_targets_through_ambient_s
     }
 }
 
-#[cfg(unix)]
+#[cfg(not(unix))]
 #[tokio::test]
-async fn materialized_links_inherit_the_targets_executable_intent() {
-    use std::os::unix::fs::PermissionsExt as _;
-
+async fn symlink_members_fail_by_default_on_unsupported_platforms() {
     let temp = tempdir().unwrap();
-    let mut archive = ArchiveBuilder::new();
-    archive
-        .posix("target", b'0', b"executable", "", 0o755)
-        .posix("link", b'2', b"", "target", 0o644);
-    let bytes = archive.finish();
-    Archive::new(bytes.as_slice())
-        .extract(temp.path(), DecodePolicy::default())
-        .await
-        .unwrap();
-    assert_ne!(
-        std::fs::metadata(temp.path().join("link"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o111,
-        0
-    );
-}
-
-#[cfg(windows)]
-#[tokio::test]
-async fn native_symlink_creation_is_rejected_only_when_a_link_is_encountered() {
-    let temp = tempdir().unwrap();
-    let policy = DecodePolicy::default().link_policy(LinkPolicy::default().create_symlinks(true));
     let regular = single_posix_member("file", b'0', b"contents", "", 0o644);
     Archive::new(regular.as_slice())
-        .extract(temp.path().join("regular"), policy)
+        .extract(temp.path().join("regular"), DecodePolicy::default())
         .await
         .unwrap();
 
@@ -387,7 +373,7 @@ async fn native_symlink_creation_is_rejected_only_when_a_link_is_encountered() {
     let destination = temp.path().join("link");
     assert!(matches!(
         Archive::new(bytes.as_slice())
-            .extract(&destination, policy)
+            .extract(&destination, DecodePolicy::default())
             .await,
         Err(DecodeError::PolicyViolation {
             position: 1024,
@@ -401,7 +387,29 @@ async fn native_symlink_creation_is_rejected_only_when_a_link_is_encountered() {
     assert!(!destination.join("link").exists());
 }
 
-#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn skipped_symlinks_have_no_filesystem_effect() {
+    let temp = tempdir().unwrap();
+    let mut archive = ArchiveBuilder::new();
+    archive
+        .posix("same", b'0', b"keep", "", 0o644)
+        .posix("same", b'2', b"", "missing", 0o644)
+        .posix("skipped", b'2', b"", "missing", 0o644);
+    let bytes = archive.finish();
+    let destination = temp.path().join("out");
+    Archive::new(bytes.as_slice())
+        .extract(
+            &destination,
+            DecodePolicy::default()
+                .link_policy(LinkPolicy::default().symlink_policy(SymlinkPolicy::Skip)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(destination.join("same")).unwrap(), b"keep");
+    assert!(std::fs::symlink_metadata(destination.join("skipped")).is_err());
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn ambient_file_and_directory_targets_require_explicit_opt_in() {
     let temp = tempdir().unwrap();
@@ -428,10 +436,12 @@ async fn ambient_file_and_directory_targets_require_explicit_opt_in() {
             let result = Archive::new(bytes.as_slice())
                 .extract(&destination, policy)
                 .await;
-            if allow_ambient && !directory {
+            if allow_ambient {
                 result.unwrap();
-                assert_eq!(std::fs::read(destination.join("link")).unwrap(), b"ambient");
-                assert!(destination.join("link").is_file());
+                assert_eq!(
+                    std::fs::read_link(destination.join("link")).unwrap(),
+                    Path::new("ambient")
+                );
             } else {
                 assert!(matches!(result, Err(DecodeError::InvalidLink { .. })));
                 assert!(!destination.join("link").exists());
@@ -442,32 +452,29 @@ async fn ambient_file_and_directory_targets_require_explicit_opt_in() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn materialization_rejects_ambient_non_regular_files() {
+async fn native_links_allow_ambient_non_regular_targets() {
     let temp = tempdir().unwrap();
     let destination = temp.path().join("out");
     std::fs::create_dir(&destination).unwrap();
     let _socket = UnixListener::bind(destination.join("socket")).unwrap();
     let bytes = single_posix_member("link", b'2', b"", "socket", 0o644);
-    assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(
-                &destination,
-                DecodePolicy::default()
-                    .link_policy(LinkPolicy::default().allow_ambient_targets(true)),
-            )
-            .await,
-        Err(DecodeError::InvalidLink {
-            reason: "materialization target is not a regular file",
-            ..
-        })
-    ));
-    assert!(!destination.join("link").exists());
+    Archive::new(bytes.as_slice())
+        .extract(
+            &destination,
+            DecodePolicy::default().link_policy(LinkPolicy::default().allow_ambient_targets(true)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_link(destination.join("link")).unwrap(),
+        Path::new("socket")
+    );
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 #[tokio::test]
 async fn ambient_link_components_must_resolve_beneath_the_root() {
-    use support::{symlink_dir, symlink_file};
+    use support::symlink_dir;
 
     let temp = tempdir().unwrap();
     let policy =
@@ -482,7 +489,10 @@ async fn ambient_link_components_must_resolve_beneath_the_root() {
         .extract(&destination, policy)
         .await
         .unwrap();
-    assert_eq!(std::fs::read(destination.join("alias")).unwrap(), b"inside");
+    assert_eq!(
+        std::fs::read_link(destination.join("alias")).unwrap(),
+        Path::new("ambient-link")
+    );
 
     let destination = temp.path().join("contained-intermediate");
     std::fs::create_dir_all(destination.join("target")).unwrap();
@@ -493,7 +503,10 @@ async fn ambient_link_components_must_resolve_beneath_the_root() {
         .extract(&destination, policy)
         .await
         .unwrap();
-    assert_eq!(std::fs::read(destination.join("alias")).unwrap(), b"inside");
+    assert_eq!(
+        std::fs::read_link(destination.join("alias")).unwrap(),
+        Path::new("ambient-link/file")
+    );
 
     let destination = temp.path().join("leaf");
     let outside = temp.path().join("outside-file");
@@ -531,31 +544,7 @@ async fn ambient_link_components_must_resolve_beneath_the_root() {
     assert!(!destination.join("alias").exists());
 }
 
-#[cfg(windows)]
-#[tokio::test]
-async fn ambient_junction_components_outside_the_root_are_rejected() {
-    let temp = tempdir().unwrap();
-    let destination = temp.path().join("destination");
-    let outside = temp.path().join("outside");
-    std::fs::create_dir(&destination).unwrap();
-    std::fs::create_dir(&outside).unwrap();
-    std::fs::write(outside.join("file"), b"outside").unwrap();
-    junction::create(&outside, destination.join("ambient-junction")).unwrap();
-
-    let bytes = single_posix_member("alias", b'2', b"", "ambient-junction/file", 0o644);
-    let policy =
-        DecodePolicy::default().link_policy(LinkPolicy::default().allow_ambient_targets(true));
-    assert!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, policy)
-            .await
-            .is_err()
-    );
-    assert!(!destination.join("alias").exists());
-    assert_eq!(std::fs::read(outside.join("file")).unwrap(), b"outside");
-}
-
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 #[tokio::test]
 async fn default_target_policy_uses_filesystem_provenance() {
     let temp = tempdir().unwrap();
@@ -571,7 +560,7 @@ async fn default_target_policy_uses_filesystem_provenance() {
             .extract(&destination, DecodePolicy::default())
             .await,
         Err(DecodeError::InvalidLink {
-            reason: "target was not created by this extraction",
+            reason: "ambient target is not allowed",
             ..
         })
     ));
@@ -588,11 +577,12 @@ async fn default_target_policy_uses_filesystem_provenance() {
         .await
         .unwrap();
     assert_eq!(
-        std::fs::read(destination.join("alias")).unwrap(),
-        b"archive"
+        std::fs::read_link(destination.join("alias")).unwrap(),
+        Path::new("ambient/file")
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn symlink_graphs_allow_finite_expansion_and_reject_cycles_and_escapes() {
     let temp = tempdir().unwrap();
@@ -610,6 +600,14 @@ async fn symlink_graphs_allow_finite_expansion_and_reject_cycles_and_escapes() {
     assert_eq!(
         std::fs::read_to_string(destination.join("b")).unwrap(),
         "ok"
+    );
+    assert_eq!(
+        std::fs::read_link(destination.join("a")).unwrap(),
+        Path::new("file")
+    );
+    assert_eq!(
+        std::fs::read_link(destination.join("b")).unwrap(),
+        Path::new("a")
     );
 
     for (case, first_target, second_target, expansion_limit) in [
@@ -655,6 +653,7 @@ async fn symlink_graphs_allow_finite_expansion_and_reject_cycles_and_escapes() {
     assert!(!destination.join("link").exists());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn overwritten_pending_symlinks_do_not_affect_installation_or_resolution() {
     let temp = tempdir().unwrap();
@@ -676,9 +675,13 @@ async fn overwritten_pending_symlinks_do_not_affect_installation_or_resolution()
         b"file"
     );
     assert_eq!(std::fs::read(destination.join("alias")).unwrap(), b"target");
-    assert!(destination.join("alias").is_file());
+    assert_eq!(
+        std::fs::read_link(destination.join("alias")).unwrap(),
+        Path::new("target")
+    );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn later_link_entries_replace_links_of_the_same_kind() {
     let temp = tempdir().unwrap();
@@ -700,7 +703,10 @@ async fn later_link_entries_replace_links_of_the_same_kind() {
             .unwrap();
         assert_eq!(std::fs::read(destination.join("same")).unwrap(), b"second");
         if typeflag == b'2' {
-            assert!(destination.join("same").is_file());
+            assert_eq!(
+                std::fs::read_link(destination.join("same")).unwrap(),
+                Path::new("second")
+            );
         }
     }
 }
@@ -816,11 +822,8 @@ async fn link_policies_are_enforced_before_link_creation() {
         Archive::new(bytes.as_slice())
             .extract(
                 &destination,
-                DecodePolicy::default().link_policy(
-                    LinkPolicy::default()
-                        .allow_symlinks(false)
-                        .create_symlinks(true),
-                ),
+                DecodePolicy::default()
+                    .link_policy(LinkPolicy::default().symlink_policy(SymlinkPolicy::Reject),),
             )
             .await,
         Err(DecodeError::PolicyViolation {
@@ -865,7 +868,7 @@ async fn link_policies_are_enforced_before_link_creation() {
             &destination,
             DecodePolicy::default().link_policy(
                 LinkPolicy::default()
-                    .allow_symlinks(false)
+                    .symlink_policy(SymlinkPolicy::Reject)
                     .allow_hard_links(true),
             ),
         )
@@ -894,11 +897,7 @@ async fn native_symlink_and_hard_link_builders_compose() {
     Archive::new(bytes.as_slice())
         .extract(
             temp.path(),
-            DecodePolicy::default().link_policy(
-                LinkPolicy::default()
-                    .create_symlinks(true)
-                    .allow_hard_links(true),
-            ),
+            DecodePolicy::default().link_policy(LinkPolicy::default().allow_hard_links(true)),
         )
         .await
         .unwrap();

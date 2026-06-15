@@ -7,7 +7,7 @@ use std::{
 };
 
 use tar_codec::{
-    decode::{Archive, DecodeError, DecodePolicy, LinkPolicy},
+    decode::{Archive, DecodeError, DecodePolicy},
     default_name_validator,
     encode::{EncodeError, EncodePolicy, Encoder, EntryMetadata, TraversalError},
 };
@@ -353,10 +353,7 @@ async fn recursive_encoding_preserves_symlinks_and_repeated_inodes() {
 
     let destination = temp.path().join("out");
     Archive::new(bytes.as_slice())
-        .extract(
-            &destination,
-            DecodePolicy::default().link_policy(LinkPolicy::default().create_symlinks(true)),
-        )
+        .extract(&destination, DecodePolicy::default())
         .await
         .unwrap();
     assert!(
