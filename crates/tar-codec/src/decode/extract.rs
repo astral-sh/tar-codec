@@ -23,15 +23,14 @@ use {cap_std::fs::OpenOptionsExt as _, std::os::unix::fs::PermissionsExt as _};
 
 /// A symbolic link awaiting graph validation and final extraction.
 ///
-/// [`PendingSymlink::link_contents`] preserves the archive text for optional
-/// native installation, while [`PendingSymlink::resolved_target`] is used to
-/// validate the archive's symbolic-link graph relative to the extraction root.
-#[derive(Clone, Debug)]
+/// [`PendingSymlink::target`] preserves the archive text for optional native
+/// installation, while [`PendingSymlink::resolved_target`] is used to validate
+/// the archive's symbolic-link graph relative to the extraction root.
+#[derive(Debug)]
 struct PendingSymlink {
     path: PathBuf,
     position: u64,
-    target_text: String,
-    link_contents: String,
+    target: String,
     resolved_target: PathBuf,
     requires_directory: bool,
 }
@@ -41,7 +40,7 @@ impl PendingSymlink {
         DecodeError::invalid_link(
             self.position,
             self.path.clone(),
-            self.target_text.clone(),
+            self.target.clone(),
             reason,
         )
     }
@@ -95,10 +94,8 @@ struct ExtractionRoot {
     symlinks: Vec<PendingSymlink>,
 }
 
-/// The filesystem shape of a fully resolved symbolic-link target.
-///
-/// This determines which kind of symbolic link to create on platforms such as
-/// Windows, where file and directory symbolic links use different operations.
+/// The filesystem shape of a fully resolved symbolic-link target, used to
+/// enforce path-suffix and materialization constraints.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum TerminalKind {
     /// The target exists and is a regular file.
@@ -313,8 +310,7 @@ impl ExtractionRoot {
     }
 
     async fn reserve_symlink(&mut self, member: &DecodedMember) -> Result<(), DecodeError> {
-        let target_text = member.link_target.clone();
-        let target = validate_symlink_target(member.position, &member.path, &target_text)?;
+        let target = validate_symlink_target(member.position, &member.path, &member.link_target)?;
         self.ensure_parents(&member.path).await?;
         self.replace_leaf(&member.path).await?;
         let path = member.path.clone();
@@ -324,8 +320,7 @@ impl ExtractionRoot {
         self.symlinks.push(PendingSymlink {
             path,
             position: member.position,
-            target_text,
-            link_contents: target.link_contents,
+            target: member.link_target.clone(),
             resolved_target: target.resolved_target,
             requires_directory: target.requires_directory,
         });
@@ -488,19 +483,18 @@ impl ExtractionRoot {
             let (target_path, kind) = match target {
                 ResolvedTarget::Known { path, kind } => (path, kind),
                 ResolvedTarget::Unowned(_)
-                    if !policy.symlink_targets.allow_ambient
-                        && !policy.symlink_targets.allow_missing =>
+                    if !policy.allow_ambient_targets && !policy.allow_missing_targets =>
                 {
                     return Err(link.error("target was not created by this extraction"));
                 }
                 ResolvedTarget::Unowned(path) => {
                     let kind = self.inspect_ambient_target(&path).await?;
                     match kind {
-                        TerminalKind::Dangling if !policy.symlink_targets.allow_missing => {
+                        TerminalKind::Dangling if !policy.allow_missing_targets => {
                             return Err(link.error("target does not exist"));
                         }
                         TerminalKind::File | TerminalKind::Directory | TerminalKind::Other
-                            if !policy.symlink_targets.allow_ambient =>
+                            if !policy.allow_ambient_targets =>
                         {
                             return Err(link.error("ambient target is not allowed"));
                         }
@@ -523,12 +517,13 @@ impl ExtractionRoot {
                     }
                 }
             }
-            links.push((link.clone(), target_path));
+            links.push((index, target_path));
         }
 
         if policy.create_symlinks {
-            for (link, _) in links {
-                let contents = link.link_contents;
+            for (index, _) in links {
+                let link = &self.symlinks[index];
+                let contents = link.target.clone();
                 self.with_entry_parent(
                     "create symbolic link",
                     &link.path,
@@ -539,18 +534,15 @@ impl ExtractionRoot {
         } else {
             // TODO: Consider a configurable cumulative byte limit to bound
             // output amplification from many links to one large target.
-            for (link, target) in links {
-                self.materialize_symlink(&link, &target).await?;
+            for (index, target) in links {
+                let path = self.symlinks[index].path.clone();
+                self.materialize_symlink(&path, &target).await?;
             }
         }
         Ok(())
     }
 
-    async fn materialize_symlink(
-        &mut self,
-        link: &PendingSymlink,
-        target: &Path,
-    ) -> Result<(), DecodeError> {
+    async fn materialize_symlink(&mut self, path: &Path, target: &Path) -> Result<(), DecodeError> {
         let mut source = self
             .open_existing_file("open symbolic-link target", target)
             .await?;
@@ -568,29 +560,19 @@ impl ExtractionRoot {
         #[cfg(not(unix))]
         let executable = false;
 
-        self.entries.remove(&link.path);
-        self.symlink_indices.remove(&link.path);
+        self.entries.remove(path);
+        self.symlink_indices.remove(path);
         let mut file = self
-            .open_file(
-                "materialize symbolic link",
-                &link.path,
-                true,
-                false,
-                executable,
-            )
+            .open_file("materialize symbolic link", path, true, false, executable)
             .await?;
-        self.entries.insert(link.path.clone(), ExtractedEntry::File);
+        self.entries.insert(path.to_owned(), ExtractedEntry::File);
         tokio::io::copy(&mut source, &mut file)
             .await
             .map_err(|source| {
-                DecodeError::filesystem("materialize symbolic link", link.path.clone(), source)
+                DecodeError::filesystem("materialize symbolic link", path.to_owned(), source)
             })?;
         file.flush().await.map_err(|source| {
-            DecodeError::filesystem(
-                "flush materialized symbolic link",
-                link.path.clone(),
-                source,
-            )
+            DecodeError::filesystem("flush materialized symbolic link", path.to_owned(), source)
         })?;
         Ok(())
     }

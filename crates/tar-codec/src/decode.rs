@@ -56,15 +56,8 @@ pub struct LinkPolicy {
     allow_symlinks: bool,
     create_symlinks: bool,
     allow_hard_links: bool,
-    symlink_targets: TargetPolicy,
-}
-
-/// Controls which symbolic-link targets a [`LinkPolicy`] may resolve outside
-/// the archive.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct TargetPolicy {
-    allow_ambient: bool,
-    allow_missing: bool,
+    allow_ambient_targets: bool,
+    allow_missing_targets: bool,
 }
 
 /// Controls which otherwise valid pax features extraction may accept.
@@ -110,7 +103,8 @@ impl Default for LinkPolicy {
             allow_symlinks: true,
             create_symlinks: false,
             allow_hard_links: false,
-            symlink_targets: TargetPolicy::default(),
+            allow_ambient_targets: false,
+            allow_missing_targets: false,
         }
     }
 }
@@ -298,7 +292,7 @@ impl LinkPolicy {
     /// **forbidden by default**. This setting does not affect hard-link target
     /// validation.
     pub fn allow_ambient_targets(mut self, allow: bool) -> Self {
-        self.symlink_targets.allow_ambient = allow;
+        self.allow_ambient_targets = allow;
         self
     }
 
@@ -309,7 +303,7 @@ impl LinkPolicy {
     /// an existing regular file, or on hard-link target validation. Missing
     /// targets are **forbidden by default**.
     pub fn allow_missing_targets(mut self, allow: bool) -> Self {
-        self.symlink_targets.allow_missing = allow;
+        self.allow_missing_targets = allow;
         self
     }
 }
@@ -747,11 +741,8 @@ fn normalize_member_path(position: u64, value: &str) -> Result<PathBuf, DecodeEr
     Ok(path)
 }
 
-/// A validated symbolic-link target represented in both coordinate systems
-/// needed during extraction.
+/// A validated symbolic-link target resolved for extraction.
 struct ValidatedSymlinkTarget {
-    /// Exact archive-provided contents, before platform-specific installation.
-    link_contents: String,
     /// The target resolved relative to the extraction root, used for
     /// containment and symbolic-link graph validation.
     resolved_target: PathBuf,
@@ -759,13 +750,12 @@ struct ValidatedSymlinkTarget {
     requires_directory: bool,
 }
 
-/// Validates and resolves a symbolic-link target without changing its contents.
+/// Validates and resolves a symbolic-link target.
 ///
-/// [`ValidatedSymlinkTarget::link_contents`] preserves the exact archive-provided
-/// value, while [`ValidatedSymlinkTarget::resolved_target`]
-/// identifies its destination relative to the extraction root. For example,
-/// `../file` on a link at `dir/link` remains `../file` as link contents and
-/// resolves to `file`.
+/// [`ValidatedSymlinkTarget::resolved_target`] identifies the target relative
+/// to the extraction root. For example, `../file` on a link at `dir/link`
+/// resolves to `file`. The caller retains the archive-provided text for native
+/// symbolic-link creation.
 ///
 /// Absolute, platform-prefixed, escaping, and lexically ambiguous targets are
 /// rejected. In particular, a parent component following a normal component
@@ -824,7 +814,6 @@ fn validate_symlink_target(
         }
     }
     Ok(ValidatedSymlinkTarget {
-        link_contents: value.to_owned(),
         resolved_target: resolved,
         requires_directory: value.ends_with('/')
             || matches!(value.rsplit('/').next(), Some("." | "..")),
@@ -926,31 +915,18 @@ mod tests {
     }
 
     #[test]
-    fn preserves_symlink_contents_and_resolves_targets() {
-        for (link, target, expected_contents, expected_resolved, requires_directory) in [
-            ("link", "target", "target", "target", false),
-            ("nested/link", "../target", "../target", "target", false),
-            (
-                "nested/link",
-                "./target",
-                "./target",
-                "nested/target",
-                false,
-            ),
-            (
-                "a/b/link",
-                "../c/target",
-                "../c/target",
-                "a/c/target",
-                false,
-            ),
-            ("nested/link", ".", ".", "nested", true),
-            ("nested/link", "target/", "target/", "nested/target", true),
-            ("nested/link", "target/.", "target/.", "nested/target", true),
+    fn resolves_symlink_targets() {
+        for (link, target, expected_resolved, requires_directory) in [
+            ("link", "target", "target", false),
+            ("nested/link", "../target", "target", false),
+            ("nested/link", "./target", "nested/target", false),
+            ("a/b/link", "../c/target", "a/c/target", false),
+            ("nested/link", ".", "nested", true),
+            ("nested/link", "target/", "nested/target", true),
+            ("nested/link", "target/.", "nested/target", true),
         ] {
             let validated = validate_symlink_target(0, Path::new(link), target)
                 .expect("symlink target should be valid");
-            assert_eq!(validated.link_contents, expected_contents);
             assert_eq!(validated.resolved_target, Path::new(expected_resolved));
             assert_eq!(validated.requires_directory, requires_directory);
         }
