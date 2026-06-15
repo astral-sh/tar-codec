@@ -788,8 +788,12 @@ fn create_symlink(
     path: &Path,
     kind: TerminalKind,
 ) -> io::Result<()> {
-    // Tar link targets use `/`, but Windows stores the supplied target text in
-    // a reparse point without making it usable as a native relative path.
+    // `CreateSymbolicLinkW` stores the target text verbatim in the reparse
+    // point. When Windows later traverses that target, a relative target such
+    // as `dir/file` fails with `ERROR_INVALID_NAME` because `/` is not treated
+    // as a component separator. Convert tar's separators after validation.
+    // Libarchive performs the same translation:
+    // <https://github.com/libarchive/libarchive/blob/7a35e717/libarchive/archive_write_disk_windows.c#L638-L655>
     let contents = contents.replace('/', "\\");
     match kind {
         TerminalKind::File => directory.symlink_file(&contents, path),
