@@ -7,6 +7,8 @@ use std::{
 };
 
 use super::*;
+#[cfg(unix)]
+use cap_std::fs::OpenOptionsExt as _;
 use cap_std::{
     ambient_authority,
     fs::{Dir, Metadata, OpenOptions},
@@ -18,8 +20,6 @@ use {
     cap_std::fs::MetadataExt as _, std::os::windows::fs::MetadataExt as _,
     windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT,
 };
-#[cfg(unix)]
-use {cap_std::fs::OpenOptionsExt as _, std::os::unix::fs::PermissionsExt as _};
 
 /// A symbolic link awaiting graph validation and final extraction.
 ///
@@ -95,15 +95,13 @@ struct ExtractionRoot {
 }
 
 /// The filesystem shape of a fully resolved symbolic-link target, used to
-/// enforce path-suffix and materialization constraints.
+/// enforce directory-required path suffixes.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum TerminalKind {
-    /// The target exists and is a regular file.
-    File,
     /// The target exists and is a directory.
     Directory,
-    /// The target exists but is neither a regular file nor a directory.
-    Other,
+    /// The target exists and is not a directory.
+    NonDirectory,
     /// The target does not yet exist.
     Dangling,
 }
@@ -115,7 +113,7 @@ enum TerminalKind {
 /// by the extraction and therefore requires policy-dependent handling.
 enum ResolvedTarget {
     /// The extraction root or an archive-created entry of the given kind.
-    Known { path: PathBuf, kind: TerminalKind },
+    Known(TerminalKind),
     /// A normalized root-relative path not created by this extraction.
     Unowned(PathBuf),
 }
@@ -127,9 +125,9 @@ impl<R: AsyncRead + Unpin> Archive<R> {
     ///
     /// `policy` controls extraction semantics, including overwrite behavior.
     /// See [`DecodePolicy`] for information about each option and its default.
-    /// By default, symbolic-link members are materialized as independent
-    /// regular-file copies of archive-created targets. This can amplify output
-    /// when many links reference the same large target.
+    /// By default, symbolic-link members are preserved as native links. On
+    /// Windows, symbolic-link members must be skipped or rejected through
+    /// [`LinkPolicy`].
     ///
     /// Archived Unix permission modes are normalized rather than restored. New
     /// regular files are created with mode `0o777` when any archived execute bit
@@ -172,7 +170,9 @@ impl<R: AsyncRead + Unpin> Archive<R> {
                     frame.payload.skip().await?;
                 }
                 UstarKind::SymbolicLink => {
-                    root.reserve_symlink(&member).await?;
+                    if policy.link_policy.symlink_policy == SymlinkPolicy::Preserve {
+                        root.reserve_symlink(&member).await?;
+                    }
                     frame.payload.skip().await?;
                 }
                 UstarKind::HardLink => {
@@ -471,7 +471,7 @@ impl ExtractionRoot {
             .any(|candidate| candidate != path && candidate.starts_with(path))
     }
 
-    async fn finalize_symlinks(&mut self, policy: LinkPolicy) -> Result<(), DecodeError> {
+    async fn finalize_symlinks(&self, policy: LinkPolicy) -> Result<(), DecodeError> {
         let mut links = Vec::with_capacity(self.symlinks.len());
         for (index, link) in self.symlinks.iter().enumerate() {
             if self.symlink_indices.get(&link.path) != Some(&index) {
@@ -480,8 +480,8 @@ impl ExtractionRoot {
             let target = self
                 .resolve_terminal(&link.resolved_target)
                 .map_err(|reason| link.error(reason))?;
-            let (target_path, kind) = match target {
-                ResolvedTarget::Known { path, kind } => (path, kind),
+            let kind = match target {
+                ResolvedTarget::Known(kind) => kind,
                 ResolvedTarget::Unowned(_)
                     if !policy.allow_ambient_targets && !policy.allow_missing_targets =>
                 {
@@ -496,87 +496,32 @@ impl ExtractionRoot {
                         TerminalKind::Dangling if !policy.allow_missing_targets => {
                             return Err(link.error("target does not exist"));
                         }
-                        TerminalKind::File | TerminalKind::Directory | TerminalKind::Other
+                        TerminalKind::Directory | TerminalKind::NonDirectory
                             if !policy.allow_ambient_targets =>
                         {
                             return Err(link.error("ambient target is not allowed"));
                         }
                         _ => {}
                     }
-                    (path, kind)
+                    kind
                 }
             };
-            if matches!(kind, TerminalKind::File | TerminalKind::Other) && link.requires_directory {
+            if kind == TerminalKind::NonDirectory && link.requires_directory {
                 return Err(link.error("target path suffix requires a directory"));
             }
-            if !policy.create_symlinks {
-                match kind {
-                    TerminalKind::File => {}
-                    TerminalKind::Directory | TerminalKind::Other => {
-                        return Err(link.error("materialization target is not a regular file"));
-                    }
-                    TerminalKind::Dangling => {
-                        return Err(link.error("materialization target does not exist"));
-                    }
-                }
-            }
-            links.push((index, target_path));
+            links.push(index);
         }
 
-        if policy.create_symlinks {
-            for (index, _) in links {
-                let link = &self.symlinks[index];
-                let contents = link.target.clone();
-                self.with_entry_parent(
-                    "create symbolic link",
-                    &link.path,
-                    move |directory, path| create_symlink(directory, &contents, path),
-                )
-                .await?;
-            }
-        } else {
-            // TODO: Consider a configurable cumulative byte limit to bound
-            // output amplification from many links to one large target.
-            for (index, target) in links {
-                let path = self.symlinks[index].path.clone();
-                self.materialize_symlink(&path, &target).await?;
-            }
+        for index in links {
+            let link = &self.symlinks[index];
+            let contents = link.target.clone();
+            self.with_entry_parent(
+                "create symbolic link",
+                &link.path,
+                move |directory, path| create_symlink(directory, &contents, path),
+            )
+            .await?;
         }
-        Ok(())
-    }
-
-    async fn materialize_symlink(&mut self, path: &Path, target: &Path) -> Result<(), DecodeError> {
-        let mut source = self
-            .open_existing_file("open symbolic-link target", target)
-            .await?;
-        #[cfg(unix)]
-        let executable = source
-            .metadata()
-            .await
-            .map_err(|source| {
-                DecodeError::filesystem("inspect symbolic-link target", target.to_owned(), source)
-            })?
-            .permissions()
-            .mode()
-            & 0o111
-            != 0;
-        #[cfg(not(unix))]
-        let executable = false;
-
-        self.entries.remove(path);
-        self.symlink_indices.remove(path);
-        let mut file = self
-            .open_file("materialize symbolic link", path, true, false, executable)
-            .await?;
-        self.entries.insert(path.to_owned(), ExtractedEntry::File);
-        tokio::io::copy(&mut source, &mut file)
-            .await
-            .map_err(|source| {
-                DecodeError::filesystem("materialize symbolic link", path.to_owned(), source)
-            })?;
-        file.flush().await.map_err(|source| {
-            DecodeError::filesystem("flush materialized symbolic link", path.to_owned(), source)
-        })?;
         Ok(())
     }
 
@@ -605,18 +550,13 @@ impl ExtractionRoot {
                 path = rewritten;
             } else {
                 return Ok(match self.entries.get(&path) {
-                    _ if path.as_os_str().is_empty() => ResolvedTarget::Known {
-                        path,
-                        kind: TerminalKind::Directory,
-                    },
-                    Some(ExtractedEntry::CreatedDirectory) => ResolvedTarget::Known {
-                        path,
-                        kind: TerminalKind::Directory,
-                    },
-                    Some(ExtractedEntry::File) => ResolvedTarget::Known {
-                        path,
-                        kind: TerminalKind::File,
-                    },
+                    _ if path.as_os_str().is_empty() => {
+                        ResolvedTarget::Known(TerminalKind::Directory)
+                    }
+                    Some(ExtractedEntry::CreatedDirectory) => {
+                        ResolvedTarget::Known(TerminalKind::Directory)
+                    }
+                    Some(ExtractedEntry::File) => ResolvedTarget::Known(TerminalKind::NonDirectory),
                     Some(ExtractedEntry::Symlink) => continue,
                     Some(ExtractedEntry::AmbientDirectory) | None => ResolvedTarget::Unowned(path),
                 });
@@ -635,8 +575,7 @@ impl ExtractionRoot {
             }
             let kind = match directory.metadata(path) {
                 Ok(metadata) if metadata.is_dir() => Ok(TerminalKind::Directory),
-                Ok(metadata) if metadata.is_file() => Ok(TerminalKind::File),
-                Ok(_) => Ok(TerminalKind::Other),
+                Ok(_) => Ok(TerminalKind::NonDirectory),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(TerminalKind::Dangling),
                 Err(error) => Err(error),
             }?;
@@ -732,19 +671,6 @@ impl ExtractionRoot {
                 directory
                     .open_with(path, &options)
                     .map(|file| file.into_std())
-            })
-            .await?;
-        Ok(File::from_std(file))
-    }
-
-    async fn open_existing_file(
-        &self,
-        operation: &'static str,
-        path: &Path,
-    ) -> Result<File, DecodeError> {
-        let file = self
-            .with_entry_parent(operation, path, |directory, path| {
-                directory.open(path).map(|file| file.into_std())
             })
             .await?;
         Ok(File::from_std(file))
