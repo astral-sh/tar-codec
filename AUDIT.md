@@ -22,7 +22,7 @@ Six findings needed a decision or remediation at the reviewed revision because d
 
 The link and `/.` cases change object reachability or type. Parent promotion discards an earlier archive member and chooses a third filesystem interpretation rather than rejecting an ambiguous sequence. DIF-01 is an intentional consequence of the crate's portable permission model rather than a failure to enforce archive-provided access control.
 
-DIF-01 and DIF-05 have since been accepted and documented as intentional metadata-model differentials. DIF-02, DIF-03, and DIF-04 have been remediated with exact-or-reject link handling, fail-closed implicit parent creation, and directory-required member-suffix validation respectively.
+DIF-01, DIF-05, and DIF-06 have since been accepted and documented as intentional metadata-model differentials. DIF-07 is accepted as a documented, explicit opt-in risk. DIF-02, DIF-03, and DIF-04 have been remediated with exact-or-reject link handling, fail-closed implicit parent creation, and directory-required member-suffix validation respectively.
 
 | ID | Severity | Disposition | Differential |
 | --- | --- | --- | --- |
@@ -31,8 +31,8 @@ DIF-01 and DIF-05 have since been accepted and documented as intentional metadat
 | DIF-03 | Medium | Remediated | Non-directory archive ancestors are promoted to directories |
 | DIF-04 | Medium | Remediated | `/.` bypasses regular-file trailing-separator rejection |
 | DIF-05 | Informational | Accepted / documented | PAX ownership is accepted but not applied |
-| DIF-06 | Low | Needs decision | PAX timestamps are accepted but not applied |
-| DIF-07 | Medium | Documented opt-in risk | Unknown vendor records can hide path/sparse semantics |
+| DIF-06 | Informational | Accepted / documented | PAX timestamps are accepted but not applied |
+| DIF-07 | Medium | Accepted / documented opt-in risk | Unknown vendor records can hide path/sparse semantics |
 | DIF-08 | Informational | Expected fail-closed | Duplicate local PAX records are rejected by default |
 | DIF-09 | Informational | Expected fail-closed | Unknown vendor records are rejected by default |
 | DIF-10 | Informational | Expected fail-closed | Unknown unnamespaced keywords are rejected structurally |
@@ -139,21 +139,21 @@ This differential is accepted. Numeric identities are host-specific, ownership c
 
 ### DIF-06 — PAX timestamps are accepted but not applied
 
-Severity: Low  
-Class: metadata differential
+Severity: Informational
+Class: accepted portable metadata-model differential
 
 For `x{mtime=1.25} -> file("timed", "X")`, GNU tar and libarchive restore 1.25 seconds after the Epoch; `tar-codec` leaves extraction time. Ordinary whole-second `mtime`, persistent global `mtime`, and `atime` are also ignored.
 
-This differs from the previous audit's timestamp precision boundary: even values parsed without loss are never applied. Restore supported timestamps after writes, or reject records whose semantics extraction intentionally omits.
+This differs from the previous audit's timestamp precision boundary: even values parsed without loss are never applied. This differential is accepted as part of the extraction metadata model. Timestamp restoration is platform-dependent, status-change time generally cannot be set directly, and this API does not attempt backup-style metadata restoration. `Archive::extract` now documents that filesystem timestamps reflect extraction activity.
 
 ### DIF-07 — Unknown vendor opt-in can ignore path and sparse semantics
 
 Severity: Medium  
-Class: explicit non-default fail-open policy
+Class: accepted explicit non-default fail-open policy
 
 With `allow_unknown_pax_vendor_records(true)`, `x{GNU.sparse.name=sparse-name} -> file("raw", "ok")` is extracted as `raw`; libarchive extracts `sparse-name`, and GNU sparse metadata can also alter logical size and payload mapping.
 
-Default extraction rejects this archive, so the default is safe. Policy documentation already warns about exactly this risk. Keep the option visibly dangerous, and consider always rejecting known semantic families such as `GNU.sparse.*` unless their complete versioned semantics are implemented.
+Default extraction rejects this archive, so the default is safe. This differential is accepted because the caller must explicitly request that unknown vendor semantics be ignored. The policy documentation warns that doing so can change effective paths, sizes, and payload interpretation, and names `GNU.sparse.*` as a concrete example.
 
 ## Expected fail-closed differentials and peer faults
 
@@ -228,9 +228,8 @@ After extracting preceding members, `tar-codec` errors if EOF follows zero or on
 
 The count excludes prior-audit behavior: unknown typeflags; nonzero sizes on directory/FIFO/device entries; negative/out-of-range timestamps and fractional truncation; unsupported `hdrcharset` values; plain `file/` regular members; default rejection of ambient/missing symlink targets; and the 1 MiB PAX-extension limit. They remain observable but are not new coverage.
 
-## Recommended remediation order
+## Remaining guidance
 
-1. Decide whether timestamps are restored or rejected (DIF-06).
-2. Keep the remaining strict defaults; they are useful responses to real parser splits.
+No further remediation is recommended for the accepted metadata-model differentials. Keep the remaining strict defaults; they are useful responses to real parser splits.
 
 Behavioral fixes should receive focused integration tests under `crates/tar-codec/tests`, asserting both the result and final object type/content/link text so partial-error extraction cannot masquerade as a match.

@@ -138,6 +138,8 @@ impl<R: AsyncRead + Unpin> Archive<R> {
     /// Archived owner and group metadata, including PAX `uid`, `gid`, `uname`,
     /// and `gname` records, is not restored. Filesystem ownership is instead
     /// determined by the extracting process and destination directory.
+    /// Archived access, modification, and status-change timestamps are also not
+    /// restored; filesystem timestamps reflect extraction activity.
     ///
     /// **IMPORTANT**: `dest` **MUST NOT** be concurrently modified during extraction.
     /// No correctness/isolation guarantees are made if `dest` is externally modified.
