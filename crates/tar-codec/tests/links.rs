@@ -210,6 +210,43 @@ async fn default_preserves_links_to_missing_root_and_directory_targets() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn targets_blocked_by_archive_files_are_dangling() {
+    let temp = tempdir().unwrap();
+    let mut archive = ArchiveBuilder::new();
+    archive.posix("file", b'0', b"contents", "", 0o644).posix(
+        "link",
+        b'2',
+        b"",
+        "file/child",
+        0o644,
+    );
+    let bytes = archive.finish();
+    Archive::new(bytes.as_slice())
+        .extract(temp.path().join("allow"), DecodePolicy::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_link(temp.path().join("allow/link")).unwrap(),
+        Path::new("file/child")
+    );
+
+    assert!(matches!(
+        Archive::new(bytes.as_slice())
+            .extract(
+                temp.path().join("deny"),
+                DecodePolicy::default()
+                    .link_policy(LinkPolicy::default().allow_missing_targets(false)),
+            )
+            .await,
+        Err(DecodeError::InvalidLink {
+            reason: "target does not exist",
+            ..
+        })
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn missing_targets_can_be_forbidden() {
     let temp = tempdir().unwrap();
     let bytes = single_posix_member("link", b'2', b"", "missing", 0o644);
@@ -318,9 +355,9 @@ async fn missing_target_opt_in_does_not_allow_dangling_targets_through_ambient_s
     }
 }
 
-#[cfg(windows)]
+#[cfg(not(unix))]
 #[tokio::test]
-async fn symlink_members_fail_by_default() {
+async fn symlink_members_fail_by_default_on_unsupported_platforms() {
     let temp = tempdir().unwrap();
     let regular = single_posix_member("file", b'0', b"contents", "", 0o644);
     Archive::new(regular.as_slice())

@@ -178,7 +178,7 @@ impl DecodePolicy {
         if kind == UstarKind::SymbolicLink {
             let violation = match self.link_policy.symlink_policy {
                 SymlinkPolicy::Reject => Some(DecodePolicyViolation::SymbolicLink),
-                #[cfg(windows)]
+                #[cfg(not(unix))]
                 SymlinkPolicy::Preserve => {
                     Some(DecodePolicyViolation::NativeSymlinkCreationUnsupported)
                 }
@@ -263,8 +263,8 @@ impl DecodePolicy {
 impl LinkPolicy {
     /// Configures how symbolic-link members are handled during extraction.
     ///
-    /// Symbolic-link members are preserved by default. Windows does not support
-    /// native symbolic-link extraction, so callers on Windows must select
+    /// Symbolic-link members are preserved by default. Non-Unix platforms do
+    /// not support native symbolic-link extraction, so callers there must select
     /// [`SymlinkPolicy::Skip`] or [`SymlinkPolicy::Reject`].
     pub fn symlink_policy(mut self, policy: SymlinkPolicy) -> Self {
         self.symlink_policy = policy;

@@ -126,7 +126,7 @@ impl<R: AsyncRead + Unpin> Archive<R> {
     /// `policy` controls extraction semantics, including overwrite behavior.
     /// See [`DecodePolicy`] for information about each option and its default.
     /// By default, symbolic-link members are preserved as native links. On
-    /// Windows, symbolic-link members must be skipped or rejected through
+    /// non-Unix platforms, symbolic-link members must be skipped or rejected through
     /// [`LinkPolicy`].
     ///
     /// Archived Unix permission modes are normalized rather than restored. New
@@ -493,9 +493,6 @@ impl ExtractionRoot {
                         return Err(link.error("ambient target is not allowed"));
                     }
                     match kind {
-                        TerminalKind::Dangling if !policy.allow_missing_targets => {
-                            return Err(link.error("target does not exist"));
-                        }
                         TerminalKind::Directory | TerminalKind::NonDirectory
                             if !policy.allow_ambient_targets =>
                         {
@@ -506,6 +503,9 @@ impl ExtractionRoot {
                     kind
                 }
             };
+            if kind == TerminalKind::Dangling && !policy.allow_missing_targets {
+                return Err(link.error("target does not exist"));
+            }
             if kind == TerminalKind::NonDirectory && link.requires_directory {
                 return Err(link.error("target path suffix requires a directory"));
             }
@@ -532,18 +532,23 @@ impl ExtractionRoot {
             if !visited.insert(path.clone()) {
                 return Err("symbolic-link target cycle");
             }
-            let mut components = path.components();
+            let mut components = path.components().peekable();
             let mut prefix = PathBuf::new();
             let mut rewritten = None;
-            for component in components.by_ref() {
+            while let Some(component) = components.next() {
                 prefix.push(component.as_os_str());
                 if let Some(link_index) = self.symlink_indices.get(&prefix)
                     && let Some(link) = self.symlinks.get(*link_index)
                 {
                     let mut target = link.resolved_target.clone();
-                    target.extend(components.map(|component| component.as_os_str()));
+                    target.extend(components.by_ref().map(|component| component.as_os_str()));
                     rewritten = Some(target);
                     break;
+                }
+                if components.peek().is_some()
+                    && matches!(self.entries.get(&prefix), Some(ExtractedEntry::File))
+                {
+                    return Ok(ResolvedTarget::Known(TerminalKind::Dangling));
                 }
             }
             if let Some(rewritten) = rewritten {
