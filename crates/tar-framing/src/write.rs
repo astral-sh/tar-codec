@@ -29,7 +29,7 @@ pub struct PaxMember<'a> {
     pub kind: UstarKind,
     /// The meaningful regular-file payload size.
     pub size: u64,
-    /// The UTF-8 symbolic-link target, when `kind` is [`MemberKind::SymbolicLink`].
+    /// The UTF-8 symbolic-link target, when `kind` is [`UstarKind::SymbolicLink`].
     pub link_path: Option<&'a str>,
     /// Whether a regular file should carry executable intent.
     pub executable: bool,

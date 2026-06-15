@@ -254,6 +254,7 @@ pub enum PaxRecord {
     /// File access time in integral seconds; fractional seconds are discarded.
     Atime(PaxValue<u64>),
     /// Encoding of the following member's file data.
+    // TODO: Consider enforcing known values here, similarly to what we do for `hdrcharset`.
     Charset(PaxValue<Arc<str>>),
     /// An uninterpreted archive comment.
     Comment(PaxValue<Arc<str>>),
