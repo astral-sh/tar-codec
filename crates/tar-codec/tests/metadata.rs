@@ -7,7 +7,9 @@ use support::{
     set_identity_byte, single_posix_member,
 };
 use tar_codec::{
-    decode::{Archive, DecodeError, DecodePolicy, DecodePolicyViolation, PaxDecodePolicy},
+    decode::{
+        Archive, DecodeError, DecodePolicy, DecodePolicyViolation, LinkPolicy, PaxDecodePolicy,
+    },
     default_name_validator,
 };
 use tar_framing::{FrameError, FrameErrorInner, PaxKeyword};
@@ -178,7 +180,8 @@ async fn member_and_link_name_validation_is_configurable() {
             "hard-link target",
         ),
     ] {
-        let policy = DecodePolicy::default().allow_hard_links(true);
+        let policy =
+            DecodePolicy::default().link_policy(LinkPolicy::default().allow_hard_links(true));
         assert!(matches!(
             Archive::new(bytes.as_slice())
                 .extract(temp.path().join(case), policy)

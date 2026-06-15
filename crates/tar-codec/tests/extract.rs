@@ -3,7 +3,7 @@ pub mod support;
 use std::path::Path;
 
 use support::{ArchiveBuilder, ArchiveFormat, EntryKind, header, pax_record, single_posix_member};
-use tar_codec::decode::{Archive, DecodeError, DecodePolicy};
+use tar_codec::decode::{Archive, DecodeError, DecodePolicy, LinkPolicy};
 use tar_framing::{FrameError, FrameErrorInner, PaxKeyword, UstarKind};
 use tempfile::tempdir;
 
@@ -282,7 +282,10 @@ async fn later_entries_replace_representative_cross_kind_paths() {
             .entry("same", last, b"last");
         let bytes = archive.finish();
         Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default().allow_hard_links(true))
+            .extract(
+                &destination,
+                DecodePolicy::default().link_policy(LinkPolicy::default().allow_hard_links(true)),
+            )
             .await
             .unwrap();
         match last {
@@ -296,10 +299,11 @@ async fn later_entries_replace_representative_cross_kind_paths() {
             EntryKind::Directory => assert!(destination.join("same").is_dir(), "{case}"),
             EntryKind::SymbolicLink => {
                 assert_eq!(
-                    std::fs::read_link(destination.join("same")).unwrap(),
-                    Path::new("target"),
+                    std::fs::read(destination.join("same")).unwrap(),
+                    b"target",
                     "{case}"
                 );
+                assert!(destination.join("same").is_file(), "{case}");
             }
             EntryKind::HardLink => {
                 std::fs::write(destination.join("target"), b"updated").unwrap();
@@ -341,7 +345,10 @@ async fn extraction_replaces_empty_leaves_but_rejects_non_directory_parents() {
             .entry("same", archive_kind, b"archive");
         let bytes = archive.finish();
         Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default().allow_hard_links(true))
+            .extract(
+                &destination,
+                DecodePolicy::default().link_policy(LinkPolicy::default().allow_hard_links(true)),
+            )
             .await
             .unwrap();
         match archive_kind {
@@ -350,10 +357,8 @@ async fn extraction_replaces_empty_leaves_but_rejects_non_directory_parents() {
             }
             EntryKind::Directory => assert!(destination.join("same").is_dir()),
             EntryKind::SymbolicLink => {
-                assert_eq!(
-                    std::fs::read_link(destination.join("same")).unwrap(),
-                    Path::new("target")
-                );
+                assert_eq!(std::fs::read(destination.join("same")).unwrap(), b"target");
+                assert!(destination.join("same").is_file());
             }
             EntryKind::HardLink => {
                 std::fs::write(destination.join("target"), b"updated").unwrap();
@@ -379,7 +384,7 @@ async fn extraction_replaces_empty_leaves_but_rejects_non_directory_parents() {
             Archive::new(bytes.as_slice())
                 .extract(
                     &destination,
-                    DecodePolicy::default().allow_hard_links(true),
+                    DecodePolicy::default().link_policy(LinkPolicy::default().allow_hard_links(true)),
                 )
                 .await,
             Err(DecodeError::PathCollision { path }) if path == Path::new("parent")

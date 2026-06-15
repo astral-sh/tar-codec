@@ -38,26 +38,33 @@ impl<R> Archive<R> {
 /// See each configuration API for its default.
 #[derive(Clone, Copy, Debug)]
 pub struct DecodePolicy {
-    allow_symlinks: bool,
-    symlink_target_policy: SymlinkTargetPolicy,
-    allow_hard_links: bool,
+    link_policy: LinkPolicy,
     allow_overwrites: bool,
     allow_gnu: bool,
     pax_policy: PaxDecodePolicy,
     name_validation: NameValidation,
 }
 
-/// Controls which symbolic-link targets extraction may accept.
+/// Controls how symbolic- and hard-link members are extracted.
+///
+/// By default, symbolic-link members are materialized as independent regular
+/// files containing the bytes of an archive-created target. Hard links, native
+/// symbolic links, ambient symbolic-link targets, and missing symbolic-link
+/// targets each require explicit opt-in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinkPolicy {
+    allow_symlinks: bool,
+    create_symlinks: bool,
+    allow_hard_links: bool,
+    symlink_targets: TargetPolicy,
+}
+
+/// Controls which symbolic-link targets a [`LinkPolicy`] may resolve outside
+/// the archive.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum SymlinkTargetPolicy {
-    /// Allow only the extraction root or entries created by this extraction.
-    #[default]
-    ArchiveOnly,
-    /// Also allow missing targets and existing filesystem entries.
-    ///
-    /// Existing symbolic links are followed only when capability-relative
-    /// resolution remains beneath the extraction root.
-    AllowAmbientAndMissing,
+struct TargetPolicy {
+    allow_ambient: bool,
+    allow_missing: bool,
 }
 
 /// Controls which otherwise valid pax features extraction may accept.
@@ -88,9 +95,7 @@ impl Default for PaxDecodePolicy {
 impl Default for DecodePolicy {
     fn default() -> Self {
         Self {
-            allow_symlinks: true,
-            symlink_target_policy: SymlinkTargetPolicy::default(),
-            allow_hard_links: false,
+            link_policy: LinkPolicy::default(),
             allow_overwrites: true,
             allow_gnu: true,
             pax_policy: PaxDecodePolicy::default(),
@@ -99,35 +104,21 @@ impl Default for DecodePolicy {
     }
 }
 
+impl Default for LinkPolicy {
+    fn default() -> Self {
+        Self {
+            allow_symlinks: true,
+            create_symlinks: false,
+            allow_hard_links: false,
+            symlink_targets: TargetPolicy::default(),
+        }
+    }
+}
+
 impl DecodePolicy {
-    /// Configures whether symbolic-link members may be extracted.
-    ///
-    /// Symlink extraction is **allowed by default**.
-    pub fn allow_symlinks(mut self, allow: bool) -> Self {
-        self.allow_symlinks = allow;
-        self
-    }
-
-    /// Configures which symbolic-link targets extraction may accept.
-    ///
-    /// By default, only the extraction root and entries created by this
-    /// extraction are accepted. See [`SymlinkTargetPolicy`] for the available
-    /// policies.
-    pub fn symlink_target_policy(mut self, policy: SymlinkTargetPolicy) -> Self {
-        self.symlink_target_policy = policy;
-        self
-    }
-
-    /// Configures whether hard-link members may be extracted.
-    ///
-    /// Hardlinks are **forbidden by default** because they're (1) not common,
-    /// (2) harder to extract in a cross-platform manner, and
-    /// (3) may be differential-prone dependending on the input.
-    ///
-    /// **IMPORTANT**: Only enable hard-link extraction if you fully
-    /// trust the archive you're extracting from.
-    pub fn allow_hard_links(mut self, allow: bool) -> Self {
-        self.allow_hard_links = allow;
+    /// Configures symbolic- and hard-link extraction behavior.
+    pub fn link_policy(mut self, policy: LinkPolicy) -> Self {
+        self.link_policy = policy;
         self
     }
 
@@ -181,15 +172,24 @@ impl DecodePolicy {
     }
 
     fn check_member_kind(&self, position: u64, kind: UstarKind) -> Result<(), DecodeError> {
-        let violation = match kind {
-            UstarKind::SymbolicLink if !self.allow_symlinks => {
-                Some(DecodePolicyViolation::SymbolicLink)
-            }
-            UstarKind::HardLink if !self.allow_hard_links => Some(DecodePolicyViolation::HardLink),
-            _ => None,
-        };
-        if let Some(violation) = violation {
-            return Err(DecodeError::policy_violation(position, violation));
+        if kind == UstarKind::SymbolicLink && !self.link_policy.allow_symlinks {
+            return Err(DecodeError::policy_violation(
+                position,
+                DecodePolicyViolation::SymbolicLink,
+            ));
+        }
+        #[cfg(windows)]
+        if kind == UstarKind::SymbolicLink && self.link_policy.create_symlinks {
+            return Err(DecodeError::policy_violation(
+                position,
+                DecodePolicyViolation::NativeSymlinkCreationUnsupported,
+            ));
+        }
+        if kind == UstarKind::HardLink && !self.link_policy.allow_hard_links {
+            return Err(DecodeError::policy_violation(
+                position,
+                DecodePolicyViolation::HardLink,
+            ));
         }
         Ok(())
     }
@@ -254,6 +254,63 @@ impl DecodePolicy {
             ));
         }
         Ok(())
+    }
+}
+
+impl LinkPolicy {
+    /// Configures whether symbolic-link members may be extracted.
+    ///
+    /// When disabled, symbolic-link members are rejected regardless of the
+    /// other settings. Symbolic-link members are **allowed by default**.
+    pub fn allow_symlinks(mut self, allow: bool) -> Self {
+        self.allow_symlinks = allow;
+        self
+    }
+
+    /// Configures whether symbolic-link members are installed as native links.
+    ///
+    /// Native creation is **disabled by default**. Symbolic links are instead
+    /// materialized as independent regular files. Native creation is not
+    /// supported on Windows.
+    pub fn create_symlinks(mut self, create: bool) -> Self {
+        self.create_symlinks = create;
+        self
+    }
+
+    /// Configures whether hard-link members may be extracted.
+    ///
+    /// Hard links are **forbidden by default** because they are uncommon,
+    /// difficult to extract consistently across platforms, and prone to
+    /// implementation differentials.
+    ///
+    /// **IMPORTANT**: Only enable hard-link extraction if you fully trust the
+    /// archive being extracted.
+    pub fn allow_hard_links(mut self, allow: bool) -> Self {
+        self.allow_hard_links = allow;
+        self
+    }
+
+    /// Configures whether symbolic-link targets already present in the
+    /// destination may be used.
+    ///
+    /// Existing symbolic links are followed only when capability-relative
+    /// resolution remains beneath the extraction root. Ambient targets are
+    /// **forbidden by default**. This setting does not affect hard-link target
+    /// validation.
+    pub fn allow_ambient_targets(mut self, allow: bool) -> Self {
+        self.symlink_targets.allow_ambient = allow;
+        self
+    }
+
+    /// Configures whether missing symbolic-link targets may be used for native
+    /// symbolic links.
+    ///
+    /// This setting has no effect during materialization, which always requires
+    /// an existing regular file, or on hard-link target validation. Missing
+    /// targets are **forbidden by default**.
+    pub fn allow_missing_targets(mut self, allow: bool) -> Self {
+        self.symlink_targets.allow_missing = allow;
+        self
     }
 }
 
@@ -407,6 +464,9 @@ pub enum DecodePolicyViolation {
     /// A symbolic-link member appeared when links are forbidden.
     #[error("symbolic-link members are not allowed")]
     SymbolicLink,
+    /// Native symbolic-link creation was requested on an unsupported platform.
+    #[error("native symbolic-link creation is not supported on this platform")]
+    NativeSymlinkCreationUnsupported,
     /// A hard-link member appeared when links are forbidden.
     #[error("hard-link members are not allowed")]
     HardLink,

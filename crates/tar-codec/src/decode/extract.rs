@@ -7,8 +7,6 @@ use std::{
 };
 
 use super::*;
-#[cfg(unix)]
-use cap_std::fs::OpenOptionsExt as _;
 use cap_std::{
     ambient_authority,
     fs::{Dir, Metadata, OpenOptions},
@@ -20,13 +18,14 @@ use {
     cap_std::fs::MetadataExt as _, std::os::windows::fs::MetadataExt as _,
     windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT,
 };
+#[cfg(unix)]
+use {cap_std::fs::OpenOptionsExt as _, std::os::unix::fs::PermissionsExt as _};
 
-/// A symbolic link awaiting graph validation and filesystem installation.
+/// A symbolic link awaiting graph validation and final extraction.
 ///
-/// [`PendingSymlink::link_contents`] preserves the archive text for filesystem
-/// installation, while [`PendingSymlink::resolved_target`] is used to validate
-/// the archive's symbolic-link graph relative to the extraction root. Windows
-/// installation translates archive `/` separators to native separators.
+/// [`PendingSymlink::link_contents`] preserves the archive text for optional
+/// native installation, while [`PendingSymlink::resolved_target`] is used to
+/// validate the archive's symbolic-link graph relative to the extraction root.
 #[derive(Clone, Debug)]
 struct PendingSymlink {
     path: PathBuf,
@@ -102,10 +101,12 @@ struct ExtractionRoot {
 /// Windows, where file and directory symbolic links use different operations.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum TerminalKind {
-    /// The target exists and is not a directory.
+    /// The target exists and is a regular file.
     File,
     /// The target exists and is a directory.
     Directory,
+    /// The target exists but is neither a regular file nor a directory.
+    Other,
     /// The target does not yet exist.
     Dangling,
 }
@@ -117,7 +118,7 @@ enum TerminalKind {
 /// by the extraction and therefore requires policy-dependent handling.
 enum ResolvedTarget {
     /// The extraction root or an archive-created entry of the given kind.
-    Known(TerminalKind),
+    Known { path: PathBuf, kind: TerminalKind },
     /// A normalized root-relative path not created by this extraction.
     Unowned(PathBuf),
 }
@@ -129,6 +130,9 @@ impl<R: AsyncRead + Unpin> Archive<R> {
     ///
     /// `policy` controls extraction semantics, including overwrite behavior.
     /// See [`DecodePolicy`] for information about each option and its default.
+    /// By default, symbolic-link members are materialized as independent
+    /// regular-file copies of archive-created targets. This can amplify output
+    /// when many links reference the same large target.
     ///
     /// Archived Unix permission modes are normalized rather than restored. New
     /// regular files are created with mode `0o777` when any archived execute bit
@@ -187,7 +191,7 @@ impl<R: AsyncRead + Unpin> Archive<R> {
                 }
             }
         }
-        root.install_symlinks(policy.symlink_target_policy).await
+        root.finalize_symlinks(policy.link_policy).await
     }
 }
 
@@ -472,10 +476,7 @@ impl ExtractionRoot {
             .any(|candidate| candidate != path && candidate.starts_with(path))
     }
 
-    async fn install_symlinks(
-        &self,
-        target_policy: SymlinkTargetPolicy,
-    ) -> Result<(), DecodeError> {
+    async fn finalize_symlinks(&mut self, policy: LinkPolicy) -> Result<(), DecodeError> {
         let mut links = Vec::with_capacity(self.symlinks.len());
         for (index, link) in self.symlinks.iter().enumerate() {
             if self.symlink_indices.get(&link.path) != Some(&index) {
@@ -484,33 +485,113 @@ impl ExtractionRoot {
             let target = self
                 .resolve_terminal(&link.resolved_target)
                 .map_err(|reason| link.error(reason))?;
-            let kind = match (target, target_policy) {
-                (ResolvedTarget::Known(kind), _) => kind,
-                (ResolvedTarget::Unowned(_), SymlinkTargetPolicy::ArchiveOnly) => {
+            let (target_path, kind) = match target {
+                ResolvedTarget::Known { path, kind } => (path, kind),
+                ResolvedTarget::Unowned(_)
+                    if !policy.symlink_targets.allow_ambient
+                        && !policy.symlink_targets.allow_missing =>
+                {
                     return Err(link.error("target was not created by this extraction"));
                 }
-                (ResolvedTarget::Unowned(path), SymlinkTargetPolicy::AllowAmbientAndMissing) => {
-                    self.inspect_ambient_target(&path).await?
+                ResolvedTarget::Unowned(path) => {
+                    let kind = self.inspect_ambient_target(&path).await?;
+                    match kind {
+                        TerminalKind::Dangling if !policy.symlink_targets.allow_missing => {
+                            return Err(link.error("target does not exist"));
+                        }
+                        TerminalKind::File | TerminalKind::Directory | TerminalKind::Other
+                            if !policy.symlink_targets.allow_ambient =>
+                        {
+                            return Err(link.error("ambient target is not allowed"));
+                        }
+                        _ => {}
+                    }
+                    (path, kind)
                 }
             };
-            let kind = match (kind, link.requires_directory) {
-                (TerminalKind::File, true) => {
-                    return Err(link.error("target path suffix requires a directory"));
+            if matches!(kind, TerminalKind::File | TerminalKind::Other) && link.requires_directory {
+                return Err(link.error("target path suffix requires a directory"));
+            }
+            if !policy.create_symlinks {
+                match kind {
+                    TerminalKind::File => {}
+                    TerminalKind::Directory | TerminalKind::Other => {
+                        return Err(link.error("materialization target is not a regular file"));
+                    }
+                    TerminalKind::Dangling => {
+                        return Err(link.error("materialization target does not exist"));
+                    }
                 }
-                (TerminalKind::Dangling, true) => TerminalKind::Directory,
-                (kind, _) => kind,
-            };
-            links.push((link, kind));
+            }
+            links.push((link.clone(), target_path));
         }
-        for (link, kind) in links {
-            let contents = link.link_contents.clone();
-            self.with_entry_parent(
-                "create symbolic link",
+
+        if policy.create_symlinks {
+            for (link, _) in links {
+                let contents = link.link_contents;
+                self.with_entry_parent(
+                    "create symbolic link",
+                    &link.path,
+                    move |directory, path| create_symlink(directory, &contents, path),
+                )
+                .await?;
+            }
+        } else {
+            // TODO: Consider a configurable cumulative byte limit to bound
+            // output amplification from many links to one large target.
+            for (link, target) in links {
+                self.materialize_symlink(&link, &target).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn materialize_symlink(
+        &mut self,
+        link: &PendingSymlink,
+        target: &Path,
+    ) -> Result<(), DecodeError> {
+        let mut source = self
+            .open_existing_file("open symbolic-link target", target)
+            .await?;
+        #[cfg(unix)]
+        let executable = source
+            .metadata()
+            .await
+            .map_err(|source| {
+                DecodeError::filesystem("inspect symbolic-link target", target.to_owned(), source)
+            })?
+            .permissions()
+            .mode()
+            & 0o111
+            != 0;
+        #[cfg(not(unix))]
+        let executable = false;
+
+        self.entries.remove(&link.path);
+        self.symlink_indices.remove(&link.path);
+        let mut file = self
+            .open_file(
+                "materialize symbolic link",
                 &link.path,
-                move |directory, path| create_symlink(directory, &contents, path, kind),
+                true,
+                false,
+                executable,
             )
             .await?;
-        }
+        self.entries.insert(link.path.clone(), ExtractedEntry::File);
+        tokio::io::copy(&mut source, &mut file)
+            .await
+            .map_err(|source| {
+                DecodeError::filesystem("materialize symbolic link", link.path.clone(), source)
+            })?;
+        file.flush().await.map_err(|source| {
+            DecodeError::filesystem(
+                "flush materialized symbolic link",
+                link.path.clone(),
+                source,
+            )
+        })?;
         Ok(())
     }
 
@@ -539,13 +620,18 @@ impl ExtractionRoot {
                 path = rewritten;
             } else {
                 return Ok(match self.entries.get(&path) {
-                    _ if path.as_os_str().is_empty() => {
-                        ResolvedTarget::Known(TerminalKind::Directory)
-                    }
-                    Some(ExtractedEntry::CreatedDirectory) => {
-                        ResolvedTarget::Known(TerminalKind::Directory)
-                    }
-                    Some(ExtractedEntry::File) => ResolvedTarget::Known(TerminalKind::File),
+                    _ if path.as_os_str().is_empty() => ResolvedTarget::Known {
+                        path,
+                        kind: TerminalKind::Directory,
+                    },
+                    Some(ExtractedEntry::CreatedDirectory) => ResolvedTarget::Known {
+                        path,
+                        kind: TerminalKind::Directory,
+                    },
+                    Some(ExtractedEntry::File) => ResolvedTarget::Known {
+                        path,
+                        kind: TerminalKind::File,
+                    },
                     Some(ExtractedEntry::Symlink) => continue,
                     Some(ExtractedEntry::AmbientDirectory) | None => ResolvedTarget::Unowned(path),
                 });
@@ -561,7 +647,8 @@ impl ExtractionRoot {
             }
             match directory.metadata(path) {
                 Ok(metadata) if metadata.is_dir() => Ok(TerminalKind::Directory),
-                Ok(_) => Ok(TerminalKind::File),
+                Ok(metadata) if metadata.is_file() => Ok(TerminalKind::File),
+                Ok(_) => Ok(TerminalKind::Other),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(TerminalKind::Dangling),
                 Err(error) => Err(error),
             }
@@ -642,6 +729,19 @@ impl ExtractionRoot {
                 directory
                     .open_with(path, &options)
                     .map(|file| file.into_std())
+            })
+            .await?;
+        Ok(File::from_std(file))
+    }
+
+    async fn open_existing_file(
+        &self,
+        operation: &'static str,
+        path: &Path,
+    ) -> Result<File, DecodeError> {
+        let file = self
+            .with_entry_parent(operation, path, |directory, path| {
+                directory.open(path).map(|file| file.into_std())
             })
             .await?;
         Ok(File::from_std(file))
@@ -772,43 +872,12 @@ fn metadata_is_link(metadata: &Metadata) -> bool {
 }
 
 #[cfg(unix)]
-fn create_symlink(
-    directory: &Dir,
-    contents: &str,
-    path: &Path,
-    _kind: TerminalKind,
-) -> io::Result<()> {
+fn create_symlink(directory: &Dir, contents: &str, path: &Path) -> io::Result<()> {
     directory.symlink(contents, path)
 }
 
-#[cfg(windows)]
-fn create_symlink(
-    directory: &Dir,
-    contents: &str,
-    path: &Path,
-    kind: TerminalKind,
-) -> io::Result<()> {
-    // `CreateSymbolicLinkW` stores the target text verbatim in the reparse
-    // point. When Windows later traverses that target, a relative target such
-    // as `dir/file` fails with `ERROR_INVALID_NAME` because `/` is not treated
-    // as a component separator. Convert tar's separators after validation.
-    // Libarchive performs the same translation:
-    // <https://github.com/libarchive/libarchive/blob/7a35e717/libarchive/archive_write_disk_windows.c#L638-L655>
-    let contents = contents.replace('/', "\\");
-    match kind {
-        TerminalKind::File => directory.symlink_file(&contents, path),
-        TerminalKind::Directory => directory.symlink_dir(&contents, path),
-        TerminalKind::Dangling => directory.symlink_file(&contents, path),
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn create_symlink(
-    _directory: &Dir,
-    _contents: &str,
-    _path: &Path,
-    _kind: TerminalKind,
-) -> io::Result<()> {
+#[cfg(not(unix))]
+fn create_symlink(_directory: &Dir, _contents: &str, _path: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "symbolic links are not supported on this platform",
