@@ -23,13 +23,13 @@ const END_MARKER_BYTES: [u8; BLOCK_SIZE * 2] = [0; BLOCK_SIZE * 2];
 pub struct PaxMember<'a> {
     /// The UTF-8 member path written into the local pax header.
     ///
-    /// Non-directory paths cannot end in `/`.
+    /// Non-directory paths cannot end in `/` or a final `.` or `..` component.
     pub path: &'a str,
     /// The supported ordinary member kind.
     pub kind: UstarKind,
     /// The meaningful regular-file payload size.
     pub size: u64,
-    /// The UTF-8 symbolic-link target, when `kind` is [`MemberKind::SymbolicLink`].
+    /// The UTF-8 symbolic-link target, when `kind` is [`UstarKind::SymbolicLink`].
     pub link_path: Option<&'a str>,
     /// Whether a regular file should carry executable intent.
     pub executable: bool,
@@ -70,9 +70,9 @@ pub enum FramingWriteError {
     /// A PAX record keyword is empty or contains `=`.
     #[error("pax record keywords must be non-empty and cannot contain '='")]
     InvalidPaxRecordKeyword,
-    /// A non-directory member path has a trailing archive separator.
-    #[error("member type {kind:?} cannot have a trailing path separator")]
-    TrailingPathSeparator {
+    /// A non-directory member path has a suffix that requires a directory.
+    #[error("member type {kind:?} cannot have a directory-required path suffix")]
+    DirectoryRequiredPathSuffix {
         /// The affected member kind.
         kind: UstarKind,
     },
@@ -208,11 +208,18 @@ pub fn payload_padding(size: u64) -> &'static [u8] {
 
 fn validate_member(member: PaxMember<'_>) -> Result<(), FramingWriteError> {
     validate_text("path", member.path)?;
-    // Defensive: our own decoder rejects non-directories that end with trailing
-    // slashes, so we should never encode one.
+    // Defensive: our own decoder rejects non-directories with suffixes that
+    // require directory resolution, so we should never encode one.
     // TODO: Single-source this check, maybe in name validation?
-    if member.path.ends_with('/') && !matches!(member.kind, UstarKind::Directory) {
-        return Err(FramingWriteError::TrailingPathSeparator { kind: member.kind });
+    if !matches!(member.kind, UstarKind::Directory)
+        && (member.path.ends_with('/')
+            || member
+                .path
+                .rsplit('/')
+                .next()
+                .is_some_and(|component| matches!(component, "." | "..")))
+    {
+        return Err(FramingWriteError::DirectoryRequiredPathSuffix { kind: member.kind });
     }
     match member.kind {
         UstarKind::Regular | UstarKind::Directory if member.link_path.is_some() => {

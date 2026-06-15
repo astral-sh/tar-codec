@@ -7,7 +7,7 @@ use std::{
 };
 
 use tar_codec::{
-    decode::{Archive, DecodeError, DecodePolicy},
+    decode::{Archive, DecodeError, DecodePolicy, LinkPolicy},
     default_name_validator,
     encode::{EncodeError, EncodePolicy, Encoder, EntryMetadata, TraversalError},
 };
@@ -118,25 +118,54 @@ async fn manual_entries_round_trip_and_preserve_archive_names() {
 }
 
 #[tokio::test]
-async fn manual_regular_entry_rejects_trailing_separator_before_writing() {
+async fn manual_regular_entry_rejects_directory_required_suffix_before_writing() {
     let mut encoder = Encoder::new(Vec::new());
-    assert!(matches!(
-        encoder
-            .add_entry("file/", b"rejected", EntryMetadata::default())
-            .await,
-        Err(EncodeError::Framing(
-            FramingWriteError::TrailingPathSeparator {
-                kind: UstarKind::Regular
-            }
-        ))
-    ));
+    for path in [
+        "file/",
+        "file/.",
+        "file//.",
+        "file/././.",
+        "file/./././",
+        "foo/bar/..",
+        "foo/bar/../",
+    ] {
+        assert!(matches!(
+            encoder
+                .add_entry(path, b"rejected", EntryMetadata::default())
+                .await,
+            Err(EncodeError::Framing(
+                FramingWriteError::DirectoryRequiredPathSuffix {
+                    kind: UstarKind::Regular
+                }
+            ))
+        ));
+    }
 
     encoder
         .add_entry("accepted", b"contents", EntryMetadata::default())
         .await
-        .unwrap();
-    let bytes = encoder.finish().await.unwrap();
+        .expect("encoder should remain usable after preflight rejections");
+    let bytes = encoder.finish().await.expect("archive should finish");
     assert_eq!(encoded_paths(&bytes).await, ["accepted"]);
+}
+
+/// The encoder must reject root-level `.` and `..` regular members just as it
+/// rejects those components when they follow an archive path separator.
+#[tokio::test]
+async fn manual_regular_entry_rejects_top_level_directory_components_before_writing() {
+    for path in [".", ".."] {
+        let mut encoder = Encoder::new(Vec::new());
+        assert!(matches!(
+            encoder
+                .add_entry(path, b"rejected", EntryMetadata::default())
+                .await,
+            Err(EncodeError::Framing(
+                FramingWriteError::DirectoryRequiredPathSuffix {
+                    kind: UstarKind::Regular
+                }
+            ))
+        ));
+    }
 }
 
 #[tokio::test]
@@ -324,9 +353,18 @@ async fn recursive_encoding_preserves_symlinks_and_repeated_inodes() {
 
     let destination = temp.path().join("out");
     Archive::new(bytes.as_slice())
-        .extract(&destination, DecodePolicy::default())
+        .extract(
+            &destination,
+            DecodePolicy::default().link_policy(LinkPolicy::default().create_symlinks(true)),
+        )
         .await
         .unwrap();
+    assert!(
+        std::fs::symlink_metadata(destination.join("safe/file"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(
         std::fs::read_to_string(destination.join("safe/file")).unwrap(),
         "contents"

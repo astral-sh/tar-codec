@@ -3,7 +3,7 @@ pub mod support;
 use std::path::Path;
 
 use support::{ArchiveBuilder, ArchiveFormat, EntryKind, header, pax_record, single_posix_member};
-use tar_codec::decode::{Archive, DecodeError, DecodePolicy};
+use tar_codec::decode::{Archive, DecodeError, DecodePolicy, LinkPolicy};
 use tar_framing::{FrameError, FrameErrorInner, PaxKeyword, UstarKind};
 use tempfile::tempdir;
 
@@ -131,33 +131,72 @@ async fn rejects_directory_payload_without_writing_embedded_members() {
     assert!(std::fs::read_dir(destination).unwrap().next().is_none());
 }
 
-/// Ensures that we reject a regular file that ends with a trailing slash.
+/// Ensures that we reject a regular file with a directory-required path suffix.
 /// See malo's `malicious/pax_path_trailoing_slash_file.tar` for the case
 /// that this was derived from.
 /// See: <https://github.com/fastzip/malo/tree/3df544f1a2fc498b2a84eb34981deb111cadbf32/tar/malicious>
 #[tokio::test]
-async fn rejects_trailing_separator_on_regular_file_without_writing_members() {
-    let mut archive = ArchiveBuilder::new();
-    archive
-        .pax(b'x', &pax_record(PaxKeyword::Path, "file.txt/"))
-        .posix("ignored", b'0', b"hello", "", 0o644);
-    let bytes = archive.finish();
+async fn rejects_directory_required_suffix_on_regular_file_without_writing_members() {
+    for path in [
+        "file.txt/",
+        "file.txt/.",
+        "file.txt//.",
+        "file.txt/././.",
+        "file.txt/./././",
+        "foo/bar/..",
+        "foo/bar/../",
+    ] {
+        let mut archive = ArchiveBuilder::new();
+        archive
+            .pax(b'x', &pax_record(PaxKeyword::Path, path))
+            .posix("ignored", b'0', b"hello", "", 0o644);
+        let bytes = archive.finish();
 
-    let temp = tempdir().unwrap();
-    let destination = temp.path().join("out");
-    assert!(matches!(
+        let temp = tempdir().expect("temporary directory should be created");
+        let destination = temp.path().join("out");
+        assert!(matches!(
+            Archive::new(bytes.as_slice())
+                .extract(&destination, DecodePolicy::default())
+                .await,
+            Err(DecodeError::UnsafePath {
+                position: 1024,
+                context: "member path",
+                value,
+                reason: "only a directory may have a directory-required path suffix",
+            }) if value == path
+        ));
+        assert!(destination.is_dir());
+        assert!(
+            std::fs::read_dir(destination)
+                .expect("destination should be readable")
+                .next()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn accepts_directory_required_suffix_on_directory_members() {
+    for path in [
+        "directory/.",
+        "directory//.",
+        "directory/././.",
+        "directory/./././",
+    ] {
+        let mut archive = ArchiveBuilder::new();
+        archive
+            .pax(b'x', &pax_record(PaxKeyword::Path, path))
+            .posix("ignored", b'5', b"", "", 0o755);
+        let bytes = archive.finish();
+
+        let temp = tempdir().expect("temporary directory should be created");
+        let destination = temp.path().join("out");
         Archive::new(bytes.as_slice())
             .extract(&destination, DecodePolicy::default())
-            .await,
-        Err(DecodeError::UnsafePath {
-            position: 1024,
-            context: "member path",
-            value,
-            reason: "only a directory may have a trailing separator",
-        }) if value == "file.txt/"
-    ));
-    assert!(destination.is_dir());
-    assert!(std::fs::read_dir(destination).unwrap().next().is_none());
+            .await
+            .expect("directory member should be extracted");
+        assert!(destination.join("directory").is_dir());
+    }
 }
 
 #[tokio::test]
@@ -243,7 +282,10 @@ async fn later_entries_replace_representative_cross_kind_paths() {
             .entry("same", last, b"last");
         let bytes = archive.finish();
         Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default().allow_hard_links(true))
+            .extract(
+                &destination,
+                DecodePolicy::default().link_policy(LinkPolicy::default().allow_hard_links(true)),
+            )
             .await
             .unwrap();
         match last {
@@ -257,10 +299,11 @@ async fn later_entries_replace_representative_cross_kind_paths() {
             EntryKind::Directory => assert!(destination.join("same").is_dir(), "{case}"),
             EntryKind::SymbolicLink => {
                 assert_eq!(
-                    std::fs::read_link(destination.join("same")).unwrap(),
-                    Path::new("target"),
+                    std::fs::read(destination.join("same")).unwrap(),
+                    b"target",
                     "{case}"
                 );
+                assert!(destination.join("same").is_file(), "{case}");
             }
             EntryKind::HardLink => {
                 std::fs::write(destination.join("target"), b"updated").unwrap();
@@ -274,8 +317,14 @@ async fn later_entries_replace_representative_cross_kind_paths() {
     }
 }
 
+/// Ensures exact-path members can replace eligible leaves while descendants
+/// cannot implicitly promote non-directory ancestors into directories.
+///
+/// The ancestor cases cover archive-created regular files, hard links, and
+/// pending symbolic links, as well as an ambient regular file. The descendant
+/// uses a PAX `path` override so the check applies to the effective member path.
 #[tokio::test]
-async fn extraction_replaces_empty_leaves_and_promotes_non_directory_parents() {
+async fn extraction_replaces_empty_leaves_but_rejects_non_directory_parents() {
     let temp = tempdir().unwrap();
     for (case, existing_file, archive_kind) in [
         ("file-to-directory", true, EntryKind::Directory),
@@ -296,7 +345,10 @@ async fn extraction_replaces_empty_leaves_and_promotes_non_directory_parents() {
             .entry("same", archive_kind, b"archive");
         let bytes = archive.finish();
         Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default().allow_hard_links(true))
+            .extract(
+                &destination,
+                DecodePolicy::default().link_policy(LinkPolicy::default().allow_hard_links(true)),
+            )
             .await
             .unwrap();
         match archive_kind {
@@ -305,10 +357,8 @@ async fn extraction_replaces_empty_leaves_and_promotes_non_directory_parents() {
             }
             EntryKind::Directory => assert!(destination.join("same").is_dir()),
             EntryKind::SymbolicLink => {
-                assert_eq!(
-                    std::fs::read_link(destination.join("same")).unwrap(),
-                    Path::new("target")
-                );
+                assert_eq!(std::fs::read(destination.join("same")).unwrap(), b"target");
+                assert!(destination.join("same").is_file());
             }
             EntryKind::HardLink => {
                 std::fs::write(destination.join("target"), b"updated").unwrap();
@@ -320,35 +370,54 @@ async fn extraction_replaces_empty_leaves_and_promotes_non_directory_parents() {
     for (case, parent) in [
         ("file-parent", EntryKind::File),
         ("symbolic-link-parent", EntryKind::SymbolicLink),
+        ("hard-link-parent", EntryKind::HardLink),
     ] {
         let destination = temp.path().join(case);
         let mut archive = ArchiveBuilder::new();
         archive
+            .posix("target", b'0', b"target", "", 0o644)
             .entry("parent", parent, b"old")
-            .posix("parent/child", b'0', b"new", "", 0o644);
+            .pax(b'x', &pax_record(PaxKeyword::Path, "parent/child"))
+            .posix("ignored", b'0', b"new", "", 0o644);
         let bytes = archive.finish();
-        Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default())
-            .await
-            .unwrap();
-        assert_eq!(
-            std::fs::read(destination.join("parent/child")).unwrap(),
-            b"new"
-        );
+        assert!(matches!(
+            Archive::new(bytes.as_slice())
+                .extract(
+                    &destination,
+                    DecodePolicy::default().link_policy(LinkPolicy::default().allow_hard_links(true)),
+                )
+                .await,
+            Err(DecodeError::PathCollision { path }) if path == Path::new("parent")
+        ));
+        assert!(!destination.join("parent/child").exists());
+        match parent {
+            EntryKind::File => {
+                assert_eq!(std::fs::read(destination.join("parent")).unwrap(), b"old");
+            }
+            EntryKind::HardLink => {
+                assert_eq!(
+                    std::fs::read(destination.join("parent")).unwrap(),
+                    b"target"
+                );
+            }
+            EntryKind::SymbolicLink => {
+                assert!(!destination.join("parent").exists());
+            }
+            EntryKind::Directory => {}
+        }
     }
 
     let destination = temp.path().join("ambient-parent");
     std::fs::create_dir(&destination).unwrap();
     std::fs::write(destination.join("parent"), b"old").unwrap();
     let bytes = single_posix_member("parent/child", b'0', b"new", "", 0o644);
-    Archive::new(bytes.as_slice())
-        .extract(&destination, DecodePolicy::default())
-        .await
-        .unwrap();
-    assert_eq!(
-        std::fs::read(destination.join("parent/child")).unwrap(),
-        b"new"
-    );
+    assert!(matches!(
+        Archive::new(bytes.as_slice())
+            .extract(&destination, DecodePolicy::default())
+            .await,
+        Err(DecodeError::PathCollision { path }) if path == Path::new("parent")
+    ));
+    assert_eq!(std::fs::read(destination.join("parent")).unwrap(), b"old");
 }
 
 #[tokio::test]
@@ -474,9 +543,12 @@ async fn non_empty_directories_are_never_replaced() {
     assert!(destination.join("same").is_dir());
 }
 
+/// Ensures a destination symbolic link cannot be used or replaced as an
+/// implicit parent, while an exact-path leaf link remains replaceable without
+/// modifying the object it targets.
 #[cfg(any(unix, windows))]
 #[tokio::test]
-async fn extraction_replaces_destination_symlinks_without_following_them() {
+async fn extraction_rejects_symlink_parents_and_replaces_symlink_leaves_without_following() {
     use support::{symlink_dir, symlink_file};
 
     let temp = tempdir().unwrap();
@@ -486,13 +558,15 @@ async fn extraction_replaces_destination_symlinks_without_following_them() {
     std::fs::create_dir_all(&outside).unwrap();
     symlink_dir(&outside, destination.join("parent")).unwrap();
     let bytes = single_posix_member("parent/file", b'0', b"good", "", 0o644);
-    Archive::new(bytes.as_slice())
-        .extract(&destination, DecodePolicy::default())
-        .await
-        .unwrap();
+    assert!(matches!(
+        Archive::new(bytes.as_slice())
+            .extract(&destination, DecodePolicy::default())
+            .await,
+        Err(DecodeError::PathCollision { path }) if path == Path::new("parent")
+    ));
     assert_eq!(
-        std::fs::read(destination.join("parent/file")).unwrap(),
-        b"good"
+        std::fs::read_link(destination.join("parent")).unwrap(),
+        outside
     );
     assert!(!outside.join("file").exists());
 
@@ -533,9 +607,11 @@ async fn rejects_a_symlink_destination_root_without_modifying_its_target() {
     assert!(!target.join("file").exists());
 }
 
+/// Ensures Windows junctions receive the same fail-closed treatment as other
+/// link-like objects when used as an implicit parent or extraction root.
 #[cfg(windows)]
 #[tokio::test]
-async fn destination_junctions_are_replaced_as_parents_and_rejected_as_roots() {
+async fn destination_junctions_are_rejected_as_parents_and_roots() {
     let temp = tempdir().unwrap();
     let outside = temp.path().join("outside");
     std::fs::create_dir(&outside).unwrap();
@@ -545,14 +621,12 @@ async fn destination_junctions_are_replaced_as_parents_and_rejected_as_roots() {
     std::fs::create_dir(&destination).unwrap();
     junction::create(&outside, destination.join("junction")).unwrap();
     let bytes = single_posix_member("junction/file", b'0', b"archive", "", 0o644);
-    Archive::new(bytes.as_slice())
-        .extract(&destination, DecodePolicy::default())
-        .await
-        .unwrap();
-    assert_eq!(
-        std::fs::read(destination.join("junction/file")).unwrap(),
-        b"archive"
-    );
+    assert!(matches!(
+        Archive::new(bytes.as_slice())
+            .extract(&destination, DecodePolicy::default())
+            .await,
+        Err(DecodeError::PathCollision { path }) if path == Path::new("junction")
+    ));
     assert!(!outside.join("file").exists());
 
     let destination = temp.path().join("root-junction");
