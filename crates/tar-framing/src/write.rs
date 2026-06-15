@@ -215,8 +215,9 @@ fn validate_member(member: PaxMember<'_>) -> Result<(), FramingWriteError> {
         && (member.path.ends_with('/')
             || member
                 .path
-                .rsplit_once('/')
-                .is_some_and(|(_, component)| matches!(component, "." | "..")))
+                .rsplit('/')
+                .next()
+                .is_some_and(|component| matches!(component, "." | "..")))
     {
         return Err(FramingWriteError::DirectoryRequiredPathSuffix { kind: member.kind });
     }

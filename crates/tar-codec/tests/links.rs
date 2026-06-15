@@ -1,9 +1,11 @@
 pub mod support;
 
-#[cfg(unix)]
-use std::os::unix::net::UnixListener;
 use std::path::Path;
+#[cfg(unix)]
+use std::{io, os::unix::net::UnixListener};
 
+#[cfg(unix)]
+use support::symlink_file;
 use support::{ArchiveBuilder, pax_record, single_posix_member};
 use tar_codec::decode::{Archive, DecodeError, DecodePolicy, DecodePolicyViolation, LinkPolicy};
 use tar_framing::PaxKeyword;
@@ -296,6 +298,49 @@ async fn native_target_controls_are_independent() {
             ..
         })
     ));
+}
+
+/// A missing-target opt-in must not classify paths through existing filesystem
+/// symlinks as ordinary absent targets and bypass the ambient-target policy.
+#[cfg(unix)]
+#[tokio::test]
+async fn missing_target_opt_in_does_not_allow_dangling_targets_through_ambient_symlinks() {
+    let temp = tempdir().unwrap();
+    for (case, ambient_target, archive_target) in [
+        ("leaf", "missing", "ambient-link"),
+        ("intermediate", "ambient", "ambient-link/missing"),
+    ] {
+        let destination = temp.path().join(case);
+        std::fs::create_dir(&destination).unwrap();
+        if case == "intermediate" {
+            std::fs::create_dir(destination.join("ambient")).unwrap();
+        }
+        symlink_file(ambient_target, destination.join("ambient-link")).unwrap();
+        let bytes = single_posix_member("link", b'2', b"", archive_target, 0o644);
+        let policy = DecodePolicy::default().link_policy(
+            LinkPolicy::default()
+                .create_symlinks(true)
+                .allow_missing_targets(true),
+        );
+
+        assert!(matches!(
+            Archive::new(bytes.as_slice())
+                .extract(&destination, policy)
+                .await,
+            Err(DecodeError::InvalidLink {
+                reason: "ambient target is not allowed",
+                ..
+            })
+        ));
+        assert!(matches!(
+            std::fs::symlink_metadata(destination.join("link")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound
+        ));
+        assert_eq!(
+            std::fs::read_link(destination.join("ambient-link")).unwrap(),
+            Path::new(ambient_target)
+        );
+    }
 }
 
 #[cfg(unix)]

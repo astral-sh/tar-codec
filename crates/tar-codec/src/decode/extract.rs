@@ -488,7 +488,10 @@ impl ExtractionRoot {
                     return Err(link.error("target was not created by this extraction"));
                 }
                 ResolvedTarget::Unowned(path) => {
-                    let kind = self.inspect_ambient_target(&path).await?;
+                    let (kind, traverses_ambient_link) = self.inspect_ambient_target(&path).await?;
+                    if traverses_ambient_link && !policy.allow_ambient_targets {
+                        return Err(link.error("ambient target is not allowed"));
+                    }
                     match kind {
                         TerminalKind::Dangling if !policy.allow_missing_targets => {
                             return Err(link.error("target does not exist"));
@@ -622,18 +625,36 @@ impl ExtractionRoot {
         Err("symbolic-link target expansion limit exceeded")
     }
 
-    async fn inspect_ambient_target(&self, path: &Path) -> Result<TerminalKind, DecodeError> {
+    async fn inspect_ambient_target(
+        &self,
+        path: &Path,
+    ) -> Result<(TerminalKind, bool), DecodeError> {
         self.with_root("inspect symbolic-link target", path, |directory, path| {
             if path.as_os_str().is_empty() {
-                return Ok(TerminalKind::Directory);
+                return Ok((TerminalKind::Directory, false));
             }
-            match directory.metadata(path) {
+            let kind = match directory.metadata(path) {
                 Ok(metadata) if metadata.is_dir() => Ok(TerminalKind::Directory),
                 Ok(metadata) if metadata.is_file() => Ok(TerminalKind::File),
                 Ok(_) => Ok(TerminalKind::Other),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(TerminalKind::Dangling),
                 Err(error) => Err(error),
+            }?;
+            if kind != TerminalKind::Dangling {
+                return Ok((kind, false));
             }
+
+            let mut prefix = PathBuf::new();
+            for component in path.components() {
+                prefix.push(component.as_os_str());
+                match directory.symlink_metadata(&prefix) {
+                    Ok(metadata) if metadata_is_link(&metadata) => return Ok((kind, true)),
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok((kind, false))
         })
         .await
     }

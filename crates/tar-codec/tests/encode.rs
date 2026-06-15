@@ -149,6 +149,25 @@ async fn manual_regular_entry_rejects_directory_required_suffix_before_writing()
     assert_eq!(encoded_paths(&bytes).await, ["accepted"]);
 }
 
+/// The encoder must reject root-level `.` and `..` regular members just as it
+/// rejects those components when they follow an archive path separator.
+#[tokio::test]
+async fn manual_regular_entry_rejects_top_level_directory_components_before_writing() {
+    for path in [".", ".."] {
+        let mut encoder = Encoder::new(Vec::new());
+        assert!(matches!(
+            encoder
+                .add_entry(path, b"rejected", EntryMetadata::default())
+                .await,
+            Err(EncodeError::Framing(
+                FramingWriteError::DirectoryRequiredPathSuffix {
+                    kind: UstarKind::Regular
+                }
+            ))
+        ));
+    }
+}
+
 #[tokio::test]
 async fn manual_validation_and_collision_errors_leave_the_encoder_usable() {
     let mut encoder = Encoder::new(Vec::new());
