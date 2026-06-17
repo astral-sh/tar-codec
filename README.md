@@ -10,17 +10,12 @@ Goals:
 Anti-goals:
 
 - Encoding support for anything other than pax
-- Decoding support for legacy (pre-ustar) archives
-- Decoding archives that mix POSIX pax/ustar and GNU framing in one stream, for now
+- Decoding support for legacy (pre-ustar, "UNIX v7") archives
+- Decoding archives that mix POSIX pax/ustar and GNU framing in one stream
 
-## Architecture
+## Usage
 
-`tar-framing` reads and writes physical tar structure. `tar-codec` owns the
-tar-specific projection and pax encoding details. `archive-trait` owns the
-format-neutral building and extraction workflows: validation, collision state,
-filesystem traversal, source streaming, link policy, and destination behavior.
-Future archive formats can reuse those workflows by implementing the same
-format hooks.
+Encoding/archive serialization:
 
 ```rust
 use tar_codec::{ArchiveBuilder as _, EntryMetadata, TarEncoder};
@@ -32,10 +27,10 @@ encoder
 encoder.finish().await?;
 ```
 
-Use `ArchiveBuilder::builder_with_policy` and `builder::BuilderPolicy` to
-configure generic name validation and source traversal. Recursive builds reject
-symbolic links by default. Configure `builder::SymlinkPolicy::Preserve` to
-retain link members instead. Compression remains the caller's responsibility.
+See `ArchiveBuilder::builder_with_policy` for policy knobs that
+can be changed during building.
+
+Decoding/extracting:
 
 ```rust
 use tar_codec::{Archive as _, TarArchive, extract::ExtractPolicy};
@@ -45,8 +40,11 @@ TarArchive::new(reader)
     .await?;
 ```
 
-Use `TarArchive::with_policy` and `DecodePolicy` for GNU/PAX decoding controls.
-Use `extract::ExtractPolicy` for generic name, overwrite, and link behavior.
+Unlike encoding, decoding/extraction has two policy layers:
+
+- Use `TarArchive::with_policy` to control various aspects of GNU or pax handling.
+- Use `extract::ExtractPolicy` to control various aspects of how archives become
+  real paths on the host filesystem.
 
 ## Performance
 
