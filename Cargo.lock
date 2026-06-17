@@ -103,6 +103,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "walkdir",
  "windows-sys 0.60.2",
 ]
 
@@ -968,7 +969,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "walkdir",
 ]
 
 [[package]]

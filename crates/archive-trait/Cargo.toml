@@ -1,6 +1,6 @@
 [package]
 name = "archive-trait"
-description = "Format-neutral, asynchronous archive extraction"
+description = "Format-neutral, asynchronous archive construction and extraction"
 
 version = { workspace = true }
 edition = { workspace = true }
@@ -13,7 +13,8 @@ readme = { workspace = true }
 [dependencies]
 cap-std = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync"] }
+walkdir = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }

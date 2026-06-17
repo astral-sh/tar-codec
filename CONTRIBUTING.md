@@ -5,10 +5,7 @@
 There are a few important architectural divisions/separations of concerns
 to be aware of when making changes.
 
-There are four abstraction layers in the tar-codec repository:
-two live in `tar-framing`, one lives in `tar-codec`, and one lives in
-`archive-trait`.
-In order of abstraction, lowest to highest:
+Archive reading has four abstraction layers, from lowest to highest:
 
 - tar-framing: the _physical_ layer turns an asynchronous input source into a
   stream of tar blocks according to the pax or GNU tar state machine.
@@ -21,10 +18,20 @@ In order of abstraction, lowest to highest:
 - archive-trait: the _extract_ layer turns format-neutral archive members into
   files, directories, links, and other destination state on disk.
 
+Archive building follows the same separation in reverse:
+
+- archive-trait: the _build_ layer owns entry addition, name validation,
+  collision tracking, recursive filesystem traversal, source streaming, and
+  poisoning semantics.
+- tar-codec: the _encode_ layer projects generic build operations into pax
+  members and owns tar framing, padding, sequence numbers, and terminators.
+- tar-framing: the _physical_ write layer serializes individual pax members.
+
 These layers/concerns should be preserved when making changes.
 For example, any change that affects framing (which blocks are considered
 headers, extensions, data, etc.) should occur in the physical layer, while a
-change to path containment or filesystem behavior belongs in `archive-trait`.
+change to source traversal, path containment, or filesystem behavior belongs in
+`archive-trait`.
 
 ## Formatting and linting
 

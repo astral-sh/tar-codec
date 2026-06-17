@@ -1,5 +1,7 @@
-//! Format-neutral, asynchronous archive extraction.
+//! Format-neutral, asynchronous archive construction and extraction.
 //!
+//! Archive formats implement [`ArchiveBuilder`] to reuse high-level entry
+//! addition, recursive filesystem traversal, validation, and source streaming.
 //! Archive formats implement [`Archive`] by projecting their entries into
 //! [`Member`] values. The default [`Archive::extract_in`] implementation then
 //! applies common extraction policy and filesystem behavior.
@@ -7,6 +9,7 @@
 //! Extraction assumes unique access to the destination directory. Concurrent
 //! mutation of that directory is outside the threat model.
 
+mod builder;
 mod extract;
 mod name;
 
@@ -18,6 +21,10 @@ use std::{
 
 use thiserror::Error;
 
+pub use builder::{
+    ArchiveBuilder, BuildError, BuilderPolicy, BuilderState, EntryMetadata, EntryPayload,
+    TraversalError,
+};
 pub use name::{NameValidator, default_name_validator};
 
 /// Common metadata for one archive member.

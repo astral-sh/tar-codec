@@ -1,8 +1,8 @@
-//! Bounded filesystem traversal for recursive encoding.
+//! Bounded filesystem traversal for recursive archive building.
 //!
 //! Directory walking is synchronous filesystem work, so [`TraversalStream`]
 //! runs [`WalkDir`] on Tokio's blocking pool and sends typed entries back to the
-//! async encoder. This lets traversal overlap with payload reads and archive
+//! async builder. This lets traversal overlap with payload reads and archive
 //! writes without blocking the async executor.
 //!
 //! The producer sends entries in batches rather than one at a time. The channel
@@ -12,7 +12,7 @@
 //! [`WalkDir`] is configured for deterministic depth-first traversal with
 //! directories before their contents. Source symbolic links are reported as
 //! entries and never followed. This module reads their textual targets, while
-//! the encoder preserves those targets without applying extraction policy.
+//! the builder preserves those targets without applying extraction policy.
 
 use std::{
     io, mem,
@@ -30,12 +30,12 @@ use crate::name::NameValidation;
 /// This is an internal performance tuning knob. Larger batches reduce channel
 /// overhead but increase traversal lookahead and delay late source errors.
 pub(crate) const DIRECTORY_TRAVERSAL_BATCH_ENTRIES: usize = 256;
-/// Number of completed batches allowed to wait for the encoder.
+/// Number of completed batches allowed to wait for the builder.
 ///
 /// The producer may also be filling one additional batch locally.
 const DIRECTORY_TRAVERSAL_BUFFER_BATCHES: usize = 1;
 
-/// One source filesystem entry normalized for recursive encoding.
+/// One source filesystem entry normalized for recursive archive building.
 #[derive(Debug)]
 pub(crate) struct TraversalEntry {
     /// Source path used when opening regular files or reporting errors.
@@ -46,7 +46,7 @@ pub(crate) struct TraversalEntry {
     pub(crate) kind: TraversalKind,
 }
 
-/// Filesystem kinds supported by recursive encoding.
+/// Filesystem kinds supported by recursive archive building.
 #[derive(Debug)]
 pub(crate) enum TraversalKind {
     /// A real directory.
@@ -59,7 +59,7 @@ pub(crate) enum TraversalKind {
 
 /// Asynchronous consumer side of one blocking directory traversal.
 ///
-/// The channel and producer task stay private so the encoder only depends on a
+/// The channel and producer task stay private so the builder only depends on a
 /// small typed stream abstraction.
 pub(crate) struct TraversalStream {
     entries: mpsc::Receiver<Vec<TraversalEntry>>,
@@ -75,14 +75,14 @@ impl TraversalStream {
     /// Stops unused production and waits for the blocking traversal task.
     ///
     /// The receiver is dropped before awaiting the task so a producer blocked
-    /// on a full channel can terminate when the encoder exits early.
+    /// on a full channel can terminate when the builder exits early.
     pub(crate) async fn finish(self) -> Result<(), TraversalError> {
         drop(self.entries);
         self.task.await?
     }
 }
 
-/// A failure while traversing a recursive encoding source.
+/// A failure while traversing a recursive archive source.
 #[derive(Debug, Error)]
 pub enum TraversalError {
     /// A traversed source entry unexpectedly falls outside the recursive root.
@@ -93,21 +93,21 @@ pub enum TraversalError {
         /// The failed traversal invariant.
         reason: &'static str,
     },
-    /// An archive name was rejected by the configured encode policy.
-    #[error("archive {context} rejected by encode policy: {value:?}")]
+    /// An archive name was rejected by the configured builder policy.
+    #[error("archive {context} rejected by builder policy: {value:?}")]
     NameRejected {
         /// The role of the rejected archive text.
         context: &'static str,
         /// The rejected UTF-8 value.
         value: String,
     },
-    /// A source path component cannot be represented by this UTF-8-only encoder.
+    /// A source path component cannot be represented by this UTF-8-only builder.
     #[error("source path is not valid UTF-8: {path}")]
     NonUtf8SourcePath {
         /// The affected source filesystem path.
         path: PathBuf,
     },
-    /// A symbolic-link target cannot be represented by this UTF-8-only encoder.
+    /// A symbolic-link target cannot be represented by this UTF-8-only builder.
     #[error("symbolic-link target is not valid UTF-8: {path}")]
     NonUtf8LinkTarget {
         /// The affected symbolic-link source path.
@@ -226,7 +226,7 @@ impl TraversalSender {
     }
 }
 
-/// Converts one [`WalkDir`] entry into the encoder's supported filesystem model.
+/// Converts one [`WalkDir`] entry into the builder's supported filesystem model.
 ///
 /// Source symbolic links are classified and read but deliberately not followed.
 /// Their UTF-8 textual targets are preserved for framing; extraction policy is
@@ -331,10 +331,10 @@ mod tests {
     #[test]
     fn joins_native_relative_paths_with_archive_separators() {
         let relative = Path::new("nested").join("file");
-        assert_eq!(
-            join_archive_path("tree", &relative, &relative, NameValidation::Default,).unwrap(),
-            "tree/nested/file"
-        );
+        assert!(matches!(
+            join_archive_path("tree", &relative, &relative, NameValidation::Default),
+            Ok(path) if path == "tree/nested/file"
+        ));
     }
 
     #[cfg(unix)]

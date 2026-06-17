@@ -15,11 +15,25 @@ Anti-goals:
 
 ## Architecture
 
-`tar-framing` parses physical and logical tar structure. `tar-codec` validates
-tar-specific policy and projects those logical entries into the common member
-model from `archive-trait`. The latter owns path validation, link policy, and
-filesystem extraction, so the same extraction engine can support future archive
-formats with the same basic member shape.
+`tar-framing` reads and writes physical tar structure. `tar-codec` owns the
+tar-specific projection and pax encoding details. `archive-trait` owns the
+format-neutral building and extraction workflows: validation, collision state,
+filesystem traversal, source streaming, link policy, and destination behavior.
+Future archive formats can reuse those workflows by implementing the same
+format hooks.
+
+```rust
+use tar_codec::{ArchiveBuilder as _, EntryMetadata, TarEncoder};
+
+let mut encoder = TarEncoder::new(writer);
+encoder
+    .add_entry("README.md", b"hello\n", EntryMetadata::default())
+    .await?;
+let writer = encoder.finish().await?;
+```
+
+Use `TarEncoder::with_policy` and `BuilderPolicy` to configure generic name
+validation. Compression remains the caller's responsibility.
 
 ```rust
 use tar_codec::{Archive as _, ExtractPolicy, TarArchive};

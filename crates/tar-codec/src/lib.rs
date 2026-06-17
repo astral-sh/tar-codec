@@ -1,6 +1,7 @@
 //! High-level decoding and encoding for tar archives.
 //!
-//! See [`decode`] for tar decoding, [`encode`] for pax encoding, and
+//! See [`decode`] for tar decoding, [`encode`] for pax encoding,
+//! [`ArchiveBuilder`] for format-neutral construction, and
 //! [`Archive::extract_in`] for format-neutral extraction.
 //!
 //! ## Security
@@ -12,17 +13,15 @@
 //! See the [repository's SECURITY.md](https://github.com/astral-sh/tar-codec/blob/main/SECURITY.md)
 //! for more information.
 
-mod blocking;
-mod name;
-
 pub mod decode;
 pub mod encode;
 
 pub use archive_trait::{
-    Archive, ExtractError, ExtractPolicy, ExtractPolicyViolation, LentPayload, LinkPolicy, Member,
-    MemberMetadata, MemberPayload, Members, NameValidator, SpecialKind, SymlinkPolicy,
-    default_name_validator,
+    Archive, ArchiveBuilder, BuildError, BuilderPolicy, EntryMetadata, ExtractError, ExtractPolicy,
+    ExtractPolicyViolation, LentPayload, LinkPolicy, Member, MemberMetadata, MemberPayload,
+    Members, NameValidator, SpecialKind, SymlinkPolicy, TraversalError, default_name_validator,
 };
 pub use decode::{
     DecodeError, DecodePolicy, DecodePolicyViolation, PaxDecodePolicy, TarArchive, TarMemberPayload,
 };
+pub use encode::{EncodeError, TarEncoder};

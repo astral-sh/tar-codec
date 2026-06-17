@@ -10,8 +10,7 @@ use std::{
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tar_codec::{
-    Archive as _, ExtractPolicy, TarArchive,
-    encode::{Encoder, EntryMetadata},
+    Archive as _, ArchiveBuilder as _, EntryMetadata, ExtractPolicy, TarArchive, TarEncoder,
 };
 use tempfile::{TempDir, tempdir};
 use tokio::{
@@ -176,7 +175,7 @@ fn fixture(id: &'static str, files: Vec<(String, Vec<u8>)>) -> Fixture {
 }
 
 async fn encode_entries_tar_codec(fixture: &Fixture) -> u64 {
-    let mut encoder = Encoder::new(FramingSink::default());
+    let mut encoder = TarEncoder::new(FramingSink::default());
     for entry in &fixture.entries {
         encoder
             .add_entry(&entry.archive_path, &entry.data, EntryMetadata::default())
@@ -223,7 +222,7 @@ async fn encode_entries_tokio_tar(fixture: &Fixture) -> u64 {
 }
 
 async fn encode_directory_tar_codec(fixture: &Fixture) -> u64 {
-    let mut encoder = Encoder::new(FramingSink::default());
+    let mut encoder = TarEncoder::new(FramingSink::default());
     encoder
         .add_directory(&fixture.source)
         .await
@@ -274,7 +273,7 @@ fn configure_tokio_tar_header(header: &mut tokio_tar::Header, payload_len: usize
 }
 
 async fn pax_archive(fixture: &Fixture) -> Vec<u8> {
-    let mut encoder = Encoder::new(Vec::new());
+    let mut encoder = TarEncoder::new(Vec::new());
     for entry in &fixture.entries {
         encoder
             .add_entry(&entry.archive_path, &entry.data, EntryMetadata::default())

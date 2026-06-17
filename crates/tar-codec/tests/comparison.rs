@@ -1,8 +1,7 @@
 use std::{fs, path::Path};
 
 use tar_codec::{
-    Archive as _, ExtractPolicy, TarArchive,
-    encode::{Encoder, EntryMetadata},
+    Archive as _, ArchiveBuilder as _, EntryMetadata, ExtractPolicy, TarArchive, TarEncoder,
 };
 use tempfile::tempdir;
 
@@ -26,7 +25,7 @@ async fn extracts_pax_and_ustar_archives_across_crates() {
 }
 
 async fn pax_archive() -> Vec<u8> {
-    let mut encoder = Encoder::new(Vec::new());
+    let mut encoder = TarEncoder::new(Vec::new());
     for (path, data) in ENTRIES {
         encoder
             .add_entry(path, data, EntryMetadata::default())
