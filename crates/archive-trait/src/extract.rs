@@ -126,8 +126,10 @@ pub(crate) async fn extract<A: Archive>(
     policy: ExtractPolicy,
 ) -> Result<(), ExtractError<A::Error>> {
     let mut root = ExtractionRoot::<A::Error>::open(destination, policy.allow_overwrites).await?;
-    let mut payload_chunk = Vec::new();
-    let mut small_payload = Vec::new();
+    // Scratch space reused for each payload read and streamed directly for large files.
+    let mut chunk_buffer = Vec::new();
+    // Complete small-file contents, buffered so payload validation precedes file creation.
+    let mut buffered_payload = Vec::new();
     while let Some(member) = members.next().await.map_err(ExtractError::Archive)? {
         check_member_policy(&member, policy)?;
         let decoded = decode_member(&member, policy)?;
@@ -143,8 +145,8 @@ pub(crate) async fn extract<A: Archive>(
                     size,
                     executable,
                     payload,
-                    &mut payload_chunk,
-                    &mut small_payload,
+                    &mut chunk_buffer,
+                    &mut buffered_payload,
                 )
                 .await?;
             }
@@ -155,7 +157,7 @@ pub(crate) async fn extract<A: Archive>(
                 }
             }
             Member::HardLink { size, payload, .. } => {
-                root.extract_hard_link(&decoded, size, payload, &mut payload_chunk)
+                root.extract_hard_link(&decoded, size, payload, &mut chunk_buffer)
                     .await?;
             }
             Member::Special { kind, .. } => {
@@ -437,20 +439,20 @@ fn resolve_link_target<E>(
 
 async fn write_payload<P: MemberPayload>(
     mut payload: P,
-    payload_chunk: &mut Vec<u8>,
+    chunk_buffer: &mut Vec<u8>,
     path: &Path,
     mut file: File,
 ) -> Result<(), ExtractError<P::Error>> {
     loop {
-        payload_chunk.clear();
+        chunk_buffer.clear();
         if !payload
-            .next_chunk(payload_chunk, EXTRACTION_CHUNK_BYTES)
+            .next_chunk(chunk_buffer, EXTRACTION_CHUNK_BYTES)
             .await
             .map_err(ExtractError::Archive)?
         {
             break;
         }
-        file.write_all(payload_chunk)
+        file.write_all(chunk_buffer)
             .await
             .map_err(|source| ExtractError::filesystem("write file", path.to_owned(), source))?;
     }
@@ -507,24 +509,27 @@ impl<E> ExtractionRoot<E> {
         size: u64,
         executable: bool,
         mut payload: P,
-        payload_chunk: &mut Vec<u8>,
-        small_payload: &mut Vec<u8>,
+        chunk_buffer: &mut Vec<u8>,
+        buffered_payload: &mut Vec<u8>,
     ) -> Result<(), ExtractError<E>> {
         if size <= EXTRACTION_CHUNK_BYTES as u64 {
-            small_payload.clear();
+            buffered_payload.clear();
+            if let Ok(payload_size) = usize::try_from(size) {
+                buffered_payload.reserve(payload_size);
+            }
             loop {
-                payload_chunk.clear();
+                chunk_buffer.clear();
                 if !payload
-                    .next_chunk(payload_chunk, EXTRACTION_CHUNK_BYTES)
+                    .next_chunk(chunk_buffer, EXTRACTION_CHUNK_BYTES)
                     .await
                     .map_err(ExtractError::Archive)?
                 {
                     break;
                 }
-                small_payload.extend_from_slice(payload_chunk);
+                buffered_payload.extend_from_slice(chunk_buffer);
             }
             let mut file = self.create_file(path, executable).await?;
-            file.write_all(small_payload).await.map_err(|source| {
+            file.write_all(buffered_payload).await.map_err(|source| {
                 ExtractError::filesystem("write file", path.to_owned(), source)
             })?;
             file.flush().await.map_err(|source| {
@@ -533,7 +538,7 @@ impl<E> ExtractionRoot<E> {
             return Ok(());
         }
         let file = self.create_file(path, executable).await?;
-        write_payload(payload, payload_chunk, path, file).await
+        write_payload(payload, chunk_buffer, path, file).await
     }
 
     async fn extract_directory(&mut self, path: &Path) -> Result<(), ExtractError<E>> {
@@ -594,7 +599,7 @@ impl<E> ExtractionRoot<E> {
         member: &ExtractMember,
         size: u64,
         payload: P,
-        payload_chunk: &mut Vec<u8>,
+        chunk_buffer: &mut Vec<u8>,
     ) -> Result<(), ExtractError<E>> {
         let target_text = member.link_target.clone();
         let target = resolve_link_target(
@@ -635,7 +640,7 @@ impl<E> ExtractionRoot<E> {
             let file = self
                 .open_file("truncate file", &member.path, false, true, false)
                 .await?;
-            write_payload(payload, payload_chunk, &member.path, file).await
+            write_payload(payload, chunk_buffer, &member.path, file).await
         }
     }
 
