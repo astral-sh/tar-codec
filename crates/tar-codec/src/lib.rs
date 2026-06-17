@@ -19,7 +19,7 @@ pub mod decode;
 pub mod encode;
 
 pub use archive_trait::{
-    Archive, ExtractError, ExtractPolicy, ExtractPolicyViolation, LinkPolicy, Member,
+    Archive, ExtractError, ExtractPolicy, ExtractPolicyViolation, LentPayload, LinkPolicy, Member,
     MemberMetadata, MemberPayload, Members, NameValidator, SpecialKind, SymlinkPolicy,
     default_name_validator,
 };

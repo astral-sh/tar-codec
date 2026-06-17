@@ -384,7 +384,9 @@ impl<R: AsyncRead + Unpin> ArchiveTrait for TarArchive<R> {
     where
         Self: 'a;
 
-    async fn next_member(&mut self) -> Result<Option<Member<Self::Payload<'_>>>, Self::Error> {
+    async fn next_member<'a>(
+        &'a mut self,
+    ) -> Result<Option<Member<Self::Payload<'a>>>, Self::Error> {
         let Some(frame) = self.reader.next_frame().await? else {
             return Ok(None);
         };
@@ -393,9 +395,9 @@ impl<R: AsyncRead + Unpin> ArchiveTrait for TarArchive<R> {
     }
 }
 
-fn project_member<R>(
-    frame: MemberFrame<'_, R>,
-) -> Result<Member<TarMemberPayload<'_, R>>, DecodeError> {
+fn project_member<'a, R>(
+    frame: MemberFrame<'a, R>,
+) -> Result<Member<TarMemberPayload<'a, R>>, DecodeError> {
     let position = frame.header.position;
     let kind = frame.header.kind;
     let size = frame.header.effective_size;

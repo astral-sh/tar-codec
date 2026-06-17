@@ -56,6 +56,40 @@ async fn extracts_common_members_and_streams_large_payloads() {
 }
 
 #[tokio::test]
+async fn extracts_small_payload_returned_in_short_chunks() {
+    const SMALL_BYTES: usize = 128 * 1024 + 7;
+
+    let expected = (0..SMALL_BYTES)
+        .map(|index| u8::try_from(index % 251).expect("payload byte should fit"))
+        .collect::<Vec<_>>();
+    let temp = tempdir().expect("temporary directory should be created");
+    let destination = temp.path().join("out");
+
+    TestArchive::new([Entry::file("small", expected.clone())])
+        .extract_in(&destination, ExtractPolicy::default())
+        .await
+        .expect("archive should extract");
+
+    assert_eq!(
+        std::fs::read(destination.join("small")).expect("small file should be readable"),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn validates_empty_payload_before_creating_file() {
+    let temp = tempdir().expect("temporary directory should be created");
+    let destination = temp.path().join("out");
+
+    let result = TestArchive::new([Entry::invalid_file("invalid", b"")])
+        .extract_in(&destination, ExtractPolicy::default())
+        .await;
+
+    assert!(matches!(result, Err(ExtractError::Archive(_))));
+    assert!(!destination.join("invalid").exists());
+}
+
+#[tokio::test]
 async fn rejects_unsafe_special_and_colliding_members() {
     let temp = tempdir().expect("temporary directory should be created");
     let destination = temp.path().join("unsafe");

@@ -12,6 +12,7 @@ mod name;
 
 use std::{
     io,
+    marker::PhantomData,
     path::{Path, PathBuf},
 };
 
@@ -96,6 +97,36 @@ impl<P> Member<P> {
             | Self::Special { metadata, .. } => metadata,
         }
     }
+
+    fn lend_payload<'a>(self) -> Member<LentPayload<'a, P>> {
+        match self {
+            Self::File {
+                metadata,
+                size,
+                executable,
+                payload,
+            } => Member::File {
+                metadata,
+                size,
+                executable,
+                payload: LentPayload::new(payload),
+            },
+            Self::Directory { metadata } => Member::Directory { metadata },
+            Self::SymbolicLink { metadata, target } => Member::SymbolicLink { metadata, target },
+            Self::HardLink {
+                metadata,
+                target,
+                size,
+                payload,
+            } => Member::HardLink {
+                metadata,
+                target,
+                size,
+                payload: LentPayload::new(payload),
+            },
+            Self::Special { metadata, kind } => Member::Special { metadata, kind },
+        }
+    }
 }
 
 /// A streaming cursor over one archive member's payload.
@@ -107,7 +138,12 @@ pub trait MemberPayload: Sized {
     /// The archive-format error returned while reading the payload.
     type Error;
 
-    /// Reads validated payload bytes into a reusable chunk buffer.
+    /// Reads the next validated payload chunk into a reusable buffer.
+    ///
+    /// Returns `true` when `buffer` contains a nonempty chunk. Returns `false`
+    /// only after the payload has been fully consumed and validated. Callers
+    /// clear `buffer` before each call, and implementations may return chunks
+    /// shorter than `target_len`.
     async fn next_chunk(
         &mut self,
         buffer: &mut Vec<u8>,
@@ -116,6 +152,42 @@ pub trait MemberPayload: Sized {
 
     /// Discards and validates all remaining payload bytes.
     async fn skip(self) -> Result<(), Self::Error>;
+}
+
+/// A member payload that keeps its lending [`Members`] cursor borrowed.
+///
+/// This wrapper is returned by [`Members::next`]. Its private fields prevent a
+/// payload whose concrete type does not itself borrow the archive from being
+/// detached from the cursor lifetime.
+#[derive(Debug)]
+pub struct LentPayload<'a, P> {
+    payload: P,
+    cursor: PhantomData<&'a mut ()>,
+}
+
+impl<P> LentPayload<'_, P> {
+    fn new(payload: P) -> Self {
+        Self {
+            payload,
+            cursor: PhantomData,
+        }
+    }
+}
+
+impl<P: MemberPayload> MemberPayload for LentPayload<'_, P> {
+    type Error = P::Error;
+
+    async fn next_chunk(
+        &mut self,
+        buffer: &mut Vec<u8>,
+        target_len: usize,
+    ) -> Result<bool, Self::Error> {
+        self.payload.next_chunk(buffer, target_len).await
+    }
+
+    async fn skip(self) -> Result<(), Self::Error> {
+        self.payload.skip().await
+    }
 }
 
 /// A consuming, lending member cursor.
@@ -128,8 +200,10 @@ impl<A: Archive> Members<A> {
     ///
     /// The returned payload borrows this cursor, so the cursor cannot advance
     /// until that member is dropped or consumed.
-    pub async fn next(&mut self) -> Result<Option<Member<A::Payload<'_>>>, A::Error> {
-        self.archive.next_member().await
+    pub async fn next<'a>(
+        &'a mut self,
+    ) -> Result<Option<Member<LentPayload<'a, A::Payload<'a>>>>, A::Error> {
+        Ok(self.archive.next_member().await?.map(Member::lend_payload))
     }
 }
 
@@ -151,7 +225,9 @@ pub trait Archive: Sized {
     /// Implementations must drain and validate an unfinished preceding payload
     /// before returning another member.
     #[doc(hidden)]
-    async fn next_member(&mut self) -> Result<Option<Member<Self::Payload<'_>>>, Self::Error>;
+    async fn next_member<'a>(
+        &'a mut self,
+    ) -> Result<Option<Member<Self::Payload<'a>>>, Self::Error>;
 
     /// Consumes this archive and returns its lending member cursor.
     fn members(self) -> Members<Self> {

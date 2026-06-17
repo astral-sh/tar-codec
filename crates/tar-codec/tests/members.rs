@@ -4,14 +4,16 @@ use std::{error::Error, io};
 
 use support::{ArchiveBuilder, pax_record};
 use tar_codec::{
-    Archive as _, DecodeError, DecodePolicy, Member, MemberPayload as _, PaxDecodePolicy,
-    SpecialKind, TarArchive, TarMemberPayload,
+    Archive as _, DecodeError, DecodePolicy, Member, MemberPayload, PaxDecodePolicy, SpecialKind,
+    TarArchive,
 };
 use tar_framing::PaxKeyword;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
-async fn read_payload(mut payload: TarMemberPayload<'_, &[u8]>) -> Result<Vec<u8>, DecodeError> {
+async fn read_payload<P: MemberPayload<Error = DecodeError>>(
+    mut payload: P,
+) -> Result<Vec<u8>, DecodeError> {
     let mut data = Vec::new();
     let mut chunk = Vec::new();
     while payload.next_chunk(&mut chunk, 3).await? {

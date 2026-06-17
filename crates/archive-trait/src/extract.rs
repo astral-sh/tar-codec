@@ -127,6 +127,7 @@ pub(crate) async fn extract<A: Archive>(
 ) -> Result<(), ExtractError<A::Error>> {
     let mut root = ExtractionRoot::<A::Error>::open(destination, policy.allow_overwrites).await?;
     let mut payload_chunk = Vec::new();
+    let mut small_payload = Vec::new();
     while let Some(member) = members.next().await.map_err(ExtractError::Archive)? {
         check_member_policy(&member, policy)?;
         let decoded = decode_member(&member, policy)?;
@@ -137,8 +138,15 @@ pub(crate) async fn extract<A: Archive>(
                 payload,
                 ..
             } => {
-                root.extract_file(&decoded.path, size, executable, payload, &mut payload_chunk)
-                    .await?;
+                root.extract_file(
+                    &decoded.path,
+                    size,
+                    executable,
+                    payload,
+                    &mut payload_chunk,
+                    &mut small_payload,
+                )
+                .await?;
             }
             Member::Directory { .. } => root.extract_directory(&decoded.path).await?,
             Member::SymbolicLink { .. } => {
@@ -433,11 +441,15 @@ async fn write_payload<P: MemberPayload>(
     path: &Path,
     mut file: File,
 ) -> Result<(), ExtractError<P::Error>> {
-    while payload
-        .next_chunk(payload_chunk, EXTRACTION_CHUNK_BYTES)
-        .await
-        .map_err(ExtractError::Archive)?
-    {
+    loop {
+        payload_chunk.clear();
+        if !payload
+            .next_chunk(payload_chunk, EXTRACTION_CHUNK_BYTES)
+            .await
+            .map_err(ExtractError::Archive)?
+        {
+            break;
+        }
         file.write_all(payload_chunk)
             .await
             .map_err(|source| ExtractError::filesystem("write file", path.to_owned(), source))?;
@@ -496,17 +508,23 @@ impl<E> ExtractionRoot<E> {
         executable: bool,
         mut payload: P,
         payload_chunk: &mut Vec<u8>,
+        small_payload: &mut Vec<u8>,
     ) -> Result<(), ExtractError<E>> {
         if size <= EXTRACTION_CHUNK_BYTES as u64 {
-            payload_chunk.clear();
-            if size != 0 {
-                payload
+            small_payload.clear();
+            loop {
+                payload_chunk.clear();
+                if !payload
                     .next_chunk(payload_chunk, EXTRACTION_CHUNK_BYTES)
                     .await
-                    .map_err(ExtractError::Archive)?;
+                    .map_err(ExtractError::Archive)?
+                {
+                    break;
+                }
+                small_payload.extend_from_slice(payload_chunk);
             }
             let mut file = self.create_file(path, executable).await?;
-            file.write_all(payload_chunk).await.map_err(|source| {
+            file.write_all(small_payload).await.map_err(|source| {
                 ExtractError::filesystem("write file", path.to_owned(), source)
             })?;
             file.flush().await.map_err(|source| {

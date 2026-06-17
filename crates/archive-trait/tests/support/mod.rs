@@ -3,6 +3,8 @@ use std::collections::VecDeque;
 use archive_trait::{Archive, Member, MemberMetadata, MemberPayload, SpecialKind};
 use thiserror::Error;
 
+const MAX_TEST_CHUNK_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Error)]
 #[error("test archive failure")]
 pub struct TestError;
@@ -13,6 +15,7 @@ pub enum Entry {
         path: String,
         data: Vec<u8>,
         executable: bool,
+        fail_at_end: bool,
     },
     Directory {
         position: u64,
@@ -44,6 +47,17 @@ impl Entry {
             path: path.to_owned(),
             data: data.into(),
             executable: false,
+            fail_at_end: false,
+        }
+    }
+
+    pub fn invalid_file(path: &str, data: impl Into<Vec<u8>>) -> Self {
+        Self::File {
+            position: 0,
+            path: path.to_owned(),
+            data: data.into(),
+            executable: false,
+            fail_at_end: true,
         }
     }
 
@@ -53,6 +67,7 @@ impl Entry {
             path: path.to_owned(),
             data: data.into(),
             executable: true,
+            fail_at_end: false,
         }
     }
 
@@ -104,11 +119,16 @@ impl TestArchive {
 pub struct TestPayload {
     data: Vec<u8>,
     offset: usize,
+    fail_at_end: bool,
 }
 
 impl TestPayload {
-    fn new(data: Vec<u8>) -> Self {
-        Self { data, offset: 0 }
+    fn new(data: Vec<u8>, fail_at_end: bool) -> Self {
+        Self {
+            data,
+            offset: 0,
+            fail_at_end,
+        }
     }
 }
 
@@ -122,11 +142,14 @@ impl MemberPayload for TestPayload {
     ) -> Result<bool, Self::Error> {
         buffer.clear();
         if self.offset == self.data.len() {
+            if self.fail_at_end {
+                return Err(TestError);
+            }
             return Ok(false);
         }
         let end = self
             .offset
-            .saturating_add(target_len.max(1))
+            .saturating_add(target_len.clamp(1, MAX_TEST_CHUNK_BYTES))
             .min(self.data.len());
         buffer.extend_from_slice(&self.data[self.offset..end]);
         self.offset = end;
@@ -134,6 +157,9 @@ impl MemberPayload for TestPayload {
     }
 
     async fn skip(self) -> Result<(), Self::Error> {
+        if self.fail_at_end {
+            return Err(TestError);
+        }
         Ok(())
     }
 }
@@ -142,7 +168,9 @@ impl Archive for TestArchive {
     type Error = TestError;
     type Payload<'a> = TestPayload;
 
-    async fn next_member(&mut self) -> Result<Option<Member<Self::Payload<'_>>>, Self::Error> {
+    async fn next_member<'a>(
+        &'a mut self,
+    ) -> Result<Option<Member<Self::Payload<'a>>>, Self::Error> {
         let Some(entry) = self.entries.pop_front() else {
             return Ok(None);
         };
@@ -155,11 +183,12 @@ impl Archive for TestArchive {
                 path,
                 data,
                 executable,
+                fail_at_end,
             } => Member::File {
                 metadata: MemberMetadata { path, position },
                 size: data.len() as u64,
                 executable,
-                payload: TestPayload::new(data),
+                payload: TestPayload::new(data, fail_at_end),
             },
             Entry::Directory { position, path } => Member::Directory {
                 metadata: MemberMetadata { path, position },
@@ -181,7 +210,7 @@ impl Archive for TestArchive {
                 metadata: MemberMetadata { path, position },
                 target,
                 size: data.len() as u64,
-                payload: TestPayload::new(data),
+                payload: TestPayload::new(data, false),
             },
             Entry::Special {
                 position,
