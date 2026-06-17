@@ -40,37 +40,71 @@ async fn link_policies_reject_or_skip_without_creating_links() {
         (
             "symbolic",
             "link",
-            entry::symbolic_link("link", "missing"),
+            entry::symbolic_link("link", "target"),
             LinkPolicy::default().symlink_policy(SymlinkPolicy::Reject),
             ExtractPolicyViolation::SymbolicLink,
         ),
         (
             "hard",
             "hard",
-            entry::hard_link("hard", "missing", b""),
+            entry::hard_link("hard", "target", b"new"),
             LinkPolicy::default(),
             ExtractPolicyViolation::HardLink,
         ),
     ] {
         let destination = temp.path().join(case);
-        let result = TestArchive::new([member])
+        let result = TestArchive::new([entry::file("target", b"keep"), member])
             .extract_in(&destination, ExtractPolicy::default().link_policy(policy))
             .await;
         assert!(matches!(
             result,
             Err(ExtractError::PolicyViolation { violation, .. }) if violation == expected
         ));
+        assert_eq!(
+            std::fs::read(destination.join("target")).expect("prior output should remain readable"),
+            b"keep"
+        );
         assert!(!destination.join(path).exists());
     }
 
+    let destination = temp.path().join("hard-only");
+    TestArchive::new([
+        entry::file("target", b"old"),
+        entry::hard_link("hard", "target", b"new"),
+    ])
+    .extract_in(
+        &destination,
+        ExtractPolicy::default().link_policy(
+            LinkPolicy::default()
+                .symlink_policy(SymlinkPolicy::Reject)
+                .allow_hard_links(true),
+        ),
+    )
+    .await
+    .expect("hard-link policy should be independent of symbolic links");
+    for path in ["target", "hard"] {
+        assert_eq!(
+            std::fs::read(destination.join(path)).expect("hard link should be readable"),
+            b"new"
+        );
+    }
+
     let destination = temp.path().join("skipped");
-    TestArchive::new([entry::symbolic_link("link", "missing")])
-        .extract_in(
-            &destination,
-            ExtractPolicy::default()
-                .link_policy(LinkPolicy::default().symlink_policy(SymlinkPolicy::Skip)),
-        )
-        .await
-        .expect("skipped link should not fail");
-    assert!(!destination.join("link").exists());
+    TestArchive::new([
+        entry::file("same", b"keep"),
+        entry::symbolic_link("same", "missing"),
+        entry::symbolic_link("skipped", "missing"),
+    ])
+    .extract_in(
+        &destination,
+        ExtractPolicy::default()
+            .link_policy(LinkPolicy::default().symlink_policy(SymlinkPolicy::Skip)),
+    )
+    .await
+    .expect("skipped link should not fail");
+    assert_eq!(
+        std::fs::read(destination.join("same")).expect("existing file should remain readable"),
+        b"keep"
+    );
+    assert!(!destination.join("skipped").exists());
 }

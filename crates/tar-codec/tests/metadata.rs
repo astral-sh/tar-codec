@@ -4,15 +4,14 @@ use std::sync::Arc;
 
 use support::{
     ArchiveBuilder, ArchiveFormat, header, pax_record, raw_pax_record, set_checksum,
-    set_identity_byte, single_posix_member,
+    set_identity_byte,
+};
+use tar_codec::{
+    Archive as _, DecodeError, DecodePolicy, DecodePolicyViolation, ExtractError, PaxDecodePolicy,
+    TarArchive, extract::ExtractPolicy,
 };
 #[cfg(unix)]
-use tar_codec::default_name_validator;
-use tar_codec::{
-    Archive as _, DecodeError, DecodePolicy, DecodePolicyViolation, ExtractError,
-    ExtractPolicyViolation, PaxDecodePolicy, TarArchive,
-    extract::{ExtractPolicy, LinkPolicy, SymlinkPolicy},
-};
+use tar_codec::{ExtractPolicyViolation, default_name_validator};
 use tar_framing::{FrameError, FrameErrorInner, PaxKeyword};
 use tempfile::tempdir;
 
@@ -161,54 +160,6 @@ async fn gnu_long_metadata_and_validation_use_effective_names() {
             ..
         }) if value == "blocked"
     ));
-}
-
-#[tokio::test]
-async fn member_and_link_name_validation_is_configurable() {
-    let temp = tempdir().unwrap();
-    for (case, bytes, context) in [
-        (
-            "member",
-            single_posix_member(" rejected", b'0', b"", "", 0o644),
-            "member path",
-        ),
-        (
-            "symlink",
-            single_posix_member("link", b'2', b"", " rejected", 0o644),
-            "symbolic-link target",
-        ),
-        (
-            "hard-link",
-            single_posix_member("link", b'1', b"", " rejected", 0o644),
-            "hard-link target",
-        ),
-    ] {
-        let policy = ExtractPolicy::default().link_policy(
-            LinkPolicy::default()
-                .allow_hard_links(true)
-                .symlink_policy(SymlinkPolicy::Skip),
-        );
-        assert!(matches!(
-            TarArchive::new(bytes.as_slice())
-                .extract_in(temp.path().join(case), policy)
-                .await,
-            Err(ExtractError::PolicyViolation {
-                violation: ExtractPolicyViolation::NameRejected {
-                    context: actual,
-                    ..
-                },
-                ..
-            }) if actual == context
-        ));
-    }
-
-    let destination = temp.path().join("disabled");
-    let bytes = single_posix_member(" allowed", b'0', b"ok", "", 0o644);
-    TarArchive::new(bytes.as_slice())
-        .extract_in(&destination, ExtractPolicy::default().name_validator(None))
-        .await
-        .unwrap();
-    assert_eq!(std::fs::read(destination.join(" allowed")).unwrap(), b"ok");
 }
 
 #[tokio::test]

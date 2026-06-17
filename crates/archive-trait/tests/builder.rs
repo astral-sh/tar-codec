@@ -1,11 +1,13 @@
-use std::{fmt, io::Write as _, path::PathBuf};
+use std::{io::Write as _, path::PathBuf};
 
+#[cfg(unix)]
+use archive_trait::builder::SymlinkPolicy;
 use archive_trait::{
     ArchiveBuilder, BuildError, BuilderState, EntryMetadata, EntryPayload, TraversalError,
-    builder::{BuilderPolicy, SymlinkPolicy},
-    default_name_validator,
+    builder::BuilderPolicy, default_name_validator,
 };
 use tempfile::tempdir;
+use thiserror::Error;
 
 const LARGE_FILE_BYTES: usize = 1024 * 1024 + 17;
 
@@ -24,16 +26,20 @@ enum RecordedEntry {
     },
 }
 
-#[derive(Debug)]
-struct MockError;
-
-impl fmt::Display for MockError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("injected format failure")
+impl RecordedEntry {
+    fn file(path: &str, data: &[u8], executable: bool) -> Self {
+        Self::File {
+            path: path.to_owned(),
+            data: data.to_vec(),
+            executable,
+            chunks: 1,
+        }
     }
 }
 
-impl std::error::Error for MockError {}
+#[derive(Debug, Error)]
+#[error("injected format failure")]
+struct MockError;
 
 enum SourceMutation {
     Grow(PathBuf),
@@ -164,6 +170,13 @@ async fn manual_entries_preserve_order_metadata_and_collision_state() {
             Err(BuildError::PathCollision { .. })
         ));
     }
+    let temp = tempdir().expect("temporary directory should be created");
+    let directory = temp.path().join("bin");
+    std::fs::create_dir(&directory).expect("directory should be created");
+    builder
+        .add_directory(&directory)
+        .await
+        .expect("an implicit ancestor should accept its explicit directory member");
     builder
         .add_entry("bin/other", b"other", EntryMetadata::default())
         .await
@@ -172,24 +185,10 @@ async fn manual_entries_preserve_order_metadata_and_collision_state() {
     assert_eq!(
         builder.entries,
         [
-            RecordedEntry::File {
-                path: "bin/tool".to_owned(),
-                data: b"run".to_vec(),
-                executable: true,
-                chunks: 1,
-            },
-            RecordedEntry::File {
-                path: "README".to_owned(),
-                data: b"hello".to_vec(),
-                executable: false,
-                chunks: 1,
-            },
-            RecordedEntry::File {
-                path: "bin/other".to_owned(),
-                data: b"other".to_vec(),
-                executable: false,
-                chunks: 1,
-            },
+            RecordedEntry::file("bin/tool", b"run", true),
+            RecordedEntry::file("README", b"hello", false),
+            RecordedEntry::Directory("bin".to_owned()),
+            RecordedEntry::file("bin/other", b"other", false),
         ]
     );
 }
@@ -295,7 +294,7 @@ async fn recursive_build_is_sorted_and_streams_small_and_large_files() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn recursive_build_rejects_symlinks_by_default() {
+async fn recursive_build_applies_symlink_policy() {
     use std::os::unix::fs::symlink;
 
     let temp = tempdir().expect("temporary directory should be created");
@@ -303,37 +302,24 @@ async fn recursive_build_rejects_symlinks_by_default() {
     std::fs::create_dir(&source).expect("source directory should be created");
     std::fs::write(source.join("target"), b"contents").expect("target should be written");
     symlink("target", source.join("link")).expect("symbolic link should be created");
-
-    assert!(matches!(
-        MockBuilder::new().add_directory(&source).await,
-        Err(BuildError::Traversal(
-            TraversalError::SymbolicLinkRejected { .. }
-        ))
-    ));
+    let directory_target = temp.path().join("directory-target");
+    std::fs::create_dir(&directory_target).expect("directory target should be created");
+    symlink("../directory-target", source.join("directory"))
+        .expect("directory symbolic link should be created");
 
     let linked_root = temp.path().join("root-link");
     symlink("links", &linked_root).expect("root symbolic link should be created");
-    assert!(matches!(
-        MockBuilder::new().add_directory(&linked_root).await,
-        Err(BuildError::Traversal(
-            TraversalError::SymbolicLinkRejected { .. }
-        ))
-    ));
-}
+    for rejected_source in [&source, &linked_root] {
+        assert!(matches!(
+            MockBuilder::new().add_directory(rejected_source).await,
+            Err(BuildError::Traversal(
+                TraversalError::SymbolicLinkRejected { .. }
+            ))
+        ));
+    }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn recursive_build_can_preserve_symbolic_links() {
-    use std::os::unix::fs::symlink;
-
-    let temp = tempdir().expect("temporary directory should be created");
-    let source = temp.path().join("links");
-    std::fs::create_dir(&source).expect("source directory should be created");
-    std::fs::write(source.join("target"), b"contents").expect("target should be written");
-    symlink("target", source.join("link")).expect("symbolic link should be created");
-
-    let policy = BuilderPolicy::default().symlink_policy(SymlinkPolicy::Preserve);
-    let mut builder = MockBuilder::with_policy(policy);
+    let preserve = BuilderPolicy::default().symlink_policy(SymlinkPolicy::Preserve);
+    let mut builder = MockBuilder::with_policy(preserve);
     builder
         .add_directory(&source)
         .await
@@ -343,13 +329,15 @@ async fn recursive_build_can_preserve_symbolic_links() {
         path: "links/link".to_owned(),
         target: "target".to_owned(),
     }));
+    assert!(builder.entries.contains(&RecordedEntry::SymbolicLink {
+        path: "links/directory".to_owned(),
+        target: "../directory-target".to_owned(),
+    }));
 
     symlink("blocked", source.join("custom")).expect("custom link should be created");
-    let policy = BuilderPolicy::default()
-        .symlink_policy(SymlinkPolicy::Preserve)
-        .name_validator(Some(|name| {
-            default_name_validator(name) && !name.contains("blocked")
-        }));
+    let policy = preserve.name_validator(Some(|name| {
+        default_name_validator(name) && !name.contains("blocked")
+    }));
     assert!(matches!(
         MockBuilder::with_policy(policy).add_directory(&source).await,
         Err(BuildError::Traversal(TraversalError::NameRejected {
@@ -360,22 +348,40 @@ async fn recursive_build_can_preserve_symbolic_links() {
 
     std::fs::remove_file(source.join("custom")).expect("custom link should be removed");
     symlink(" leading", source.join("disabled")).expect("disabled-policy link should be created");
-    MockBuilder::with_policy(
-        BuilderPolicy::default()
-            .symlink_policy(SymlinkPolicy::Preserve)
-            .name_validator(None),
-    )
-    .add_directory(&source)
-    .await
-    .expect("disabled validation should accept the link target");
+    MockBuilder::with_policy(preserve.name_validator(None))
+        .add_directory(&source)
+        .await
+        .expect("disabled validation should accept the link target");
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn recursive_build_reports_non_utf8_and_unsupported_sources() {
-    use std::{ffi::OsString, os::unix::ffi::OsStringExt as _, os::unix::net::UnixListener};
+    use std::{
+        ffi::OsString,
+        os::unix::{ffi::OsStringExt as _, fs::symlink, net::UnixListener},
+    };
 
     let temp = tempdir().expect("temporary directory should be created");
+    let source = temp.path().join("file");
+    std::fs::write(&source, b"contents").expect("source file should be written");
+    assert!(matches!(
+        MockBuilder::new().add_directory(&source).await,
+        Err(BuildError::Traversal(
+            TraversalError::SourceNotDirectory { .. }
+        ))
+    ));
+
+    let source = temp.path().join(" rejected");
+    std::fs::create_dir(&source).expect("rejected source directory should be created");
+    assert!(matches!(
+        MockBuilder::new().add_directory(&source).await,
+        Err(BuildError::Traversal(TraversalError::NameRejected {
+            context: "member path",
+            ..
+        }))
+    ));
+
     let source = temp.path().join("invalid");
     std::fs::create_dir(&source).expect("source directory should be created");
     let invalid_name = OsString::from_vec(vec![0xff]);
@@ -387,6 +393,22 @@ async fn recursive_build_reports_non_utf8_and_unsupported_sources() {
             ))
         ));
     }
+
+    let source = temp.path().join("invalid-link");
+    std::fs::create_dir(&source).expect("link source directory should be created");
+    symlink(
+        PathBuf::from(OsString::from_vec(vec![0xff])),
+        source.join("link"),
+    )
+    .expect("non-UTF-8 symbolic link should be created");
+    assert!(matches!(
+        MockBuilder::with_policy(BuilderPolicy::default().symlink_policy(SymlinkPolicy::Preserve))
+            .add_directory(&source)
+            .await,
+        Err(BuildError::Traversal(
+            TraversalError::NonUtf8LinkTarget { .. }
+        ))
+    ));
 
     let source = temp.path().join("socket");
     std::fs::create_dir(&source).expect("socket directory should be created");

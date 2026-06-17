@@ -39,19 +39,10 @@ impl EntryMetadata {
 }
 
 /// Controls format-neutral archive construction behavior.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct BuilderPolicy {
     name_validation: NameValidation,
     symlink_policy: SymlinkPolicy,
-}
-
-impl Default for BuilderPolicy {
-    fn default() -> Self {
-        Self {
-            name_validation: NameValidation::Default,
-            symlink_policy: SymlinkPolicy::default(),
-        }
-    }
 }
 
 /// Controls how source symbolic links are handled during recursive builds.
@@ -411,7 +402,7 @@ async fn write_source_file<B: ArchiveBuilder>(
     traversal: &mut DirectoryBuild,
 ) -> Result<(), BuildError<B::Error>> {
     let buffer = mem::take(&mut traversal.source_buffer);
-    let PreparedPayload { buffer, result } = prepare_source_file(&entry.source, buffer).await;
+    let (buffer, result) = prepare_source_file(&entry.source, buffer).await;
     let (mut payload, executable) = match result {
         Ok(prepared) => prepared.into_payload(buffer),
         Err(error) => {
@@ -431,11 +422,6 @@ struct DirectoryBuild {
     entries: HashMap<String, ArchivedEntry>,
     source_buffer: Vec<u8>,
     emitted: bool,
-}
-
-struct PreparedPayload {
-    buffer: Vec<u8>,
-    result: Result<PreparedSourceFile, SourceError>,
 }
 
 enum PreparedSourceFile {
@@ -486,9 +472,12 @@ impl PreparedSourceFile {
     }
 }
 
-async fn prepare_source_file(path: &Path, buffer: Vec<u8>) -> PreparedPayload {
+async fn prepare_source_file(
+    path: &Path,
+    buffer: Vec<u8>,
+) -> (Vec<u8>, Result<PreparedSourceFile, SourceError>) {
     let path = path.to_path_buf();
-    let (buffer, result) = with_reusable_buffer(buffer, move |buffer| {
+    with_reusable_buffer(buffer, move |buffer| {
         let file = std::fs::File::open(&path)
             .map_err(|source| SourceError::filesystem("open source file", &path, source))?;
         let metadata = file
@@ -523,8 +512,7 @@ async fn prepare_source_file(path: &Path, buffer: Vec<u8>) -> PreparedPayload {
         }
         Ok(PreparedSourceFile::Buffered { size, executable })
     })
-    .await;
-    PreparedPayload { buffer, result }
+    .await
 }
 
 async fn with_reusable_buffer<T, F>(

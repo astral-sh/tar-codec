@@ -4,7 +4,10 @@ pub mod support;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
-use archive_trait::{Archive as _, ExtractError, SpecialKind, extract::ExtractPolicy};
+use archive_trait::{
+    Archive as _, ExtractError, ExtractPolicyViolation, SpecialKind,
+    extract::{ExtractPolicy, LinkPolicy, SymlinkPolicy},
+};
 use support::{TestArchive, entry};
 use tempfile::tempdir;
 
@@ -59,6 +62,52 @@ fn patterned_payload(size: usize) -> Vec<u8> {
     (0..size)
         .map(|index| u8::try_from(index % 251).expect("payload byte should fit"))
         .collect()
+}
+
+#[tokio::test]
+async fn name_validation_covers_member_and_link_values() {
+    let temp = tempdir().expect("temporary directory should be created");
+    let policy = ExtractPolicy::default().link_policy(
+        LinkPolicy::default()
+            .allow_hard_links(true)
+            .symlink_policy(SymlinkPolicy::Skip),
+    );
+    for (case, member, context) in [
+        ("member", entry::file(" rejected", b""), "member path"),
+        (
+            "symbolic",
+            entry::symbolic_link("link", " rejected"),
+            "symbolic-link target",
+        ),
+        (
+            "hard",
+            entry::hard_link("link", " rejected", b""),
+            "hard-link target",
+        ),
+    ] {
+        assert!(matches!(
+            TestArchive::new([member])
+                .extract_in(temp.path().join(case), policy)
+                .await,
+            Err(ExtractError::PolicyViolation {
+                violation: ExtractPolicyViolation::NameRejected {
+                    context: actual,
+                    ..
+                },
+                ..
+            }) if actual == context
+        ));
+    }
+
+    let destination = temp.path().join("disabled");
+    TestArchive::new([entry::file(" allowed", b"ok")])
+        .extract_in(&destination, ExtractPolicy::default().name_validator(None))
+        .await
+        .expect("disabled validation should accept boundary whitespace");
+    assert_eq!(
+        std::fs::read(destination.join(" allowed")).expect("file should be readable"),
+        b"ok"
+    );
 }
 
 #[tokio::test]

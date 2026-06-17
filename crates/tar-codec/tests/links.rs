@@ -6,9 +6,11 @@ use std::{io, os::unix::net::UnixListener, path::Path};
 use support::{ArchiveBuilder, single_posix_member};
 #[cfg(unix)]
 use support::{pax_record, symlink_file};
+#[cfg(not(unix))]
+use tar_codec::ExtractPolicyViolation;
 use tar_codec::{
-    Archive as _, ExtractError, ExtractPolicyViolation, TarArchive,
-    extract::{ExtractPolicy, LinkPolicy, SymlinkPolicy},
+    Archive as _, ExtractError, TarArchive,
+    extract::{ExtractPolicy, LinkPolicy},
 };
 #[cfg(unix)]
 use tar_framing::PaxKeyword;
@@ -386,28 +388,6 @@ async fn symlink_members_fail_by_default_on_unsupported_platforms() {
         b"contents"
     );
     assert!(!destination.join("link").exists());
-}
-
-#[tokio::test]
-async fn skipped_symlinks_have_no_filesystem_effect() {
-    let temp = tempdir().unwrap();
-    let mut archive = ArchiveBuilder::new();
-    archive
-        .posix("same", b'0', b"keep", "", 0o644)
-        .posix("same", b'2', b"", "missing", 0o644)
-        .posix("skipped", b'2', b"", "missing", 0o644);
-    let bytes = archive.finish();
-    let destination = temp.path().join("out");
-    TarArchive::new(bytes.as_slice())
-        .extract_in(
-            &destination,
-            ExtractPolicy::default()
-                .link_policy(LinkPolicy::default().symlink_policy(SymlinkPolicy::Skip)),
-        )
-        .await
-        .unwrap();
-    assert_eq!(std::fs::read(destination.join("same")).unwrap(), b"keep");
-    assert!(std::fs::symlink_metadata(destination.join("skipped")).is_err());
 }
 
 #[cfg(unix)]
@@ -808,81 +788,6 @@ async fn hard_links_cannot_replace_their_targets() {
         ));
         assert_eq!(std::fs::read(destination.join("target")).unwrap(), b"keep");
     }
-}
-
-#[tokio::test]
-async fn link_policies_are_enforced_before_link_creation() {
-    let temp = tempdir().unwrap();
-    let destination = temp.path().join("symlink");
-    let mut archive = ArchiveBuilder::new();
-    archive
-        .posix("target", b'0', b"ok", "", 0o644)
-        .posix("link", b'2', b"", "target", 0o644);
-    let bytes = archive.finish();
-    assert!(matches!(
-        TarArchive::new(bytes.as_slice())
-            .extract_in(
-                &destination,
-                ExtractPolicy::default()
-                    .link_policy(LinkPolicy::default().symlink_policy(SymlinkPolicy::Reject),),
-            )
-            .await,
-        Err(ExtractError::PolicyViolation {
-            position: 1024,
-            violation: ExtractPolicyViolation::SymbolicLink,
-        })
-    ));
-    assert_eq!(
-        std::fs::read_to_string(destination.join("target")).unwrap(),
-        "ok"
-    );
-    assert!(!destination.join("link").exists());
-
-    let destination = temp.path().join("hard-link");
-    let mut archive = ArchiveBuilder::new();
-    archive.posix("target", b'0', b"keep", "", 0o644).posix(
-        "link",
-        b'1',
-        b"untrusted linkdata",
-        "target",
-        0o644,
-    );
-    let bytes = archive.finish();
-    assert!(matches!(
-        TarArchive::new(bytes.as_slice())
-            .extract_in(&destination, ExtractPolicy::default())
-            .await,
-        Err(ExtractError::PolicyViolation {
-            position: 1024,
-            violation: ExtractPolicyViolation::HardLink,
-        })
-    ));
-    assert_eq!(
-        std::fs::read_to_string(destination.join("target")).unwrap(),
-        "keep"
-    );
-    assert!(!destination.join("link").exists());
-
-    let destination = temp.path().join("hard-link-only");
-    TarArchive::new(bytes.as_slice())
-        .extract_in(
-            &destination,
-            ExtractPolicy::default().link_policy(
-                LinkPolicy::default()
-                    .symlink_policy(SymlinkPolicy::Reject)
-                    .allow_hard_links(true),
-            ),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        std::fs::read(destination.join("target")).unwrap(),
-        b"untrusted linkdata"
-    );
-    assert_eq!(
-        std::fs::read(destination.join("link")).unwrap(),
-        b"untrusted linkdata"
-    );
 }
 
 #[cfg(unix)]

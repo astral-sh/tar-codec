@@ -15,8 +15,9 @@ pub fn default_name_validator(name: &str) -> bool {
         && !bytes.last().is_some_and(u8::is_ascii_whitespace)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) enum NameValidation {
+    #[default]
     Default,
     Disabled,
     Custom(NameValidator),

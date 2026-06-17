@@ -266,24 +266,20 @@ fn traversal_entry(
     } else if file_type.is_file() {
         TraversalKind::Regular
     } else if file_type.is_symlink() {
-        match symlink_policy {
-            SymlinkPolicy::Reject => {
-                return Err(TraversalError::SymbolicLinkRejected {
-                    path: path.to_path_buf(),
-                });
-            }
-            SymlinkPolicy::Preserve => {
-                let target = std::fs::read_link(path)
-                    .map_err(|error| filesystem_error("read symbolic link", path, error))?;
-                let Some(target) = target.to_str().map(str::to_owned) else {
-                    return Err(TraversalError::NonUtf8LinkTarget {
-                        path: path.to_path_buf(),
-                    });
-                };
-                validate_name(&target, validation, "symbolic-link target")?;
-                TraversalKind::SymbolicLink { target }
-            }
+        if symlink_policy == SymlinkPolicy::Reject {
+            return Err(TraversalError::SymbolicLinkRejected {
+                path: path.to_path_buf(),
+            });
         }
+        let target = std::fs::read_link(path)
+            .map_err(|error| filesystem_error("read symbolic link", path, error))?;
+        let Some(target) = target.to_str().map(str::to_owned) else {
+            return Err(TraversalError::NonUtf8LinkTarget {
+                path: path.to_path_buf(),
+            });
+        };
+        validate_name(&target, validation, "symbolic-link target")?;
+        TraversalKind::SymbolicLink { target }
     } else {
         return Err(TraversalError::UnsupportedFilesystemType {
             path: path.to_path_buf(),

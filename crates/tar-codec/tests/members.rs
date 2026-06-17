@@ -47,6 +47,7 @@ async fn projects_every_member_kind_and_streams_payloads() -> TestResult {
         return Err(io::Error::other("expected regular file member").into());
     };
     assert_eq!(metadata.path, "file");
+    assert_eq!(metadata.position, 0);
     assert_eq!(size, 8);
     assert!(executable);
     assert_eq!(read_payload(payload).await?, b"contents");
@@ -105,30 +106,34 @@ async fn projects_every_member_kind_and_streams_payloads() -> TestResult {
 
 #[tokio::test]
 async fn resolves_format_metadata_but_leaves_extraction_paths_raw() -> TestResult {
+    let records = [
+        pax_record(PaxKeyword::Path, "../effective"),
+        pax_record(PaxKeyword::LinkPath, "../target"),
+    ]
+    .concat();
     let mut archive = ArchiveBuilder::new();
     archive
-        .pax(b'x', &pax_record(PaxKeyword::Path, "../effective"))
-        .posix("raw", b'0', b"payload", "", 0o644);
-    let bytes = archive.finish();
-    let mut members = TarArchive::new(bytes.as_slice()).members();
-    let Some(Member::File {
-        metadata, payload, ..
-    }) = members.next().await?
-    else {
-        return Err(io::Error::other("expected pax file member").into());
-    };
-    assert_eq!(metadata.path, "../effective");
-    assert_eq!(read_payload(payload).await?, b"payload");
-
-    let mut archive = ArchiveBuilder::new();
-    archive
-        .gnu("longname", b'L', b"effective\0", "", 0o644)
-        .gnu("raw", b'0', b"gnu", "", 0o644);
+        .pax(b'x', &records)
+        .posix("raw", b'2', b"", "ignored", 0o644);
     let bytes = archive.finish();
     let mut members = TarArchive::new(bytes.as_slice()).members();
     assert!(matches!(
         members.next().await?,
-        Some(Member::File { metadata, .. }) if metadata.path == "effective"
+        Some(Member::SymbolicLink { metadata, target })
+            if metadata.path == "../effective" && target == "../target"
+    ));
+
+    let mut archive = ArchiveBuilder::new();
+    archive
+        .gnu("longname", b'L', b"effective\0", "", 0o644)
+        .gnu("longlink", b'K', b"target\0", "", 0o644)
+        .gnu("raw", b'2', b"", "ignored", 0o644);
+    let bytes = archive.finish();
+    let mut members = TarArchive::new(bytes.as_slice()).members();
+    assert!(matches!(
+        members.next().await?,
+        Some(Member::SymbolicLink { metadata, target })
+            if metadata.path == "effective" && target == "target"
     ));
     Ok(())
 }
@@ -152,6 +157,20 @@ async fn advancing_drains_payload_and_applies_tar_policy() -> TestResult {
         return Err(io::Error::other("expected second file member").into());
     };
     assert_eq!(read_payload(payload).await?, b"next");
+
+    let mut archive = ArchiveBuilder::new();
+    archive.posix("truncated", b'0', &[b'x'; 1024], "", 0o644);
+    let mut bytes = archive.finish();
+    bytes.truncate(1025);
+    let mut members = TarArchive::new(bytes.as_slice()).members();
+    {
+        let Some(Member::File { mut payload, .. }) = members.next().await? else {
+            return Err(io::Error::other("expected truncated file member").into());
+        };
+        let mut chunk = Vec::new();
+        assert!(payload.next_chunk(&mut chunk, 1).await?);
+    }
+    assert!(matches!(members.next().await, Err(DecodeError::Framing(_))));
 
     let mut archive = ArchiveBuilder::new();
     archive.gnu("file", b'0', b"", "", 0o644);
