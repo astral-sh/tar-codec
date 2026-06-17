@@ -52,7 +52,10 @@ pub enum Member<P> {
     File {
         /// Common member metadata.
         metadata: MemberMetadata,
-        /// The effective payload size.
+        /// The logical, decoded payload size in bytes.
+        ///
+        /// `payload` must yield exactly this many bytes before completing
+        /// successfully. Format-level framing and compression are excluded.
         size: u64,
         /// Whether the archived mode carries executable intent.
         executable: bool,
@@ -77,7 +80,10 @@ pub enum Member<P> {
         metadata: MemberMetadata,
         /// The archive-provided link target.
         target: String,
-        /// The effective payload size.
+        /// The logical, decoded replacement-payload size in bytes.
+        ///
+        /// `payload` must yield exactly this many bytes before completing
+        /// successfully. Format-level framing and compression are excluded.
         size: u64,
         /// The streaming member payload.
         payload: P,
@@ -143,12 +149,16 @@ pub trait MemberPayload: Sized {
     /// The archive-format error returned while reading the payload.
     type Error;
 
-    /// Reads the next validated payload chunk into a reusable buffer.
+    /// Reads the next validated, logical payload chunk into a reusable buffer.
     ///
     /// Returns `true` when `buffer` contains a nonempty chunk. Returns `false`
     /// only after the payload has been fully consumed and validated. Callers
     /// clear `buffer` before each call, and implementations may return chunks
     /// shorter than `target_len`.
+    ///
+    /// Successful chunks contain decoded member contents rather than stored or
+    /// compressed bytes. Their total length must equal the `size` declared by
+    /// the enclosing [`Member`]; a mismatch must produce an error.
     async fn next_chunk(
         &mut self,
         buffer: &mut Vec<u8>,

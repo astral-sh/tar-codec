@@ -109,7 +109,8 @@ impl BuilderState {
     }
 }
 
-/// A format-neutral payload supplied to an [`ArchiveBuilder`] implementation.
+/// A format-neutral, uncompressed payload supplied to an [`ArchiveBuilder`]
+/// implementation.
 pub struct EntryPayload<'a> {
     size: u64,
     inner: EntryPayloadInner<'a>,
@@ -133,12 +134,15 @@ enum EntryPayloadInner<'a> {
 }
 
 impl EntryPayload<'_> {
-    /// Returns the payload size declared before format framing begins.
+    /// Returns the logical, uncompressed source size in bytes.
+    ///
+    /// This is the total number of bytes yielded by [`Self::next_chunk`], not
+    /// necessarily the size ultimately stored by the archive format.
     pub fn size(&self) -> u64 {
         self.size
     }
 
-    /// Returns the next payload chunk.
+    /// Returns the next chunk of logical, uncompressed source bytes.
     pub async fn next_chunk<E>(&mut self) -> Result<Option<&[u8]>, BuildError<E>> {
         match &mut self.inner {
             EntryPayloadInner::Borrowed { bytes, yielded } => {

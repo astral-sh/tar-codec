@@ -30,6 +30,13 @@ encoder.finish().await?;
 See `ArchiveBuilder::builder_with_policy` for policy knobs that
 can be changed during building.
 
+Note that `tar-codec` does **not** perform compression for you.
+If you want a compressed tar stream (like a `.tar.gz`) consider
+supplying an adapted writer, such as from the [async-compression]
+crate.
+
+[async-compression]: https://docs.rs/async-compression/latest/async_compression/
+
 Decoding/extracting:
 
 ```rust
