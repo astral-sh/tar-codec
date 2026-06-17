@@ -13,8 +13,23 @@ use crate::{
     },
 };
 
+/// The longest string representation of a u64.
+/// `u64::MAX` is `18446744073709551615` so `len(18446744073709551615) == 20`.
 const MAX_DECIMAL_U64_BYTES: usize = 20;
+const _: () = assert!(MAX_DECIMAL_U64_BYTES == (u64::MAX.ilog10() as usize) + 1);
+
 const MAX_SEQUENCE_NAME_BYTES: usize = b"PaxHeaders/".len() + MAX_DECIMAL_U64_BYTES;
+
+/// Concatenated, zero-padded decimal representations of 0 through 99. The pair
+/// for `value` starts at offset `value * 2`.
+///
+/// This gives us a very cheap LUT in [`decimal_u64`].
+const DECIMAL_PAIRS: &[u8; 200] = b"\
+    0001020304050607080910111213141516171819\
+    2021222324252627282930313233343536373839\
+    4041424344454647484950515253545556575859\
+    6061626364656667686970717273747576777879\
+    8081828384858687888990919293949596979899";
 const ZERO_BLOCK: Block = [0; BLOCK_SIZE];
 const END_MARKER_BYTES: [u8; BLOCK_SIZE * 2] = [0; BLOCK_SIZE * 2];
 
@@ -148,11 +163,9 @@ pub fn frame_pax_member_into(
         })?;
     let padded_payload_len = padded_payload_len(payload_len)?;
 
-    let mut extended_name_buffer = [0; MAX_SEQUENCE_NAME_BYTES];
-    let extended_name = prefixed_decimal_name(b"PaxHeaders/", sequence, &mut extended_name_buffer);
-    let mut fallback_name_buffer = [0; MAX_SEQUENCE_NAME_BYTES];
-    let fallback_name = prefixed_decimal_name(b"PaxEntries/", sequence, &mut fallback_name_buffer);
-    let member_path = split_ustar_path(member.path.as_bytes()).unwrap_or((&[], fallback_name));
+    let mut sequence_name_buffer = [0; MAX_SEQUENCE_NAME_BYTES];
+    let extended_name = prefixed_decimal_name(b"PaxHeaders/", sequence, &mut sequence_name_buffer);
+    let sequence_name_len = extended_name.len();
     let fallback_size = if fits_octal(SIZE_RANGE.len(), member.size) {
         member.size
     } else {
@@ -182,6 +195,15 @@ pub fn frame_pax_member_into(
         b'x',
         b"",
     )?;
+    let member_path: (&[u8], &[u8]) =
+        if let Some(member_path) = split_ustar_path(member.path.as_bytes()) {
+            member_path
+        } else {
+            // The extended header has copied its name, and both prefixes have the
+            // same length, so the sequence-name buffer can become the fallback.
+            sequence_name_buffer[..b"PaxEntries/".len()].copy_from_slice(b"PaxEntries/");
+            (&[], &sequence_name_buffer[..sequence_name_len])
+        };
     build_header_into(
         member_header,
         member_path,
@@ -373,16 +395,78 @@ fn prefixed_decimal_name<'a>(
     &buffer[..len]
 }
 
-fn decimal_u64(mut value: u64, buffer: &mut [u8; MAX_DECIMAL_U64_BYTES]) -> &[u8] {
-    let mut start = buffer.len();
-    loop {
-        start -= 1;
-        buffer[start] = b'0' + (value % 10) as u8;
-        value /= 10;
-        if value == 0 {
-            return &buffer[start..];
-        }
+/// Writes `value` as right-aligned decimal ASCII and returns the initialized suffix.
+/// Short values stay inline; larger values use [`decimal_u64_large`].
+#[inline]
+fn decimal_u64(value: u64, buffer: &mut [u8; MAX_DECIMAL_U64_BYTES]) -> &[u8] {
+    // PAX record lengths and sequence numbers are usually short, so keep their
+    // common path straight-line. Larger values are rendered four digits at a time.
+    if value < 10 {
+        buffer[MAX_DECIMAL_U64_BYTES - 1] = b'0' + value as u8;
+        return &buffer[MAX_DECIMAL_U64_BYTES - 1..];
     }
+    if value < 100 {
+        let value = value as u8;
+        let tens = value / 10;
+        buffer[MAX_DECIMAL_U64_BYTES - 2] = b'0' + tens;
+        buffer[MAX_DECIMAL_U64_BYTES - 1] = b'0' + value - tens * 10;
+        return &buffer[MAX_DECIMAL_U64_BYTES - 2..];
+    }
+    if value < 1_000 {
+        let value = value as u16;
+        let hundreds = value / 100;
+        let remainder = (value - hundreds * 100) as u8;
+        let tens = remainder / 10;
+        buffer[MAX_DECIMAL_U64_BYTES - 3] = b'0' + hundreds as u8;
+        buffer[MAX_DECIMAL_U64_BYTES - 2] = b'0' + tens;
+        buffer[MAX_DECIMAL_U64_BYTES - 1] = b'0' + remainder - tens * 10;
+        return &buffer[MAX_DECIMAL_U64_BYTES - 3..];
+    }
+
+    decimal_u64_large(value, buffer)
+}
+
+/// Writes larger values in four-digit chunks, leaving the leading group to the tail.
+/// Note: this is **not** inlined so that our fast path ([`decimal_u64`]) can be inlined
+/// without pulling the slower path's code into each caller, which would harm locality.
+#[inline(never)]
+fn decimal_u64_large(value: u64, buffer: &mut [u8; MAX_DECIMAL_U64_BYTES]) -> &[u8] {
+    let mut remaining = value;
+    let mut start = buffer.len();
+
+    // Leave the leading one to four digits for the tail below, avoiding one
+    // final division by 10,000 when the digit count is a multiple of four.
+    while remaining >= 10_000 {
+        start -= 4;
+        let quad = (remaining % 10_000) as usize;
+        remaining /= 10_000;
+        let first_pair = quad / 100 * 2;
+        let second_pair = quad % 100 * 2;
+        buffer[start] = DECIMAL_PAIRS[first_pair];
+        buffer[start + 1] = DECIMAL_PAIRS[first_pair + 1];
+        buffer[start + 2] = DECIMAL_PAIRS[second_pair];
+        buffer[start + 3] = DECIMAL_PAIRS[second_pair + 1];
+    }
+
+    if remaining >= 100 {
+        start -= 2;
+        let pair = remaining as usize % 100 * 2;
+        remaining /= 100;
+        buffer[start] = DECIMAL_PAIRS[pair];
+        buffer[start + 1] = DECIMAL_PAIRS[pair + 1];
+    }
+
+    if remaining >= 10 {
+        start -= 2;
+        let pair = remaining as usize * 2;
+        buffer[start] = DECIMAL_PAIRS[pair];
+        buffer[start + 1] = DECIMAL_PAIRS[pair + 1];
+    } else {
+        start -= 1;
+        buffer[start] = b'0' + remaining as u8;
+    }
+
+    &buffer[start..]
 }
 
 fn append_decimal_usize(output: &mut Vec<u8>, value: usize) {
@@ -431,6 +515,15 @@ mod tests {
         bytes.extend_from_slice(payload_padding(member.size));
         bytes.extend_from_slice(end_marker_bytes());
         Ok(bytes)
+    }
+
+    fn assert_decimal_u64_matches_standard(value: u64) {
+        let mut buffer = [b'?'; MAX_DECIMAL_U64_BYTES];
+        assert_eq!(
+            decimal_u64(value, &mut buffer),
+            value.to_string().as_bytes(),
+            "value: {value}"
+        );
     }
 
     #[test]
@@ -539,6 +632,59 @@ mod tests {
                 append_pax_record(&mut Vec::new(), &keyword, b"value"),
                 Err(FramingWriteError::InvalidPaxRecordKeyword)
             );
+        }
+    }
+
+    #[test]
+    fn formats_u64_values_across_decimal_boundaries() {
+        for (value, expected) in [
+            (0, "0"),
+            (9, "9"),
+            (10, "10"),
+            (99, "99"),
+            (100, "100"),
+            (999, "999"),
+            (1_000, "1000"),
+            (1_001, "1001"),
+            (9_999, "9999"),
+            (10_000, "10000"),
+            (1_000_001, "1000001"),
+            (u64::MAX, "18446744073709551615"),
+        ] {
+            let mut buffer = [0; MAX_DECIMAL_U64_BYTES];
+            assert_eq!(decimal_u64(value, &mut buffer), expected.as_bytes());
+        }
+    }
+
+    #[test]
+    fn matches_standard_formatting_across_the_u64_range() {
+        // Exhaust the short-value paths and every possible four-digit suffix.
+        for value in 0..1_000_000 {
+            assert_decimal_u64_matches_standard(value);
+        }
+
+        // Exercise both sides of every remaining decimal-width transition.
+        for exponent in 6..=19 {
+            let power = 10_u64.pow(exponent);
+            for distance in 0..=9 {
+                if let Some(value) = power.checked_sub(distance) {
+                    assert_decimal_u64_matches_standard(value);
+                }
+                if distance != 0
+                    && let Some(value) = power.checked_add(distance)
+                {
+                    assert_decimal_u64_matches_standard(value);
+                }
+            }
+        }
+
+        // This full-period LCG samples the full u64 domain reproducibly.
+        let mut value = 0x4d59_5df4_d0f3_3173;
+        for _ in 0..250_000 {
+            assert_decimal_u64_matches_standard(value);
+            value = value
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
         }
     }
 
