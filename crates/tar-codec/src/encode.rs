@@ -7,7 +7,7 @@
 use std::io;
 
 use archive_trait::{
-    ArchiveBuilder, BuildError, BuilderPolicy, BuilderState, EntryMetadata, EntryPayload,
+    ArchiveBuilder, BuildError, BuilderState, EntryMetadata, EntryPayload, builder::BuilderPolicy,
 };
 use tar_framing::{
     UstarKind,

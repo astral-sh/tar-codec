@@ -42,23 +42,47 @@ impl EntryMetadata {
 #[derive(Clone, Copy, Debug)]
 pub struct BuilderPolicy {
     name_validation: NameValidation,
+    symlink_policy: SymlinkPolicy,
 }
 
 impl Default for BuilderPolicy {
     fn default() -> Self {
         Self {
             name_validation: NameValidation::Default,
+            symlink_policy: SymlinkPolicy::default(),
         }
     }
 }
 
+/// Controls how source symbolic links are handled during recursive builds.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SymlinkPolicy {
+    /// Reject recursive sources containing symbolic links.
+    #[default]
+    Reject,
+    /// Preserve symbolic links as link members in the resulting archive.
+    Preserve,
+    // TODO: Consider adding some kind of "Dereference" policy in the future,
+    // where symlinks get followed and replaced with their normal file/directory
+    // contents.
+}
+
 impl BuilderPolicy {
-    /// Configures validation for member names and symbolic-link targets.
+    /// Configures validation for member names and preserved symbolic-link targets.
     ///
     /// Passing [`None`] disables configurable name validation. UTF-8 and
     /// archive-format requirements still apply.
     pub fn name_validator(mut self, validator: Option<NameValidator>) -> Self {
         self.name_validation = NameValidation::from_validator(validator);
+        self
+    }
+
+    /// Configures how recursive builds handle source symbolic links.
+    ///
+    /// Symbolic links are **rejected by default**. Use
+    /// [`SymlinkPolicy::Preserve`] to write link members instead.
+    pub fn symlink_policy(mut self, policy: SymlinkPolicy) -> Self {
+        self.symlink_policy = policy;
         self
     }
 }
@@ -295,19 +319,21 @@ pub trait ArchiveBuilder: Sized {
     /// Recursively adds a filesystem directory beneath its UTF-8 basename.
     ///
     /// Entries are visited in deterministic sorted order and files are streamed
-    /// with bounded memory. Source symbolic-link targets are preserved without
-    /// applying extraction policy. A late traversal or validation failure may
-    /// leave partial output and poison this builder.
+    /// with bounded memory. Source symbolic links are rejected by default;
+    /// [`BuilderPolicy::symlink_policy`] can instead preserve them. A late
+    /// traversal or validation failure may leave partial output and poison
+    /// this builder.
     async fn add_directory<P: AsRef<Path>>(
         &mut self,
         source: P,
     ) -> Result<(), BuildError<Self::Error>> {
         self.builder_state().ensure_active()?;
         let source = source.as_ref().to_path_buf();
-        let (validation, entries, source_buffer) = {
+        let (validation, symlink_policy, entries, source_buffer) = {
             let state = self.builder_state();
             (
                 state.policy.name_validation,
+                state.policy.symlink_policy,
                 state.entries.clone(),
                 mem::take(&mut state.source_buffer),
             )
@@ -317,7 +343,7 @@ pub trait ArchiveBuilder: Sized {
             source_buffer,
             emitted: false,
         };
-        let mut entries = match stream_directory_entries(source, validation) {
+        let mut entries = match stream_directory_entries(source, validation, symlink_policy) {
             Ok(entries) => entries,
             Err(error) => {
                 self.builder_state().source_buffer = traversal.source_buffer;

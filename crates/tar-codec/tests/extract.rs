@@ -6,8 +6,10 @@ use std::path::Path;
 use support::EntryKind;
 use support::{ArchiveBuilder, ArchiveFormat, header, pax_record, single_posix_member};
 #[cfg(unix)]
-use tar_codec::LinkPolicy;
-use tar_codec::{Archive as _, DecodeError, ExtractError, ExtractPolicy, TarArchive};
+use tar_codec::{
+    Archive as _, DecodeError, ExtractError, TarArchive,
+    extract::{ExtractPolicy, LinkPolicy},
+};
 use tar_framing::{FrameError, FrameErrorInner, PaxKeyword, UstarKind};
 use tempfile::tempdir;
 

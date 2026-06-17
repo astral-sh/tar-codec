@@ -7,8 +7,8 @@ use support::{ArchiveBuilder, single_posix_member};
 #[cfg(unix)]
 use support::{pax_record, symlink_file};
 use tar_codec::{
-    Archive as _, ExtractError, ExtractPolicy, ExtractPolicyViolation, LinkPolicy, SymlinkPolicy,
-    TarArchive,
+    Archive as _, ExtractError, ExtractPolicyViolation, TarArchive,
+    extract::{ExtractPolicy, LinkPolicy, SymlinkPolicy},
 };
 #[cfg(unix)]
 use tar_framing::PaxKeyword;

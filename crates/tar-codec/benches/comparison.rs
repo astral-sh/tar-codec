@@ -10,7 +10,8 @@ use std::{
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tar_codec::{
-    Archive as _, ArchiveBuilder as _, EntryMetadata, ExtractPolicy, TarArchive, TarEncoder,
+    Archive as _, ArchiveBuilder as _, EntryMetadata, TarArchive, TarEncoder,
+    extract::ExtractPolicy,
 };
 use tempfile::{TempDir, tempdir};
 use tokio::{

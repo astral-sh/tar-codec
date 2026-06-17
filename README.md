@@ -32,11 +32,13 @@ encoder
 let writer = encoder.finish().await?;
 ```
 
-Use `TarEncoder::with_policy` and `BuilderPolicy` to configure generic name
-validation. Compression remains the caller's responsibility.
+Use `TarEncoder::with_policy` and `builder::BuilderPolicy` to configure generic
+name validation and source traversal. Recursive builds reject symbolic links by
+default. Configure `builder::SymlinkPolicy::Preserve` to retain link members
+instead. Compression remains the caller's responsibility.
 
 ```rust
-use tar_codec::{Archive as _, ExtractPolicy, TarArchive};
+use tar_codec::{Archive as _, TarArchive, extract::ExtractPolicy};
 
 TarArchive::new(reader)
     .extract_in("destination", ExtractPolicy::default())
@@ -44,7 +46,7 @@ TarArchive::new(reader)
 ```
 
 Use `TarArchive::with_policy` and `DecodePolicy` for GNU/PAX decoding controls.
-Use `ExtractPolicy` for generic name, overwrite, and link behavior.
+Use `extract::ExtractPolicy` for generic name, overwrite, and link behavior.
 
 ## Performance
 

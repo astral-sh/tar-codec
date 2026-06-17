@@ -9,8 +9,9 @@ use support::{
 #[cfg(unix)]
 use tar_codec::default_name_validator;
 use tar_codec::{
-    Archive as _, DecodeError, DecodePolicy, DecodePolicyViolation, ExtractError, ExtractPolicy,
-    ExtractPolicyViolation, LinkPolicy, PaxDecodePolicy, SymlinkPolicy, TarArchive,
+    Archive as _, DecodeError, DecodePolicy, DecodePolicyViolation, ExtractError,
+    ExtractPolicyViolation, PaxDecodePolicy, TarArchive,
+    extract::{ExtractPolicy, LinkPolicy, SymlinkPolicy},
 };
 use tar_framing::{FrameError, FrameErrorInner, PaxKeyword};
 use tempfile::tempdir;

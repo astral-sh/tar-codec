@@ -7,8 +7,10 @@ use std::{
 };
 
 use tar_codec::{
-    Archive as _, ArchiveBuilder as _, BuildError, EncodeError, EntryMetadata, ExtractPolicy,
-    TarArchive, TarEncoder,
+    Archive as _, ArchiveBuilder as _, BuildError, EncodeError, EntryMetadata, TarArchive,
+    TarEncoder, TraversalError,
+    builder::{BuilderPolicy, SymlinkPolicy},
+    extract::ExtractPolicy,
 };
 use tar_framing::{
     UstarKind,
@@ -220,7 +222,7 @@ async fn recursive_encoding_round_trips_small_and_large_files() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn recursive_encoding_frames_symbolic_links() {
+async fn recursive_encoding_rejects_symlinks_by_default_and_can_preserve_them() {
     use std::os::unix::fs::symlink;
 
     let temp = tempdir().expect("temporary directory should be created");
@@ -229,7 +231,15 @@ async fn recursive_encoding_frames_symbolic_links() {
     std::fs::write(source.join("target"), b"contents").expect("target should be written");
     symlink("target", source.join("link")).expect("symbolic link should be created");
 
-    let mut encoder = TarEncoder::new(Vec::new());
+    assert!(matches!(
+        TarEncoder::new(Vec::new()).add_directory(&source).await,
+        Err(BuildError::Traversal(
+            TraversalError::SymbolicLinkRejected { .. }
+        ))
+    ));
+
+    let policy = BuilderPolicy::default().symlink_policy(SymlinkPolicy::Preserve);
+    let mut encoder = TarEncoder::with_policy(Vec::new(), policy);
     encoder
         .add_directory(&source)
         .await

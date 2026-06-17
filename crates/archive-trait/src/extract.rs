@@ -1,4 +1,4 @@
-//! Filesystem extraction implementation and its private support types.
+//! Format-neutral extraction policies and filesystem implementation.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -21,6 +21,148 @@ use {
     cap_std::fs::MetadataExt as _, std::os::windows::fs::MetadataExt as _,
     windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT,
 };
+
+/// Controls generic archive extraction behavior.
+///
+/// See each configuration API for its default.
+#[derive(Clone, Copy, Debug)]
+pub struct ExtractPolicy {
+    pub(crate) link_policy: LinkPolicy,
+    pub(crate) allow_overwrites: bool,
+    pub(crate) name_validation: crate::name::NameValidation,
+}
+
+/// Controls how symbolic- and hard-link members are extracted.
+///
+/// By default, symbolic links are preserved as native links, including links
+/// to missing targets. Hard links and ambient symbolic-link targets require
+/// explicit opt-in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinkPolicy {
+    pub(crate) symlink_policy: SymlinkPolicy,
+    pub(crate) allow_hard_links: bool,
+    pub(crate) allow_ambient_targets: bool,
+    pub(crate) allow_missing_targets: bool,
+}
+
+/// Controls how symbolic-link members are handled during extraction.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SymlinkPolicy {
+    /// Preserve symbolic-link members as native filesystem links.
+    #[default]
+    Preserve,
+    /// Ignore symbolic-link members without changing the filesystem.
+    Skip,
+    /// Reject archives containing symbolic-link members.
+    Reject,
+}
+
+impl Default for ExtractPolicy {
+    fn default() -> Self {
+        Self {
+            link_policy: LinkPolicy::default(),
+            allow_overwrites: true,
+            name_validation: crate::name::NameValidation::Default,
+        }
+    }
+}
+
+impl Default for LinkPolicy {
+    fn default() -> Self {
+        Self {
+            symlink_policy: SymlinkPolicy::default(),
+            allow_hard_links: false,
+            allow_ambient_targets: false,
+            allow_missing_targets: true,
+        }
+    }
+}
+
+impl ExtractPolicy {
+    /// Configures symbolic- and hard-link extraction behavior.
+    pub fn link_policy(mut self, policy: LinkPolicy) -> Self {
+        self.link_policy = policy;
+        self
+    }
+
+    /// Configures whether archive members may replace existing entries.
+    ///
+    /// Overwrites are **allowed by default**. Replacement never follows
+    /// symbolic links or recursively removes non-empty directories. Real
+    /// directories are always reused, including when overwrites are disabled.
+    pub fn allow_overwrites(mut self, allow: bool) -> Self {
+        self.allow_overwrites = allow;
+        self
+    }
+
+    /// Configures validation for member names and link targets.
+    ///
+    /// Passing [`None`] disables configurable name validation. UTF-8 and
+    /// extraction containment requirements still apply.
+    pub fn name_validator(mut self, validator: Option<NameValidator>) -> Self {
+        self.name_validation = crate::name::NameValidation::from_validator(validator);
+        self
+    }
+
+    fn check_name<E>(
+        self,
+        position: u64,
+        context: &'static str,
+        value: &str,
+    ) -> Result<(), ExtractError<E>> {
+        if !self.name_validation.accepts(value) {
+            return Err(ExtractError::policy_violation(
+                position,
+                ExtractPolicyViolation::NameRejected {
+                    context,
+                    value: value.to_owned(),
+                },
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl LinkPolicy {
+    /// Configures how symbolic-link members are handled during extraction.
+    ///
+    /// Symbolic links are preserved by default. Platforms without native
+    /// symbolic-link creation require [`SymlinkPolicy::Skip`] or
+    /// [`SymlinkPolicy::Reject`].
+    pub fn symlink_policy(mut self, policy: SymlinkPolicy) -> Self {
+        self.symlink_policy = policy;
+        self
+    }
+
+    /// Configures whether hard-link members may be extracted.
+    ///
+    /// Hard links are **forbidden by default** because they are uncommon,
+    /// difficult to extract consistently, and prone to implementation
+    /// differentials. Enable them only for trusted archives.
+    pub fn allow_hard_links(mut self, allow: bool) -> Self {
+        self.allow_hard_links = allow;
+        self
+    }
+
+    /// Configures whether pre-existing symbolic-link targets may be used.
+    ///
+    /// Existing symbolic links are followed only when capability-relative
+    /// resolution remains beneath the extraction root. Ambient targets are
+    /// **forbidden by default**. This does not affect hard-link validation.
+    pub fn allow_ambient_targets(mut self, allow: bool) -> Self {
+        self.allow_ambient_targets = allow;
+        self
+    }
+
+    /// Configures whether symbolic links to missing targets may be extracted.
+    ///
+    /// Missing symbolic-link targets are **allowed by default**. This does not
+    /// affect hard-link validation.
+    pub fn allow_missing_targets(mut self, allow: bool) -> Self {
+        self.allow_missing_targets = allow;
+        self
+    }
+}
 
 /// A symbolic link awaiting graph validation and final extraction.
 ///

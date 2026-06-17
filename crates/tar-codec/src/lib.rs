@@ -17,10 +17,11 @@ pub mod decode;
 pub mod encode;
 
 pub use archive_trait::{
-    Archive, ArchiveBuilder, BuildError, BuilderPolicy, EntryMetadata, ExtractError, ExtractPolicy,
-    ExtractPolicyViolation, LentPayload, LinkPolicy, Member, MemberMetadata, MemberPayload,
-    Members, NameValidator, SpecialKind, SymlinkPolicy, TraversalError, default_name_validator,
+    Archive, ArchiveBuilder, BuildError, EntryMetadata, ExtractError, ExtractPolicyViolation,
+    LentPayload, Member, MemberMetadata, MemberPayload, Members, NameValidator, SpecialKind,
+    TraversalError, default_name_validator,
 };
+pub use archive_trait::{builder, extract};
 pub use decode::{
     DecodeError, DecodePolicy, DecodePolicyViolation, PaxDecodePolicy, TarArchive, TarMemberPayload,
 };

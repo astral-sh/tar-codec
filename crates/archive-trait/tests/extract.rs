@@ -4,7 +4,7 @@ pub mod support;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
-use archive_trait::{Archive as _, ExtractError, ExtractPolicy, SpecialKind};
+use archive_trait::{Archive as _, ExtractError, SpecialKind, extract::ExtractPolicy};
 use support::{TestArchive, entry};
 use tempfile::tempdir;
 

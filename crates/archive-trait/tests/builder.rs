@@ -1,8 +1,9 @@
 use std::{fmt, io::Write as _, path::PathBuf};
 
 use archive_trait::{
-    ArchiveBuilder, BuildError, BuilderPolicy, BuilderState, EntryMetadata, EntryPayload,
-    TraversalError, default_name_validator,
+    ArchiveBuilder, BuildError, BuilderState, EntryMetadata, EntryPayload, TraversalError,
+    builder::{BuilderPolicy, SymlinkPolicy},
+    default_name_validator,
 };
 use tempfile::tempdir;
 
@@ -294,7 +295,7 @@ async fn recursive_build_is_sorted_and_streams_small_and_large_files() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn recursive_build_preserves_symbolic_links_without_following_them() {
+async fn recursive_build_rejects_symlinks_by_default() {
     use std::os::unix::fs::symlink;
 
     let temp = tempdir().expect("temporary directory should be created");
@@ -303,7 +304,36 @@ async fn recursive_build_preserves_symbolic_links_without_following_them() {
     std::fs::write(source.join("target"), b"contents").expect("target should be written");
     symlink("target", source.join("link")).expect("symbolic link should be created");
 
-    let mut builder = MockBuilder::new();
+    assert!(matches!(
+        MockBuilder::new().add_directory(&source).await,
+        Err(BuildError::Traversal(
+            TraversalError::SymbolicLinkRejected { .. }
+        ))
+    ));
+
+    let linked_root = temp.path().join("root-link");
+    symlink("links", &linked_root).expect("root symbolic link should be created");
+    assert!(matches!(
+        MockBuilder::new().add_directory(&linked_root).await,
+        Err(BuildError::Traversal(
+            TraversalError::SymbolicLinkRejected { .. }
+        ))
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recursive_build_can_preserve_symbolic_links() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempdir().expect("temporary directory should be created");
+    let source = temp.path().join("links");
+    std::fs::create_dir(&source).expect("source directory should be created");
+    std::fs::write(source.join("target"), b"contents").expect("target should be written");
+    symlink("target", source.join("link")).expect("symbolic link should be created");
+
+    let policy = BuilderPolicy::default().symlink_policy(SymlinkPolicy::Preserve);
+    let mut builder = MockBuilder::with_policy(policy);
     builder
         .add_directory(&source)
         .await
@@ -315,9 +345,11 @@ async fn recursive_build_preserves_symbolic_links_without_following_them() {
     }));
 
     symlink("blocked", source.join("custom")).expect("custom link should be created");
-    let policy = BuilderPolicy::default().name_validator(Some(|name| {
-        default_name_validator(name) && !name.contains("blocked")
-    }));
+    let policy = BuilderPolicy::default()
+        .symlink_policy(SymlinkPolicy::Preserve)
+        .name_validator(Some(|name| {
+            default_name_validator(name) && !name.contains("blocked")
+        }));
     assert!(matches!(
         MockBuilder::with_policy(policy).add_directory(&source).await,
         Err(BuildError::Traversal(TraversalError::NameRejected {
@@ -328,10 +360,14 @@ async fn recursive_build_preserves_symbolic_links_without_following_them() {
 
     std::fs::remove_file(source.join("custom")).expect("custom link should be removed");
     symlink(" leading", source.join("disabled")).expect("disabled-policy link should be created");
-    MockBuilder::with_policy(BuilderPolicy::default().name_validator(None))
-        .add_directory(&source)
-        .await
-        .expect("disabled validation should accept the link target");
+    MockBuilder::with_policy(
+        BuilderPolicy::default()
+            .symlink_policy(SymlinkPolicy::Preserve)
+            .name_validator(None),
+    )
+    .add_directory(&source)
+    .await
+    .expect("disabled validation should accept the link target");
 }
 
 #[cfg(unix)]

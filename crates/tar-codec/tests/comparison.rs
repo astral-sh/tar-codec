@@ -1,7 +1,8 @@
 use std::{fs, path::Path};
 
 use tar_codec::{
-    Archive as _, ArchiveBuilder as _, EntryMetadata, ExtractPolicy, TarArchive, TarEncoder,
+    Archive as _, ArchiveBuilder as _, EntryMetadata, TarArchive, TarEncoder,
+    extract::ExtractPolicy,
 };
 use tempfile::tempdir;
 

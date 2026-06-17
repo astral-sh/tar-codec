@@ -10,9 +10,10 @@
 //! lookahead while amortizing channel wakeups.
 //!
 //! [`WalkDir`] is configured for deterministic depth-first traversal with
-//! directories before their contents. Source symbolic links are reported as
-//! entries and never followed. This module reads their textual targets, while
-//! the builder preserves those targets without applying extraction policy.
+//! directories before their contents and never follows symbolic links.
+//! Depending on [`super::BuilderPolicy`], source links are rejected or reported
+//! as link entries whose textual targets are preserved without applying
+//! extraction policy.
 
 use std::{
     io, mem,
@@ -23,6 +24,7 @@ use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinHandle};
 use walkdir::{DirEntry, WalkDir};
 
+use super::SymlinkPolicy;
 use crate::name::NameValidation;
 
 /// Number of filesystem entries grouped into one producer batch.
@@ -119,6 +121,12 @@ pub enum TraversalError {
         /// The rejected source directory.
         path: PathBuf,
     },
+    /// The builder policy rejects source symbolic links.
+    #[error("symbolic link rejected by builder policy: {path}")]
+    SymbolicLinkRejected {
+        /// The rejected symbolic link.
+        path: PathBuf,
+    },
     /// The recursive source contains a filesystem node outside the supported subset.
     #[error("unsupported filesystem entry type: {path}")]
     UnsupportedFilesystemType {
@@ -148,12 +156,19 @@ pub enum TraversalError {
 pub(crate) fn stream_directory_entries(
     source: PathBuf,
     validation: NameValidation,
+    symlink_policy: SymlinkPolicy,
 ) -> Result<TraversalStream, TraversalError> {
     let archive_path = source_archive_path(&source, validation)?;
     let (sender, receiver) = mpsc::channel(DIRECTORY_TRAVERSAL_BUFFER_BATCHES);
     let task = tokio::task::spawn_blocking(move || {
         let mut output = TraversalSender::new(sender);
-        stream_directory_entries_blocking(&source, &archive_path, validation, &mut output)?;
+        stream_directory_entries_blocking(
+            &source,
+            &archive_path,
+            validation,
+            symlink_policy,
+            &mut output,
+        )?;
         output.flush();
         Ok(())
     });
@@ -180,6 +195,7 @@ fn stream_directory_entries_blocking(
     source: &Path,
     archive_path: &str,
     validation: NameValidation,
+    symlink_policy: SymlinkPolicy,
     output: &mut TraversalSender,
 ) -> Result<(), TraversalError> {
     let entries = WalkDir::new(source)
@@ -191,7 +207,13 @@ fn stream_directory_entries_blocking(
             let path = error.path().unwrap_or(source).to_path_buf();
             filesystem_error("traverse source directory", &path, error.into())
         })?;
-        if !output.push(traversal_entry(source, archive_path, validation, entry)?) {
+        if !output.push(traversal_entry(
+            source,
+            archive_path,
+            validation,
+            symlink_policy,
+            entry,
+        )?) {
             break;
         }
     }
@@ -228,18 +250,46 @@ impl TraversalSender {
 
 /// Converts one [`WalkDir`] entry into the builder's supported filesystem model.
 ///
-/// Source symbolic links are classified and read but deliberately not followed.
-/// Their UTF-8 textual targets are preserved for framing; extraction policy is
-/// deliberately left to archive consumers.
+/// Preserved links retain their UTF-8 textual targets for framing; extraction
+/// policy is left to archive consumers.
 fn traversal_entry(
     source: &Path,
     archive_path: &str,
     validation: NameValidation,
+    symlink_policy: SymlinkPolicy,
     entry: DirEntry,
 ) -> Result<TraversalEntry, TraversalError> {
     let path = entry.path();
     let file_type = entry.file_type();
-    if entry.depth() == 0 && !file_type.is_dir() {
+    let kind = if file_type.is_dir() {
+        TraversalKind::Directory
+    } else if file_type.is_file() {
+        TraversalKind::Regular
+    } else if file_type.is_symlink() {
+        match symlink_policy {
+            SymlinkPolicy::Reject => {
+                return Err(TraversalError::SymbolicLinkRejected {
+                    path: path.to_path_buf(),
+                });
+            }
+            SymlinkPolicy::Preserve => {
+                let target = std::fs::read_link(path)
+                    .map_err(|error| filesystem_error("read symbolic link", path, error))?;
+                let Some(target) = target.to_str().map(str::to_owned) else {
+                    return Err(TraversalError::NonUtf8LinkTarget {
+                        path: path.to_path_buf(),
+                    });
+                };
+                validate_name(&target, validation, "symbolic-link target")?;
+                TraversalKind::SymbolicLink { target }
+            }
+        }
+    } else {
+        return Err(TraversalError::UnsupportedFilesystemType {
+            path: path.to_path_buf(),
+        });
+    };
+    if entry.depth() == 0 && !matches!(&kind, TraversalKind::Directory) {
         return Err(TraversalError::SourceNotDirectory {
             path: source.to_path_buf(),
         });
@@ -254,25 +304,6 @@ fn traversal_entry(
         archive_path.to_owned()
     } else {
         join_archive_path(archive_path, relative, path, validation)?
-    };
-    let kind = if file_type.is_dir() {
-        TraversalKind::Directory
-    } else if file_type.is_file() {
-        TraversalKind::Regular
-    } else if file_type.is_symlink() {
-        let target = std::fs::read_link(path)
-            .map_err(|error| filesystem_error("read symbolic link", path, error))?;
-        let Some(target) = target.to_str().map(str::to_owned) else {
-            return Err(TraversalError::NonUtf8LinkTarget {
-                path: path.to_path_buf(),
-            });
-        };
-        validate_name(&target, validation, "symbolic-link target")?;
-        TraversalKind::SymbolicLink { target }
-    } else {
-        return Err(TraversalError::UnsupportedFilesystemType {
-            path: path.to_path_buf(),
-        });
     };
     Ok(TraversalEntry {
         source: entry.into_path(),

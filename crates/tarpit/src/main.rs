@@ -6,7 +6,7 @@ use std::{
 
 use async_compression::tokio::bufread::GzipDecoder;
 use clap::{Parser, Subcommand};
-use tar_codec::{Archive as _, DecodeError, ExtractError, ExtractPolicy, TarArchive};
+use tar_codec::{Archive as _, DecodeError, ExtractError, TarArchive, extract::ExtractPolicy};
 use tar_framing::{
     ArchiveFormat, FrameError, GnuKind, HdrCharset, PaxKind, PaxRecord, PaxString, PaxValue,
     UstarKind,

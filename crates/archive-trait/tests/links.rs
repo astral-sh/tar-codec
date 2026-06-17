@@ -1,7 +1,8 @@
 pub mod support;
 
 use archive_trait::{
-    Archive as _, ExtractError, ExtractPolicy, ExtractPolicyViolation, LinkPolicy, SymlinkPolicy,
+    Archive as _, ExtractError, ExtractPolicyViolation,
+    extract::{ExtractPolicy, LinkPolicy, SymlinkPolicy},
 };
 use support::{TestArchive, entry};
 use tempfile::tempdir;
