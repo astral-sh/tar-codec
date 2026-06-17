@@ -399,6 +399,10 @@ fn prefixed_decimal_name<'a>(
 /// Short values stay inline; larger values use [`decimal_u64_large`].
 #[inline]
 fn decimal_u64(value: u64, buffer: &mut [u8; MAX_DECIMAL_U64_BYTES]) -> &[u8] {
+    // TODO: Replace this with `core::fmt::NumBuffer` once our MSRV is 1.98+.
+    // Rust's (more generic) version:
+    // <https://github.com/rust-lang/rust/blob/c1b22f44c3/library/core/src/fmt/num.rs#L190-L253>
+
     // PAX record lengths and sequence numbers are usually short, so keep their
     // common path straight-line. Larger values are rendered four digits at a time.
     if value < 10 {
