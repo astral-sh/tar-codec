@@ -1,0 +1,29 @@
+[package]
+name = "archive-trait"
+description = "Format-neutral, asynchronous archive extraction"
+
+version = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+readme = { workspace = true }
+
+[dependencies]
+cap-std = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+junction = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lib]
+doctest = false

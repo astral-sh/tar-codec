@@ -13,6 +13,25 @@ Anti-goals:
 - Decoding support for legacy (pre-ustar) archives
 - Decoding archives that mix POSIX pax/ustar and GNU framing in one stream, for now
 
+## Architecture
+
+`tar-framing` parses physical and logical tar structure. `tar-codec` validates
+tar-specific policy and projects those logical entries into the common member
+model from `archive-trait`. The latter owns path validation, link policy, and
+filesystem extraction, so the same extraction engine can support future archive
+formats with the same basic member shape.
+
+```rust
+use tar_codec::{Archive as _, ExtractPolicy, TarArchive};
+
+TarArchive::new(reader)
+    .extract_in("destination", ExtractPolicy::default())
+    .await?;
+```
+
+Use `TarArchive::with_policy` and `DecodePolicy` for GNU/PAX decoding controls.
+Use `ExtractPolicy` for generic name, overwrite, and link behavior.
+
 ## Performance
 
 tar-codec aims to be as fast as (or substantially faster than) other
@@ -47,4 +66,3 @@ differ by less than 1%.
 Recursive encoding policies are not identical: `tar-codec` emits pure pax
 archives and streams a deterministic sorted traversal, while the comparison
 builders emit conventional headers.
-

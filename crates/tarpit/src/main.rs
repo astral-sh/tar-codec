@@ -6,7 +6,7 @@ use std::{
 
 use async_compression::tokio::bufread::GzipDecoder;
 use clap::{Parser, Subcommand};
-use tar_codec::decode::{Archive, DecodeError, DecodePolicy};
+use tar_codec::{Archive as _, DecodeError, ExtractError, ExtractPolicy, TarArchive};
 use tar_framing::{
     ArchiveFormat, FrameError, GnuKind, HdrCharset, PaxKind, PaxRecord, PaxString, PaxValue,
     UstarKind,
@@ -51,7 +51,7 @@ enum CliError {
         source: io::Error,
     },
     #[error(transparent)]
-    Extract(#[from] DecodeError),
+    Extract(#[from] ExtractError<DecodeError>),
     #[error(transparent)]
     Framing(#[from] FrameError),
     #[error("failed to write frame dump: {0}")]
@@ -98,12 +98,12 @@ async fn dump_archive<W: Write>(archive: &Path, output: &mut W) -> Result<(), Cl
 async fn extract_archive(archive: &Path, destination: &Path) -> Result<(), CliError> {
     let file = open_archive(archive).await?;
     if is_gzip_tar(archive) {
-        Archive::new(GzipDecoder::new(BufReader::new(file)))
-            .extract(destination, DecodePolicy::default())
+        TarArchive::new(GzipDecoder::new(BufReader::new(file)))
+            .extract_in(destination, ExtractPolicy::default())
             .await?;
     } else {
-        Archive::new(file)
-            .extract(destination, DecodePolicy::default())
+        TarArchive::new(file)
+            .extract_in(destination, ExtractPolicy::default())
             .await?;
     }
     Ok(())

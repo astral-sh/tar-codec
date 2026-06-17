@@ -1,77 +1,54 @@
-//! Decoding and extraction of pax or GNU tar streams.
+//! Member-oriented decoding of pax or GNU tar streams.
 
-use std::{
-    collections::HashSet,
-    io,
-    path::{Component, Path, PathBuf},
+use std::collections::HashSet;
+
+use archive_trait::{
+    Archive as ArchiveTrait, Member, MemberMetadata, MemberPayload as MemberPayloadTrait,
+    SpecialKind,
 };
-
 use tar_framing::{
     ArchiveFormat, FrameError, PaxKeyword, PaxKind, PaxRecord, UstarKind,
-    logical::{MemberExtensions, MemberFrame, TarReader},
+    logical::{MemberExtensions, MemberFrame, MemberPayload as FramingMemberPayload, TarReader},
 };
 use thiserror::Error;
 use tokio::io::AsyncRead;
 
-use crate::{NameValidator, name::NameValidation};
-
 pub use tar_framing::DEFAULT_MAX_PAX_EXTENSION_SIZE;
 
-mod extract;
-
 /// A one-pass reader for a validated pax or GNU tar archive.
-pub struct Archive<R> {
+pub struct TarArchive<R> {
     reader: TarReader<R>,
+    policy: DecodePolicy,
 }
 
-impl<R> Archive<R> {
+impl<R> TarArchive<R> {
     /// Creates an archive decoder from an uncompressed tar reader.
     pub fn new(reader: R) -> Self {
+        Self::with_policy(reader, DecodePolicy::default())
+    }
+
+    /// Creates an archive decoder using `policy`.
+    pub fn with_policy(reader: R, policy: DecodePolicy) -> Self {
         Self {
-            reader: TarReader::new(reader),
+            reader: TarReader::with_max_pax_extension_size(
+                reader,
+                policy.pax_policy.max_extension_size,
+            ),
+            policy,
         }
     }
 }
 
-/// Controls which otherwise valid archive features extraction may accept.
+/// Controls which otherwise valid tar features member decoding may accept.
 ///
 /// See each configuration API for its default.
 #[derive(Clone, Copy, Debug)]
 pub struct DecodePolicy {
-    link_policy: LinkPolicy,
-    allow_overwrites: bool,
     allow_gnu: bool,
     pax_policy: PaxDecodePolicy,
-    name_validation: NameValidation,
 }
 
-/// Controls how symbolic- and hard-link members are extracted.
-///
-/// By default, symbolic-link members are preserved as native links, including
-/// links to missing targets. Hard links and ambient symbolic-link targets
-/// require explicit opt-in.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LinkPolicy {
-    symlink_policy: SymlinkPolicy,
-    allow_hard_links: bool,
-    allow_ambient_targets: bool,
-    allow_missing_targets: bool,
-}
-
-/// Controls how symbolic-link members are handled during extraction.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum SymlinkPolicy {
-    /// Preserve symbolic-link members as native filesystem links.
-    #[default]
-    Preserve,
-    /// Ignore symbolic-link members without changing the filesystem.
-    Skip,
-    /// Reject archives containing symbolic-link members.
-    Reject,
-}
-
-/// Controls which otherwise valid pax features extraction may accept.
-///
+/// Controls which otherwise valid pax features member decoding may accept.
 ///
 /// See each allow API for its default.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,47 +75,14 @@ impl Default for PaxDecodePolicy {
 impl Default for DecodePolicy {
     fn default() -> Self {
         Self {
-            link_policy: LinkPolicy::default(),
-            allow_overwrites: true,
             allow_gnu: true,
             pax_policy: PaxDecodePolicy::default(),
-            name_validation: NameValidation::Default,
-        }
-    }
-}
-
-impl Default for LinkPolicy {
-    fn default() -> Self {
-        Self {
-            symlink_policy: SymlinkPolicy::default(),
-            allow_hard_links: false,
-            allow_ambient_targets: false,
-            allow_missing_targets: true,
         }
     }
 }
 
 impl DecodePolicy {
-    /// Configures symbolic- and hard-link extraction behavior.
-    pub fn link_policy(mut self, policy: LinkPolicy) -> Self {
-        self.link_policy = policy;
-        self
-    }
-
-    /// Configures whether archive members may replace existing destination
-    /// entries.
-    ///
-    /// Overwrites during extraction are **allowed by default**.
-    ///
-    /// Replacement never follows symbolic links or recursively removes
-    /// non-empty directories. Real directories are always reused, including
-    /// when overwrites are disabled.
-    pub fn allow_overwrites(mut self, allow: bool) -> Self {
-        self.allow_overwrites = allow;
-        self
-    }
-
-    /// Configures whether archives in the GNU framing family may be extracted.
+    /// Configures whether archives in the GNU framing family may be decoded.
     ///
     /// GNU tar archives are **allowed by default**.
     ///
@@ -155,43 +99,11 @@ impl DecodePolicy {
         self
     }
 
-    /// Configures validation for member names and link targets.
-    ///
-    /// Passing [`None`] disables configurable name validation. UTF-8 and
-    /// extraction containment requirements still apply.
-    pub fn name_validator(mut self, validator: Option<NameValidator>) -> Self {
-        self.name_validation = NameValidation::from_validator(validator);
-        self
-    }
-
     fn check_format(&self, position: u64, format: ArchiveFormat) -> Result<(), DecodeError> {
         if format == ArchiveFormat::Gnu && !self.allow_gnu {
             return Err(DecodeError::policy_violation(
                 position,
                 DecodePolicyViolation::GnuArchive,
-            ));
-        }
-        Ok(())
-    }
-
-    fn check_member_kind(&self, position: u64, kind: UstarKind) -> Result<(), DecodeError> {
-        if kind == UstarKind::SymbolicLink {
-            let violation = match self.link_policy.symlink_policy {
-                SymlinkPolicy::Reject => Some(DecodePolicyViolation::SymbolicLink),
-                #[cfg(not(unix))]
-                SymlinkPolicy::Preserve => {
-                    Some(DecodePolicyViolation::NativeSymlinkCreationUnsupported)
-                }
-                _ => None,
-            };
-            if let Some(violation) = violation {
-                return Err(DecodeError::policy_violation(position, violation));
-            }
-        }
-        if kind == UstarKind::HardLink && !self.link_policy.allow_hard_links {
-            return Err(DecodeError::policy_violation(
-                position,
-                DecodePolicyViolation::HardLink,
             ));
         }
         Ok(())
@@ -225,7 +137,6 @@ impl DecodePolicy {
                 .unwrap_or(frame.header.position),
         };
         self.check_format(format_position, frame.header.format)?;
-        self.check_member_kind(frame.header.position, frame.header.kind)?;
         if let MemberExtensions::Pax(state) = &frame.extensions {
             for extension in state
                 .extensions()
@@ -239,70 +150,6 @@ impl DecodePolicy {
             }
         }
         Ok(())
-    }
-
-    fn check_name(
-        &self,
-        position: u64,
-        context: &'static str,
-        value: &str,
-    ) -> Result<(), DecodeError> {
-        if !self.name_validation.accepts(value) {
-            return Err(DecodeError::policy_violation(
-                position,
-                DecodePolicyViolation::NameRejected {
-                    context,
-                    value: value.to_owned(),
-                },
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl LinkPolicy {
-    /// Configures how symbolic-link members are handled during extraction.
-    ///
-    /// Symbolic-link members are preserved by default. Non-Unix platforms do
-    /// not support native symbolic-link extraction, so callers there must select
-    /// [`SymlinkPolicy::Skip`] or [`SymlinkPolicy::Reject`].
-    pub fn symlink_policy(mut self, policy: SymlinkPolicy) -> Self {
-        self.symlink_policy = policy;
-        self
-    }
-
-    /// Configures whether hard-link members may be extracted.
-    ///
-    /// Hard links are **forbidden by default** because they are uncommon,
-    /// difficult to extract consistently across platforms, and prone to
-    /// implementation differentials.
-    ///
-    /// **IMPORTANT**: Only enable hard-link extraction if you fully trust the
-    /// archive being extracted.
-    pub fn allow_hard_links(mut self, allow: bool) -> Self {
-        self.allow_hard_links = allow;
-        self
-    }
-
-    /// Configures whether symbolic-link targets already present in the
-    /// destination may be used.
-    ///
-    /// Existing symbolic links are followed only when capability-relative
-    /// resolution remains beneath the extraction root. Ambient targets are
-    /// **forbidden by default**. This setting does not affect hard-link target
-    /// validation.
-    pub fn allow_ambient_targets(mut self, allow: bool) -> Self {
-        self.allow_ambient_targets = allow;
-        self
-    }
-
-    /// Configures whether symbolic links to missing targets may be extracted.
-    ///
-    /// This setting has no effect on hard-link target validation. Missing
-    /// symbolic-link targets are **allowed by default**.
-    pub fn allow_missing_targets(mut self, allow: bool) -> Self {
-        self.allow_missing_targets = allow;
-        self
     }
 }
 
@@ -442,27 +289,10 @@ impl PaxDecodePolicy {
     }
 }
 
-/// A valid archive feature rejected by the selected [`DecodePolicy`].
+/// A valid tar feature rejected by the selected [`DecodePolicy`].
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum DecodePolicyViolation {
-    /// An effective member name or link target was rejected by the configured validator.
-    #[error("archive {context} rejected by name policy: {value:?}")]
-    NameRejected {
-        /// The role of the rejected archive text.
-        context: &'static str,
-        /// The rejected UTF-8 value.
-        value: String,
-    },
-    /// A symbolic-link member appeared when links are forbidden.
-    #[error("symbolic-link members are not allowed")]
-    SymbolicLink,
-    /// A symbolic-link member requires native creation on an unsupported platform.
-    #[error("native symbolic-link creation is not supported on this platform")]
-    NativeSymlinkCreationUnsupported,
-    /// A hard-link member appeared when links are forbidden.
-    #[error("hard-link members are not allowed")]
-    HardLink,
-    /// A GNU-family frame appeared when only POSIX-pax extraction is allowed.
+    /// A GNU-family frame appeared when only POSIX-pax decoding is allowed.
     #[error("GNU archives are not allowed")]
     GnuArchive,
     /// A global POSIX pax extended header appeared when it is forbidden.
@@ -490,26 +320,12 @@ pub enum DecodePolicyViolation {
     },
 }
 
-/// An error produced while decoding or securely extracting an archive.
+/// An error produced while decoding tar members.
 #[derive(Debug, Error)]
 pub enum DecodeError {
     /// The underlying tar stream is not structurally valid.
     #[error(transparent)]
     Framing(#[from] FrameError),
-    /// A destination filesystem operation failed.
-    #[error("failed to {operation} {path}: {source}")]
-    Filesystem {
-        /// The operation that failed.
-        operation: &'static str,
-        /// The path involved in the failed operation.
-        path: PathBuf,
-        /// The underlying I/O error.
-        #[source]
-        source: io::Error,
-    },
-    /// A blocking extraction operation failed to complete.
-    #[error("failed to complete blocking extraction operation: {0}")]
-    BlockingTask(#[from] tokio::task::JoinError),
     /// An effective member path or link target is not UTF-8 text.
     #[error("at byte {position}: {field} is not valid UTF-8")]
     InvalidUtf8 {
@@ -518,54 +334,8 @@ pub enum DecodeError {
         /// Metadata field being decoded.
         field: &'static str,
     },
-    /// An archive member path or link value is unsafe to extract.
-    #[error("at byte {position}: unsafe {context} {value:?}: {reason}")]
-    UnsafePath {
-        /// Source member-header position.
-        position: u64,
-        /// Whether this is a member path or link target.
-        context: &'static str,
-        /// Archive-provided value.
-        value: String,
-        /// Rejection reason.
-        reason: &'static str,
-    },
-    /// An archive entry collides with an existing path that cannot be replaced.
-    #[error("archive entry collides with existing path {path}")]
-    PathCollision {
-        /// Normalized extraction-relative path.
-        path: PathBuf,
-    },
-    /// A member kind is deliberately excluded from secure extraction.
-    #[error("at byte {position}: cannot extract unsupported member type {kind:?} at {path}")]
-    UnsupportedMember {
-        /// Source member-header position.
-        position: u64,
-        /// Normalized extraction-relative path.
-        path: PathBuf,
-        /// Unsupported member kind.
-        kind: UstarKind,
-    },
-    /// A symbolic or hard link cannot be safely resolved.
-    #[error("at byte {position}: invalid link {path} -> {target:?}: {reason}")]
-    InvalidLink {
-        /// Source member-header position.
-        position: u64,
-        /// Normalized link path.
-        path: PathBuf,
-        /// Archive-provided or normalized link target.
-        target: String,
-        /// Rejection reason.
-        reason: &'static str,
-    },
-    /// A frame stream violated the contract expected from `tar-framing`.
-    #[error("invalid tar frame sequence: {reason}")]
-    InvalidFrameSequence {
-        /// Internal sequence expectation.
-        reason: &'static str,
-    },
-    /// A structurally valid archive feature was rejected by extraction policy.
-    #[error("at byte {position}: extraction policy rejected input: {violation}")]
+    /// A structurally valid tar feature was rejected by decode policy.
+    #[error("at byte {position}: decode policy rejected input: {violation}")]
     PolicyViolation {
         /// Source header position for the rejected feature.
         position: u64,
@@ -581,366 +351,103 @@ impl DecodeError {
             violation,
         }
     }
+}
 
-    fn invalid_link(position: u64, path: PathBuf, target: String, reason: &'static str) -> Self {
-        Self::InvalidLink {
-            position,
-            path,
-            target,
-            reason,
-        }
+/// A tar member payload adapted to [`MemberPayloadTrait`].
+pub struct TarMemberPayload<'a, R> {
+    payload: FramingMemberPayload<'a, R>,
+}
+
+impl<R: AsyncRead + Unpin> MemberPayloadTrait for TarMemberPayload<'_, R> {
+    type Error = DecodeError;
+
+    async fn next_chunk(
+        &mut self,
+        buffer: &mut Vec<u8>,
+        target_len: usize,
+    ) -> Result<bool, Self::Error> {
+        self.payload
+            .next_chunk(buffer, target_len)
+            .await
+            .map_err(Into::into)
     }
 
-    fn unsafe_path(
-        position: u64,
-        context: &'static str,
-        value: &str,
-        reason: &'static str,
-    ) -> Self {
-        Self::UnsafePath {
-            position,
-            context,
-            value: value.to_owned(),
-            reason,
-        }
-    }
-
-    fn filesystem(operation: &'static str, path: PathBuf, source: io::Error) -> Self {
-        Self::Filesystem {
-            operation,
-            path,
-            source,
-        }
+    async fn skip(self) -> Result<(), Self::Error> {
+        self.payload.skip().await.map_err(Into::into)
     }
 }
 
-#[derive(Debug)]
-struct DecodedMember {
-    position: u64,
-    path: PathBuf,
-    kind: UstarKind,
-    link_target: String,
-    executable: bool,
-    effective_size: u64,
+impl<R: AsyncRead + Unpin> ArchiveTrait for TarArchive<R> {
+    type Error = DecodeError;
+    type Payload<'a>
+        = TarMemberPayload<'a, R>
+    where
+        Self: 'a;
+
+    async fn next_member(&mut self) -> Result<Option<Member<Self::Payload<'_>>>, Self::Error> {
+        let Some(frame) = self.reader.next_frame().await? else {
+            return Ok(None);
+        };
+        self.policy.check_member(&frame)?;
+        project_member(frame).map(Some)
+    }
 }
 
-fn decode_member<R>(
-    frame: &MemberFrame<'_, R>,
-    policy: &DecodePolicy,
-) -> Result<DecodedMember, DecodeError> {
-    let header = &frame.header;
-    let mode = header.mode()?;
-    let executable = mode & 0o111 != 0;
-    let path_text = std::str::from_utf8(frame.effective_path()?.as_ref())
+fn project_member<R>(
+    frame: MemberFrame<'_, R>,
+) -> Result<Member<TarMemberPayload<'_, R>>, DecodeError> {
+    let position = frame.header.position;
+    let kind = frame.header.kind;
+    let size = frame.header.effective_size;
+    let executable = frame.header.mode()? & 0o111 != 0;
+    let path = std::str::from_utf8(frame.effective_path()?.as_ref())
         .map(str::to_owned)
         .map_err(|_| DecodeError::InvalidUtf8 {
-            position: header.position,
+            position,
             field: "path",
         })?;
-    policy.check_name(header.position, "member path", &path_text)?;
-
-    // This is a conservative choice: some other decoders treat directory-required
-    // suffixes on a regular file as a signal to make a directory, while others
-    // silently strip them and create a regular file instead. The former is
-    // consistent with pre-ustar ("v7 tar") behavior, but is ambiguous in a
-    // ustar/pax/GNU setting.
-    // TODO: Make this configurable through policy?
-    if header.kind != UstarKind::Directory
-        && (path_text.ends_with('/')
-            || path_text
-                .rsplit_once('/')
-                .is_some_and(|(_, component)| matches!(component, "." | "..")))
-    {
-        return Err(DecodeError::unsafe_path(
-            header.position,
-            "member path",
-            &path_text,
-            "only a directory may have a directory-required path suffix",
-        ));
-    }
-    let path = normalize_member_path(header.position, &path_text)?;
-    if path.as_os_str().is_empty() && header.kind != UstarKind::Directory {
-        return Err(DecodeError::unsafe_path(
-            header.position,
-            "member path",
-            &path_text,
-            "only a directory may resolve to the extraction root",
-        ));
-    }
-    let link_target = if matches!(header.kind, UstarKind::HardLink | UstarKind::SymbolicLink) {
-        let target = std::str::from_utf8(frame.effective_link_path()?.as_ref())
+    let target = if matches!(kind, UstarKind::HardLink | UstarKind::SymbolicLink) {
+        std::str::from_utf8(frame.effective_link_path()?.as_ref())
             .map(str::to_owned)
             .map_err(|_| DecodeError::InvalidUtf8 {
-                position: header.position,
+                position,
                 field: "linkpath",
-            })?;
-        let context = if header.kind == UstarKind::SymbolicLink {
-            "symbolic-link target"
-        } else {
-            "hard-link target"
-        };
-        policy.check_name(header.position, context, &target)?;
-        if target.is_empty() {
-            return Err(DecodeError::invalid_link(
-                header.position,
-                path,
-                target,
-                "link target is empty",
-            ));
-        }
-        target
+            })?
     } else {
         String::new()
     };
+    let metadata = MemberMetadata { path, position };
 
-    Ok(DecodedMember {
-        position: header.position,
-        path,
-        kind: header.kind,
-        link_target,
-        executable,
-        effective_size: header.effective_size,
+    Ok(match kind {
+        UstarKind::Regular | UstarKind::Contiguous => Member::File {
+            metadata,
+            size,
+            executable,
+            payload: TarMemberPayload {
+                payload: frame.payload,
+            },
+        },
+        UstarKind::Directory => Member::Directory { metadata },
+        UstarKind::SymbolicLink => Member::SymbolicLink { metadata, target },
+        UstarKind::HardLink => Member::HardLink {
+            metadata,
+            target,
+            size,
+            payload: TarMemberPayload {
+                payload: frame.payload,
+            },
+        },
+        UstarKind::CharacterDevice => Member::Special {
+            metadata,
+            kind: SpecialKind::CharacterDevice,
+        },
+        UstarKind::BlockDevice => Member::Special {
+            metadata,
+            kind: SpecialKind::BlockDevice,
+        },
+        UstarKind::Fifo => Member::Special {
+            metadata,
+            kind: SpecialKind::Fifo,
+        },
     })
-}
-
-fn normalize_member_path(position: u64, value: &str) -> Result<PathBuf, DecodeError> {
-    validate_extraction_path(position, "member path", value)?;
-    let mut path = PathBuf::new();
-    for component in Path::new(value).components() {
-        match component {
-            Component::Prefix(_) => {
-                return Err(DecodeError::unsafe_path(
-                    position,
-                    "member path",
-                    value,
-                    "contains a platform path prefix",
-                ));
-            }
-            Component::RootDir => {
-                return Err(DecodeError::unsafe_path(
-                    position,
-                    "member path",
-                    value,
-                    "is absolute",
-                ));
-            }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                return Err(DecodeError::unsafe_path(
-                    position,
-                    "member path",
-                    value,
-                    "contains a parent-directory component",
-                ));
-            }
-            Component::Normal(component) => path.push(component),
-        }
-    }
-    Ok(path)
-}
-
-/// A validated symbolic-link target resolved for extraction.
-struct ValidatedSymlinkTarget {
-    /// The target resolved relative to the extraction root, used for
-    /// containment and symbolic-link graph validation.
-    resolved_target: PathBuf,
-    /// Whether the target's suffix requires its terminal object to be a directory.
-    requires_directory: bool,
-}
-
-/// Validates and resolves a symbolic-link target.
-///
-/// [`ValidatedSymlinkTarget::resolved_target`] identifies the target relative
-/// to the extraction root. For example, `../file` on a link at `dir/link`
-/// resolves to `file`. The caller retains the archive-provided text for native
-/// symbolic-link creation.
-///
-/// Absolute, platform-prefixed, escaping, and lexically ambiguous targets are
-/// rejected. In particular, a parent component following a normal component
-/// could resolve differently if that component is a symbolic link or not a
-/// directory, so accepting it would make lexical graph validation unsound.
-fn validate_symlink_target(
-    position: u64,
-    path: &Path,
-    value: &str,
-) -> Result<ValidatedSymlinkTarget, DecodeError> {
-    validate_extraction_path(position, "symbolic-link target", value)?;
-    let base = path.parent().unwrap_or_else(|| Path::new(""));
-    let mut resolved = base.to_owned();
-    let mut normal_component_seen = false;
-    for component in Path::new(value).components() {
-        match component {
-            Component::Prefix(_) => {
-                return Err(DecodeError::unsafe_path(
-                    position,
-                    "symbolic-link target",
-                    value,
-                    "contains a platform path prefix",
-                ));
-            }
-            Component::RootDir => {
-                return Err(DecodeError::unsafe_path(
-                    position,
-                    "symbolic-link target",
-                    value,
-                    "is absolute",
-                ));
-            }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if normal_component_seen {
-                    return Err(DecodeError::unsafe_path(
-                        position,
-                        "symbolic-link target",
-                        value,
-                        "contains ambiguous parent-directory traversal",
-                    ));
-                }
-                if !resolved.pop() {
-                    return Err(DecodeError::unsafe_path(
-                        position,
-                        "symbolic-link target",
-                        value,
-                        "escapes the destination root",
-                    ));
-                }
-            }
-            Component::Normal(component) => {
-                normal_component_seen = true;
-                resolved.push(component);
-            }
-        }
-    }
-    Ok(ValidatedSymlinkTarget {
-        resolved_target: resolved,
-        requires_directory: value.ends_with('/')
-            || matches!(value.rsplit('/').next(), Some("." | "..")),
-    })
-}
-
-/// Reject absolute paths, as well as any path containing backslashes.
-///
-/// The latter effectively rejects Windows-style paths.
-fn validate_extraction_path(
-    position: u64,
-    context: &'static str,
-    value: &str,
-) -> Result<(), DecodeError> {
-    if value.contains('\\') {
-        return Err(DecodeError::unsafe_path(
-            position,
-            context,
-            value,
-            "contains a backslash separator",
-        ));
-    }
-    if value.starts_with('/') {
-        return Err(DecodeError::unsafe_path(
-            position,
-            context,
-            value,
-            "is absolute",
-        ));
-    }
-    Ok(())
-}
-
-fn resolve_link_target(
-    position: u64,
-    context: &'static str,
-    value: &str,
-    base: &Path,
-) -> Result<PathBuf, DecodeError> {
-    validate_extraction_path(position, context, value)?;
-    let mut path = base.to_owned();
-    for component in Path::new(value).components() {
-        match component {
-            Component::Prefix(_) => {
-                return Err(DecodeError::unsafe_path(
-                    position,
-                    context,
-                    value,
-                    "contains a platform path prefix",
-                ));
-            }
-            Component::RootDir => {
-                return Err(DecodeError::unsafe_path(
-                    position,
-                    context,
-                    value,
-                    "is absolute",
-                ));
-            }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !path.pop() {
-                    return Err(DecodeError::unsafe_path(
-                        position,
-                        context,
-                        value,
-                        "escapes the destination root",
-                    ));
-                }
-            }
-            Component::Normal(component) => path.push(component),
-        }
-    }
-    Ok(path)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rejects_parent_directory_components_in_member_paths() {
-        for value in [
-            "..",
-            "../name",
-            "name/..",
-            "name/../other",
-            "name//../other",
-        ] {
-            assert!(matches!(
-                normalize_member_path(0, value),
-                Err(DecodeError::UnsafePath {
-                    context: "member path",
-                    reason: "contains a parent-directory component",
-                    ..
-                })
-            ));
-        }
-    }
-
-    #[test]
-    fn resolves_symlink_targets() {
-        for (link, target, expected_resolved, requires_directory) in [
-            ("link", "target", "target", false),
-            ("nested/link", "../target", "target", false),
-            ("nested/link", "./target", "nested/target", false),
-            ("a/b/link", "../c/target", "a/c/target", false),
-            ("nested/link", ".", "nested", true),
-            ("nested/link", "target/", "nested/target", true),
-            ("nested/link", "target/.", "nested/target", true),
-        ] {
-            let validated = validate_symlink_target(0, Path::new(link), target)
-                .expect("symlink target should be valid");
-            assert_eq!(validated.resolved_target, Path::new(expected_resolved));
-            assert_eq!(validated.requires_directory, requires_directory);
-        }
-    }
-
-    #[test]
-    fn rejects_ambiguous_parent_directory_traversal_in_symlink_targets() {
-        for target in ["a/..", "a/../target", "../a/../target"] {
-            assert!(matches!(
-                validate_symlink_target(0, Path::new("nested/link"), target),
-                Err(DecodeError::UnsafePath {
-                    context: "symbolic-link target",
-                    reason: "contains ambiguous parent-directory traversal",
-                    ..
-                })
-            ));
-        }
-    }
 }

@@ -1,6 +1,7 @@
 //! High-level decoding and encoding for tar archives.
 //!
-//! See [`decode`] for decoding/extraction and [`encode`] for pax encoding.
+//! See [`decode`] for tar decoding, [`encode`] for pax encoding, and
+//! [`Archive::extract_in`] for format-neutral extraction.
 //!
 //! ## Security
 //!
@@ -17,4 +18,11 @@ mod name;
 pub mod decode;
 pub mod encode;
 
-pub use name::{NameValidator, default_name_validator};
+pub use archive_trait::{
+    Archive, ExtractError, ExtractPolicy, ExtractPolicyViolation, LinkPolicy, Member,
+    MemberMetadata, MemberPayload, Members, NameValidator, SpecialKind, SymlinkPolicy,
+    default_name_validator,
+};
+pub use decode::{
+    DecodeError, DecodePolicy, DecodePolicyViolation, PaxDecodePolicy, TarArchive, TarMemberPayload,
+};

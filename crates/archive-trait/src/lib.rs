@@ -1,0 +1,462 @@
+//! Format-neutral, asynchronous archive extraction.
+//!
+//! Archive formats implement [`Archive`] by projecting their entries into
+//! [`Member`] values. The default [`Archive::extract_in`] implementation then
+//! applies common extraction policy and filesystem behavior.
+//!
+//! Extraction assumes unique access to the destination directory. Concurrent
+//! mutation of that directory is outside the threat model.
+
+mod extract;
+mod name;
+
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
+
+use thiserror::Error;
+
+pub use name::{NameValidator, default_name_validator};
+
+/// Common metadata for one archive member.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemberMetadata {
+    /// The archive-relative member path before extraction normalization.
+    pub path: String,
+    /// The member's byte position in the source archive.
+    pub position: u64,
+}
+
+/// A special-file kind that generic extraction deliberately rejects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpecialKind {
+    /// A character device.
+    CharacterDevice,
+    /// A block device.
+    BlockDevice,
+    /// A FIFO.
+    Fifo,
+}
+
+/// One format-neutral archive member.
+#[derive(Debug)]
+pub enum Member<P> {
+    /// A regular file with a streaming payload.
+    File {
+        /// Common member metadata.
+        metadata: MemberMetadata,
+        /// The effective payload size.
+        size: u64,
+        /// Whether the archived mode carries executable intent.
+        executable: bool,
+        /// The streaming member payload.
+        payload: P,
+    },
+    /// A directory.
+    Directory {
+        /// Common member metadata.
+        metadata: MemberMetadata,
+    },
+    /// A symbolic link.
+    SymbolicLink {
+        /// Common member metadata.
+        metadata: MemberMetadata,
+        /// The archive-provided link target.
+        target: String,
+    },
+    /// A hard link, optionally followed by replacement payload bytes.
+    HardLink {
+        /// Common member metadata.
+        metadata: MemberMetadata,
+        /// The archive-provided link target.
+        target: String,
+        /// The effective payload size.
+        size: u64,
+        /// The streaming member payload.
+        payload: P,
+    },
+    /// A parsed special file that cannot be extracted safely.
+    Special {
+        /// Common member metadata.
+        metadata: MemberMetadata,
+        /// The special-file kind.
+        kind: SpecialKind,
+    },
+}
+
+impl<P> Member<P> {
+    /// Returns this member's common metadata.
+    pub fn metadata(&self) -> &MemberMetadata {
+        match self {
+            Self::File { metadata, .. }
+            | Self::Directory { metadata }
+            | Self::SymbolicLink { metadata, .. }
+            | Self::HardLink { metadata, .. }
+            | Self::Special { metadata, .. } => metadata,
+        }
+    }
+}
+
+/// A streaming cursor over one archive member's payload.
+#[expect(
+    async_fn_in_trait,
+    reason = "payload readers may be !Send and run on a local executor"
+)]
+pub trait MemberPayload: Sized {
+    /// The archive-format error returned while reading the payload.
+    type Error;
+
+    /// Reads validated payload bytes into a reusable chunk buffer.
+    async fn next_chunk(
+        &mut self,
+        buffer: &mut Vec<u8>,
+        target_len: usize,
+    ) -> Result<bool, Self::Error>;
+
+    /// Discards and validates all remaining payload bytes.
+    async fn skip(self) -> Result<(), Self::Error>;
+}
+
+/// A consuming, lending member cursor.
+pub struct Members<A> {
+    archive: A,
+}
+
+impl<A: Archive> Members<A> {
+    /// Returns the next archive member.
+    ///
+    /// The returned payload borrows this cursor, so the cursor cannot advance
+    /// until that member is dropped or consumed.
+    pub async fn next(&mut self) -> Result<Option<Member<A::Payload<'_>>>, A::Error> {
+        self.archive.next_member().await
+    }
+}
+
+/// A one-pass archive that can enumerate and extract format-neutral members.
+#[expect(
+    async_fn_in_trait,
+    reason = "archive readers may be !Send and run on a local executor"
+)]
+pub trait Archive: Sized {
+    /// The archive-format error returned during member iteration.
+    type Error;
+    /// The streaming payload type lent by each file member.
+    type Payload<'a>: MemberPayload<Error = Self::Error>
+    where
+        Self: 'a;
+
+    /// Implementation hook used by [`Members::next`].
+    ///
+    /// Implementations must drain and validate an unfinished preceding payload
+    /// before returning another member.
+    #[doc(hidden)]
+    async fn next_member(&mut self) -> Result<Option<Member<Self::Payload<'_>>>, Self::Error>;
+
+    /// Consumes this archive and returns its lending member cursor.
+    fn members(self) -> Members<Self> {
+        Members { archive: self }
+    }
+
+    /// Securely extracts this archive beneath `destination` under `policy`.
+    ///
+    /// `destination` is created if it does not already exist. Symbolic links
+    /// are preserved by default on platforms that support native creation;
+    /// hard links require explicit opt-in through [`LinkPolicy`].
+    ///
+    /// Archived Unix permission modes are normalized rather than restored. New
+    /// regular files are created with mode `0o777` when executable intent is
+    /// set and `0o666` otherwise, in both cases filtered by the process umask.
+    /// Directories use the platform's default creation mode, and special mode
+    /// bits are not restored. Ownership and timestamps are likewise determined
+    /// by extraction activity rather than archived metadata.
+    ///
+    /// **IMPORTANT**: `destination` must not be concurrently modified during
+    /// extraction. No correctness or isolation guarantees are made under
+    /// external mutation.
+    ///
+    /// Extraction is streamwise: a late error can leave a partially extracted
+    /// destination. Callers requiring all-or-nothing behavior should extract
+    /// into a new temporary directory and atomically rename it afterward.
+    async fn extract_in<P: AsRef<Path>>(
+        self,
+        destination: P,
+        policy: ExtractPolicy,
+    ) -> Result<(), ExtractError<Self::Error>> {
+        extract::extract(self.members(), destination.as_ref(), policy).await
+    }
+}
+
+/// Controls generic archive extraction behavior.
+///
+/// See each configuration API for its default.
+#[derive(Clone, Copy, Debug)]
+pub struct ExtractPolicy {
+    pub(crate) link_policy: LinkPolicy,
+    pub(crate) allow_overwrites: bool,
+    pub(crate) name_validation: name::NameValidation,
+}
+
+/// Controls how symbolic- and hard-link members are extracted.
+///
+/// By default, symbolic links are preserved as native links, including links
+/// to missing targets. Hard links and ambient symbolic-link targets require
+/// explicit opt-in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinkPolicy {
+    pub(crate) symlink_policy: SymlinkPolicy,
+    pub(crate) allow_hard_links: bool,
+    pub(crate) allow_ambient_targets: bool,
+    pub(crate) allow_missing_targets: bool,
+}
+
+/// Controls how symbolic-link members are handled during extraction.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SymlinkPolicy {
+    /// Preserve symbolic-link members as native filesystem links.
+    #[default]
+    Preserve,
+    /// Ignore symbolic-link members without changing the filesystem.
+    Skip,
+    /// Reject archives containing symbolic-link members.
+    Reject,
+}
+
+impl Default for ExtractPolicy {
+    fn default() -> Self {
+        Self {
+            link_policy: LinkPolicy::default(),
+            allow_overwrites: true,
+            name_validation: name::NameValidation::Default,
+        }
+    }
+}
+
+impl Default for LinkPolicy {
+    fn default() -> Self {
+        Self {
+            symlink_policy: SymlinkPolicy::default(),
+            allow_hard_links: false,
+            allow_ambient_targets: false,
+            allow_missing_targets: true,
+        }
+    }
+}
+
+impl ExtractPolicy {
+    /// Configures symbolic- and hard-link extraction behavior.
+    pub fn link_policy(mut self, policy: LinkPolicy) -> Self {
+        self.link_policy = policy;
+        self
+    }
+
+    /// Configures whether archive members may replace existing entries.
+    ///
+    /// Overwrites are **allowed by default**. Replacement never follows
+    /// symbolic links or recursively removes non-empty directories. Real
+    /// directories are always reused, including when overwrites are disabled.
+    pub fn allow_overwrites(mut self, allow: bool) -> Self {
+        self.allow_overwrites = allow;
+        self
+    }
+
+    /// Configures validation for member names and link targets.
+    ///
+    /// Passing [`None`] disables configurable name validation. UTF-8 and
+    /// extraction containment requirements still apply.
+    pub fn name_validator(mut self, validator: Option<NameValidator>) -> Self {
+        self.name_validation = name::NameValidation::from_validator(validator);
+        self
+    }
+
+    fn check_name<E>(
+        self,
+        position: u64,
+        context: &'static str,
+        value: &str,
+    ) -> Result<(), ExtractError<E>> {
+        if !self.name_validation.accepts(value) {
+            return Err(ExtractError::policy_violation(
+                position,
+                ExtractPolicyViolation::NameRejected {
+                    context,
+                    value: value.to_owned(),
+                },
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl LinkPolicy {
+    /// Configures how symbolic-link members are handled during extraction.
+    ///
+    /// Symbolic links are preserved by default. Platforms without native
+    /// symbolic-link creation require [`SymlinkPolicy::Skip`] or
+    /// [`SymlinkPolicy::Reject`].
+    pub fn symlink_policy(mut self, policy: SymlinkPolicy) -> Self {
+        self.symlink_policy = policy;
+        self
+    }
+
+    /// Configures whether hard-link members may be extracted.
+    ///
+    /// Hard links are **forbidden by default** because they are uncommon,
+    /// difficult to extract consistently, and prone to implementation
+    /// differentials. Enable them only for trusted archives.
+    pub fn allow_hard_links(mut self, allow: bool) -> Self {
+        self.allow_hard_links = allow;
+        self
+    }
+
+    /// Configures whether pre-existing symbolic-link targets may be used.
+    ///
+    /// Existing symbolic links are followed only when capability-relative
+    /// resolution remains beneath the extraction root. Ambient targets are
+    /// **forbidden by default**. This does not affect hard-link validation.
+    pub fn allow_ambient_targets(mut self, allow: bool) -> Self {
+        self.allow_ambient_targets = allow;
+        self
+    }
+
+    /// Configures whether symbolic links to missing targets may be extracted.
+    ///
+    /// Missing symbolic-link targets are **allowed by default**. This does not
+    /// affect hard-link validation.
+    pub fn allow_missing_targets(mut self, allow: bool) -> Self {
+        self.allow_missing_targets = allow;
+        self
+    }
+}
+
+/// A valid member feature rejected by the selected [`ExtractPolicy`].
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum ExtractPolicyViolation {
+    /// An effective member name or link target was rejected.
+    #[error("archive {context} rejected by name policy: {value:?}")]
+    NameRejected {
+        /// The role of the rejected archive text.
+        context: &'static str,
+        /// The rejected UTF-8 value.
+        value: String,
+    },
+    /// A symbolic-link member appeared when links are forbidden.
+    #[error("symbolic-link members are not allowed")]
+    SymbolicLink,
+    /// A symbolic-link member requires native creation on an unsupported platform.
+    #[error("native symbolic-link creation is not supported on this platform")]
+    NativeSymlinkCreationUnsupported,
+    /// A hard-link member appeared when links are forbidden.
+    #[error("hard-link members are not allowed")]
+    HardLink,
+}
+
+/// An error produced while securely extracting an archive.
+#[derive(Debug, Error)]
+pub enum ExtractError<E> {
+    /// Reading or decoding the underlying archive failed.
+    #[error(transparent)]
+    Archive(E),
+    /// A destination filesystem operation failed.
+    #[error("failed to {operation} {path}: {source}")]
+    Filesystem {
+        /// The operation that failed.
+        operation: &'static str,
+        /// The path involved in the failed operation.
+        path: PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        source: io::Error,
+    },
+    /// A blocking extraction operation failed to complete.
+    #[error("failed to complete blocking extraction operation: {0}")]
+    BlockingTask(#[from] tokio::task::JoinError),
+    /// An archive member path or link value is unsafe to extract.
+    #[error("at byte {position}: unsafe {context} {value:?}: {reason}")]
+    UnsafePath {
+        /// Source member position.
+        position: u64,
+        /// Whether this is a member path or link target.
+        context: &'static str,
+        /// Archive-provided value.
+        value: String,
+        /// Rejection reason.
+        reason: &'static str,
+    },
+    /// An archive entry collides with a path that cannot be replaced.
+    #[error("archive entry collides with existing path {path}")]
+    PathCollision {
+        /// Normalized extraction-relative path.
+        path: PathBuf,
+    },
+    /// A special member kind is deliberately excluded from extraction.
+    #[error("at byte {position}: cannot extract unsupported member type {kind:?} at {path}")]
+    UnsupportedMember {
+        /// Source member position.
+        position: u64,
+        /// Normalized extraction-relative path.
+        path: PathBuf,
+        /// Unsupported special-file kind.
+        kind: SpecialKind,
+    },
+    /// A symbolic or hard link cannot be safely resolved.
+    #[error("at byte {position}: invalid link {path} -> {target:?}: {reason}")]
+    InvalidLink {
+        /// Source member position.
+        position: u64,
+        /// Normalized link path.
+        path: PathBuf,
+        /// Archive-provided or normalized link target.
+        target: String,
+        /// Rejection reason.
+        reason: &'static str,
+    },
+    /// A structurally valid member was rejected by extraction policy.
+    #[error("at byte {position}: extraction policy rejected input: {violation}")]
+    PolicyViolation {
+        /// Source member position.
+        position: u64,
+        /// The selected policy rule that rejected the member.
+        violation: ExtractPolicyViolation,
+    },
+}
+
+impl<E> ExtractError<E> {
+    fn policy_violation(position: u64, violation: ExtractPolicyViolation) -> Self {
+        Self::PolicyViolation {
+            position,
+            violation,
+        }
+    }
+
+    fn invalid_link(position: u64, path: PathBuf, target: String, reason: &'static str) -> Self {
+        Self::InvalidLink {
+            position,
+            path,
+            target,
+            reason,
+        }
+    }
+
+    fn unsafe_path(
+        position: u64,
+        context: &'static str,
+        value: &str,
+        reason: &'static str,
+    ) -> Self {
+        Self::UnsafePath {
+            position,
+            context,
+            value: value.to_owned(),
+            reason,
+        }
+    }
+
+    fn filesystem(operation: &'static str, path: PathBuf, source: io::Error) -> Self {
+        Self::Filesystem {
+            operation,
+            path,
+            source,
+        }
+    }
+}

@@ -6,8 +6,9 @@ use std::{io, os::unix::net::UnixListener, path::Path};
 use support::{ArchiveBuilder, single_posix_member};
 #[cfg(unix)]
 use support::{pax_record, symlink_file};
-use tar_codec::decode::{
-    Archive, DecodeError, DecodePolicy, DecodePolicyViolation, LinkPolicy, SymlinkPolicy,
+use tar_codec::{
+    Archive as _, ExtractError, ExtractPolicy, ExtractPolicyViolation, LinkPolicy, SymlinkPolicy,
+    TarArchive,
 };
 #[cfg(unix)]
 use tar_framing::PaxKeyword;
@@ -27,8 +28,8 @@ async fn preserves_safe_symlink_chains_and_forward_references() {
         .posix("forward", b'2', b"", "later", 0o644)
         .posix("later", b'0', b"later", "", 0o644);
     let bytes = archive.finish();
-    Archive::new(bytes.as_slice())
-        .extract(&destination, DecodePolicy::default())
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, ExtractPolicy::default())
         .await
         .unwrap();
     for (path, target) in [
@@ -58,8 +59,8 @@ async fn preserves_dangling_symlink_chains_by_default() {
     let destination = temp.path().join("dangling");
     std::fs::create_dir_all(destination.join("ambient")).unwrap();
     let bytes = single_posix_member("link", b'2', b"", "ambient/missing", 0o644);
-    Archive::new(bytes.as_slice())
-        .extract(&destination, DecodePolicy::default())
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, ExtractPolicy::default())
         .await
         .unwrap();
     assert_eq!(
@@ -73,8 +74,8 @@ async fn preserves_dangling_symlink_chains_by_default() {
         .posix("one", b'2', b"", "two", 0o644)
         .posix("two", b'2', b"", "missing", 0o644);
     let bytes = archive.finish();
-    Archive::new(bytes.as_slice())
-        .extract(&destination, DecodePolicy::default())
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, ExtractPolicy::default())
         .await
         .unwrap();
     assert_eq!(
@@ -91,7 +92,7 @@ async fn preserves_dangling_symlink_chains_by_default() {
 #[tokio::test]
 async fn preserves_directory_required_symlink_targets_and_rejects_file_targets() {
     let temp = tempdir().expect("temporary directory should be created");
-    let policy = DecodePolicy::default();
+    let policy = ExtractPolicy::default();
     for (case, target) in [("separator", "target/"), ("dot", "target/.")] {
         let destination = temp.path().join(format!("directory-{case}"));
         let mut archive = ArchiveBuilder::new();
@@ -100,8 +101,8 @@ async fn preserves_directory_required_symlink_targets_and_rejects_file_targets()
             .pax(b'x', &pax_record(PaxKeyword::LinkPath, target))
             .posix("link", b'2', b"", "ignored", 0o644);
         let bytes = archive.finish();
-        Archive::new(bytes.as_slice())
-            .extract(&destination, policy)
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, policy)
             .await
             .expect("directory-required target should resolve to a directory");
         assert_eq!(
@@ -119,10 +120,10 @@ async fn preserves_directory_required_symlink_targets_and_rejects_file_targets()
             .posix("link", b'2', b"", "ignored", 0o644);
         let bytes = archive.finish();
         assert!(matches!(
-            Archive::new(bytes.as_slice())
-                .extract(&destination, policy)
+            TarArchive::new(bytes.as_slice())
+                .extract_in(&destination, policy)
                 .await,
-            Err(DecodeError::InvalidLink {
+            Err(ExtractError::InvalidLink {
                 reason: "target path suffix requires a directory",
                 ..
             })
@@ -150,10 +151,10 @@ async fn rejects_ambiguous_parent_directory_traversal_in_pax_symlink_targets() {
     let bytes = archive.finish();
 
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default())
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, ExtractPolicy::default())
             .await,
-        Err(DecodeError::UnsafePath {
+        Err(ExtractError::UnsafePath {
             context: "symbolic-link target",
             reason: "contains ambiguous parent-directory traversal",
             ..
@@ -181,8 +182,8 @@ async fn default_preserves_links_to_missing_root_and_directory_targets() {
         } else {
             single_posix_member("link", b'2', b"", target, 0o644)
         };
-        Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default())
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, ExtractPolicy::default())
             .await
             .unwrap();
         assert_eq!(
@@ -198,10 +199,10 @@ async fn default_preserves_links_to_missing_root_and_directory_targets() {
         .posix("link", b'2', b"", "file/", 0o644);
     let bytes = archive.finish();
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default())
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, ExtractPolicy::default())
             .await,
-        Err(DecodeError::InvalidLink {
+        Err(ExtractError::InvalidLink {
             reason: "target path suffix requires a directory",
             ..
         })
@@ -221,8 +222,8 @@ async fn targets_blocked_by_archive_files_are_dangling() {
         0o644,
     );
     let bytes = archive.finish();
-    Archive::new(bytes.as_slice())
-        .extract(temp.path().join("allow"), DecodePolicy::default())
+    TarArchive::new(bytes.as_slice())
+        .extract_in(temp.path().join("allow"), ExtractPolicy::default())
         .await
         .unwrap();
     assert_eq!(
@@ -231,14 +232,14 @@ async fn targets_blocked_by_archive_files_are_dangling() {
     );
 
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(
+        TarArchive::new(bytes.as_slice())
+            .extract_in(
                 temp.path().join("deny"),
-                DecodePolicy::default()
+                ExtractPolicy::default()
                     .link_policy(LinkPolicy::default().allow_missing_targets(false)),
             )
             .await,
-        Err(DecodeError::InvalidLink {
+        Err(ExtractError::InvalidLink {
             reason: "target does not exist",
             ..
         })
@@ -251,14 +252,14 @@ async fn missing_targets_can_be_forbidden() {
     let temp = tempdir().unwrap();
     let bytes = single_posix_member("link", b'2', b"", "missing", 0o644);
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(
+        TarArchive::new(bytes.as_slice())
+            .extract_in(
                 temp.path(),
-                DecodePolicy::default()
+                ExtractPolicy::default()
                     .link_policy(LinkPolicy::default().allow_missing_targets(false)),
             )
             .await,
-        Err(DecodeError::InvalidLink {
+        Err(ExtractError::InvalidLink {
             reason: "target was not created by this extraction",
             ..
         })
@@ -274,12 +275,12 @@ async fn native_target_controls_are_independent() {
     std::fs::create_dir(&destination).unwrap();
     std::fs::write(destination.join("ambient"), b"ambient").unwrap();
     let bytes = single_posix_member("link", b'2', b"", "ambient", 0o644);
-    let policy = DecodePolicy::default();
+    let policy = ExtractPolicy::default();
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, policy)
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, policy)
             .await,
-        Err(DecodeError::InvalidLink {
+        Err(ExtractError::InvalidLink {
             reason: "ambient target is not allowed",
             ..
         })
@@ -289,13 +290,13 @@ async fn native_target_controls_are_independent() {
     std::fs::create_dir(&destination).unwrap();
     std::fs::write(destination.join("ambient"), b"ambient").unwrap();
     let bytes = single_posix_member("link", b'2', b"", "ambient", 0o644);
-    let policy = DecodePolicy::default().link_policy(
+    let policy = ExtractPolicy::default().link_policy(
         LinkPolicy::default()
             .allow_ambient_targets(true)
             .allow_missing_targets(false),
     );
-    Archive::new(bytes.as_slice())
-        .extract(&destination, policy)
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, policy)
         .await
         .unwrap();
     assert_eq!(
@@ -306,10 +307,10 @@ async fn native_target_controls_are_independent() {
     let destination = temp.path().join("ambient-only");
     let bytes = single_posix_member("link", b'2', b"", "missing", 0o644);
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, policy)
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, policy)
             .await,
-        Err(DecodeError::InvalidLink {
+        Err(ExtractError::InvalidLink {
             reason: "target does not exist",
             ..
         })
@@ -333,13 +334,13 @@ async fn missing_target_opt_in_does_not_allow_dangling_targets_through_ambient_s
         }
         symlink_file(ambient_target, destination.join("ambient-link")).unwrap();
         let bytes = single_posix_member("link", b'2', b"", archive_target, 0o644);
-        let policy = DecodePolicy::default();
+        let policy = ExtractPolicy::default();
 
         assert!(matches!(
-            Archive::new(bytes.as_slice())
-                .extract(&destination, policy)
+            TarArchive::new(bytes.as_slice())
+                .extract_in(&destination, policy)
                 .await,
-            Err(DecodeError::InvalidLink {
+            Err(ExtractError::InvalidLink {
                 reason: "ambient target is not allowed",
                 ..
             })
@@ -360,8 +361,8 @@ async fn missing_target_opt_in_does_not_allow_dangling_targets_through_ambient_s
 async fn symlink_members_fail_by_default_on_unsupported_platforms() {
     let temp = tempdir().unwrap();
     let regular = single_posix_member("file", b'0', b"contents", "", 0o644);
-    Archive::new(regular.as_slice())
-        .extract(temp.path().join("regular"), DecodePolicy::default())
+    TarArchive::new(regular.as_slice())
+        .extract_in(temp.path().join("regular"), ExtractPolicy::default())
         .await
         .unwrap();
 
@@ -372,12 +373,12 @@ async fn symlink_members_fail_by_default_on_unsupported_platforms() {
     let bytes = archive.finish();
     let destination = temp.path().join("link");
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default())
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, ExtractPolicy::default())
             .await,
-        Err(DecodeError::PolicyViolation {
+        Err(ExtractError::PolicyViolation {
             position: 1024,
-            violation: DecodePolicyViolation::NativeSymlinkCreationUnsupported,
+            violation: ExtractPolicyViolation::NativeSymlinkCreationUnsupported,
         })
     ));
     assert_eq!(
@@ -397,10 +398,10 @@ async fn skipped_symlinks_have_no_filesystem_effect() {
         .posix("skipped", b'2', b"", "missing", 0o644);
     let bytes = archive.finish();
     let destination = temp.path().join("out");
-    Archive::new(bytes.as_slice())
-        .extract(
+    TarArchive::new(bytes.as_slice())
+        .extract_in(
             &destination,
-            DecodePolicy::default()
+            ExtractPolicy::default()
                 .link_policy(LinkPolicy::default().symlink_policy(SymlinkPolicy::Skip)),
         )
         .await
@@ -428,13 +429,13 @@ async fn ambient_file_and_directory_targets_require_explicit_opt_in() {
             }
             let bytes = single_posix_member("link", b'2', b"", "ambient", 0o644);
             let policy = if allow_ambient {
-                DecodePolicy::default()
+                ExtractPolicy::default()
                     .link_policy(LinkPolicy::default().allow_ambient_targets(true))
             } else {
-                DecodePolicy::default()
+                ExtractPolicy::default()
             };
-            let result = Archive::new(bytes.as_slice())
-                .extract(&destination, policy)
+            let result = TarArchive::new(bytes.as_slice())
+                .extract_in(&destination, policy)
                 .await;
             if allow_ambient {
                 result.unwrap();
@@ -443,7 +444,7 @@ async fn ambient_file_and_directory_targets_require_explicit_opt_in() {
                     Path::new("ambient")
                 );
             } else {
-                assert!(matches!(result, Err(DecodeError::InvalidLink { .. })));
+                assert!(matches!(result, Err(ExtractError::InvalidLink { .. })));
                 assert!(!destination.join("link").exists());
             }
         }
@@ -458,10 +459,10 @@ async fn native_links_allow_ambient_non_regular_targets() {
     std::fs::create_dir(&destination).unwrap();
     let _socket = UnixListener::bind(destination.join("socket")).unwrap();
     let bytes = single_posix_member("link", b'2', b"", "socket", 0o644);
-    Archive::new(bytes.as_slice())
-        .extract(
+    TarArchive::new(bytes.as_slice())
+        .extract_in(
             &destination,
-            DecodePolicy::default().link_policy(LinkPolicy::default().allow_ambient_targets(true)),
+            ExtractPolicy::default().link_policy(LinkPolicy::default().allow_ambient_targets(true)),
         )
         .await
         .unwrap();
@@ -478,15 +479,15 @@ async fn ambient_link_components_must_resolve_beneath_the_root() {
 
     let temp = tempdir().unwrap();
     let policy =
-        DecodePolicy::default().link_policy(LinkPolicy::default().allow_ambient_targets(true));
+        ExtractPolicy::default().link_policy(LinkPolicy::default().allow_ambient_targets(true));
 
     let destination = temp.path().join("contained-leaf");
     std::fs::create_dir(&destination).unwrap();
     std::fs::write(destination.join("target"), b"inside").unwrap();
     symlink_file(Path::new("target"), destination.join("ambient-link")).unwrap();
     let bytes = single_posix_member("alias", b'2', b"", "ambient-link", 0o644);
-    Archive::new(bytes.as_slice())
-        .extract(&destination, policy)
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, policy)
         .await
         .unwrap();
     assert_eq!(
@@ -499,8 +500,8 @@ async fn ambient_link_components_must_resolve_beneath_the_root() {
     std::fs::write(destination.join("target/file"), b"inside").unwrap();
     symlink_dir(Path::new("target"), destination.join("ambient-link")).unwrap();
     let bytes = single_posix_member("alias", b'2', b"", "ambient-link/file", 0o644);
-    Archive::new(bytes.as_slice())
-        .extract(&destination, policy)
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, policy)
         .await
         .unwrap();
     assert_eq!(
@@ -520,8 +521,8 @@ async fn ambient_link_components_must_resolve_beneath_the_root() {
         .posix("alias", b'2', b"", "safe", 0o644);
     let bytes = archive.finish();
     assert!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, policy)
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, policy)
             .await
             .is_err()
     );
@@ -536,8 +537,8 @@ async fn ambient_link_components_must_resolve_beneath_the_root() {
     symlink_dir(&outside, destination.join("ambient-link")).unwrap();
     let bytes = single_posix_member("alias", b'2', b"", "ambient-link/file", 0o644);
     assert!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, policy)
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, policy)
             .await
             .is_err()
     );
@@ -556,10 +557,10 @@ async fn default_target_policy_uses_filesystem_provenance() {
         .posix("alias", b'2', b"", "ambient", 0o644);
     let bytes = archive.finish();
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default())
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, ExtractPolicy::default())
             .await,
-        Err(DecodeError::InvalidLink {
+        Err(ExtractError::InvalidLink {
             reason: "ambient target is not allowed",
             ..
         })
@@ -572,8 +573,8 @@ async fn default_target_policy_uses_filesystem_provenance() {
         .posix("ambient/file", b'0', b"archive", "", 0o644)
         .posix("alias", b'2', b"", "ambient/file", 0o644);
     let bytes = archive.finish();
-    Archive::new(bytes.as_slice())
-        .extract(&destination, DecodePolicy::default())
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, ExtractPolicy::default())
         .await
         .unwrap();
     assert_eq!(
@@ -593,8 +594,8 @@ async fn symlink_graphs_allow_finite_expansion_and_reject_cycles_and_escapes() {
         .posix("a", b'2', b"", "file", 0o644)
         .posix("b", b'2', b"", "a", 0o644);
     let bytes = archive.finish();
-    Archive::new(bytes.as_slice())
-        .extract(&destination, DecodePolicy::default())
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, ExtractPolicy::default())
         .await
         .unwrap();
     assert_eq!(
@@ -624,15 +625,15 @@ async fn symlink_graphs_allow_finite_expansion_and_reject_cycles_and_escapes() {
             0o644,
         );
         let bytes = archive.finish();
-        let error = Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default())
+        let error = TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, ExtractPolicy::default())
             .await
             .unwrap_err();
-        assert!(matches!(error, DecodeError::InvalidLink { .. }));
+        assert!(matches!(error, ExtractError::InvalidLink { .. }));
         if expansion_limit {
             assert!(matches!(
                 error,
-                DecodeError::InvalidLink {
+                ExtractError::InvalidLink {
                     reason: "symbolic-link target expansion limit exceeded",
                     ..
                 }
@@ -645,10 +646,10 @@ async fn symlink_graphs_allow_finite_expansion_and_reject_cycles_and_escapes() {
     let destination = temp.path().join("escape");
     let bytes = single_posix_member("link", b'2', b"", "../outside", 0o644);
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default())
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, ExtractPolicy::default())
             .await,
-        Err(DecodeError::UnsafePath { .. })
+        Err(ExtractError::UnsafePath { .. })
     ));
     assert!(!destination.join("link").exists());
 }
@@ -666,8 +667,8 @@ async fn overwritten_pending_symlinks_do_not_affect_installation_or_resolution()
         .posix("target", b'2', b"", "missing", 0o644)
         .posix("target", b'0', b"target", "", 0o644);
     let bytes = archive.finish();
-    Archive::new(bytes.as_slice())
-        .extract(&destination, DecodePolicy::default())
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, ExtractPolicy::default())
         .await
         .unwrap();
     assert_eq!(
@@ -694,10 +695,10 @@ async fn later_link_entries_replace_links_of_the_same_kind() {
             .posix("same", typeflag, b"", "first", 0o644)
             .posix("same", typeflag, b"", "second", 0o644);
         let bytes = archive.finish();
-        Archive::new(bytes.as_slice())
-            .extract(
+        TarArchive::new(bytes.as_slice())
+            .extract_in(
                 &destination,
-                DecodePolicy::default().link_policy(LinkPolicy::default().allow_hard_links(true)),
+                ExtractPolicy::default().link_policy(LinkPolicy::default().allow_hard_links(true)),
             )
             .await
             .unwrap();
@@ -714,15 +715,15 @@ async fn later_link_entries_replace_links_of_the_same_kind() {
 #[tokio::test]
 async fn hard_links_require_prior_archive_targets_and_apply_linkdata() {
     let temp = tempdir().unwrap();
-    let policy = DecodePolicy::default().link_policy(LinkPolicy::default().allow_hard_links(true));
+    let policy = ExtractPolicy::default().link_policy(LinkPolicy::default().allow_hard_links(true));
     let destination = temp.path().join("linkdata");
     let mut archive = ArchiveBuilder::new();
     archive
         .posix("a", b'0', b"old", "", 0o644)
         .posix("b", b'1', b"new", "a", 0o644);
     let bytes = archive.finish();
-    Archive::new(bytes.as_slice())
-        .extract(&destination, policy)
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, policy)
         .await
         .unwrap();
     assert_eq!(std::fs::read(destination.join("a")).unwrap(), b"new");
@@ -730,20 +731,20 @@ async fn hard_links_require_prior_archive_targets_and_apply_linkdata() {
 
     let unresolved = single_posix_member("b", b'1', b"", "a", 0o644);
     assert!(matches!(
-        Archive::new(unresolved.as_slice())
-            .extract(temp.path().join("forward"), policy)
+        TarArchive::new(unresolved.as_slice())
+            .extract_in(temp.path().join("forward"), policy)
             .await,
-        Err(DecodeError::InvalidLink { .. })
+        Err(ExtractError::InvalidLink { .. })
     ));
 
     let destination = temp.path().join("ambient");
     std::fs::create_dir(&destination).unwrap();
     std::fs::write(destination.join("a"), b"ambient").unwrap();
     assert!(matches!(
-        Archive::new(unresolved.as_slice())
-            .extract(&destination, policy)
+        TarArchive::new(unresolved.as_slice())
+            .extract_in(&destination, policy)
             .await,
-        Err(DecodeError::InvalidLink { .. })
+        Err(ExtractError::InvalidLink { .. })
     ));
     assert_eq!(std::fs::read(destination.join("a")).unwrap(), b"ambient");
     assert!(!destination.join("b").exists());
@@ -754,8 +755,8 @@ async fn hard_links_require_prior_archive_targets_and_apply_linkdata() {
         .posix("a", b'0', b"", "", 0o644)
         .posix("b", b'1', b"", "a", 0o755);
     let bytes = archive.finish();
-    Archive::new(bytes.as_slice())
-        .extract(&destination, policy)
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, policy)
         .await
         .unwrap();
     assert!(destination.join("b").is_file());
@@ -770,8 +771,8 @@ async fn hard_links_require_prior_archive_targets_and_apply_linkdata() {
             .posix("a", b'0', b"old", "", 0o644)
             .posix("b", b'1', b"new", "a", 0o755);
         let bytes = archive.finish();
-        Archive::new(bytes.as_slice())
-            .extract(&destination, policy)
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, policy)
             .await
             .unwrap();
         assert_eq!(
@@ -796,14 +797,14 @@ async fn hard_links_cannot_replace_their_targets() {
             .posix(path, b'1', b"", "target", 0o644);
         let bytes = archive.finish();
         assert!(matches!(
-            Archive::new(bytes.as_slice())
-                .extract(
+            TarArchive::new(bytes.as_slice())
+                .extract_in(
                     &destination,
-                    DecodePolicy::default()
+                    ExtractPolicy::default()
                         .link_policy(LinkPolicy::default().allow_hard_links(true)),
                 )
                 .await,
-            Err(DecodeError::InvalidLink { .. })
+            Err(ExtractError::InvalidLink { .. })
         ));
         assert_eq!(std::fs::read(destination.join("target")).unwrap(), b"keep");
     }
@@ -819,16 +820,16 @@ async fn link_policies_are_enforced_before_link_creation() {
         .posix("link", b'2', b"", "target", 0o644);
     let bytes = archive.finish();
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(
+        TarArchive::new(bytes.as_slice())
+            .extract_in(
                 &destination,
-                DecodePolicy::default()
+                ExtractPolicy::default()
                     .link_policy(LinkPolicy::default().symlink_policy(SymlinkPolicy::Reject),),
             )
             .await,
-        Err(DecodeError::PolicyViolation {
+        Err(ExtractError::PolicyViolation {
             position: 1024,
-            violation: DecodePolicyViolation::SymbolicLink,
+            violation: ExtractPolicyViolation::SymbolicLink,
         })
     ));
     assert_eq!(
@@ -848,12 +849,12 @@ async fn link_policies_are_enforced_before_link_creation() {
     );
     let bytes = archive.finish();
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default())
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, ExtractPolicy::default())
             .await,
-        Err(DecodeError::PolicyViolation {
+        Err(ExtractError::PolicyViolation {
             position: 1024,
-            violation: DecodePolicyViolation::HardLink,
+            violation: ExtractPolicyViolation::HardLink,
         })
     ));
     assert_eq!(
@@ -863,10 +864,10 @@ async fn link_policies_are_enforced_before_link_creation() {
     assert!(!destination.join("link").exists());
 
     let destination = temp.path().join("hard-link-only");
-    Archive::new(bytes.as_slice())
-        .extract(
+    TarArchive::new(bytes.as_slice())
+        .extract_in(
             &destination,
-            DecodePolicy::default().link_policy(
+            ExtractPolicy::default().link_policy(
                 LinkPolicy::default()
                     .symlink_policy(SymlinkPolicy::Reject)
                     .allow_hard_links(true),
@@ -894,10 +895,10 @@ async fn native_symlink_and_hard_link_builders_compose() {
         .posix("symbolic", b'2', b"", "target", 0o644)
         .posix("hard", b'1', b"", "target", 0o644);
     let bytes = archive.finish();
-    Archive::new(bytes.as_slice())
-        .extract(
+    TarArchive::new(bytes.as_slice())
+        .extract_in(
             temp.path(),
-            DecodePolicy::default().link_policy(LinkPolicy::default().allow_hard_links(true)),
+            ExtractPolicy::default().link_policy(LinkPolicy::default().allow_hard_links(true)),
         )
         .await
         .unwrap();

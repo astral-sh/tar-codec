@@ -7,8 +7,7 @@ use std::{
 };
 
 use tar_codec::{
-    decode::{Archive, DecodeError, DecodePolicy},
-    default_name_validator,
+    Archive as _, ExtractError, ExtractPolicy, TarArchive, default_name_validator,
     encode::{EncodeError, EncodePolicy, Encoder, EntryMetadata, TraversalError},
 };
 use tar_framing::{
@@ -75,8 +74,8 @@ async fn manual_entries_round_trip_and_preserve_archive_names() {
     }
     let temp = tempdir().unwrap();
     let destination = temp.path().join("out");
-    Archive::new(bytes.as_slice())
-        .extract(&destination, DecodePolicy::default())
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, ExtractPolicy::default())
         .await
         .unwrap();
     assert_eq!(std::fs::read(destination.join("bin/tool")).unwrap(), b"run");
@@ -295,8 +294,8 @@ async fn recursive_encoding_is_sorted_and_round_trips_small_and_large_files() {
     );
 
     let destination = temp.path().join("out");
-    Archive::new(bytes.as_slice())
-        .extract(&destination, DecodePolicy::default())
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, ExtractPolicy::default())
         .await
         .unwrap();
     assert_eq!(
@@ -352,8 +351,8 @@ async fn recursive_encoding_preserves_symlinks_and_repeated_inodes() {
     assert_eq!(regular_files, 2);
 
     let destination = temp.path().join("out");
-    Archive::new(bytes.as_slice())
-        .extract(&destination, DecodePolicy::default())
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, ExtractPolicy::default())
         .await
         .unwrap();
     assert!(
@@ -374,10 +373,10 @@ async fn recursive_encoding_preserves_symlinks_and_repeated_inodes() {
     encoder.add_directory(&escape).await.unwrap();
     let bytes = encoder.finish().await.unwrap();
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(temp.path().join("escape-out"), DecodePolicy::default())
+        TarArchive::new(bytes.as_slice())
+            .extract_in(temp.path().join("escape-out"), ExtractPolicy::default())
             .await,
-        Err(DecodeError::UnsafePath {
+        Err(ExtractError::UnsafePath {
             context: "symbolic-link target",
             ..
         })

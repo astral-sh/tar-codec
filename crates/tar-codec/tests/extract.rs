@@ -6,8 +6,8 @@ use std::path::Path;
 use support::EntryKind;
 use support::{ArchiveBuilder, ArchiveFormat, header, pax_record, single_posix_member};
 #[cfg(unix)]
-use tar_codec::decode::LinkPolicy;
-use tar_codec::decode::{Archive, DecodeError, DecodePolicy};
+use tar_codec::LinkPolicy;
+use tar_codec::{Archive as _, DecodeError, ExtractError, ExtractPolicy, TarArchive};
 use tar_framing::{FrameError, FrameErrorInner, PaxKeyword, UstarKind};
 use tempfile::tempdir;
 
@@ -34,8 +34,8 @@ async fn extracts_files_directories_large_payloads_and_archive_path_syntax() {
     let bytes = archive.finish();
 
     std::fs::create_dir_all(destination.join("large")).unwrap();
-    Archive::new(bytes.as_slice())
-        .extract(&destination, DecodePolicy::default())
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, ExtractPolicy::default())
         .await
         .unwrap();
     assert_eq!(std::fs::read(destination.join("bin/tool")).unwrap(), b"run");
@@ -72,10 +72,10 @@ async fn rejects_invalid_destinations_unsafe_paths_and_unsupported_members() {
     let file_destination = temp.path().join("file");
     std::fs::write(&file_destination, b"keep").unwrap();
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(&file_destination, DecodePolicy::default())
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&file_destination, ExtractPolicy::default())
             .await,
-        Err(DecodeError::Filesystem { .. })
+        Err(ExtractError::Filesystem { .. })
     ));
     assert_eq!(std::fs::read(&file_destination).unwrap(), b"keep");
 
@@ -86,13 +86,13 @@ async fn rejects_invalid_destinations_unsafe_paths_and_unsupported_members() {
     ] {
         let bytes = single_posix_member(name, b'0', b"", "", 0o644);
         assert!(matches!(
-            Archive::new(bytes.as_slice())
-                .extract(
+            TarArchive::new(bytes.as_slice())
+                .extract_in(
                     temp.path().join(case),
-                    DecodePolicy::default().name_validator(None),
+                    ExtractPolicy::default().name_validator(None),
                 )
                 .await,
-            Err(DecodeError::UnsafePath { .. })
+            Err(ExtractError::UnsafePath { .. })
         ));
     }
     assert!(!temp.path().join("escape").exists());
@@ -100,10 +100,10 @@ async fn rejects_invalid_destinations_unsafe_paths_and_unsupported_members() {
     let destination = temp.path().join("unsupported");
     let bytes = single_posix_member("device", b'3', b"", "", 0o644);
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default())
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, ExtractPolicy::default())
             .await,
-        Err(DecodeError::UnsupportedMember { .. })
+        Err(ExtractError::UnsupportedMember { .. })
     ));
 }
 
@@ -120,16 +120,16 @@ async fn rejects_directory_payload_without_writing_embedded_members() {
     let temp = tempdir().unwrap();
     let destination = temp.path().join("out");
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default())
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, ExtractPolicy::default())
             .await,
-        Err(DecodeError::Framing(FrameError {
+        Err(ExtractError::Archive(DecodeError::Framing(FrameError {
             position: 0,
             inner: FrameErrorInner::InvalidMemberSize {
                 kind: UstarKind::Directory,
                 size: 512,
             },
-        }))
+        })))
     ));
     assert!(destination.is_dir());
     assert!(std::fs::read_dir(destination).unwrap().next().is_none());
@@ -159,10 +159,10 @@ async fn rejects_directory_required_suffix_on_regular_file_without_writing_membe
         let temp = tempdir().expect("temporary directory should be created");
         let destination = temp.path().join("out");
         assert!(matches!(
-            Archive::new(bytes.as_slice())
-                .extract(&destination, DecodePolicy::default())
+            TarArchive::new(bytes.as_slice())
+                .extract_in(&destination, ExtractPolicy::default())
                 .await,
-            Err(DecodeError::UnsafePath {
+            Err(ExtractError::UnsafePath {
                 position: 1024,
                 context: "member path",
                 value,
@@ -195,8 +195,8 @@ async fn accepts_directory_required_suffix_on_directory_members() {
 
         let temp = tempdir().expect("temporary directory should be created");
         let destination = temp.path().join("out");
-        Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default())
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, ExtractPolicy::default())
             .await
             .expect("directory member should be extracted");
         assert!(destination.join("directory").is_dir());
@@ -218,8 +218,8 @@ async fn later_entries_replace_duplicate_normalized_and_ambient_files() {
         .posix("nested/normalized", b'0', b"new", "", 0o644)
         .posix("ambient", b'0', b"archive", "", 0o644);
     let bytes = archive.finish();
-    Archive::new(bytes.as_slice())
-        .extract(&destination, DecodePolicy::default())
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, ExtractPolicy::default())
         .await
         .unwrap();
 
@@ -246,8 +246,8 @@ async fn ambient_file_replacement_unlinks_the_inode_and_applies_mode() {
     std::fs::hard_link(destination.join("same"), destination.join("sibling")).unwrap();
     let bytes = single_posix_member("same", b'0', b"archive", "", 0o755);
 
-    Archive::new(bytes.as_slice())
-        .extract(&destination, DecodePolicy::default())
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, ExtractPolicy::default())
         .await
         .unwrap();
     assert_eq!(std::fs::read(destination.join("same")).unwrap(), b"archive");
@@ -286,10 +286,10 @@ async fn later_entries_replace_representative_cross_kind_paths() {
             .entry("./same", first, b"first")
             .entry("same", last, b"last");
         let bytes = archive.finish();
-        Archive::new(bytes.as_slice())
-            .extract(
+        TarArchive::new(bytes.as_slice())
+            .extract_in(
                 &destination,
-                DecodePolicy::default().link_policy(LinkPolicy::default().allow_hard_links(true)),
+                ExtractPolicy::default().link_policy(LinkPolicy::default().allow_hard_links(true)),
             )
             .await
             .unwrap();
@@ -349,10 +349,10 @@ async fn extraction_replaces_empty_leaves_but_rejects_non_directory_parents() {
             .posix("target", b'0', b"target", "", 0o644)
             .entry("same", archive_kind, b"archive");
         let bytes = archive.finish();
-        Archive::new(bytes.as_slice())
-            .extract(
+        TarArchive::new(bytes.as_slice())
+            .extract_in(
                 &destination,
-                DecodePolicy::default().link_policy(LinkPolicy::default().allow_hard_links(true)),
+                ExtractPolicy::default().link_policy(LinkPolicy::default().allow_hard_links(true)),
             )
             .await
             .unwrap();
@@ -388,13 +388,13 @@ async fn extraction_replaces_empty_leaves_but_rejects_non_directory_parents() {
             .posix("ignored", b'0', b"new", "", 0o644);
         let bytes = archive.finish();
         assert!(matches!(
-            Archive::new(bytes.as_slice())
-                .extract(
+            TarArchive::new(bytes.as_slice())
+                .extract_in(
                     &destination,
-                    DecodePolicy::default().link_policy(LinkPolicy::default().allow_hard_links(true)),
+                    ExtractPolicy::default().link_policy(LinkPolicy::default().allow_hard_links(true)),
                 )
                 .await,
-            Err(DecodeError::PathCollision { path }) if path == Path::new("parent")
+            Err(ExtractError::PathCollision { path }) if path == Path::new("parent")
         ));
         assert!(!destination.join("parent/child").exists());
         match parent {
@@ -419,10 +419,10 @@ async fn extraction_replaces_empty_leaves_but_rejects_non_directory_parents() {
     std::fs::write(destination.join("parent"), b"old").unwrap();
     let bytes = single_posix_member("parent/child", b'0', b"new", "", 0o644);
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default())
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, ExtractPolicy::default())
             .await,
-        Err(DecodeError::PathCollision { path }) if path == Path::new("parent")
+        Err(ExtractError::PathCollision { path }) if path == Path::new("parent")
     ));
     assert_eq!(std::fs::read(destination.join("parent")).unwrap(), b"old");
 }
@@ -477,13 +477,13 @@ async fn disabled_overwrites_reject_replacements_but_reuse_directories() {
             std::fs::write(destination.join("same"), b"ambient").unwrap();
         }
         assert!(matches!(
-            Archive::new(bytes.as_slice())
-                .extract(
+            TarArchive::new(bytes.as_slice())
+                .extract_in(
                     &destination,
-                    DecodePolicy::default().allow_overwrites(false),
+                    ExtractPolicy::default().allow_overwrites(false),
                 )
                 .await,
-            Err(DecodeError::PathCollision { .. })
+            Err(ExtractError::PathCollision { .. })
         ));
     }
 
@@ -495,10 +495,10 @@ async fn disabled_overwrites_reject_replacements_but_reuse_directories() {
         .posix("same", b'5', b"", "", 0o755)
         .posix("same", b'5', b"", "", 0o755);
     let bytes = archive.finish();
-    Archive::new(bytes.as_slice())
-        .extract(
+    TarArchive::new(bytes.as_slice())
+        .extract_in(
             &destination,
-            DecodePolicy::default().allow_overwrites(false),
+            ExtractPolicy::default().allow_overwrites(false),
         )
         .await
         .unwrap();
@@ -531,10 +531,10 @@ async fn non_empty_directories_are_never_replaced() {
     for (case, bytes) in archives {
         let destination = temp.path().join(case);
         assert!(matches!(
-            Archive::new(bytes.as_slice())
-                .extract(&destination, DecodePolicy::default())
+            TarArchive::new(bytes.as_slice())
+                .extract_in(&destination, ExtractPolicy::default())
                 .await,
-            Err(DecodeError::PathCollision { .. })
+            Err(ExtractError::PathCollision { .. })
         ));
         assert!(destination.join("same").is_dir());
     }
@@ -544,10 +544,10 @@ async fn non_empty_directories_are_never_replaced() {
     std::fs::write(destination.join("same/child"), b"keep").unwrap();
     let bytes = single_posix_member("same", b'0', b"replace", "", 0o644);
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default())
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, ExtractPolicy::default())
             .await,
-        Err(DecodeError::PathCollision { .. })
+        Err(ExtractError::PathCollision { .. })
     ));
     assert!(destination.join("same").is_dir());
 }
@@ -568,10 +568,10 @@ async fn extraction_rejects_symlink_parents_and_replaces_symlink_leaves_without_
     symlink_dir(&outside, destination.join("parent")).unwrap();
     let bytes = single_posix_member("parent/file", b'0', b"good", "", 0o644);
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default())
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, ExtractPolicy::default())
             .await,
-        Err(DecodeError::PathCollision { path }) if path == Path::new("parent")
+        Err(ExtractError::PathCollision { path }) if path == Path::new("parent")
     ));
     assert_eq!(
         std::fs::read_link(destination.join("parent")).unwrap(),
@@ -585,8 +585,8 @@ async fn extraction_rejects_symlink_parents_and_replaces_symlink_leaves_without_
     std::fs::write(&outside, b"keep").unwrap();
     symlink_file(&outside, destination.join("same")).unwrap();
     let bytes = single_posix_member("same", b'0', b"archive", "", 0o644);
-    Archive::new(bytes.as_slice())
-        .extract(&destination, DecodePolicy::default())
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, ExtractPolicy::default())
         .await
         .unwrap();
     assert_eq!(std::fs::read(destination.join("same")).unwrap(), b"archive");
@@ -607,46 +607,11 @@ async fn rejects_a_symlink_destination_root_without_modifying_its_target() {
     let bytes = single_posix_member("file", b'0', b"archive", "", 0o644);
 
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default())
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, ExtractPolicy::default())
             .await,
-        Err(DecodeError::Filesystem { .. })
+        Err(ExtractError::Filesystem { .. })
     ));
     assert_eq!(std::fs::read(target.join("keep")).unwrap(), b"keep");
     assert!(!target.join("file").exists());
-}
-
-/// Ensures Windows junctions receive the same fail-closed treatment as other
-/// link-like objects when used as an implicit parent or extraction root.
-#[cfg(windows)]
-#[tokio::test]
-async fn destination_junctions_are_rejected_as_parents_and_roots() {
-    let temp = tempdir().unwrap();
-    let outside = temp.path().join("outside");
-    std::fs::create_dir(&outside).unwrap();
-    std::fs::write(outside.join("keep"), b"keep").unwrap();
-
-    let destination = temp.path().join("parent");
-    std::fs::create_dir(&destination).unwrap();
-    junction::create(&outside, destination.join("junction")).unwrap();
-    let bytes = single_posix_member("junction/file", b'0', b"archive", "", 0o644);
-    assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default())
-            .await,
-        Err(DecodeError::PathCollision { path }) if path == Path::new("junction")
-    ));
-    assert!(!outside.join("file").exists());
-
-    let destination = temp.path().join("root-junction");
-    junction::create(&outside, &destination).unwrap();
-    let bytes = single_posix_member("file", b'0', b"archive", "", 0o644);
-    assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default())
-            .await,
-        Err(DecodeError::Filesystem { .. })
-    ));
-    assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"keep");
-    assert!(!outside.join("file").exists());
 }

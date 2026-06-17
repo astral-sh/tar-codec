@@ -1,7 +1,7 @@
 use std::{fs, path::Path};
 
 use tar_codec::{
-    decode::{Archive, DecodePolicy},
+    Archive as _, ExtractPolicy, TarArchive,
     encode::{Encoder, EntryMetadata},
 };
 use tempfile::tempdir;
@@ -84,8 +84,8 @@ fn configure_tokio_tar_header(header: &mut tokio_tar::Header, payload_len: usize
 async fn assert_tar_codec_extracts(archive: &[u8]) {
     let temp = tempdir().expect("temporary extraction directory should be created");
     let destination = temp.path().join("out");
-    Archive::new(archive)
-        .extract(&destination, DecodePolicy::default())
+    TarArchive::new(archive)
+        .extract_in(&destination, ExtractPolicy::default())
         .await
         .expect("tar-codec should extract archive");
     assert_contents(&destination);

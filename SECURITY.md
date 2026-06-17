@@ -8,6 +8,9 @@ for how to report issues in tar-codec.
 ## Security model
 
 tar-codec is intended to be resilient to many common differentials when parsing tar streams.
+Its format-neutral extraction guarantees are implemented by the workspace's
+`archive-trait` crate and shared by every archive implementation using that
+extractor.
 
 General properties:
 

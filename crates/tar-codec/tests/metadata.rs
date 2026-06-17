@@ -6,12 +6,12 @@ use support::{
     ArchiveBuilder, ArchiveFormat, header, pax_record, raw_pax_record, set_checksum,
     set_identity_byte, single_posix_member,
 };
-use tar_codec::decode::{
-    Archive, DecodeError, DecodePolicy, DecodePolicyViolation, LinkPolicy, PaxDecodePolicy,
-    SymlinkPolicy,
-};
 #[cfg(unix)]
 use tar_codec::default_name_validator;
+use tar_codec::{
+    Archive as _, DecodeError, DecodePolicy, DecodePolicyViolation, ExtractError, ExtractPolicy,
+    ExtractPolicyViolation, LinkPolicy, PaxDecodePolicy, SymlinkPolicy, TarArchive,
+};
 use tar_framing::{FrameError, FrameErrorInner, PaxKeyword};
 use tempfile::tempdir;
 
@@ -39,13 +39,13 @@ async fn pax_precedence_and_validation_use_effective_names() {
         .pax(b'x', &local_link)
         .posix("raw-link", b'2', b"", "wrong-target", 0o644);
     let bytes = archive.finish();
-    let policy = DecodePolicy::default().pax_policy(
+    let decode_policy = DecodePolicy::default().pax_policy(
         PaxDecodePolicy::default()
             .allow_global_pax_extensions(true)
             .allow_global_pax_member_metadata(true),
     );
-    Archive::new(bytes.as_slice())
-        .extract(&destination, policy)
+    TarArchive::with_policy(bytes.as_slice(), decode_policy)
+        .extract_in(&destination, ExtractPolicy::default())
         .await
         .unwrap();
     assert_eq!(
@@ -66,11 +66,11 @@ async fn pax_precedence_and_validation_use_effective_names() {
         .pax(b'x', &local_link)
         .posix("raw-link", b'2', b"", "wrong-target", 0o644);
     let bytes = archive.finish();
-    let policy = DecodePolicy::default().name_validator(Some(|name| {
+    let policy = ExtractPolicy::default().name_validator(Some(|name| {
         !name.contains("raw") && !name.contains("wrong")
     }));
-    Archive::new(bytes.as_slice())
-        .extract(&destination, policy)
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, policy)
         .await
         .unwrap();
     assert_eq!(
@@ -84,15 +84,15 @@ async fn pax_precedence_and_validation_use_effective_names() {
         .pax(b'x', &pax_record(PaxKeyword::Path, "blocked"))
         .posix("allowed", b'0', b"", "", 0o644);
     let bytes = archive.finish();
-    let policy = DecodePolicy::default().name_validator(Some(|name| {
+    let policy = ExtractPolicy::default().name_validator(Some(|name| {
         default_name_validator(name) && !name.contains("blocked")
     }));
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, policy)
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, policy)
             .await,
-        Err(DecodeError::PolicyViolation {
-            violation: DecodePolicyViolation::NameRejected {
+        Err(ExtractError::PolicyViolation {
+            violation: ExtractPolicyViolation::NameRejected {
                 context: "member path",
                 value,
             },
@@ -113,8 +113,8 @@ async fn gnu_long_metadata_and_validation_use_effective_names() {
         .gnu("longlink", b'K', b"../target\0", "", 0o644)
         .gnu("raw", b'2', b"", "wrong", 0o644);
     let bytes = archive.finish();
-    Archive::new(bytes.as_slice())
-        .extract(&destination, DecodePolicy::default())
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, ExtractPolicy::default())
         .await
         .unwrap();
     assert_eq!(
@@ -130,11 +130,11 @@ async fn gnu_long_metadata_and_validation_use_effective_names() {
         .gnu("longlink", b'K', b"actual\0", "", 0o644)
         .gnu("raw-link", b'2', b"", "wrong-target", 0o644);
     let bytes = archive.finish();
-    let policy = DecodePolicy::default().name_validator(Some(|name| {
+    let policy = ExtractPolicy::default().name_validator(Some(|name| {
         !name.contains("raw") && !name.contains("wrong")
     }));
-    Archive::new(bytes.as_slice())
-        .extract(&destination, policy)
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, policy)
         .await
         .unwrap();
     assert_eq!(
@@ -148,15 +148,15 @@ async fn gnu_long_metadata_and_validation_use_effective_names() {
         .gnu("longname", b'L', b"blocked\0", "", 0o644)
         .gnu("allowed", b'0', b"", "", 0o644);
     let bytes = archive.finish();
-    let policy = DecodePolicy::default().name_validator(Some(|name| {
+    let policy = ExtractPolicy::default().name_validator(Some(|name| {
         default_name_validator(name) && !name.contains("blocked")
     }));
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, policy)
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, policy)
             .await,
-        Err(DecodeError::PolicyViolation {
-            violation: DecodePolicyViolation::NameRejected { value, .. },
+        Err(ExtractError::PolicyViolation {
+            violation: ExtractPolicyViolation::NameRejected { value, .. },
             ..
         }) if value == "blocked"
     ));
@@ -182,17 +182,17 @@ async fn member_and_link_name_validation_is_configurable() {
             "hard-link target",
         ),
     ] {
-        let policy = DecodePolicy::default().link_policy(
+        let policy = ExtractPolicy::default().link_policy(
             LinkPolicy::default()
                 .allow_hard_links(true)
                 .symlink_policy(SymlinkPolicy::Skip),
         );
         assert!(matches!(
-            Archive::new(bytes.as_slice())
-                .extract(temp.path().join(case), policy)
+            TarArchive::new(bytes.as_slice())
+                .extract_in(temp.path().join(case), policy)
                 .await,
-            Err(DecodeError::PolicyViolation {
-                violation: DecodePolicyViolation::NameRejected {
+            Err(ExtractError::PolicyViolation {
+                violation: ExtractPolicyViolation::NameRejected {
                     context: actual,
                     ..
                 },
@@ -203,8 +203,8 @@ async fn member_and_link_name_validation_is_configurable() {
 
     let destination = temp.path().join("disabled");
     let bytes = single_posix_member(" allowed", b'0', b"ok", "", 0o644);
-    Archive::new(bytes.as_slice())
-        .extract(&destination, DecodePolicy::default().name_validator(None))
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, ExtractPolicy::default().name_validator(None))
         .await
         .unwrap();
     assert_eq!(std::fs::read(destination.join(" allowed")).unwrap(), b"ok");
@@ -220,22 +220,19 @@ async fn gnu_archives_can_be_forbidden_without_rejecting_empty_archives() {
         .gnu("raw", b'0', b"contents", "", 0o644);
     let bytes = archive.finish();
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default().allow_gnu(false))
+        TarArchive::with_policy(bytes.as_slice(), DecodePolicy::default().allow_gnu(false),)
+            .extract_in(&destination, ExtractPolicy::default())
             .await,
-        Err(DecodeError::PolicyViolation {
+        Err(ExtractError::Archive(DecodeError::PolicyViolation {
             position: 0,
             violation: DecodePolicyViolation::GnuArchive,
-        })
+        }))
     ));
     assert!(!destination.join("renamed").exists());
 
     let bytes = ArchiveBuilder::new().finish();
-    Archive::new(bytes.as_slice())
-        .extract(
-            temp.path().join("empty"),
-            DecodePolicy::default().allow_gnu(false),
-        )
+    TarArchive::with_policy(bytes.as_slice(), DecodePolicy::default().allow_gnu(false))
+        .extract_in(temp.path().join("empty"), ExtractPolicy::default())
         .await
         .unwrap();
 }
@@ -249,16 +246,16 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
         .posix("file", b'0', b"", "", 0o644);
     let bytes = archive.finish();
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(temp.path().join("local"), DecodePolicy::default())
+        TarArchive::new(bytes.as_slice())
+            .extract_in(temp.path().join("local"), ExtractPolicy::default())
             .await,
-        Err(DecodeError::PolicyViolation {
+        Err(ExtractError::Archive(DecodeError::PolicyViolation {
             position: 0,
             violation: DecodePolicyViolation::PaxVendorExtension {
                 vendor,
                 name,
             },
-        }) if vendor == "Acme" && name == "attribute"
+        })) if vendor == "Acme" && name == "attribute"
     ));
 
     let destination = temp.path().join("partial");
@@ -269,17 +266,17 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
         .posix("blocked", b'0', b"", "", 0o644);
     let bytes = archive.finish();
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(
-                &destination,
-                DecodePolicy::default()
-                    .pax_policy(PaxDecodePolicy::default().allow_global_pax_extensions(true),),
-            )
-            .await,
-        Err(DecodeError::PolicyViolation {
+        TarArchive::with_policy(
+            bytes.as_slice(),
+            DecodePolicy::default()
+                .pax_policy(PaxDecodePolicy::default().allow_global_pax_extensions(true),),
+        )
+        .extract_in(&destination, ExtractPolicy::default(),)
+        .await,
+        Err(ExtractError::Archive(DecodeError::PolicyViolation {
             position: 1024,
             violation: DecodePolicyViolation::PaxVendorExtension { .. },
-        })
+        }))
     ));
     assert_eq!(
         std::fs::read_to_string(destination.join("created")).unwrap(),
@@ -292,10 +289,10 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
         .pax(b'x', &pax_record(vendor_attribute_keyword(), "value"))
         .posix("file", b'0', b"ok", "", 0o644);
     let bytes = archive.finish();
-    let policy = DecodePolicy::default()
+    let decode_policy = DecodePolicy::default()
         .pax_policy(PaxDecodePolicy::default().allow_unknown_pax_vendor_records(true));
-    Archive::new(bytes.as_slice())
-        .extract(&destination, policy)
+    TarArchive::with_policy(bytes.as_slice(), decode_policy)
+        .extract_in(&destination, ExtractPolicy::default())
         .await
         .unwrap();
     assert_eq!(
@@ -316,20 +313,20 @@ async fn duplicate_pax_records_are_rejected_by_default_and_can_use_last_value() 
     let bytes = archive.finish();
 
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(temp.path().join("rejected"), DecodePolicy::default())
+        TarArchive::new(bytes.as_slice())
+            .extract_in(temp.path().join("rejected"), ExtractPolicy::default())
             .await,
-        Err(DecodeError::PolicyViolation {
+        Err(ExtractError::Archive(DecodeError::PolicyViolation {
             position: 0,
             violation: DecodePolicyViolation::DuplicatePaxRecord { keyword },
-        }) if keyword == "path"
+        })) if keyword == "path"
     ));
 
     let destination = temp.path().join("permitted");
-    let policy = DecodePolicy::default()
+    let decode_policy = DecodePolicy::default()
         .pax_policy(PaxDecodePolicy::default().allow_duplicate_pax_records(true));
-    Archive::new(bytes.as_slice())
-        .extract(&destination, policy)
+    TarArchive::with_policy(bytes.as_slice(), decode_policy)
+        .extract_in(&destination, ExtractPolicy::default())
         .await
         .unwrap();
     assert_eq!(
@@ -352,16 +349,16 @@ async fn pax_extension_size_limit_is_configurable_for_extraction() {
     let payload_size = u64::try_from(payload.len()).expect("payload size should fit u64");
 
     let destination = temp.path().join("rejected");
-    let policy = DecodePolicy::default()
+    let decode_policy = DecodePolicy::default()
         .pax_policy(PaxDecodePolicy::default().max_extension_size(payload_size - 1));
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, policy)
+        TarArchive::with_policy(bytes.as_slice(), decode_policy)
+            .extract_in(&destination, ExtractPolicy::default())
             .await,
-        Err(DecodeError::Framing(FrameError {
+        Err(ExtractError::Archive(DecodeError::Framing(FrameError {
             position: 0,
             inner: FrameErrorInner::PaxExtensionTooLarge { size, limit },
-        })) if size == payload_size && limit == payload_size - 1
+        }))) if size == payload_size && limit == payload_size - 1
     ));
     assert!(destination.is_dir());
     assert!(
@@ -372,10 +369,10 @@ async fn pax_extension_size_limit_is_configurable_for_extraction() {
     );
 
     let destination = temp.path().join("accepted");
-    let policy = DecodePolicy::default()
+    let decode_policy = DecodePolicy::default()
         .pax_policy(PaxDecodePolicy::default().max_extension_size(payload_size));
-    Archive::new(bytes.as_slice())
-        .extract(&destination, policy)
+    TarArchive::with_policy(bytes.as_slice(), decode_policy)
+        .extract_in(&destination, ExtractPolicy::default())
         .await
         .expect("extension at configured limit should extract");
     assert_eq!(
@@ -396,13 +393,13 @@ async fn global_pax_headers_support_opt_out_and_ignore_trailing_updates() {
     let reject_globals = DecodePolicy::default()
         .pax_policy(PaxDecodePolicy::default().allow_global_pax_extensions(false));
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(temp.path().join("rejected"), reject_globals)
+        TarArchive::with_policy(bytes.as_slice(), reject_globals)
+            .extract_in(temp.path().join("rejected"), ExtractPolicy::default())
             .await,
-        Err(DecodeError::PolicyViolation {
+        Err(ExtractError::Archive(DecodeError::PolicyViolation {
             position: 0,
             violation: DecodePolicyViolation::GlobalPaxExtension,
-        })
+        }))
     ));
 
     let destination = temp.path().join("permitted");
@@ -411,8 +408,8 @@ async fn global_pax_headers_support_opt_out_and_ignore_trailing_updates() {
         .pax(b'g', &pax_record(PaxKeyword::Comment, "metadata"))
         .posix("file", b'0', b"contents", "", 0o644);
     let bytes = archive.finish();
-    Archive::new(bytes.as_slice())
-        .extract(&destination, DecodePolicy::default())
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, ExtractPolicy::default())
         .await
         .unwrap();
     assert_eq!(
@@ -423,8 +420,8 @@ async fn global_pax_headers_support_opt_out_and_ignore_trailing_updates() {
     let mut archive = ArchiveBuilder::new();
     archive.pax(b'g', &pax_record(PaxKeyword::Comment, "metadata"));
     let trailing = archive.finish();
-    Archive::new(trailing.as_slice())
-        .extract(temp.path().join("trailing"), reject_globals)
+    TarArchive::with_policy(trailing.as_slice(), reject_globals)
+        .extract_in(temp.path().join("trailing"), ExtractPolicy::default())
         .await
         .unwrap();
 
@@ -432,13 +429,13 @@ async fn global_pax_headers_support_opt_out_and_ignore_trailing_updates() {
     archive.pax(b'g', b"invalid");
     let malformed = archive.finish();
     assert!(matches!(
-        Archive::new(malformed.as_slice())
-            .extract(temp.path().join("malformed"), reject_globals)
+        TarArchive::with_policy(malformed.as_slice(), reject_globals)
+            .extract_in(temp.path().join("malformed"), ExtractPolicy::default())
             .await,
-        Err(DecodeError::Framing(FrameError {
+        Err(ExtractError::Archive(DecodeError::Framing(FrameError {
             position: 0,
             inner: FrameErrorInner::InvalidPaxRecords { .. },
-        }))
+        })))
     ));
 }
 
@@ -455,18 +452,18 @@ async fn global_member_metadata_requires_opt_in_and_uses_pax_precedence() {
             .pax(b'g', &pax_record(keyword, value))
             .posix("raw", b'0', b"", "", 0o644);
         let bytes = archive.finish();
-        let policy = DecodePolicy::default()
+        let decode_policy = DecodePolicy::default()
             .pax_policy(PaxDecodePolicy::default().allow_global_pax_extensions(true));
         assert!(matches!(
-            Archive::new(bytes.as_slice())
-                .extract(temp.path().join(case), policy)
+            TarArchive::with_policy(bytes.as_slice(), decode_policy)
+                .extract_in(temp.path().join(case), ExtractPolicy::default())
                 .await,
-            Err(DecodeError::PolicyViolation {
+            Err(ExtractError::Archive(DecodeError::PolicyViolation {
                 position: 0,
                 violation: DecodePolicyViolation::GlobalPaxMemberMetadata {
                     keyword: found,
                 },
-            }) if found == expected
+            })) if found == expected
         ));
     }
 
@@ -477,13 +474,13 @@ async fn global_member_metadata_requires_opt_in_and_uses_pax_precedence() {
         .pax(b'g', &pax_record(PaxKeyword::Path, "current"))
         .posix("raw", b'0', b"contents", "", 0o644);
     let bytes = archive.finish();
-    let policy = DecodePolicy::default().pax_policy(
+    let decode_policy = DecodePolicy::default().pax_policy(
         PaxDecodePolicy::default()
             .allow_global_pax_extensions(true)
             .allow_global_pax_member_metadata(true),
     );
-    Archive::new(bytes.as_slice())
-        .extract(&destination, policy)
+    TarArchive::with_policy(bytes.as_slice(), decode_policy)
+        .extract_in(&destination, ExtractPolicy::default())
         .await
         .unwrap();
     assert_eq!(
@@ -505,10 +502,13 @@ async fn binary_names_are_rejected_and_streaming_failures_preserve_prior_output(
         .posix("raw", b'0', b"", "", 0o644);
     let binary = archive.finish();
     assert!(matches!(
-        Archive::new(binary.as_slice())
-            .extract(temp.path().join("binary"), DecodePolicy::default())
+        TarArchive::new(binary.as_slice())
+            .extract_in(temp.path().join("binary"), ExtractPolicy::default())
             .await,
-        Err(DecodeError::InvalidUtf8 { field: "path", .. })
+        Err(ExtractError::Archive(DecodeError::InvalidUtf8 {
+            field: "path",
+            ..
+        }))
     ));
 
     let destination = temp.path().join("partial");
@@ -521,10 +521,10 @@ async fn binary_names_are_rejected_and_streaming_failures_preserve_prior_output(
         .block(&invalid);
     let bytes = archive.into_unterminated();
     assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(&destination, DecodePolicy::default())
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, ExtractPolicy::default())
             .await,
-        Err(DecodeError::Framing(_))
+        Err(ExtractError::Archive(DecodeError::Framing(_)))
     ));
     assert_eq!(
         std::fs::read_to_string(destination.join("created")).unwrap(),
