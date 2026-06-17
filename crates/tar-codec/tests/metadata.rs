@@ -39,11 +39,8 @@ async fn pax_precedence_and_validation_use_effective_names() {
         .pax(b'x', &local_link)
         .posix("raw-link", b'2', b"", "wrong-target", 0o644);
     let bytes = archive.finish();
-    let decode_policy = DecodePolicy::default().pax_policy(
-        PaxDecodePolicy::default()
-            .allow_global_pax_extensions(true)
-            .allow_global_pax_member_metadata(true),
-    );
+    let decode_policy = DecodePolicy::default()
+        .pax_policy(PaxDecodePolicy::default().allow_global_pax_member_metadata(true));
     TarArchive::new_with_policy(bytes.as_slice(), decode_policy)
         .extract_in(&destination, ExtractPolicy::default())
         .await
@@ -218,13 +215,9 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
         .posix("blocked", b'0', b"", "", 0o644);
     let bytes = archive.finish();
     assert!(matches!(
-        TarArchive::new_with_policy(
-            bytes.as_slice(),
-            DecodePolicy::default()
-                .pax_policy(PaxDecodePolicy::default().allow_global_pax_extensions(true),),
-        )
-        .extract_in(&destination, ExtractPolicy::default(),)
-        .await,
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, ExtractPolicy::default(),)
+            .await,
         Err(ExtractError::Archive(DecodeError::PolicyViolation {
             position: 1024,
             violation: DecodePolicyViolation::PaxVendorExtension { .. },
@@ -404,10 +397,8 @@ async fn global_member_metadata_requires_opt_in_and_uses_pax_precedence() {
             .pax(b'g', &pax_record(keyword, value))
             .posix("raw", b'0', b"", "", 0o644);
         let bytes = archive.finish();
-        let decode_policy = DecodePolicy::default()
-            .pax_policy(PaxDecodePolicy::default().allow_global_pax_extensions(true));
         assert!(matches!(
-            TarArchive::new_with_policy(bytes.as_slice(), decode_policy)
+            TarArchive::new(bytes.as_slice())
                 .extract_in(temp.path().join(case), ExtractPolicy::default())
                 .await,
             Err(ExtractError::Archive(DecodeError::PolicyViolation {
@@ -426,11 +417,8 @@ async fn global_member_metadata_requires_opt_in_and_uses_pax_precedence() {
         .pax(b'g', &pax_record(PaxKeyword::Path, "current"))
         .posix("raw", b'0', b"contents", "", 0o644);
     let bytes = archive.finish();
-    let decode_policy = DecodePolicy::default().pax_policy(
-        PaxDecodePolicy::default()
-            .allow_global_pax_extensions(true)
-            .allow_global_pax_member_metadata(true),
-    );
+    let decode_policy = DecodePolicy::default()
+        .pax_policy(PaxDecodePolicy::default().allow_global_pax_member_metadata(true));
     TarArchive::new_with_policy(bytes.as_slice(), decode_policy)
         .extract_in(&destination, ExtractPolicy::default())
         .await

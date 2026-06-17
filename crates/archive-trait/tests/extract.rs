@@ -124,15 +124,36 @@ async fn validates_empty_payload_before_creating_file() {
 }
 
 #[tokio::test]
-async fn rejects_unsafe_special_and_colliding_members() {
+async fn rejects_invalid_destinations_unsafe_special_and_colliding_members() {
     let temp = tempdir().expect("temporary directory should be created");
-    let destination = temp.path().join("unsafe");
+    let file_destination = temp.path().join("file-destination");
+    std::fs::write(&file_destination, b"keep").expect("destination file should be written");
     assert!(matches!(
-        TestArchive::new([entry::file("../escape", b"")])
-            .extract_in(&destination, ExtractPolicy::default().name_validator(None))
+        TestArchive::new([entry::file("file", b"archive")])
+            .extract_in(&file_destination, ExtractPolicy::default())
             .await,
-        Err(ExtractError::UnsafePath { .. })
+        Err(ExtractError::Filesystem { .. })
     ));
+    assert_eq!(
+        std::fs::read(&file_destination).expect("destination file should remain readable"),
+        b"keep"
+    );
+
+    for (case, path) in [
+        ("leading-parent", "../escape"),
+        ("absolute", "/escape"),
+        ("backslash", r"nested\escape"),
+    ] {
+        assert!(matches!(
+            TestArchive::new([entry::file(path, b"")])
+                .extract_in(
+                    temp.path().join(case),
+                    ExtractPolicy::default().name_validator(None),
+                )
+                .await,
+            Err(ExtractError::UnsafePath { .. })
+        ));
+    }
     assert!(!temp.path().join("escape").exists());
 
     assert!(matches!(

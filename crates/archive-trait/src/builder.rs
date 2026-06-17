@@ -6,6 +6,7 @@
 mod traversal;
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     io::{self, Read},
     mem,
@@ -117,12 +118,8 @@ pub struct EntryPayload<'a> {
 }
 
 enum EntryPayloadInner<'a> {
-    Borrowed {
-        bytes: &'a [u8],
-        yielded: bool,
-    },
     Buffered {
-        buffer: Vec<u8>,
+        data: Cow<'a, [u8]>,
         yielded: bool,
     },
     Streaming {
@@ -145,19 +142,12 @@ impl EntryPayload<'_> {
     /// Returns the next chunk of logical, uncompressed source bytes.
     pub async fn next_chunk<E>(&mut self) -> Result<Option<&[u8]>, BuildError<E>> {
         match &mut self.inner {
-            EntryPayloadInner::Borrowed { bytes, yielded } => {
-                if *yielded || bytes.is_empty() {
+            EntryPayloadInner::Buffered { data, yielded } => {
+                if *yielded || data.is_empty() {
                     return Ok(None);
                 }
                 *yielded = true;
-                Ok(Some(bytes))
-            }
-            EntryPayloadInner::Buffered { buffer, yielded } => {
-                if *yielded || buffer.is_empty() {
-                    return Ok(None);
-                }
-                *yielded = true;
-                Ok(Some(buffer))
+                Ok(Some(&data[..]))
             }
             EntryPayloadInner::Streaming {
                 file,
@@ -168,26 +158,15 @@ impl EntryPayload<'_> {
                 if *remaining == 0 {
                     return Ok(None);
                 }
-                let chunk_len = usize::try_from((*remaining).min(SOURCE_FILE_CHUNK_BYTES as u64))
+                let chunk_size = (*remaining).min(SOURCE_FILE_CHUNK_BYTES as u64);
+                let chunk_len = usize::try_from(chunk_size)
                     .map_err(|_| arithmetic_overflow("source file read buffer size"))?;
                 buffer.resize(chunk_len, 0);
-                let length = file
-                    .read(buffer)
+                file.read_exact(buffer)
                     .await
                     .map_err(|source| filesystem_error("read source file", path, source))?;
-                if length == 0 {
-                    return Err(filesystem_error(
-                        "read source file",
-                        path,
-                        io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "source file ended before its declared size",
-                        ),
-                    ));
-                }
-                *remaining -= u64::try_from(length)
-                    .map_err(|_| arithmetic_overflow("source file read size"))?;
-                Ok(Some(&buffer[..length]))
+                *remaining -= chunk_size;
+                Ok(Some(buffer))
             }
         }
     }
@@ -197,8 +176,8 @@ impl EntryPayload<'_> {
             .map_err(|_| arithmetic_overflow("manual entry payload size"))?;
         Ok(EntryPayload {
             size,
-            inner: EntryPayloadInner::Borrowed {
-                bytes,
+            inner: EntryPayloadInner::Buffered {
+                data: Cow::Borrowed(bytes),
                 yielded: false,
             },
         })
@@ -347,7 +326,7 @@ impl<B: ArchiveBuilder> Builder<B> {
                 .entries
                 .insert(ancestor, ArchivedEntry::Directory { explicit: false });
         }
-        self.state.entries.insert(path, ArchivedEntry::Regular);
+        self.state.entries.insert(path, ArchivedEntry::NonDirectory);
         Ok(())
     }
 
@@ -364,21 +343,16 @@ impl<B: ArchiveBuilder> Builder<B> {
     ) -> Result<(), BuildError<B::Error>> {
         self.state.ensure_active()?;
         let source = source.as_ref().to_path_buf();
+        let mut entries = stream_directory_entries(
+            source,
+            self.state.policy.name_validation,
+            self.state.policy.symlink_policy,
+        )
+        .map_err(BuildError::Traversal)?;
         let mut traversal = DirectoryBuild {
             entries: self.state.entries.clone(),
             source_buffer: mem::take(&mut self.state.source_buffer),
             emitted: false,
-        };
-        let mut entries = match stream_directory_entries(
-            source,
-            self.state.policy.name_validation,
-            self.state.policy.symlink_policy,
-        ) {
-            Ok(entries) => entries,
-            Err(error) => {
-                self.state.source_buffer = traversal.source_buffer;
-                return Err(BuildError::Traversal(error));
-            }
         };
         let write_result =
             write_directory_entries(&mut self.backend, &mut entries, &mut traversal).await;
@@ -452,7 +426,7 @@ async fn write_directory_entries<B: ArchiveBuilder>(
                     reserve_entry(
                         &mut traversal.entries,
                         &entry.archive_path,
-                        ArchivedEntry::Regular,
+                        ArchivedEntry::NonDirectory,
                     )
                     .map_err(BuildFailure::recoverable)?;
                     write_source_file(builder, &entry, traversal).await?;
@@ -461,7 +435,7 @@ async fn write_directory_entries<B: ArchiveBuilder>(
                     reserve_entry(
                         &mut traversal.entries,
                         &entry.archive_path,
-                        ArchivedEntry::SymbolicLink,
+                        ArchivedEntry::NonDirectory,
                     )
                     .map_err(BuildFailure::recoverable)?;
                     builder
@@ -490,9 +464,15 @@ async fn write_source_file<B: ArchiveBuilder>(
         .write_file_member(&entry.archive_path, &mut payload, metadata)
         .await;
     traversal.source_buffer = match payload.inner {
-        EntryPayloadInner::Borrowed { .. } => Vec::new(),
-        EntryPayloadInner::Buffered { buffer, .. }
+        EntryPayloadInner::Buffered {
+            data: Cow::Owned(buffer),
+            ..
+        }
         | EntryPayloadInner::Streaming { buffer, .. } => buffer,
+        EntryPayloadInner::Buffered {
+            data: Cow::Borrowed(_),
+            ..
+        } => Vec::new(),
     };
     result
 }
@@ -540,7 +520,7 @@ async fn prepare_source_file(
                 .read_exact(&mut buffer)
                 .map_err(|source| SourceError::filesystem("read source file", &path, source))?;
             EntryPayloadInner::Buffered {
-                buffer,
+                data: Cow::Owned(buffer),
                 yielded: false,
             }
         };
@@ -647,8 +627,7 @@ pub enum BuildError<E> {
 #[derive(Clone, Debug)]
 enum ArchivedEntry {
     Directory { explicit: bool },
-    Regular,
-    SymbolicLink,
+    NonDirectory,
 }
 
 fn reserve_entry<E>(

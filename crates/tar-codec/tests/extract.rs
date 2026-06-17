@@ -65,48 +65,6 @@ async fn extracts_files_directories_large_payloads_and_archive_path_syntax() {
     }
 }
 
-#[tokio::test]
-async fn rejects_invalid_destinations_unsafe_paths_and_unsupported_members() {
-    let temp = tempdir().unwrap();
-    let bytes = single_posix_member("file", b'0', b"archive", "", 0o644);
-    let file_destination = temp.path().join("file");
-    std::fs::write(&file_destination, b"keep").unwrap();
-    assert!(matches!(
-        TarArchive::new(bytes.as_slice())
-            .extract_in(&file_destination, ExtractPolicy::default())
-            .await,
-        Err(ExtractError::Filesystem { .. })
-    ));
-    assert_eq!(std::fs::read(&file_destination).unwrap(), b"keep");
-
-    for (case, name) in [
-        ("leading-parent", "../escape"),
-        ("absolute", "/escape"),
-        ("backslash", r"nested\escape"),
-    ] {
-        let bytes = single_posix_member(name, b'0', b"", "", 0o644);
-        assert!(matches!(
-            TarArchive::new(bytes.as_slice())
-                .extract_in(
-                    temp.path().join(case),
-                    ExtractPolicy::default().name_validator(None),
-                )
-                .await,
-            Err(ExtractError::UnsafePath { .. })
-        ));
-    }
-    assert!(!temp.path().join("escape").exists());
-
-    let destination = temp.path().join("unsupported");
-    let bytes = single_posix_member("device", b'3', b"", "", 0o644);
-    assert!(matches!(
-        TarArchive::new(bytes.as_slice())
-            .extract_in(&destination, ExtractPolicy::default())
-            .await,
-        Err(ExtractError::UnsupportedMember { .. })
-    ));
-}
-
 /// Ensures that we reject a directory entry with a declared size that embeds a regular file.
 /// See malo's `malicious/dir_with_embedded_header.tar` for the case that this was derived from.
 /// See: <https://github.com/fastzip/malo/tree/3df544f1a2fc498b2a84eb34981deb111cadbf32/tar/malicious>
