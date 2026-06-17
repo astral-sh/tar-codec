@@ -1,8 +1,8 @@
 use std::{fs, path::Path};
 
 use tar_codec::{
-    decode::{Archive, DecodePolicy},
-    encode::{Encoder, EntryMetadata},
+    Archive as _, ArchiveBuilder as _, EntryMetadata, TarArchive, TarEncoder,
+    extract::ExtractPolicy,
 };
 use tempfile::tempdir;
 
@@ -26,7 +26,8 @@ async fn extracts_pax_and_ustar_archives_across_crates() {
 }
 
 async fn pax_archive() -> Vec<u8> {
-    let mut encoder = Encoder::new(Vec::new());
+    let mut bytes = Vec::new();
+    let mut encoder = TarEncoder::new(&mut bytes).builder();
     for (path, data) in ENTRIES {
         encoder
             .add_entry(path, data, EntryMetadata::default())
@@ -36,7 +37,8 @@ async fn pax_archive() -> Vec<u8> {
     encoder
         .finish()
         .await
-        .expect("tar-codec pax archive should finish")
+        .expect("tar-codec pax archive should finish");
+    bytes
 }
 
 fn tar_ustar_archive() -> Vec<u8> {
@@ -84,8 +86,8 @@ fn configure_tokio_tar_header(header: &mut tokio_tar::Header, payload_len: usize
 async fn assert_tar_codec_extracts(archive: &[u8]) {
     let temp = tempdir().expect("temporary extraction directory should be created");
     let destination = temp.path().join("out");
-    Archive::new(archive)
-        .extract(&destination, DecodePolicy::default())
+    TarArchive::new(archive)
+        .extract_in(&destination, ExtractPolicy::default())
         .await
         .expect("tar-codec should extract archive");
     assert_contents(&destination);

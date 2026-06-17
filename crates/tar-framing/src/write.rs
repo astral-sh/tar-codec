@@ -199,11 +199,12 @@ pub fn end_marker_bytes() -> &'static [u8] {
 }
 
 /// Returns the zero padding required after a payload of `size` meaningful bytes.
+#[inline]
 pub fn payload_padding(size: u64) -> &'static [u8] {
-    match size % BLOCK_SIZE as u64 {
-        0 => &[],
-        remainder => &ZERO_BLOCK[..(BLOCK_SIZE as u64 - remainder) as usize],
-    }
+    // `BLOCK_SIZE` is a power of two, so the low bits of the wrapped negation
+    // are the distance to the next block boundary, including zero when aligned.
+    let padding = size.wrapping_neg() & (BLOCK_SIZE as u64 - 1);
+    &ZERO_BLOCK[..padding as usize]
 }
 
 fn validate_member(member: PaxMember<'_>) -> Result<(), FramingWriteError> {
@@ -502,6 +503,9 @@ mod tests {
             (BLOCK_SIZE as u64, &[]),
             (1, &[0; BLOCK_SIZE - 1]),
             ((BLOCK_SIZE + 7) as u64, &[0; BLOCK_SIZE - 7]),
+            (u64::MAX - (BLOCK_SIZE as u64 - 1), &[]),
+            (u64::MAX - (BLOCK_SIZE as u64 - 2), &[0; BLOCK_SIZE - 1]),
+            (u64::MAX, &[0; 1]),
         ] {
             assert_eq!(payload_padding(size), expected, "{size}");
         }

@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/tar-codec", "crates/tar-framing", "crates/tarpit"]
+members = [
+    "crates/archive-trait",
+    "crates/tar-codec",
+    "crates/tar-framing",
+    "crates/tarpit",
+]
 
 [workspace.package]
 edition = "2024"
@@ -12,6 +17,7 @@ version = "0.1.0"
 readme = "README.md"
 
 [workspace.dependencies]
+archive-trait = { path = "crates/archive-trait" }
 tar-codec = { path = "crates/tar-codec" }
 tar-framing = { path = "crates/tar-framing" }
 

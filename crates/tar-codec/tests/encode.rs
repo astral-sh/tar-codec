@@ -6,10 +6,11 @@ use std::{
     task::{Context, Poll},
 };
 
+#[cfg(unix)]
+use tar_codec::builder::{BuilderPolicy, SymlinkPolicy};
 use tar_codec::{
-    decode::{Archive, DecodeError, DecodePolicy},
-    default_name_validator,
-    encode::{EncodeError, EncodePolicy, Encoder, EntryMetadata, TraversalError},
+    Archive as _, ArchiveBuilder as _, BuildError, EncodeError, EntryMetadata, TarArchive,
+    TarEncoder, extract::ExtractPolicy,
 };
 use tar_framing::{
     UstarKind,
@@ -43,16 +44,33 @@ impl AsyncWrite for FailingWriter {
 async fn encoded_paths(bytes: &[u8]) -> Vec<String> {
     let mut reader = TarReader::new(bytes);
     let mut paths = Vec::new();
-    while let Some(member) = reader.next_frame().await.unwrap() {
-        paths.push(String::from_utf8(member.effective_path().unwrap().into_owned()).unwrap());
-        member.payload.skip().await.unwrap();
+    while let Some(member) = reader
+        .next_frame()
+        .await
+        .expect("encoded archive should be readable")
+    {
+        paths.push(
+            String::from_utf8(
+                member
+                    .effective_path()
+                    .expect("encoded path should be valid")
+                    .into_owned(),
+            )
+            .expect("encoded path should be UTF-8"),
+        );
+        member
+            .payload
+            .skip()
+            .await
+            .expect("encoded payload should be valid");
     }
     paths
 }
 
 #[tokio::test]
-async fn manual_entries_round_trip_and_preserve_archive_names() {
-    let mut encoder = Encoder::new(Vec::new());
+async fn manual_entries_are_pax_framed_padded_terminated_and_extractable() {
+    let mut bytes = Vec::new();
+    let mut encoder = TarEncoder::new(&mut bytes).builder();
     encoder
         .add_entry(
             "bin/tool",
@@ -60,67 +78,66 @@ async fn manual_entries_round_trip_and_preserve_archive_names() {
             EntryMetadata::default().executable(true),
         )
         .await
-        .unwrap();
+        .expect("executable entry should be added");
     encoder
         .add_entry("README", b"hello", EntryMetadata::default())
         .await
-        .unwrap();
-    let bytes = encoder.finish().await.unwrap();
+        .expect("readme entry should be added");
+    encoder.finish().await.expect("archive should finish");
 
+    assert_eq!(bytes.len() % 512, 0);
+    assert!(bytes.ends_with(&[0; 1024]));
     assert_eq!(encoded_paths(&bytes).await, ["bin/tool", "README"]);
     let mut reader = TarReader::new(bytes.as_slice());
-    while let Some(member) = reader.next_frame().await.unwrap() {
-        assert!(matches!(&member.extensions, MemberExtensions::Pax(_)));
-        member.payload.skip().await.unwrap();
-    }
-    let temp = tempdir().unwrap();
-    let destination = temp.path().join("out");
-    Archive::new(bytes.as_slice())
-        .extract(&destination, DecodePolicy::default())
+    while let Some(member) = reader
+        .next_frame()
         .await
-        .unwrap();
-    assert_eq!(std::fs::read(destination.join("bin/tool")).unwrap(), b"run");
-    assert_eq!(std::fs::read(destination.join("README")).unwrap(), b"hello");
+        .expect("encoded archive should be readable")
+    {
+        assert!(matches!(&member.extensions, MemberExtensions::Pax(_)));
+        member
+            .payload
+            .skip()
+            .await
+            .expect("encoded payload should be valid");
+    }
+
+    let temp = tempdir().expect("temporary directory should be created");
+    let destination = temp.path().join("out");
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, ExtractPolicy::default())
+        .await
+        .expect("archive should extract");
+    assert_eq!(
+        std::fs::read(destination.join("bin/tool")).expect("tool should be readable"),
+        b"run"
+    );
+    assert_eq!(
+        std::fs::read(destination.join("README")).expect("readme should be readable"),
+        b"hello"
+    );
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt as _;
 
         assert_ne!(
             std::fs::metadata(destination.join("bin/tool"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o111,
-            0
-        );
-        assert_eq!(
-            std::fs::metadata(destination.join("README"))
-                .unwrap()
+                .expect("tool metadata should be readable")
                 .permissions()
                 .mode()
                 & 0o111,
             0
         );
     }
-
-    let mut encoder = Encoder::new(Vec::new());
-    for path in ["/absolute", "C:/ambiguous", "nested/../name", r"back\slash"] {
-        encoder
-            .add_entry(path, b"", EntryMetadata::default())
-            .await
-            .unwrap();
-    }
-    let bytes = encoder.finish().await.unwrap();
-    assert_eq!(
-        encoded_paths(&bytes).await,
-        ["/absolute", "C:/ambiguous", "nested/../name", r"back\slash",]
-    );
 }
 
 #[tokio::test]
-async fn manual_regular_entry_rejects_directory_required_suffix_before_writing() {
-    let mut encoder = Encoder::new(Vec::new());
+async fn tar_path_suffix_rejections_happen_before_output() {
+    let mut bytes = Vec::new();
+    let mut encoder = TarEncoder::new(&mut bytes).builder();
     for path in [
+        ".",
+        "..",
         "file/",
         "file/.",
         "file//.",
@@ -133,345 +150,120 @@ async fn manual_regular_entry_rejects_directory_required_suffix_before_writing()
             encoder
                 .add_entry(path, b"rejected", EntryMetadata::default())
                 .await,
-            Err(EncodeError::Framing(
+            Err(BuildError::Encoder(EncodeError::Framing(
                 FramingWriteError::DirectoryRequiredPathSuffix {
                     kind: UstarKind::Regular
                 }
-            ))
+            )))
         ));
     }
 
     encoder
         .add_entry("accepted", b"contents", EntryMetadata::default())
         .await
-        .expect("encoder should remain usable after preflight rejections");
-    let bytes = encoder.finish().await.expect("archive should finish");
+        .expect("framing preflight failures should leave the encoder usable");
+    encoder.finish().await.expect("archive should finish");
     assert_eq!(encoded_paths(&bytes).await, ["accepted"]);
 }
 
-/// The encoder must reject root-level `.` and `..` regular members just as it
-/// rejects those components when they follow an archive path separator.
 #[tokio::test]
-async fn manual_regular_entry_rejects_top_level_directory_components_before_writing() {
-    for path in [".", ".."] {
-        let mut encoder = Encoder::new(Vec::new());
-        assert!(matches!(
-            encoder
-                .add_entry(path, b"rejected", EntryMetadata::default())
-                .await,
-            Err(EncodeError::Framing(
-                FramingWriteError::DirectoryRequiredPathSuffix {
-                    kind: UstarKind::Regular
-                }
-            ))
-        ));
-    }
-}
-
-#[tokio::test]
-async fn manual_validation_and_collision_errors_leave_the_encoder_usable() {
-    let mut encoder = Encoder::new(Vec::new());
-    assert!(matches!(
-        encoder
-            .add_entry(" leading", b"", EntryMetadata::default())
-            .await,
-        Err(EncodeError::NameRejected {
-            context: "member path",
-            ..
-        })
-    ));
-    encoder
-        .add_entry("allowed", b"ok", EntryMetadata::default())
-        .await
-        .unwrap();
-    encoder
-        .add_entry("dir/file", b"first", EntryMetadata::default())
-        .await
-        .unwrap();
-    for path in ["dir/file", "dir/file/child"] {
-        assert!(matches!(
-            encoder.add_entry(path, b"", EntryMetadata::default()).await,
-            Err(EncodeError::PathCollision { .. })
-        ));
-    }
-    encoder
-        .add_entry("dir/other", b"other", EntryMetadata::default())
-        .await
-        .unwrap();
-    let bytes = encoder.finish().await.unwrap();
-    assert_eq!(
-        encoded_paths(&bytes).await,
-        ["allowed", "dir/file", "dir/other"]
-    );
-
-    let policy = EncodePolicy::default().name_validator(Some(|name| {
-        default_name_validator(name) && !name.contains("blocked")
-    }));
-    let mut encoder = Encoder::with_policy(Vec::new(), policy);
-    assert!(matches!(
-        encoder
-            .add_entry("blocked", b"", EntryMetadata::default())
-            .await,
-        Err(EncodeError::NameRejected { value, .. }) if value == "blocked"
-    ));
-
-    let policy = EncodePolicy::default().name_validator(None);
-    let mut encoder = Encoder::with_policy(Vec::new(), policy);
-    encoder
-        .add_entry(" leading", b"", EntryMetadata::default())
-        .await
-        .unwrap();
-    encoder.finish().await.unwrap();
-}
-
-#[tokio::test]
-async fn write_failures_and_late_collisions_poison_the_encoder() {
-    let mut encoder = Encoder::new(FailingWriter);
+async fn output_failures_poison_the_encoder() {
+    let mut encoder = TarEncoder::new(FailingWriter).builder();
     assert!(matches!(
         encoder
             .add_entry("file", b"contents", EntryMetadata::default())
             .await,
-        Err(EncodeError::Write { .. })
+        Err(BuildError::Encoder(EncodeError::Write { .. }))
     ));
     assert!(matches!(
         encoder
             .add_entry("other", b"", EntryMetadata::default())
             .await,
-        Err(EncodeError::Poisoned)
+        Err(BuildError::Poisoned)
     ));
-
-    let temp = tempdir().unwrap();
-    let source = temp.path().join("tree");
-    std::fs::create_dir(&source).unwrap();
-    std::fs::write(source.join("file"), "new").unwrap();
-    let mut encoder = Encoder::new(Vec::new());
-    encoder
-        .add_entry("tree/file", b"existing", EntryMetadata::default())
-        .await
-        .unwrap();
-    assert!(matches!(
-        encoder.add_directory(&source).await,
-        Err(EncodeError::PathCollision { .. })
-    ));
-    assert!(matches!(
-        encoder
-            .add_entry("other", b"", EntryMetadata::default())
-            .await,
-        Err(EncodeError::Poisoned)
-    ));
+    assert!(matches!(encoder.finish().await, Err(BuildError::Poisoned)));
 }
 
 #[tokio::test]
-async fn recursive_encoding_is_sorted_and_round_trips_small_and_large_files() {
+async fn recursive_encoding_round_trips_small_and_large_files() {
     const LARGE_FILE_BYTES: usize = 1024 * 1024 + 17;
 
-    let temp = tempdir().unwrap();
+    let temp = tempdir().expect("temporary directory should be created");
     let source = temp.path().join("tree");
-    std::fs::create_dir_all(source.join("sub")).unwrap();
-    std::fs::write(source.join("z"), "last").unwrap();
-    std::fs::write(source.join("a"), "first").unwrap();
-    std::fs::write(source.join("sub/file"), "nested").unwrap();
-    std::fs::write(source.join("sub/large"), vec![b'x'; LARGE_FILE_BYTES]).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(source.join("sub")).expect("source tree should be created");
+    std::fs::write(source.join("small"), b"small").expect("small file should be written");
+    std::fs::write(source.join("sub/large"), vec![b'x'; LARGE_FILE_BYTES])
+        .expect("large file should be written");
 
-        std::fs::set_permissions(source.join("a"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    let mut encoder = Encoder::new(Vec::new());
-    encoder.add_directory(&source).await.unwrap();
-    let bytes = encoder.finish().await.unwrap();
+    let mut bytes = Vec::new();
+    let mut encoder = TarEncoder::new(&mut bytes).builder();
+    encoder
+        .add_directory(&source)
+        .await
+        .expect("directory should be added");
+    encoder.finish().await.expect("archive should finish");
     assert_eq!(
         encoded_paths(&bytes).await,
-        [
-            "tree",
-            "tree/a",
-            "tree/sub",
-            "tree/sub/file",
-            "tree/sub/large",
-            "tree/z",
-        ]
+        ["tree", "tree/small", "tree/sub", "tree/sub/large"]
     );
 
     let destination = temp.path().join("out");
-    Archive::new(bytes.as_slice())
-        .extract(&destination, DecodePolicy::default())
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, ExtractPolicy::default())
         .await
-        .unwrap();
+        .expect("archive should extract");
     assert_eq!(
-        std::fs::read_to_string(destination.join("tree/sub/file")).unwrap(),
-        "nested"
+        std::fs::read(destination.join("tree/small")).expect("small file should be readable"),
+        b"small"
     );
     assert_eq!(
         std::fs::metadata(destination.join("tree/sub/large"))
-            .unwrap()
+            .expect("large file metadata should be readable")
             .len(),
         LARGE_FILE_BYTES as u64
     );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        assert_ne!(
-            std::fs::metadata(destination.join("tree/a"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o111,
-            0
-        );
-    }
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn recursive_encoding_preserves_symlinks_and_repeated_inodes() {
+async fn recursive_encoding_frames_preserved_symlinks() {
     use std::os::unix::fs::symlink;
 
-    let temp = tempdir().unwrap();
-    let source = temp.path().join("safe");
-    std::fs::create_dir_all(source.join("sub")).unwrap();
-    std::fs::write(source.join("sub/file"), "contents").unwrap();
-    std::fs::hard_link(source.join("sub/file"), source.join("copy")).unwrap();
-    symlink("sub", source.join("directory")).unwrap();
-    symlink("directory/file", source.join("file")).unwrap();
+    let temp = tempdir().expect("temporary directory should be created");
+    let source = temp.path().join("links");
+    std::fs::create_dir(&source).expect("source directory should be created");
+    std::fs::write(source.join("target"), b"contents").expect("target should be written");
+    symlink("target", source.join("link")).expect("symbolic link should be created");
 
-    let mut encoder = Encoder::new(Vec::new());
-    encoder.add_directory(&source).await.unwrap();
-    let bytes = encoder.finish().await.unwrap();
+    let policy = BuilderPolicy::default().symlink_policy(SymlinkPolicy::Preserve);
+    let mut bytes = Vec::new();
+    let mut encoder = TarEncoder::new(&mut bytes).builder_with_policy(policy);
+    encoder
+        .add_directory(&source)
+        .await
+        .expect("directory should be added");
+    encoder.finish().await.expect("archive should finish");
 
     let mut reader = TarReader::new(bytes.as_slice());
-    let mut regular_files = 0;
-    while let Some(member) = reader.next_frame().await.unwrap() {
-        if member.header.kind == UstarKind::Regular {
-            regular_files += 1;
+    let mut link = None;
+    while let Some(member) = reader
+        .next_frame()
+        .await
+        .expect("encoded archive should be readable")
+    {
+        if member.header.kind == UstarKind::SymbolicLink {
+            link = Some(
+                member
+                    .effective_link_path()
+                    .expect("link target should be valid")
+                    .into_owned(),
+            );
         }
-        member.payload.skip().await.unwrap();
+        member
+            .payload
+            .skip()
+            .await
+            .expect("encoded payload should be valid");
     }
-    assert_eq!(regular_files, 2);
-
-    let destination = temp.path().join("out");
-    Archive::new(bytes.as_slice())
-        .extract(&destination, DecodePolicy::default())
-        .await
-        .unwrap();
-    assert!(
-        std::fs::symlink_metadata(destination.join("safe/file"))
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-    assert_eq!(
-        std::fs::read_to_string(destination.join("safe/file")).unwrap(),
-        "contents"
-    );
-
-    let escape = temp.path().join("escape");
-    std::fs::create_dir(&escape).unwrap();
-    symlink("../../outside", escape.join("link")).unwrap();
-    let mut encoder = Encoder::new(Vec::new());
-    encoder.add_directory(&escape).await.unwrap();
-    let bytes = encoder.finish().await.unwrap();
-    assert!(matches!(
-        Archive::new(bytes.as_slice())
-            .extract(temp.path().join("escape-out"), DecodePolicy::default())
-            .await,
-        Err(DecodeError::UnsafePath {
-            context: "symbolic-link target",
-            ..
-        })
-    ));
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn recursive_source_and_validation_errors_are_reported_publicly() {
-    use std::{
-        ffi::OsString,
-        os::unix::{ffi::OsStringExt, fs::symlink},
-    };
-
-    let temp = tempdir().unwrap();
-    let target = temp.path().join("target");
-    std::fs::create_dir(&target).unwrap();
-    let linked_root = temp.path().join("linked-root");
-    symlink(&target, &linked_root).unwrap();
-    let mut encoder = Encoder::new(Vec::new());
-    assert!(matches!(
-        encoder.add_directory(&linked_root).await,
-        Err(EncodeError::Traversal(
-            TraversalError::SourceNotDirectory { .. }
-        ))
-    ));
-
-    let rejected_root = temp.path().join(" rejected");
-    std::fs::create_dir(&rejected_root).unwrap();
-    let mut encoder = Encoder::new(Vec::new());
-    assert!(matches!(
-        encoder.add_directory(&rejected_root).await,
-        Err(EncodeError::Traversal(TraversalError::NameRejected {
-            context: "member path",
-            ..
-        }))
-    ));
-
-    let custom_source = temp.path().join("custom-link");
-    std::fs::create_dir(&custom_source).unwrap();
-    symlink("blocked", custom_source.join("link")).unwrap();
-    let policy = EncodePolicy::default().name_validator(Some(|name| {
-        default_name_validator(name) && !name.contains("blocked")
-    }));
-    let mut encoder = Encoder::with_policy(Vec::new(), policy);
-    assert!(matches!(
-        encoder.add_directory(&custom_source).await,
-        Err(EncodeError::Traversal(TraversalError::NameRejected {
-            context: "symbolic-link target",
-            value,
-        })) if value == "blocked"
-    ));
-
-    let disabled_source = temp.path().join("disabled-link");
-    std::fs::create_dir(&disabled_source).unwrap();
-    symlink(" rejected", disabled_source.join("link")).unwrap();
-    let mut encoder =
-        Encoder::with_policy(Vec::new(), EncodePolicy::default().name_validator(None));
-    encoder.add_directory(&disabled_source).await.unwrap();
-    encoder.finish().await.unwrap();
-
-    let non_utf8_source = temp.path().join("non-utf8");
-    std::fs::create_dir(&non_utf8_source).unwrap();
-    let invalid = OsString::from_vec(vec![0xff]);
-    if std::fs::write(non_utf8_source.join(&invalid), "contents").is_ok() {
-        let mut encoder = Encoder::new(Vec::new());
-        assert!(matches!(
-            encoder.add_directory(&non_utf8_source).await,
-            Err(EncodeError::Traversal(
-                TraversalError::NonUtf8SourcePath { .. }
-            ))
-        ));
-    }
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn recursive_encoding_rejects_unsupported_filesystem_types() {
-    use std::os::unix::net::UnixListener;
-
-    let temp = tempdir().unwrap();
-    let source = temp.path().join("socket");
-    std::fs::create_dir(&source).unwrap();
-    let _listener = UnixListener::bind(source.join("listener")).unwrap();
-    let mut encoder = Encoder::new(Vec::new());
-    assert!(matches!(
-        encoder.add_directory(&source).await,
-        Err(EncodeError::Traversal(
-            TraversalError::UnsupportedFilesystemType { .. }
-        ))
-    ));
-    encoder
-        .add_entry("other", b"ok", EntryMetadata::default())
-        .await
-        .unwrap();
-    encoder.finish().await.unwrap();
+    assert_eq!(link.as_deref(), Some(&b"target"[..]));
 }

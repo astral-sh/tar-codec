@@ -1,20 +1,30 @@
 //! High-level decoding and encoding for tar archives.
 //!
-//! See [`decode`] for decoding/extraction and [`encode`] for pax encoding.
+//! See [`decode`] for tar decoding, [`encode`] for pax encoding,
+//! [`Builder`] for format-neutral construction, and
+//! [`Archive::extract_in`] for format-neutral extraction.
 //!
-//! ## Security
+//! ## Security and correctness
 //!
 //! Like other tar parsers, tar-codec assumes that it has unique access
-//! to the target directory (the "extraction root") when extracting.
-//! Concurrent mutation of the target directory is outside of the threat
-//! model.
+//! to the target directory (the "extraction root") when extracting,
+//! and to any targeted inputs when building a new archive.
+//! Concurrent mutation of files under the extraction root
+//! or of files being added to an archive is outside of the threat model.
+//!
 //! See the [repository's SECURITY.md](https://github.com/astral-sh/tar-codec/blob/main/SECURITY.md)
 //! for more information.
-
-mod blocking;
-mod name;
 
 pub mod decode;
 pub mod encode;
 
-pub use name::{NameValidator, default_name_validator};
+pub use archive_trait::{
+    Archive, ArchiveBuilder, BuildError, Builder, EntryMetadata, ExtractError,
+    ExtractPolicyViolation, LentPayload, Member, MemberMetadata, MemberPayload, Members,
+    NameValidator, SpecialKind, TraversalError, default_name_validator,
+};
+pub use archive_trait::{builder, extract};
+pub use decode::{
+    DecodeError, DecodePolicy, DecodePolicyViolation, PaxDecodePolicy, TarArchive, TarMemberPayload,
+};
+pub use encode::{EncodeError, TarEncoder};

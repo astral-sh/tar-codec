@@ -1,8 +1,10 @@
-//! Filesystem extraction implementation and its private support types.
+//! Format-neutral archive extraction.
 
 use std::{
     collections::{HashMap, HashSet},
     fs as std_fs,
+    marker::PhantomData,
+    path::Component,
     sync::Arc,
 };
 
@@ -13,13 +15,154 @@ use cap_std::{
     ambient_authority,
     fs::{Dir, Metadata, OpenOptions},
 };
-use tar_framing::logical::MemberPayload;
 use tokio::{fs::File, io::AsyncWriteExt};
 #[cfg(windows)]
 use {
     cap_std::fs::MetadataExt as _, std::os::windows::fs::MetadataExt as _,
     windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT,
 };
+
+/// Controls generic archive extraction behavior.
+///
+/// See each configuration API for its default.
+#[derive(Clone, Copy, Debug)]
+pub struct ExtractPolicy {
+    pub(crate) link_policy: LinkPolicy,
+    pub(crate) allow_overwrites: bool,
+    pub(crate) name_validation: crate::name::NameValidation,
+}
+
+/// Controls how symbolic- and hard-link members are extracted.
+///
+/// By default, symbolic links are preserved as native links, including links
+/// to missing targets. Hard links and ambient symbolic-link targets require
+/// explicit opt-in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinkPolicy {
+    pub(crate) symlink_policy: SymlinkPolicy,
+    pub(crate) allow_hard_links: bool,
+    pub(crate) allow_ambient_targets: bool,
+    pub(crate) allow_missing_targets: bool,
+}
+
+/// Controls how symbolic-link members are handled during extraction.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SymlinkPolicy {
+    /// Preserve symbolic-link members as native filesystem links.
+    #[default]
+    Preserve,
+    /// Ignore symbolic-link members without changing the filesystem.
+    Skip,
+    /// Reject archives containing symbolic-link members.
+    Reject,
+}
+
+impl Default for ExtractPolicy {
+    fn default() -> Self {
+        Self {
+            link_policy: LinkPolicy::default(),
+            allow_overwrites: true,
+            name_validation: crate::name::NameValidation::Default,
+        }
+    }
+}
+
+impl Default for LinkPolicy {
+    fn default() -> Self {
+        Self {
+            symlink_policy: SymlinkPolicy::default(),
+            allow_hard_links: false,
+            allow_ambient_targets: false,
+            allow_missing_targets: true,
+        }
+    }
+}
+
+impl ExtractPolicy {
+    /// Configures symbolic- and hard-link extraction behavior.
+    pub fn link_policy(mut self, policy: LinkPolicy) -> Self {
+        self.link_policy = policy;
+        self
+    }
+
+    /// Configures whether archive members may replace existing entries.
+    ///
+    /// Overwrites are **allowed by default**. Replacement never follows
+    /// symbolic links or recursively removes non-empty directories. Real
+    /// directories are always reused, including when overwrites are disabled.
+    pub fn allow_overwrites(mut self, allow: bool) -> Self {
+        self.allow_overwrites = allow;
+        self
+    }
+
+    /// Configures validation for member names and link targets.
+    ///
+    /// Passing [`None`] disables configurable name validation. UTF-8 and
+    /// extraction containment requirements still apply.
+    pub fn name_validator(mut self, validator: Option<NameValidator>) -> Self {
+        self.name_validation = crate::name::NameValidation::from_validator(validator);
+        self
+    }
+
+    fn check_name<E>(
+        self,
+        position: u64,
+        context: &'static str,
+        value: &str,
+    ) -> Result<(), ExtractError<E>> {
+        if !self.name_validation.accepts(value) {
+            return Err(ExtractError::policy_violation(
+                position,
+                ExtractPolicyViolation::NameRejected {
+                    context,
+                    value: value.to_owned(),
+                },
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl LinkPolicy {
+    /// Configures how symbolic-link members are handled during extraction.
+    ///
+    /// Symbolic links are preserved by default. Platforms without native
+    /// symbolic-link creation require [`SymlinkPolicy::Skip`] or
+    /// [`SymlinkPolicy::Reject`].
+    pub fn symlink_policy(mut self, policy: SymlinkPolicy) -> Self {
+        self.symlink_policy = policy;
+        self
+    }
+
+    /// Configures whether hard-link members may be extracted.
+    ///
+    /// Hard links are **forbidden by default** because they are uncommon,
+    /// difficult to extract consistently, and prone to implementation
+    /// differentials. Enable them only for trusted archives.
+    pub fn allow_hard_links(mut self, allow: bool) -> Self {
+        self.allow_hard_links = allow;
+        self
+    }
+
+    /// Configures whether pre-existing symbolic-link targets may be used.
+    ///
+    /// Existing symbolic links are followed only when capability-relative
+    /// resolution remains beneath the extraction root. Ambient targets are
+    /// **forbidden by default**. This does not affect hard-link validation.
+    pub fn allow_ambient_targets(mut self, allow: bool) -> Self {
+        self.allow_ambient_targets = allow;
+        self
+    }
+
+    /// Configures whether symbolic links to missing targets may be extracted.
+    ///
+    /// Missing symbolic-link targets are **allowed by default**. This does not
+    /// affect hard-link validation.
+    pub fn allow_missing_targets(mut self, allow: bool) -> Self {
+        self.allow_missing_targets = allow;
+        self
+    }
+}
 
 /// A symbolic link awaiting graph validation and final extraction.
 ///
@@ -36,8 +179,8 @@ struct PendingSymlink {
 }
 
 impl PendingSymlink {
-    fn error(&self, reason: &'static str) -> DecodeError {
-        DecodeError::invalid_link(
+    fn error<E>(&self, reason: &'static str) -> ExtractError<E> {
+        ExtractError::invalid_link(
             self.position,
             self.path.clone(),
             self.target.clone(),
@@ -62,12 +205,6 @@ enum ExtractedEntry {
     Symlink,
 }
 
-impl ExtractedEntry {
-    fn is_directory(self) -> bool {
-        matches!(self, Self::CreatedDirectory | Self::AmbientDirectory)
-    }
-}
-
 /// Why extraction requires a directory at a particular path.
 ///
 /// Explicit directory members participate in normal exact-path overwrite
@@ -82,7 +219,7 @@ enum DirectoryPurpose {
 }
 
 /// Represents a root directory for an extraction operation.
-struct ExtractionRoot {
+struct ExtractionRoot<E> {
     /// The capability anchoring all extraction filesystem operations.
     directory: Arc<Dir>,
     /// Capabilities for known directories, used to keep leaf operations cheap.
@@ -92,6 +229,7 @@ struct ExtractionRoot {
     entries: HashMap<PathBuf, ExtractedEntry>,
     symlink_indices: HashMap<PathBuf, usize>,
     symlinks: Vec<PendingSymlink>,
+    error: PhantomData<fn() -> E>,
 }
 
 /// The filesystem shape of a fully resolved symbolic-link target, used to
@@ -118,102 +256,350 @@ enum ResolvedTarget {
     Unowned(PathBuf),
 }
 
-impl<R: AsyncRead + Unpin> Archive<R> {
-    /// Securely extracts this archive beneath `dest` under `policy`.
-    ///
-    /// `dest` is created if it does not already exist.
-    ///
-    /// `policy` controls extraction semantics, including overwrite behavior.
-    /// See [`DecodePolicy`] for information about each option and its default.
-    /// By default, symbolic-link members are preserved as native links. On
-    /// non-Unix platforms, symbolic-link members must be skipped or rejected through
-    /// [`LinkPolicy`].
-    ///
-    /// Archived Unix permission modes are normalized rather than restored. New
-    /// regular files are created with mode `0o777` when any archived execute bit
-    /// is set and `0o666` otherwise, in both cases filtered by the process umask.
-    /// Directories use the platform's default creation mode, and special mode
-    /// bits are not restored. Callers extracting sensitive contents should
-    /// pre-create `dest` and its ancestors with suitably restrictive permissions.
-    /// Archived owner and group metadata, including PAX `uid`, `gid`, `uname`,
-    /// and `gname` records, is not restored. Filesystem ownership is instead
-    /// determined by the extracting process and destination directory.
-    /// Archived access, modification, and status-change timestamps are also not
-    /// restored; filesystem timestamps reflect extraction activity.
-    ///
-    /// **IMPORTANT**: `dest` **MUST NOT** be concurrently modified during extraction.
-    /// No correctness/isolation guarantees are made if `dest` is externally modified.
-    ///
-    /// **IMPORTANT**: extraction occurs in a streamwise fashion, meaning that a late
-    /// error can leave a partially extracted state under `dest`. Users that require
-    /// "all or nothing" behavior should attempt extraction in a new temporary
-    /// directory, and then atomically rename that directory to `dest`.
-    pub async fn extract<P: AsRef<Path>>(
-        mut self,
-        dest: P,
-        policy: DecodePolicy,
-    ) -> Result<(), DecodeError> {
-        self.reader
-            .set_max_pax_extension_size(policy.pax_policy.max_extension_size);
-        let mut root = ExtractionRoot::open(dest.as_ref(), policy.allow_overwrites).await?;
-        let mut payload_chunk = Vec::new();
-        while let Some(frame) = self.reader.next_frame().await? {
-            policy.check_member(&frame)?;
-            let member = decode_member(&frame, &policy)?;
-            match member.kind {
-                UstarKind::Regular | UstarKind::Contiguous => {
-                    root.extract_file(&member, frame.payload, &mut payload_chunk)
-                        .await?;
-                }
-                UstarKind::Directory => {
-                    root.extract_directory(&member.path).await?;
-                    frame.payload.skip().await?;
-                }
-                UstarKind::SymbolicLink => {
-                    if policy.link_policy.symlink_policy == SymlinkPolicy::Preserve {
-                        root.reserve_symlink(&member).await?;
-                    }
-                    frame.payload.skip().await?;
-                }
-                UstarKind::HardLink => {
-                    root.extract_hard_link(&member, frame.payload, &mut payload_chunk)
-                        .await?;
-                }
-                UstarKind::CharacterDevice | UstarKind::BlockDevice | UstarKind::Fifo => {
-                    return Err(DecodeError::UnsupportedMember {
-                        position: member.position,
-                        path: member.path,
-                        kind: member.kind,
-                    });
+pub(crate) async fn extract<A: Archive>(
+    mut members: Members<A>,
+    destination: &Path,
+    policy: ExtractPolicy,
+) -> Result<(), ExtractError<A::Error>> {
+    let mut root = ExtractionRoot::<A::Error>::open(destination, policy.allow_overwrites).await?;
+    // Scratch space reused for each payload read and streamed directly for large files.
+    let mut chunk_buffer = Vec::new();
+    // Complete small-file contents, buffered so payload validation precedes file creation.
+    let mut buffered_payload = Vec::new();
+    while let Some(member) = members.next().await.map_err(ExtractError::Archive)? {
+        check_member_policy(&member, policy)?;
+        let decoded = decode_member(&member, policy)?;
+        match member {
+            Member::File {
+                size,
+                executable,
+                payload,
+                ..
+            } => {
+                root.extract_file(
+                    &decoded.path,
+                    size,
+                    executable,
+                    payload,
+                    &mut chunk_buffer,
+                    &mut buffered_payload,
+                )
+                .await?;
+            }
+            Member::Directory { .. } => root.extract_directory(&decoded.path).await?,
+            Member::SymbolicLink { .. } => {
+                if policy.link_policy.symlink_policy == SymlinkPolicy::Preserve {
+                    root.reserve_symlink(&decoded).await?;
                 }
             }
+            Member::HardLink { size, payload, .. } => {
+                root.extract_hard_link(&decoded, size, payload, &mut chunk_buffer)
+                    .await?;
+            }
+            Member::Special { kind, .. } => {
+                return Err(ExtractError::UnsupportedMember {
+                    position: decoded.position,
+                    path: decoded.path,
+                    kind,
+                });
+            }
         }
-        root.finalize_symlinks(policy.link_policy).await
     }
+    root.finalize_symlinks(policy.link_policy).await
 }
 
-async fn write_payload<R: AsyncRead + Unpin>(
-    mut payload: MemberPayload<'_, R>,
-    payload_chunk: &mut Vec<u8>,
-    path: &Path,
-    mut file: File,
-) -> Result<(), DecodeError> {
-    while payload
-        .next_chunk(payload_chunk, EXTRACTION_CHUNK_BYTES)
-        .await?
-    {
-        file.write_all(payload_chunk)
-            .await
-            .map_err(|source| DecodeError::filesystem("write file", path.to_owned(), source))?;
+fn check_member_policy<E, P>(
+    member: &Member<P>,
+    policy: ExtractPolicy,
+) -> Result<(), ExtractError<E>> {
+    let position = member.metadata().position;
+    match member {
+        Member::SymbolicLink { .. } => {
+            let violation = match policy.link_policy.symlink_policy {
+                SymlinkPolicy::Reject => Some(ExtractPolicyViolation::SymbolicLink),
+                #[cfg(not(unix))]
+                SymlinkPolicy::Preserve => {
+                    Some(ExtractPolicyViolation::NativeSymlinkCreationUnsupported)
+                }
+                _ => None,
+            };
+            if let Some(violation) = violation {
+                return Err(ExtractError::policy_violation(position, violation));
+            }
+        }
+        Member::HardLink { .. } if !policy.link_policy.allow_hard_links => {
+            return Err(ExtractError::policy_violation(
+                position,
+                ExtractPolicyViolation::HardLink,
+            ));
+        }
+        _ => {}
     }
-    file.flush()
-        .await
-        .map_err(|source| DecodeError::filesystem("flush file", path.to_owned(), source))?;
     Ok(())
 }
 
-impl ExtractionRoot {
-    async fn open(dest: &Path, allow_overwrites: bool) -> Result<Self, DecodeError> {
+#[derive(Debug)]
+struct ExtractMember {
+    position: u64,
+    path: PathBuf,
+    link_target: String,
+}
+
+fn decode_member<E, P>(
+    member: &Member<P>,
+    policy: ExtractPolicy,
+) -> Result<ExtractMember, ExtractError<E>> {
+    let metadata = member.metadata();
+    policy.check_name(metadata.position, "member path", &metadata.path)?;
+
+    if !matches!(member, Member::Directory { .. })
+        && (metadata.path.ends_with('/')
+            || metadata
+                .path
+                .rsplit_once('/')
+                .is_some_and(|(_, component)| matches!(component, "." | "..")))
+    {
+        return Err(ExtractError::unsafe_path(
+            metadata.position,
+            "member path",
+            &metadata.path,
+            "only a directory may have a directory-required path suffix",
+        ));
+    }
+    let path = normalize_member_path(metadata.position, &metadata.path)?;
+    if path.as_os_str().is_empty() && !matches!(member, Member::Directory { .. }) {
+        return Err(ExtractError::unsafe_path(
+            metadata.position,
+            "member path",
+            &metadata.path,
+            "only a directory may resolve to the extraction root",
+        ));
+    }
+    let link_target = match member {
+        Member::SymbolicLink { target, .. } => {
+            policy.check_name(metadata.position, "symbolic-link target", target)?;
+            target
+        }
+        Member::HardLink { target, .. } => {
+            policy.check_name(metadata.position, "hard-link target", target)?;
+            target
+        }
+        _ => "",
+    };
+    if link_target.is_empty()
+        && matches!(
+            member,
+            Member::SymbolicLink { .. } | Member::HardLink { .. }
+        )
+    {
+        return Err(ExtractError::invalid_link(
+            metadata.position,
+            path,
+            link_target.to_owned(),
+            "link target is empty",
+        ));
+    }
+    Ok(ExtractMember {
+        position: metadata.position,
+        path,
+        link_target: link_target.to_owned(),
+    })
+}
+
+fn normalize_member_path<E>(position: u64, value: &str) -> Result<PathBuf, ExtractError<E>> {
+    validate_extraction_path(position, "member path", value)?;
+    let mut path = PathBuf::new();
+    for component in Path::new(value).components() {
+        match component {
+            Component::Prefix(_) => {
+                return Err(ExtractError::unsafe_path(
+                    position,
+                    "member path",
+                    value,
+                    "contains a platform path prefix",
+                ));
+            }
+            Component::RootDir => {
+                return Err(ExtractError::unsafe_path(
+                    position,
+                    "member path",
+                    value,
+                    "is absolute",
+                ));
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(ExtractError::unsafe_path(
+                    position,
+                    "member path",
+                    value,
+                    "contains a parent-directory component",
+                ));
+            }
+            Component::Normal(component) => path.push(component),
+        }
+    }
+    Ok(path)
+}
+
+struct ValidatedSymlinkTarget {
+    resolved_target: PathBuf,
+    requires_directory: bool,
+}
+
+fn validate_symlink_target<E>(
+    position: u64,
+    path: &Path,
+    value: &str,
+) -> Result<ValidatedSymlinkTarget, ExtractError<E>> {
+    validate_extraction_path(position, "symbolic-link target", value)?;
+    let base = path.parent().unwrap_or_else(|| Path::new(""));
+    let mut resolved = base.to_owned();
+    let mut normal_component_seen = false;
+    for component in Path::new(value).components() {
+        match component {
+            Component::Prefix(_) => {
+                return Err(ExtractError::unsafe_path(
+                    position,
+                    "symbolic-link target",
+                    value,
+                    "contains a platform path prefix",
+                ));
+            }
+            Component::RootDir => {
+                return Err(ExtractError::unsafe_path(
+                    position,
+                    "symbolic-link target",
+                    value,
+                    "is absolute",
+                ));
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normal_component_seen {
+                    return Err(ExtractError::unsafe_path(
+                        position,
+                        "symbolic-link target",
+                        value,
+                        "contains ambiguous parent-directory traversal",
+                    ));
+                }
+                if !resolved.pop() {
+                    return Err(ExtractError::unsafe_path(
+                        position,
+                        "symbolic-link target",
+                        value,
+                        "escapes the destination root",
+                    ));
+                }
+            }
+            Component::Normal(component) => {
+                normal_component_seen = true;
+                resolved.push(component);
+            }
+        }
+    }
+    Ok(ValidatedSymlinkTarget {
+        resolved_target: resolved,
+        requires_directory: value.ends_with('/')
+            || matches!(value.rsplit('/').next(), Some("." | "..")),
+    })
+}
+
+fn validate_extraction_path<E>(
+    position: u64,
+    context: &'static str,
+    value: &str,
+) -> Result<(), ExtractError<E>> {
+    if value.contains('\\') {
+        return Err(ExtractError::unsafe_path(
+            position,
+            context,
+            value,
+            "contains a backslash separator",
+        ));
+    }
+    if value.starts_with('/') {
+        return Err(ExtractError::unsafe_path(
+            position,
+            context,
+            value,
+            "is absolute",
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_link_target<E>(
+    position: u64,
+    context: &'static str,
+    value: &str,
+    base: &Path,
+) -> Result<PathBuf, ExtractError<E>> {
+    validate_extraction_path(position, context, value)?;
+    let mut path = base.to_owned();
+    for component in Path::new(value).components() {
+        match component {
+            Component::Prefix(_) => {
+                return Err(ExtractError::unsafe_path(
+                    position,
+                    context,
+                    value,
+                    "contains a platform path prefix",
+                ));
+            }
+            Component::RootDir => {
+                return Err(ExtractError::unsafe_path(
+                    position,
+                    context,
+                    value,
+                    "is absolute",
+                ));
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !path.pop() {
+                    return Err(ExtractError::unsafe_path(
+                        position,
+                        context,
+                        value,
+                        "escapes the destination root",
+                    ));
+                }
+            }
+            Component::Normal(component) => path.push(component),
+        }
+    }
+    Ok(path)
+}
+
+async fn write_payload<P: MemberPayload>(
+    mut payload: P,
+    chunk_buffer: &mut Vec<u8>,
+    path: &Path,
+    mut file: File,
+) -> Result<(), ExtractError<P::Error>> {
+    loop {
+        chunk_buffer.clear();
+        if !payload
+            .next_chunk(chunk_buffer, EXTRACTION_CHUNK_BYTES)
+            .await
+            .map_err(ExtractError::Archive)?
+        {
+            break;
+        }
+        file.write_all(chunk_buffer)
+            .await
+            .map_err(|source| ExtractError::filesystem("write file", path.to_owned(), source))?;
+    }
+    file.flush()
+        .await
+        .map_err(|source| ExtractError::filesystem("flush file", path.to_owned(), source))?;
+    Ok(())
+}
+
+impl<E> ExtractionRoot<E> {
+    async fn open(dest: &Path, allow_overwrites: bool) -> Result<Self, ExtractError<E>> {
         let dest = dest.to_owned();
         let error_path = dest.clone();
         let directory = tokio::task::spawn_blocking(move || {
@@ -237,9 +623,9 @@ impl ExtractionRoot {
             Ok(Arc::new(directory))
         })
         .await
-        .map_err(DecodeError::BlockingTask)?
+        .map_err(ExtractError::<E>::BlockingTask)?
         .map_err(|source| {
-            DecodeError::filesystem("open destination directory", error_path, source)
+            ExtractError::<E>::filesystem("open destination directory", error_path, source)
         })?;
 
         Ok(Self {
@@ -249,36 +635,49 @@ impl ExtractionRoot {
             entries: HashMap::new(),
             symlink_indices: HashMap::new(),
             symlinks: Vec::new(),
+            error: PhantomData,
         })
     }
 
-    async fn extract_file<R: AsyncRead + Unpin>(
+    async fn extract_file<P: MemberPayload<Error = E>>(
         &mut self,
-        member: &DecodedMember,
-        mut payload: MemberPayload<'_, R>,
-        payload_chunk: &mut Vec<u8>,
-    ) -> Result<(), DecodeError> {
-        if member.effective_size <= EXTRACTION_CHUNK_BYTES as u64 {
-            payload_chunk.clear();
-            if member.effective_size != 0 {
-                payload
-                    .next_chunk(payload_chunk, EXTRACTION_CHUNK_BYTES)
-                    .await?;
+        path: &Path,
+        size: u64,
+        executable: bool,
+        mut payload: P,
+        chunk_buffer: &mut Vec<u8>,
+        buffered_payload: &mut Vec<u8>,
+    ) -> Result<(), ExtractError<E>> {
+        if size <= EXTRACTION_CHUNK_BYTES as u64 {
+            buffered_payload.clear();
+            if let Ok(payload_size) = usize::try_from(size) {
+                buffered_payload.reserve(payload_size);
             }
-            let mut file = self.create_file(&member.path, member.executable).await?;
-            file.write_all(payload_chunk).await.map_err(|source| {
-                DecodeError::filesystem("write file", member.path.clone(), source)
+            loop {
+                chunk_buffer.clear();
+                if !payload
+                    .next_chunk(chunk_buffer, EXTRACTION_CHUNK_BYTES)
+                    .await
+                    .map_err(ExtractError::Archive)?
+                {
+                    break;
+                }
+                buffered_payload.extend_from_slice(chunk_buffer);
+            }
+            let mut file = self.create_file(path, executable).await?;
+            file.write_all(buffered_payload).await.map_err(|source| {
+                ExtractError::filesystem("write file", path.to_owned(), source)
             })?;
             file.flush().await.map_err(|source| {
-                DecodeError::filesystem("flush file", member.path.clone(), source)
+                ExtractError::filesystem("flush file", path.to_owned(), source)
             })?;
             return Ok(());
         }
-        let file = self.create_file(&member.path, member.executable).await?;
-        write_payload(payload, payload_chunk, &member.path, file).await
+        let file = self.create_file(path, executable).await?;
+        write_payload(payload, chunk_buffer, path, file).await
     }
 
-    async fn extract_directory(&mut self, path: &Path) -> Result<(), DecodeError> {
+    async fn extract_directory(&mut self, path: &Path) -> Result<(), ExtractError<E>> {
         if !path.as_os_str().is_empty() {
             self.ensure_parents(path).await?;
             self.ensure_directory(path, DirectoryPurpose::ExplicitMember)
@@ -287,7 +686,11 @@ impl ExtractionRoot {
         Ok(())
     }
 
-    async fn create_file(&mut self, path: &Path, executable: bool) -> Result<File, DecodeError> {
+    async fn create_file(
+        &mut self,
+        path: &Path,
+        executable: bool,
+    ) -> Result<File, ExtractError<E>> {
         self.ensure_parents(path).await?;
         if self.symlink_indices.contains_key(path) {
             self.replace_leaf(path).await?;
@@ -309,7 +712,7 @@ impl ExtractionRoot {
         Ok(file)
     }
 
-    async fn reserve_symlink(&mut self, member: &DecodedMember) -> Result<(), DecodeError> {
+    async fn reserve_symlink(&mut self, member: &ExtractMember) -> Result<(), ExtractError<E>> {
         let target = validate_symlink_target(member.position, &member.path, &member.link_target)?;
         self.ensure_parents(&member.path).await?;
         self.replace_leaf(&member.path).await?;
@@ -327,12 +730,13 @@ impl ExtractionRoot {
         Ok(())
     }
 
-    async fn extract_hard_link<R: AsyncRead + Unpin>(
+    async fn extract_hard_link<P: MemberPayload<Error = E>>(
         &mut self,
-        member: &DecodedMember,
-        payload: MemberPayload<'_, R>,
-        payload_chunk: &mut Vec<u8>,
-    ) -> Result<(), DecodeError> {
+        member: &ExtractMember,
+        size: u64,
+        payload: P,
+        chunk_buffer: &mut Vec<u8>,
+    ) -> Result<(), ExtractError<E>> {
         let target_text = member.link_target.clone();
         let target = resolve_link_target(
             member.position,
@@ -350,7 +754,7 @@ impl ExtractionRoot {
             None
         };
         if let Some(reason) = reason {
-            return Err(DecodeError::invalid_link(
+            return Err(ExtractError::invalid_link(
                 member.position,
                 member.path.clone(),
                 target_text,
@@ -365,18 +769,18 @@ impl ExtractionRoot {
         .await?;
         self.entries
             .insert(member.path.clone(), ExtractedEntry::File);
-        if member.effective_size == 0 {
-            payload.skip().await?;
+        if size == 0 {
+            payload.skip().await.map_err(ExtractError::Archive)?;
             Ok(())
         } else {
             let file = self
                 .open_file("truncate file", &member.path, false, true, false)
                 .await?;
-            write_payload(payload, payload_chunk, &member.path, file).await
+            write_payload(payload, chunk_buffer, &member.path, file).await
         }
     }
 
-    async fn ensure_parents(&mut self, path: &Path) -> Result<(), DecodeError> {
+    async fn ensure_parents(&mut self, path: &Path) -> Result<(), ExtractError<E>> {
         let Some(parent) = path.parent() else {
             return Ok(());
         };
@@ -393,15 +797,16 @@ impl ExtractionRoot {
         &mut self,
         path: &Path,
         purpose: DirectoryPurpose,
-    ) -> Result<(), DecodeError> {
-        if let Some(entry) = self.entries.get(path).copied()
-            && entry.is_directory()
-        {
+    ) -> Result<(), ExtractError<E>> {
+        if matches!(
+            self.entries.get(path),
+            Some(ExtractedEntry::CreatedDirectory | ExtractedEntry::AmbientDirectory)
+        ) {
             return Ok(());
         }
         if self.entries.contains_key(path) {
             if purpose == DirectoryPurpose::ImplicitParent {
-                return Err(DecodeError::PathCollision {
+                return Err(ExtractError::<E>::PathCollision {
                     path: path.to_owned(),
                 });
             }
@@ -423,7 +828,11 @@ impl ExtractionRoot {
             .as_ref()
             .is_some_and(|metadata| metadata.is_dir() && !metadata_is_link(metadata))
         {
-            let directory = self.open_directory(path).await?;
+            let directory = self
+                .with_entry_parent("open directory", path, |directory, path| {
+                    directory.open_dir(path)
+                })
+                .await?;
             self.directory_handles
                 .insert(path.to_owned(), Arc::new(directory));
             self.entries
@@ -434,7 +843,7 @@ impl ExtractionRoot {
             return Err(create_error);
         }
         if purpose == DirectoryPurpose::ImplicitParent {
-            return Err(DecodeError::PathCollision {
+            return Err(ExtractError::<E>::PathCollision {
                 path: path.to_owned(),
             });
         }
@@ -447,13 +856,18 @@ impl ExtractionRoot {
         Ok(())
     }
 
-    async fn replace_leaf(&mut self, path: &Path) -> Result<bool, DecodeError> {
+    async fn replace_leaf(&mut self, path: &Path) -> Result<bool, ExtractError<E>> {
         let metadata = self.metadata(path).await?;
         if metadata.is_none() && !self.entries.contains_key(path) {
             return Ok(false);
         }
-        if !self.allow_overwrites || self.has_descendant(path) {
-            return Err(DecodeError::PathCollision {
+        if !self.allow_overwrites
+            || self
+                .entries
+                .keys()
+                .any(|candidate| candidate != path && candidate.starts_with(path))
+        {
+            return Err(ExtractError::<E>::PathCollision {
                 path: path.to_owned(),
             });
         }
@@ -465,13 +879,7 @@ impl ExtractionRoot {
         Ok(true)
     }
 
-    fn has_descendant(&self, path: &Path) -> bool {
-        self.entries
-            .keys()
-            .any(|candidate| candidate != path && candidate.starts_with(path))
-    }
-
-    async fn finalize_symlinks(&self, policy: LinkPolicy) -> Result<(), DecodeError> {
+    async fn finalize_symlinks(&self, policy: LinkPolicy) -> Result<(), ExtractError<E>> {
         let mut links = Vec::with_capacity(self.symlinks.len());
         for (index, link) in self.symlinks.iter().enumerate() {
             if self.symlink_indices.get(&link.path) != Some(&index) {
@@ -573,7 +981,7 @@ impl ExtractionRoot {
     async fn inspect_ambient_target(
         &self,
         path: &Path,
-    ) -> Result<(TerminalKind, bool), DecodeError> {
+    ) -> Result<(TerminalKind, bool), ExtractError<E>> {
         self.with_root("inspect symbolic-link target", path, |directory, path| {
             if path.as_os_str().is_empty() {
                 return Ok((TerminalKind::Directory, false));
@@ -603,7 +1011,7 @@ impl ExtractionRoot {
         .await
     }
 
-    async fn metadata(&self, path: &Path) -> Result<Option<Metadata>, DecodeError> {
+    async fn metadata(&self, path: &Path) -> Result<Option<Metadata>, ExtractError<E>> {
         self.with_entry_parent("inspect", path, |directory, path| {
             match directory.symlink_metadata(path) {
                 Ok(metadata) => Ok(Some(metadata)),
@@ -614,7 +1022,11 @@ impl ExtractionRoot {
         .await
     }
 
-    async fn remove_leaf(&mut self, path: &Path, metadata: &Metadata) -> Result<(), DecodeError> {
+    async fn remove_leaf(
+        &mut self,
+        path: &Path,
+        metadata: &Metadata,
+    ) -> Result<(), ExtractError<E>> {
         if metadata.is_dir() && !metadata_is_link(metadata) {
             let is_empty = self
                 .with_entry_parent("inspect directory", path, |root, path| {
@@ -624,7 +1036,7 @@ impl ExtractionRoot {
                 })
                 .await?;
             if !is_empty {
-                return Err(DecodeError::PathCollision {
+                return Err(ExtractError::<E>::PathCollision {
                     path: path.to_owned(),
                 });
             }
@@ -661,7 +1073,7 @@ impl ExtractionRoot {
         create_new: bool,
         truncate: bool,
         executable: bool,
-    ) -> Result<File, DecodeError> {
+    ) -> Result<File, ExtractError<E>> {
         let file = self
             .with_entry_parent(operation, path, move |directory, path| {
                 let mut options = OpenOptions::new();
@@ -681,16 +1093,9 @@ impl ExtractionRoot {
         Ok(File::from_std(file))
     }
 
-    async fn create_directory(&self, path: &Path) -> Result<Dir, DecodeError> {
+    async fn create_directory(&self, path: &Path) -> Result<Dir, ExtractError<E>> {
         self.with_entry_parent("create directory", path, |directory, path| {
             directory.create_dir(path)?;
-            directory.open_dir(path)
-        })
-        .await
-    }
-
-    async fn open_directory(&self, path: &Path) -> Result<Dir, DecodeError> {
-        self.with_entry_parent("open directory", path, |directory, path| {
             directory.open_dir(path)
         })
         .await
@@ -706,7 +1111,7 @@ impl ExtractionRoot {
         operation: &'static str,
         path: &Path,
         action: F,
-    ) -> Result<T, DecodeError>
+    ) -> Result<T, ExtractError<E>>
     where
         T: Send + 'static,
         F: FnOnce(&Dir, &Path) -> io::Result<T> + Send + 'static,
@@ -732,7 +1137,7 @@ impl ExtractionRoot {
         operation: &'static str,
         path: &Path,
         action: F,
-    ) -> Result<T, DecodeError>
+    ) -> Result<T, ExtractError<E>>
     where
         T: Send + 'static,
         F: FnOnce(&Dir, &Path) -> io::Result<T> + Send + 'static,
@@ -762,27 +1167,25 @@ impl ExtractionRoot {
 /// name when a cached parent capability is available. `error_path` is the full
 /// root-relative archive path used for diagnostics; it is never passed to the
 /// filesystem. Keeping the paths separate avoids repeated path traversal
-/// without losing useful [`DecodeError::Filesystem`] context.
+/// without losing useful [`ExtractError::Filesystem`] context.
 ///
 /// Filesystem errors are annotated with `operation` and `error_path`, while a
-/// failure to join the blocking task becomes [`DecodeError::BlockingTask`].
-async fn run_blocking<T, F>(
+/// failure to join the blocking task becomes [`ExtractError::BlockingTask`].
+async fn run_blocking<E, T, F>(
     directory: Arc<Dir>,
     operation: &'static str,
     error_path: PathBuf,
     relative_path: PathBuf,
     action: F,
-) -> Result<T, DecodeError>
+) -> Result<T, ExtractError<E>>
 where
     T: Send + 'static,
     F: FnOnce(&Dir, &Path) -> io::Result<T> + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || match action(&directory, &relative_path) {
-        Ok(result) => Ok(result),
-        Err(source) => Err(DecodeError::filesystem(operation, error_path, source)),
-    })
-    .await
-    .map_err(DecodeError::BlockingTask)?
+    tokio::task::spawn_blocking(move || action(&directory, &relative_path))
+        .await
+        .map_err(ExtractError::<E>::BlockingTask)?
+        .map_err(|source| ExtractError::filesystem(operation, error_path, source))
 }
 
 #[cfg(not(windows))]

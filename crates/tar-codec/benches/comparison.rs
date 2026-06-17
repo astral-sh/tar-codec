@@ -10,8 +10,8 @@ use std::{
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tar_codec::{
-    decode::{Archive, DecodePolicy},
-    encode::{Encoder, EntryMetadata},
+    Archive as _, ArchiveBuilder as _, EntryMetadata, TarArchive, TarEncoder,
+    extract::ExtractPolicy,
 };
 use tempfile::{TempDir, tempdir};
 use tokio::{
@@ -176,7 +176,8 @@ fn fixture(id: &'static str, files: Vec<(String, Vec<u8>)>) -> Fixture {
 }
 
 async fn encode_entries_tar_codec(fixture: &Fixture) -> u64 {
-    let mut encoder = Encoder::new(FramingSink::default());
+    let mut sink = FramingSink::default();
+    let mut encoder = TarEncoder::new(&mut sink).builder();
     for entry in &fixture.entries {
         encoder
             .add_entry(&entry.archive_path, &entry.data, EntryMetadata::default())
@@ -186,8 +187,8 @@ async fn encode_entries_tar_codec(fixture: &Fixture) -> u64 {
     encoder
         .finish()
         .await
-        .expect("tar-codec archive should finish")
-        .bytes_written
+        .expect("tar-codec archive should finish");
+    sink.bytes_written
 }
 
 fn encode_entries_tar(fixture: &Fixture) -> u64 {
@@ -223,7 +224,8 @@ async fn encode_entries_tokio_tar(fixture: &Fixture) -> u64 {
 }
 
 async fn encode_directory_tar_codec(fixture: &Fixture) -> u64 {
-    let mut encoder = Encoder::new(FramingSink::default());
+    let mut sink = FramingSink::default();
+    let mut encoder = TarEncoder::new(&mut sink).builder();
     encoder
         .add_directory(&fixture.source)
         .await
@@ -231,8 +233,8 @@ async fn encode_directory_tar_codec(fixture: &Fixture) -> u64 {
     encoder
         .finish()
         .await
-        .expect("tar-codec archive should finish")
-        .bytes_written
+        .expect("tar-codec archive should finish");
+    sink.bytes_written
 }
 
 fn encode_directory_tar(fixture: &Fixture) -> u64 {
@@ -274,7 +276,8 @@ fn configure_tokio_tar_header(header: &mut tokio_tar::Header, payload_len: usize
 }
 
 async fn pax_archive(fixture: &Fixture) -> Vec<u8> {
-    let mut encoder = Encoder::new(Vec::new());
+    let mut bytes = Vec::new();
+    let mut encoder = TarEncoder::new(&mut bytes).builder();
     for entry in &fixture.entries {
         encoder
             .add_entry(&entry.archive_path, &entry.data, EntryMetadata::default())
@@ -284,7 +287,8 @@ async fn pax_archive(fixture: &Fixture) -> Vec<u8> {
     encoder
         .finish()
         .await
-        .expect("tar-codec pax archive should finish")
+        .expect("tar-codec pax archive should finish");
+    bytes
 }
 
 fn ustar_archive(fixture: &Fixture) -> Vec<u8> {
@@ -402,8 +406,8 @@ fn bench_extract(criterion: &mut Criterion, runtime: &Runtime, fixtures: &[Fixtu
                         |temp| {
                             let destination = temp.path().join("out");
                             async move {
-                                Archive::new(input.bytes.as_slice())
-                                    .extract(destination, DecodePolicy::default())
+                                TarArchive::new(input.bytes.as_slice())
+                                    .extract_in(destination, ExtractPolicy::default())
                                     .await
                                     .expect("tar-codec should extract fixture archive");
                             }

@@ -1,6 +1,6 @@
 [package]
-name = "tar-codec"
-description = "tar-codec is a small, fast, constrained tar encoder and decoder for Rust"
+name = "archive-trait"
+description = "Format-neutral, asynchronous archive construction and extraction"
 
 version = { workspace = true }
 edition = { workspace = true }
@@ -11,21 +11,20 @@ license = { workspace = true }
 readme = { workspace = true }
 
 [dependencies]
-archive-trait = { workspace = true }
-tar-framing = { workspace = true }
+cap-std = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["io-util"] }
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync"] }
+walkdir = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+junction = { workspace = true }
 
 [dev-dependencies]
-astral-tokio-tar = { workspace = true }
-criterion = { workspace = true }
-tar = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
-
-[[bench]]
-name = "comparison"
-harness = false
 
 [lib]
 doctest = false
