@@ -42,7 +42,7 @@ TarArchive::new(reader)
 
 Unlike encoding, decoding/extraction has two policy layers:
 
-- Use `TarArchive::with_policy` to control various aspects of GNU or pax handling.
+- Use `TarArchive::new_with_policy` to control various aspects of GNU or pax handling.
 - Use `extract::ExtractPolicy` to control various aspects of how archives become
   real paths on the host filesystem.
 

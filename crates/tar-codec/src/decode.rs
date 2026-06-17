@@ -24,11 +24,11 @@ pub struct TarArchive<R> {
 impl<R> TarArchive<R> {
     /// Creates an archive decoder from an uncompressed tar reader.
     pub fn new(reader: R) -> Self {
-        Self::with_policy(reader, DecodePolicy::default())
+        Self::new_with_policy(reader, DecodePolicy::default())
     }
 
     /// Creates an archive decoder using `policy`.
-    pub fn with_policy(reader: R, policy: DecodePolicy) -> Self {
+    pub fn new_with_policy(reader: R, policy: DecodePolicy) -> Self {
         Self {
             reader: TarReader::with_max_pax_extension_size(
                 reader,

@@ -176,7 +176,7 @@ async fn advancing_drains_payload_and_applies_tar_policy() -> TestResult {
     archive.gnu("file", b'0', b"", "", 0o644);
     let bytes = archive.finish();
     let mut members =
-        TarArchive::with_policy(bytes.as_slice(), DecodePolicy::default().allow_gnu(false))
+        TarArchive::new_with_policy(bytes.as_slice(), DecodePolicy::default().allow_gnu(false))
             .members();
     assert!(matches!(
         members.next().await,
@@ -188,7 +188,7 @@ async fn advancing_drains_payload_and_applies_tar_policy() -> TestResult {
         .pax(b'x', &pax_record(PaxKeyword::Comment, "metadata"))
         .posix("file", b'0', b"", "", 0o644);
     let bytes = archive.finish();
-    let mut members = TarArchive::with_policy(
+    let mut members = TarArchive::new_with_policy(
         bytes.as_slice(),
         DecodePolicy::default().pax_policy(PaxDecodePolicy::default().max_extension_size(1)),
     )
