@@ -69,7 +69,8 @@ async fn encoded_paths(bytes: &[u8]) -> Vec<String> {
 
 #[tokio::test]
 async fn manual_entries_are_pax_framed_padded_terminated_and_extractable() {
-    let mut encoder = TarEncoder::new(Vec::new());
+    let mut bytes = Vec::new();
+    let mut encoder = TarEncoder::new(&mut bytes);
     encoder
         .add_entry(
             "bin/tool",
@@ -82,7 +83,7 @@ async fn manual_entries_are_pax_framed_padded_terminated_and_extractable() {
         .add_entry("README", b"hello", EntryMetadata::default())
         .await
         .expect("readme entry should be added");
-    let bytes = encoder.finish().await.expect("archive should finish");
+    encoder.finish().await.expect("archive should finish");
 
     assert_eq!(bytes.len() % 512, 0);
     assert!(bytes.ends_with(&[0; 1024]));
@@ -132,7 +133,8 @@ async fn manual_entries_are_pax_framed_padded_terminated_and_extractable() {
 
 #[tokio::test]
 async fn tar_path_suffix_rejections_happen_before_output() {
-    let mut encoder = TarEncoder::new(Vec::new());
+    let mut bytes = Vec::new();
+    let mut encoder = TarEncoder::new(&mut bytes);
     for path in [
         ".",
         "..",
@@ -160,7 +162,7 @@ async fn tar_path_suffix_rejections_happen_before_output() {
         .add_entry("accepted", b"contents", EntryMetadata::default())
         .await
         .expect("framing preflight failures should leave the encoder usable");
-    let bytes = encoder.finish().await.expect("archive should finish");
+    encoder.finish().await.expect("archive should finish");
     assert_eq!(encoded_paths(&bytes).await, ["accepted"]);
 }
 
@@ -193,12 +195,13 @@ async fn recursive_encoding_round_trips_small_and_large_files() {
     std::fs::write(source.join("sub/large"), vec![b'x'; LARGE_FILE_BYTES])
         .expect("large file should be written");
 
-    let mut encoder = TarEncoder::new(Vec::new());
+    let mut bytes = Vec::new();
+    let mut encoder = TarEncoder::new(&mut bytes);
     encoder
         .add_directory(&source)
         .await
         .expect("directory should be added");
-    let bytes = encoder.finish().await.expect("archive should finish");
+    encoder.finish().await.expect("archive should finish");
     assert_eq!(
         encoded_paths(&bytes).await,
         ["tree", "tree/small", "tree/sub", "tree/sub/large"]
@@ -233,12 +236,13 @@ async fn recursive_encoding_frames_preserved_symlinks() {
     symlink("target", source.join("link")).expect("symbolic link should be created");
 
     let policy = BuilderPolicy::default().symlink_policy(SymlinkPolicy::Preserve);
-    let mut encoder = TarEncoder::with_policy(Vec::new(), policy);
+    let mut bytes = Vec::new();
+    let mut encoder = TarEncoder::with_policy(&mut bytes, policy);
     encoder
         .add_directory(&source)
         .await
         .expect("directory should be added");
-    let bytes = encoder.finish().await.expect("archive should finish");
+    encoder.finish().await.expect("archive should finish");
 
     let mut reader = TarReader::new(bytes.as_slice());
     let mut link = None;

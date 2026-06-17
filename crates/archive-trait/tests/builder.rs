@@ -91,6 +91,10 @@ impl ArchiveBuilder for MockBuilder {
         &mut self.state
     }
 
+    async fn finish_archive(&mut self) -> Result<(), BuildError<Self::Error>> {
+        Ok(())
+    }
+
     async fn write_file_member(
         &mut self,
         path: &str,

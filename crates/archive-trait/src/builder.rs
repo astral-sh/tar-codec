@@ -244,6 +244,13 @@ pub trait ArchiveBuilder: Sized {
     #[doc(hidden)]
     fn builder_state(&mut self) -> &mut BuilderState;
 
+    /// Writes the format-specific archive terminator or index.
+    ///
+    /// Implementations must poison their state before returning an error if
+    /// any output may have been written.
+    #[doc(hidden)]
+    async fn finish_archive(&mut self) -> Result<(), BuildError<Self::Error>>;
+
     /// Writes one regular-file member and its complete payload.
     ///
     /// Implementations must call [`EntryPayload::next_chunk`] through
@@ -352,6 +359,15 @@ pub trait ArchiveBuilder: Sized {
             state.poison();
         }
         result
+    }
+
+    /// Finalizes and consumes this archive builder.
+    ///
+    /// Callers that need to retain access to an output sink should lend it to
+    /// the concrete builder rather than transferring ownership.
+    async fn finish(mut self) -> Result<(), BuildError<Self::Error>> {
+        self.builder_state().ensure_active()?;
+        self.finish_archive().await
     }
 }
 

@@ -25,11 +25,11 @@ format hooks.
 ```rust
 use tar_codec::{ArchiveBuilder as _, EntryMetadata, TarEncoder};
 
-let mut encoder = TarEncoder::new(writer);
+let mut encoder = TarEncoder::new(&mut writer);
 encoder
     .add_entry("README.md", b"hello\n", EntryMetadata::default())
     .await?;
-let writer = encoder.finish().await?;
+encoder.finish().await?;
 ```
 
 Use `TarEncoder::with_policy` and `builder::BuilderPolicy` to configure generic

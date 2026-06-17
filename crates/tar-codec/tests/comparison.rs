@@ -26,7 +26,8 @@ async fn extracts_pax_and_ustar_archives_across_crates() {
 }
 
 async fn pax_archive() -> Vec<u8> {
-    let mut encoder = TarEncoder::new(Vec::new());
+    let mut bytes = Vec::new();
+    let mut encoder = TarEncoder::new(&mut bytes);
     for (path, data) in ENTRIES {
         encoder
             .add_entry(path, data, EntryMetadata::default())
@@ -36,7 +37,8 @@ async fn pax_archive() -> Vec<u8> {
     encoder
         .finish()
         .await
-        .expect("tar-codec pax archive should finish")
+        .expect("tar-codec pax archive should finish");
+    bytes
 }
 
 fn tar_ustar_archive() -> Vec<u8> {

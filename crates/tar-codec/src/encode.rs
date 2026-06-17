@@ -44,13 +44,6 @@ impl<W> TarEncoder<W> {
 }
 
 impl<W: AsyncWrite + Unpin> TarEncoder<W> {
-    /// Writes the required two-zero-block terminator and returns the writer.
-    pub async fn finish(mut self) -> Result<W, BuildError<EncodeError>> {
-        self.state.ensure_active()?;
-        self.write_bytes(end_marker_bytes()).await?;
-        Ok(self.writer)
-    }
-
     async fn write_member(&mut self, member: PaxMember<'_>) -> Result<(), BuildError<EncodeError>> {
         let next_sequence = self.sequence.checked_add(1).ok_or_else(|| {
             BuildError::Encoder(EncodeError::ArithmeticOverflow {
@@ -96,6 +89,10 @@ impl<W: AsyncWrite + Unpin> ArchiveBuilder for TarEncoder<W> {
 
     fn builder_state(&mut self) -> &mut BuilderState {
         &mut self.state
+    }
+
+    async fn finish_archive(&mut self) -> Result<(), BuildError<Self::Error>> {
+        self.write_bytes(end_marker_bytes()).await
     }
 
     async fn write_file_member(
