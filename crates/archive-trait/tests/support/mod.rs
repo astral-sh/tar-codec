@@ -9,107 +9,86 @@ const MAX_TEST_CHUNK_BYTES: usize = 64 * 1024;
 #[error("test archive failure")]
 pub struct TestError;
 
-pub enum Entry {
-    File {
-        position: u64,
-        path: String,
-        data: Vec<u8>,
+pub type TestEntry = Result<Member<TestPayload>, TestError>;
+
+pub mod entry {
+    use super::*;
+
+    pub fn file(path: &str, data: impl Into<Vec<u8>>) -> TestEntry {
+        file_with_options(path, data, false, false)
+    }
+
+    pub fn invalid_file(path: &str, data: impl Into<Vec<u8>>) -> TestEntry {
+        file_with_options(path, data, false, true)
+    }
+
+    pub fn executable(path: &str, data: impl Into<Vec<u8>>) -> TestEntry {
+        file_with_options(path, data, true, false)
+    }
+
+    fn file_with_options(
+        path: &str,
+        data: impl Into<Vec<u8>>,
         executable: bool,
         fail_at_end: bool,
-    },
-    Directory {
-        position: u64,
-        path: String,
-    },
-    SymbolicLink {
-        position: u64,
-        path: String,
-        target: String,
-    },
-    HardLink {
-        position: u64,
-        path: String,
-        target: String,
-        data: Vec<u8>,
-    },
-    Special {
-        position: u64,
-        path: String,
-        kind: SpecialKind,
-    },
-    Error,
-}
-
-impl Entry {
-    pub fn file(path: &str, data: impl Into<Vec<u8>>) -> Self {
-        Self::File {
-            position: 0,
-            path: path.to_owned(),
-            data: data.into(),
-            executable: false,
-            fail_at_end: false,
-        }
+    ) -> TestEntry {
+        let data = data.into();
+        Ok(Member::File {
+            metadata: metadata(path),
+            size: data.len() as u64,
+            executable,
+            payload: TestPayload::new(data, fail_at_end),
+        })
     }
 
-    pub fn invalid_file(path: &str, data: impl Into<Vec<u8>>) -> Self {
-        Self::File {
-            position: 0,
-            path: path.to_owned(),
-            data: data.into(),
-            executable: false,
-            fail_at_end: true,
-        }
+    pub fn directory(path: &str) -> TestEntry {
+        Ok(Member::Directory {
+            metadata: metadata(path),
+        })
     }
 
-    pub fn executable(path: &str, data: impl Into<Vec<u8>>) -> Self {
-        Self::File {
-            position: 0,
-            path: path.to_owned(),
-            data: data.into(),
-            executable: true,
-            fail_at_end: false,
-        }
-    }
-
-    pub fn directory(path: &str) -> Self {
-        Self::Directory {
-            position: 0,
-            path: path.to_owned(),
-        }
-    }
-
-    pub fn symbolic_link(path: &str, target: &str) -> Self {
-        Self::SymbolicLink {
-            position: 0,
-            path: path.to_owned(),
+    pub fn symbolic_link(path: &str, target: &str) -> TestEntry {
+        Ok(Member::SymbolicLink {
+            metadata: metadata(path),
             target: target.to_owned(),
-        }
+        })
     }
 
-    pub fn hard_link(path: &str, target: &str, data: impl Into<Vec<u8>>) -> Self {
-        Self::HardLink {
-            position: 0,
-            path: path.to_owned(),
+    pub fn hard_link(path: &str, target: &str, data: impl Into<Vec<u8>>) -> TestEntry {
+        let data = data.into();
+        Ok(Member::HardLink {
+            metadata: metadata(path),
             target: target.to_owned(),
-            data: data.into(),
-        }
+            size: data.len() as u64,
+            payload: TestPayload::new(data, false),
+        })
     }
 
-    pub fn special(path: &str, kind: SpecialKind) -> Self {
-        Self::Special {
-            position: 0,
-            path: path.to_owned(),
+    pub fn special(path: &str, kind: SpecialKind) -> TestEntry {
+        Ok(Member::Special {
+            metadata: metadata(path),
             kind,
+        })
+    }
+
+    pub fn error() -> TestEntry {
+        Err(TestError)
+    }
+
+    fn metadata(path: &str) -> MemberMetadata {
+        MemberMetadata {
+            path: path.to_owned(),
+            position: 0,
         }
     }
 }
 
 pub struct TestArchive {
-    entries: VecDeque<Entry>,
+    entries: VecDeque<TestEntry>,
 }
 
 impl TestArchive {
-    pub fn new(entries: impl IntoIterator<Item = Entry>) -> Self {
+    pub fn new(entries: impl IntoIterator<Item = TestEntry>) -> Self {
         Self {
             entries: entries.into_iter().collect(),
         }
@@ -171,56 +150,9 @@ impl Archive for TestArchive {
     async fn next_member<'a>(
         &'a mut self,
     ) -> Result<Option<Member<Self::Payload<'a>>>, Self::Error> {
-        let Some(entry) = self.entries.pop_front() else {
-            return Ok(None);
-        };
-        if matches!(entry, Entry::Error) {
-            return Err(TestError);
+        match self.entries.pop_front() {
+            Some(entry) => entry.map(Some),
+            None => Ok(None),
         }
-        Ok(Some(match entry {
-            Entry::File {
-                position,
-                path,
-                data,
-                executable,
-                fail_at_end,
-            } => Member::File {
-                metadata: MemberMetadata { path, position },
-                size: data.len() as u64,
-                executable,
-                payload: TestPayload::new(data, fail_at_end),
-            },
-            Entry::Directory { position, path } => Member::Directory {
-                metadata: MemberMetadata { path, position },
-            },
-            Entry::SymbolicLink {
-                position,
-                path,
-                target,
-            } => Member::SymbolicLink {
-                metadata: MemberMetadata { path, position },
-                target,
-            },
-            Entry::HardLink {
-                position,
-                path,
-                target,
-                data,
-            } => Member::HardLink {
-                metadata: MemberMetadata { path, position },
-                target,
-                size: data.len() as u64,
-                payload: TestPayload::new(data, false),
-            },
-            Entry::Special {
-                position,
-                path,
-                kind,
-            } => Member::Special {
-                metadata: MemberMetadata { path, position },
-                kind,
-            },
-            Entry::Error => return Err(TestError),
-        }))
     }
 }

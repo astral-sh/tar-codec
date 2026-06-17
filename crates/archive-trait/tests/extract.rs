@@ -5,22 +5,23 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
 use archive_trait::{Archive as _, ExtractError, ExtractPolicy, SpecialKind};
-use support::{Entry, TestArchive};
+use support::{TestArchive, entry};
 use tempfile::tempdir;
 
 #[tokio::test]
-async fn extracts_common_members_and_streams_large_payloads() {
+async fn extracts_common_members_and_streams_payload_sizes() {
+    const SMALL_BYTES: usize = 128 * 1024 + 7;
     const LARGE_BYTES: usize = 1024 * 1024 + 7;
 
-    let large = (0..LARGE_BYTES)
-        .map(|index| u8::try_from(index % 251).expect("payload byte should fit"))
-        .collect::<Vec<_>>();
+    let small = patterned_payload(SMALL_BYTES);
+    let large = patterned_payload(LARGE_BYTES);
     let archive = TestArchive::new([
-        Entry::directory("bin"),
-        Entry::executable("bin/tool", b"run"),
-        Entry::file("same", b"old"),
-        Entry::file("same", b"new"),
-        Entry::file("large", large.clone()),
+        entry::directory("bin"),
+        entry::executable("bin/tool", b"run"),
+        entry::file("same", b"old"),
+        entry::file("same", b"new"),
+        entry::file("small", small.clone()),
+        entry::file("large", large.clone()),
     ]);
     let temp = tempdir().expect("temporary directory should be created");
     let destination = temp.path().join("out");
@@ -30,18 +31,17 @@ async fn extracts_common_members_and_streams_large_payloads() {
         .await
         .expect("archive should extract");
 
-    assert_eq!(
-        std::fs::read(destination.join("bin/tool")).expect("tool should be readable"),
-        b"run"
-    );
-    assert_eq!(
-        std::fs::read(destination.join("same")).expect("replacement should be readable"),
-        b"new"
-    );
-    assert_eq!(
-        std::fs::read(destination.join("large")).expect("large file should be readable"),
-        large
-    );
+    for (path, expected) in [
+        ("bin/tool", &b"run"[..]),
+        ("same", &b"new"[..]),
+        ("small", small.as_slice()),
+        ("large", large.as_slice()),
+    ] {
+        assert_eq!(
+            std::fs::read(destination.join(path)).expect("file should be readable"),
+            expected
+        );
+    }
     #[cfg(unix)]
     {
         assert_ne!(
@@ -55,25 +55,10 @@ async fn extracts_common_members_and_streams_large_payloads() {
     }
 }
 
-#[tokio::test]
-async fn extracts_small_payload_returned_in_short_chunks() {
-    const SMALL_BYTES: usize = 128 * 1024 + 7;
-
-    let expected = (0..SMALL_BYTES)
+fn patterned_payload(size: usize) -> Vec<u8> {
+    (0..size)
         .map(|index| u8::try_from(index % 251).expect("payload byte should fit"))
-        .collect::<Vec<_>>();
-    let temp = tempdir().expect("temporary directory should be created");
-    let destination = temp.path().join("out");
-
-    TestArchive::new([Entry::file("small", expected.clone())])
-        .extract_in(&destination, ExtractPolicy::default())
-        .await
-        .expect("archive should extract");
-
-    assert_eq!(
-        std::fs::read(destination.join("small")).expect("small file should be readable"),
-        expected
-    );
+        .collect()
 }
 
 #[tokio::test]
@@ -81,7 +66,7 @@ async fn validates_empty_payload_before_creating_file() {
     let temp = tempdir().expect("temporary directory should be created");
     let destination = temp.path().join("out");
 
-    let result = TestArchive::new([Entry::invalid_file("invalid", b"")])
+    let result = TestArchive::new([entry::invalid_file("invalid", b"")])
         .extract_in(&destination, ExtractPolicy::default())
         .await;
 
@@ -94,7 +79,7 @@ async fn rejects_unsafe_special_and_colliding_members() {
     let temp = tempdir().expect("temporary directory should be created");
     let destination = temp.path().join("unsafe");
     assert!(matches!(
-        TestArchive::new([Entry::file("../escape", b"")])
+        TestArchive::new([entry::file("../escape", b"")])
             .extract_in(&destination, ExtractPolicy::default().name_validator(None))
             .await,
         Err(ExtractError::UnsafePath { .. })
@@ -102,7 +87,7 @@ async fn rejects_unsafe_special_and_colliding_members() {
     assert!(!temp.path().join("escape").exists());
 
     assert!(matches!(
-        TestArchive::new([Entry::special("device", SpecialKind::CharacterDevice)])
+        TestArchive::new([entry::special("device", SpecialKind::CharacterDevice)])
             .extract_in(temp.path().join("special"), ExtractPolicy::default())
             .await,
         Err(ExtractError::UnsupportedMember {
@@ -115,7 +100,7 @@ async fn rejects_unsafe_special_and_colliding_members() {
     std::fs::create_dir(&destination).expect("destination should be created");
     std::fs::write(destination.join("file"), b"ambient").expect("ambient file should be written");
     assert!(matches!(
-        TestArchive::new([Entry::file("file", b"archive")])
+        TestArchive::new([entry::file("file", b"archive")])
             .extract_in(
                 &destination,
                 ExtractPolicy::default().allow_overwrites(false),
@@ -129,7 +114,7 @@ async fn rejects_unsafe_special_and_colliding_members() {
 async fn archive_errors_preserve_prior_streaming_output() {
     let temp = tempdir().expect("temporary directory should be created");
     let destination = temp.path().join("partial");
-    let result = TestArchive::new([Entry::file("created", b"kept"), Entry::Error])
+    let result = TestArchive::new([entry::file("created", b"kept"), entry::error()])
         .extract_in(&destination, ExtractPolicy::default())
         .await;
 
@@ -153,7 +138,7 @@ async fn destination_junctions_are_rejected_as_parents_and_roots() {
     junction::create(&outside, destination.join("junction"))
         .expect("parent junction should be created");
     assert!(matches!(
-        TestArchive::new([Entry::file("junction/file", b"archive")])
+        TestArchive::new([entry::file("junction/file", b"archive")])
             .extract_in(&destination, ExtractPolicy::default())
             .await,
         Err(ExtractError::PathCollision { path }) if path == Path::new("junction")
@@ -163,7 +148,7 @@ async fn destination_junctions_are_rejected_as_parents_and_roots() {
     let destination = temp.path().join("root-junction");
     junction::create(&outside, &destination).expect("root junction should be created");
     assert!(matches!(
-        TestArchive::new([Entry::file("file", b"archive")])
+        TestArchive::new([entry::file("file", b"archive")])
             .extract_in(&destination, ExtractPolicy::default())
             .await,
         Err(ExtractError::Filesystem { .. })

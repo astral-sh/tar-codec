@@ -3,7 +3,7 @@ pub mod support;
 use archive_trait::{
     Archive as _, ExtractError, ExtractPolicy, ExtractPolicyViolation, LinkPolicy, SymlinkPolicy,
 };
-use support::{Entry, TestArchive};
+use support::{TestArchive, entry};
 use tempfile::tempdir;
 
 #[cfg(unix)]
@@ -12,10 +12,10 @@ async fn preserves_symlink_chains_and_supports_hard_link_payloads() {
     let temp = tempdir().expect("temporary directory should be created");
     let destination = temp.path().join("out");
     let archive = TestArchive::new([
-        Entry::file("target", b"old"),
-        Entry::symbolic_link("second", "target"),
-        Entry::symbolic_link("first", "second"),
-        Entry::hard_link("hard", "target", b"new"),
+        entry::file("target", b"old"),
+        entry::symbolic_link("second", "target"),
+        entry::symbolic_link("first", "second"),
+        entry::hard_link("hard", "target", b"new"),
     ]);
     let policy = ExtractPolicy::default().link_policy(LinkPolicy::default().allow_hard_links(true));
 
@@ -35,27 +35,35 @@ async fn preserves_symlink_chains_and_supports_hard_link_payloads() {
 #[tokio::test]
 async fn link_policies_reject_or_skip_without_creating_links() {
     let temp = tempdir().expect("temporary directory should be created");
-    let destination = temp.path().join("rejected");
-    assert!(matches!(
-        TestArchive::new([
-            Entry::file("target", b"keep"),
-            Entry::symbolic_link("link", "target"),
-        ])
-        .extract_in(
-            &destination,
-            ExtractPolicy::default()
-                .link_policy(LinkPolicy::default().symlink_policy(SymlinkPolicy::Reject),),
-        )
-        .await,
-        Err(ExtractError::PolicyViolation {
-            violation: ExtractPolicyViolation::SymbolicLink,
-            ..
-        })
-    ));
-    assert!(!destination.join("link").exists());
+    for (case, path, member, policy, expected) in [
+        (
+            "symbolic",
+            "link",
+            entry::symbolic_link("link", "missing"),
+            LinkPolicy::default().symlink_policy(SymlinkPolicy::Reject),
+            ExtractPolicyViolation::SymbolicLink,
+        ),
+        (
+            "hard",
+            "hard",
+            entry::hard_link("hard", "missing", b""),
+            LinkPolicy::default(),
+            ExtractPolicyViolation::HardLink,
+        ),
+    ] {
+        let destination = temp.path().join(case);
+        let result = TestArchive::new([member])
+            .extract_in(&destination, ExtractPolicy::default().link_policy(policy))
+            .await;
+        assert!(matches!(
+            result,
+            Err(ExtractError::PolicyViolation { violation, .. }) if violation == expected
+        ));
+        assert!(!destination.join(path).exists());
+    }
 
     let destination = temp.path().join("skipped");
-    TestArchive::new([Entry::symbolic_link("link", "missing")])
+    TestArchive::new([entry::symbolic_link("link", "missing")])
         .extract_in(
             &destination,
             ExtractPolicy::default()
@@ -64,14 +72,4 @@ async fn link_policies_reject_or_skip_without_creating_links() {
         .await
         .expect("skipped link should not fail");
     assert!(!destination.join("link").exists());
-
-    assert!(matches!(
-        TestArchive::new([Entry::hard_link("hard", "missing", b"")])
-            .extract_in(temp.path().join("hard"), ExtractPolicy::default())
-            .await,
-        Err(ExtractError::PolicyViolation {
-            violation: ExtractPolicyViolation::HardLink,
-            ..
-        })
-    ));
 }
