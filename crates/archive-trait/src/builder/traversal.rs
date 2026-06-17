@@ -170,7 +170,10 @@ pub(crate) fn stream_directory_entries(
     validate_name(&archive_path, validation, "member path")?;
     let (sender, receiver) = mpsc::channel(DIRECTORY_TRAVERSAL_BUFFER_BATCHES);
     let task = tokio::task::spawn_blocking(move || {
-        let mut output = TraversalSender::new(sender);
+        let mut output = TraversalSender {
+            sender,
+            entries: Vec::new(),
+        };
         stream_directory_entries_blocking(
             &source,
             &archive_path,
@@ -223,13 +226,6 @@ struct TraversalSender {
 }
 
 impl TraversalSender {
-    fn new(sender: mpsc::Sender<Vec<TraversalEntry>>) -> Self {
-        Self {
-            sender,
-            entries: Vec::new(),
-        }
-    }
-
     fn push(&mut self, entry: TraversalEntry) -> bool {
         self.entries.push(entry);
         self.entries.len() < DIRECTORY_TRAVERSAL_BATCH_ENTRIES || self.flush()

@@ -61,20 +61,6 @@ impl<W: AsyncWrite + Unpin> TarEncoder<W> {
         Ok(())
     }
 
-    async fn write_payload(
-        &mut self,
-        payload: &mut EntryPayload<'_>,
-    ) -> Result<(), BuildFailure<EncodeError>> {
-        while let Some(chunk) = payload.next_chunk().await.map_err(BuildFailure::poisoned)? {
-            self.write_bytes(chunk).await?;
-        }
-        let padding = payload_padding(payload.size());
-        if !padding.is_empty() {
-            self.write_bytes(padding).await?;
-        }
-        Ok(())
-    }
-
     async fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), BuildFailure<EncodeError>> {
         if let Err(source) = self.writer.write_all(bytes).await {
             return Err(BuildFailure::poisoned(BuildError::Encoder(
@@ -106,7 +92,14 @@ impl<W: AsyncWrite + Unpin> ArchiveBuilder for TarEncoder<W> {
             executable: metadata.is_executable(),
         })
         .await?;
-        self.write_payload(payload).await
+        while let Some(chunk) = payload.next_chunk().await.map_err(BuildFailure::poisoned)? {
+            self.write_bytes(chunk).await?;
+        }
+        let padding = payload_padding(payload.size());
+        if !padding.is_empty() {
+            self.write_bytes(padding).await?;
+        }
+        Ok(())
     }
 
     async fn write_directory_member(

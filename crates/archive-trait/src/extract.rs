@@ -205,12 +205,6 @@ enum ExtractedEntry {
     Symlink,
 }
 
-impl ExtractedEntry {
-    fn is_directory(self) -> bool {
-        matches!(self, Self::CreatedDirectory | Self::AmbientDirectory)
-    }
-}
-
 /// Why extraction requires a directory at a particular path.
 ///
 /// Explicit directory members participate in normal exact-path overwrite
@@ -804,9 +798,10 @@ impl<E> ExtractionRoot<E> {
         path: &Path,
         purpose: DirectoryPurpose,
     ) -> Result<(), ExtractError<E>> {
-        if let Some(entry) = self.entries.get(path).copied()
-            && entry.is_directory()
-        {
+        if matches!(
+            self.entries.get(path),
+            Some(ExtractedEntry::CreatedDirectory | ExtractedEntry::AmbientDirectory)
+        ) {
             return Ok(());
         }
         if self.entries.contains_key(path) {
@@ -833,7 +828,11 @@ impl<E> ExtractionRoot<E> {
             .as_ref()
             .is_some_and(|metadata| metadata.is_dir() && !metadata_is_link(metadata))
         {
-            let directory = self.open_directory(path).await?;
+            let directory = self
+                .with_entry_parent("open directory", path, |directory, path| {
+                    directory.open_dir(path)
+                })
+                .await?;
             self.directory_handles
                 .insert(path.to_owned(), Arc::new(directory));
             self.entries
@@ -862,7 +861,12 @@ impl<E> ExtractionRoot<E> {
         if metadata.is_none() && !self.entries.contains_key(path) {
             return Ok(false);
         }
-        if !self.allow_overwrites || self.has_descendant(path) {
+        if !self.allow_overwrites
+            || self
+                .entries
+                .keys()
+                .any(|candidate| candidate != path && candidate.starts_with(path))
+        {
             return Err(ExtractError::<E>::PathCollision {
                 path: path.to_owned(),
             });
@@ -873,12 +877,6 @@ impl<E> ExtractionRoot<E> {
         self.entries.remove(path);
         self.symlink_indices.remove(path);
         Ok(true)
-    }
-
-    fn has_descendant(&self, path: &Path) -> bool {
-        self.entries
-            .keys()
-            .any(|candidate| candidate != path && candidate.starts_with(path))
     }
 
     async fn finalize_symlinks(&self, policy: LinkPolicy) -> Result<(), ExtractError<E>> {
@@ -1098,13 +1096,6 @@ impl<E> ExtractionRoot<E> {
     async fn create_directory(&self, path: &Path) -> Result<Dir, ExtractError<E>> {
         self.with_entry_parent("create directory", path, |directory, path| {
             directory.create_dir(path)?;
-            directory.open_dir(path)
-        })
-        .await
-    }
-
-    async fn open_directory(&self, path: &Path) -> Result<Dir, ExtractError<E>> {
-        self.with_entry_parent("open directory", path, |directory, path| {
             directory.open_dir(path)
         })
         .await

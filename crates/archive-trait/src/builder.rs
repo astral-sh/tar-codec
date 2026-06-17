@@ -199,14 +199,6 @@ impl EntryPayload<'_> {
             },
         })
     }
-
-    fn into_buffer(self) -> Vec<u8> {
-        match self.inner {
-            EntryPayloadInner::Borrowed { .. } => Vec::new(),
-            EntryPayloadInner::Buffered { buffer, .. }
-            | EntryPayloadInner::Streaming { buffer, .. } => buffer,
-        }
-    }
 }
 
 /// A failure returned by an [`ArchiveBuilder`] format hook.
@@ -325,11 +317,20 @@ impl<B: ArchiveBuilder> Builder<B> {
         D: AsRef<[u8]>,
     {
         self.state.ensure_active()?;
-        let path = archive_name(
-            path.as_ref(),
-            self.state.policy.name_validation,
-            "member path",
-        )?;
+        let archive_path = path.as_ref();
+        let Some(path) = archive_path.to_str() else {
+            return Err(BuildError::InvalidArchivePath {
+                path: archive_path.to_path_buf(),
+                reason: "path is not valid UTF-8",
+            });
+        };
+        if !self.state.policy.name_validation.accepts(path) {
+            return Err(BuildError::NameRejected {
+                context: "member path",
+                value: path.to_owned(),
+            });
+        }
+        let path = path.to_owned();
         let implicit_ancestors = preflight_regular_entry(&self.state.entries, &path)?;
         let mut payload = EntryPayload::borrowed(data.as_ref())?;
         let result = self
@@ -484,7 +485,11 @@ async fn write_source_file<B: ArchiveBuilder>(
     let result = builder
         .write_file_member(&entry.archive_path, &mut payload, metadata)
         .await;
-    traversal.source_buffer = payload.into_buffer();
+    traversal.source_buffer = match payload.inner {
+        EntryPayloadInner::Borrowed { .. } => Vec::new(),
+        EntryPayloadInner::Buffered { buffer, .. }
+        | EntryPayloadInner::Streaming { buffer, .. } => buffer,
+    };
     result
 }
 
@@ -689,26 +694,6 @@ fn preflight_regular_entry<E>(
         return Err(path_collision(path));
     }
     Ok(implicit_ancestors)
-}
-
-fn archive_name<E>(
-    path: &Path,
-    validation: NameValidation,
-    context: &'static str,
-) -> Result<String, BuildError<E>> {
-    let Some(name) = path.to_str() else {
-        return Err(BuildError::InvalidArchivePath {
-            path: path.to_path_buf(),
-            reason: "path is not valid UTF-8",
-        });
-    };
-    if !validation.accepts(name) {
-        return Err(BuildError::NameRejected {
-            context,
-            value: name.to_owned(),
-        });
-    }
-    Ok(name.to_owned())
 }
 
 fn filesystem_error<E>(operation: &'static str, path: &Path, source: io::Error) -> BuildError<E> {
