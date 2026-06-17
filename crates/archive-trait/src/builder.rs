@@ -1,4 +1,7 @@
-//! Format-neutral archive construction and recursive filesystem traversal.
+//! Format-neutral archive construction.
+//!
+//! Archive formats implement [`ArchiveBuilder`] and wrap the resulting writer
+//! in a stateful [`Builder`] to use the format-neutral construction APIs.
 
 mod traversal;
 
@@ -18,7 +21,7 @@ use crate::{NameValidator, name::NameValidation};
 
 const SOURCE_FILE_CHUNK_BYTES: usize = 1024 * 1024;
 
-/// Minimal regular-file metadata accepted by [`ArchiveBuilder::add_entry`].
+/// Minimal regular-file metadata accepted by [`Builder::add_entry`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct EntryMetadata {
     executable: bool,
@@ -32,7 +35,6 @@ impl EntryMetadata {
     }
 
     /// Returns whether this entry carries executable intent.
-    #[doc(hidden)]
     pub fn is_executable(self) -> bool {
         self.executable
     }
@@ -78,12 +80,7 @@ impl BuilderPolicy {
     }
 }
 
-/// Shared state used by format-specific [`ArchiveBuilder`] implementations.
-///
-/// This type is public only so external archive formats can implement the
-/// format hooks. Its API is not intended for direct archive construction.
-#[doc(hidden)]
-pub struct BuilderState {
+struct BuilderState {
     policy: BuilderPolicy,
     entries: HashMap<String, ArchivedEntry>,
     source_buffer: Vec<u8>,
@@ -91,9 +88,7 @@ pub struct BuilderState {
 }
 
 impl BuilderState {
-    /// Creates shared builder state using `policy`.
-    #[doc(hidden)]
-    pub fn new(policy: BuilderPolicy) -> Self {
+    fn new(policy: BuilderPolicy) -> Self {
         Self {
             policy,
             entries: HashMap::new(),
@@ -102,26 +97,19 @@ impl BuilderState {
         }
     }
 
-    /// Returns an error when a previous partial write poisoned this builder.
-    #[doc(hidden)]
-    pub fn ensure_active<E>(&self) -> Result<(), BuildError<E>> {
+    fn ensure_active<E>(&self) -> Result<(), BuildError<E>> {
         if self.poisoned {
             return Err(BuildError::Poisoned);
         }
         Ok(())
     }
 
-    /// Marks this builder unusable after a potentially partial output write.
-    #[doc(hidden)]
-    pub fn poison(&mut self) {
+    fn poison(&mut self) {
         self.poisoned = true;
     }
 }
 
-/// A format-neutral payload supplied to an archive format implementation.
-///
-/// This type is public only for the doc-hidden [`ArchiveBuilder`] hooks.
-#[doc(hidden)]
+/// A format-neutral payload supplied to an [`ArchiveBuilder`] implementation.
 pub struct EntryPayload<'a> {
     size: u64,
     inner: EntryPayloadInner<'a>,
@@ -147,13 +135,11 @@ enum EntryPayloadInner<'a> {
 
 impl EntryPayload<'_> {
     /// Returns the payload size declared before format framing begins.
-    #[doc(hidden)]
     pub fn size(&self) -> u64 {
         self.size
     }
 
     /// Returns the next payload chunk and validates source-file stability.
-    #[doc(hidden)]
     pub async fn next_chunk<E>(&mut self) -> Result<Option<&[u8]>, BuildError<E>> {
         match &mut self.inner {
             EntryPayloadInner::Borrowed { bytes, yielded } => {
@@ -231,7 +217,46 @@ impl EntryPayload<'_> {
     }
 }
 
-/// A format-specific archive writer with format-neutral construction APIs.
+/// A failure returned by an [`ArchiveBuilder`] format hook.
+///
+/// This distinguishes errors known to precede output from errors that may have
+/// left a partial member in the output archive.
+#[derive(Debug)]
+pub struct BuildFailure<E> {
+    error: BuildError<E>,
+    // TODO: Maybe make all failures poisoning?
+    // I'm not sure we really need the distinction here.
+    poisons_builder: bool,
+}
+
+impl<E> BuildFailure<E> {
+    /// Reports a failure that occurred before the hook wrote any output.
+    pub fn recoverable(error: BuildError<E>) -> Self {
+        Self {
+            error,
+            poisons_builder: false,
+        }
+    }
+
+    /// Reports a failure that may have left partial output.
+    pub fn poisoned(error: BuildError<E>) -> Self {
+        Self {
+            error,
+            poisons_builder: true,
+        }
+    }
+
+    fn into_parts(self) -> (BuildError<E>, bool) {
+        (self.error, self.poisons_builder)
+    }
+}
+
+/// A format-specific archive writer that can create a stateful [`Builder`].
+///
+///
+/// Hook implementations must return [`BuildFailure::recoverable`] only when the
+/// failed invocation wrote no output. Any failure after output may have begun
+/// must use [`BuildFailure::poisoned`].
 #[expect(
     async_fn_in_trait,
     reason = "archive writers may be !Send and run on a local executor"
@@ -240,77 +265,92 @@ pub trait ArchiveBuilder: Sized {
     /// The archive-format error returned while encoding entries.
     type Error;
 
-    /// Returns the shared state used by the default builder operations.
-    #[doc(hidden)]
-    fn builder_state(&mut self) -> &mut BuilderState;
-
-    /// Writes the format-specific archive terminator or index.
+    /// Wraps this format writer in a builder using default policy.
     ///
-    /// Implementations must poison their state before returning an error if
-    /// any output may have been written.
-    #[doc(hidden)]
-    async fn finish_archive(&mut self) -> Result<(), BuildError<Self::Error>>;
+    /// Implementors should not override this default implementation.
+    fn builder(self) -> Builder<Self> {
+        Builder {
+            backend: self,
+            state: BuilderState::new(BuilderPolicy::default()),
+        }
+    }
+
+    /// Wraps this format writer in a builder using `policy`.
+    ///
+    /// Implementors should not override this default implementation.
+    fn builder_with_policy(self, policy: BuilderPolicy) -> Builder<Self> {
+        Builder {
+            backend: self,
+            state: BuilderState::new(policy),
+        }
+    }
+
+    /// Writes any format-specific archive terminator or index.
+    async fn finish_archive(&mut self) -> Result<(), BuildFailure<Self::Error>>;
 
     /// Writes one regular-file member and its complete payload.
     ///
     /// Implementations must call [`EntryPayload::next_chunk`] through
-    /// completion. If an error occurs after any output may have been written,
-    /// they must call [`BuilderState::poison`] before returning it.
-    #[doc(hidden)]
+    /// completion and classify failures using [`BuildFailure`].
     async fn write_file_member(
         &mut self,
         path: &str,
         payload: &mut EntryPayload<'_>,
         metadata: EntryMetadata,
-    ) -> Result<(), BuildError<Self::Error>>;
+    ) -> Result<(), BuildFailure<Self::Error>>;
 
     /// Writes one directory member.
-    ///
-    /// Implementations must poison their state before returning an error if
-    /// any output may have been written.
-    #[doc(hidden)]
-    async fn write_directory_member(&mut self, path: &str) -> Result<(), BuildError<Self::Error>>;
+    async fn write_directory_member(&mut self, path: &str)
+    -> Result<(), BuildFailure<Self::Error>>;
 
     /// Writes one symbolic-link member.
-    ///
-    /// Implementations must poison their state before returning an error if
-    /// any output may have been written.
-    #[doc(hidden)]
     async fn write_symbolic_link_member(
         &mut self,
         path: &str,
         target: &str,
-    ) -> Result<(), BuildError<Self::Error>>;
+    ) -> Result<(), BuildFailure<Self::Error>>;
+}
 
+/// A stateful format-neutral archive construction engine.
+///
+/// Create this wrapper with [`ArchiveBuilder::builder`] or
+/// [`ArchiveBuilder::builder_with_policy`].
+pub struct Builder<B> {
+    backend: B,
+    state: BuilderState,
+}
+
+impl<B: ArchiveBuilder> Builder<B> {
     /// Adds one regular file from an in-memory byte buffer.
-    async fn add_entry<P, D>(
+    pub async fn add_entry<P, D>(
         &mut self,
         path: P,
         data: D,
         metadata: EntryMetadata,
-    ) -> Result<(), BuildError<Self::Error>>
+    ) -> Result<(), BuildError<B::Error>>
     where
         P: AsRef<Path>,
         D: AsRef<[u8]>,
     {
-        self.builder_state().ensure_active()?;
+        self.state.ensure_active()?;
         let path = archive_name(
             path.as_ref(),
-            self.builder_state().policy.name_validation,
+            self.state.policy.name_validation,
             "member path",
         )?;
-        let implicit_ancestors = preflight_regular_entry(&self.builder_state().entries, &path)?;
+        let implicit_ancestors = preflight_regular_entry(&self.state.entries, &path)?;
         let mut payload = EntryPayload::borrowed(data.as_ref())?;
-        self.write_file_member(&path, &mut payload, metadata)
-            .await?;
+        let result = self
+            .backend
+            .write_file_member(&path, &mut payload, metadata)
+            .await;
+        self.resolve_hook(result)?;
         for ancestor in implicit_ancestors {
-            self.builder_state()
+            self.state
                 .entries
                 .insert(ancestor, ArchivedEntry::Directory { explicit: false });
         }
-        self.builder_state()
-            .entries
-            .insert(path, ArchivedEntry::Regular);
+        self.state.entries.insert(path, ArchivedEntry::Regular);
         Ok(())
     }
 
@@ -321,53 +361,76 @@ pub trait ArchiveBuilder: Sized {
     /// [`BuilderPolicy::symlink_policy`] can instead preserve them. A late
     /// traversal or validation failure may leave partial output and poison
     /// this builder.
-    async fn add_directory<P: AsRef<Path>>(
+    pub async fn add_directory<P: AsRef<Path>>(
         &mut self,
         source: P,
-    ) -> Result<(), BuildError<Self::Error>> {
-        self.builder_state().ensure_active()?;
+    ) -> Result<(), BuildError<B::Error>> {
+        self.state.ensure_active()?;
         let source = source.as_ref().to_path_buf();
-        let (validation, symlink_policy, entries, source_buffer) = {
-            let state = self.builder_state();
-            (
-                state.policy.name_validation,
-                state.policy.symlink_policy,
-                state.entries.clone(),
-                mem::take(&mut state.source_buffer),
-            )
-        };
         let mut traversal = DirectoryBuild {
-            entries,
-            source_buffer,
+            entries: self.state.entries.clone(),
+            source_buffer: mem::take(&mut self.state.source_buffer),
             emitted: false,
         };
-        let mut entries = match stream_directory_entries(source, validation, symlink_policy) {
+        let mut entries = match stream_directory_entries(
+            source,
+            self.state.policy.name_validation,
+            self.state.policy.symlink_policy,
+        ) {
             Ok(entries) => entries,
             Err(error) => {
-                self.builder_state().source_buffer = traversal.source_buffer;
+                self.state.source_buffer = traversal.source_buffer;
                 return Err(BuildError::Traversal(error));
             }
         };
-        let write_result = write_directory_entries(self, &mut entries, &mut traversal).await;
-        let traversal_result = entries.finish().await.map_err(BuildError::Traversal);
+        let write_result =
+            write_directory_entries(&mut self.backend, &mut entries, &mut traversal).await;
+        let traversal_result = entries
+            .finish()
+            .await
+            .map_err(BuildError::Traversal)
+            .map_err(BuildFailure::recoverable);
         let result = write_result.and(traversal_result);
-        let state = self.builder_state();
-        state.source_buffer = traversal.source_buffer;
-        if result.is_ok() {
-            state.entries = traversal.entries;
-        } else if traversal.emitted {
-            state.poison();
+        self.state.source_buffer = traversal.source_buffer;
+        match result {
+            Ok(()) => {
+                self.state.entries = traversal.entries;
+                Ok(())
+            }
+            Err(error) => {
+                let (error, hook_poisoned) = error.into_parts();
+                if traversal.emitted || hook_poisoned {
+                    self.state.poison();
+                }
+                Err(error)
+            }
         }
-        result
     }
 
     /// Finalizes and consumes this archive builder.
     ///
     /// Callers that need to retain access to an output sink should lend it to
-    /// the concrete builder rather than transferring ownership.
-    async fn finish(mut self) -> Result<(), BuildError<Self::Error>> {
-        self.builder_state().ensure_active()?;
-        self.finish_archive().await
+    /// the format writer before wrapping it rather than transferring ownership.
+    pub async fn finish(mut self) -> Result<(), BuildError<B::Error>> {
+        self.state.ensure_active()?;
+        let result = self.backend.finish_archive().await;
+        self.resolve_hook(result)
+    }
+
+    fn resolve_hook<T>(
+        &mut self,
+        result: Result<T, BuildFailure<B::Error>>,
+    ) -> Result<T, BuildError<B::Error>> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let (error, poisons_builder) = error.into_parts();
+                if poisons_builder {
+                    self.state.poison();
+                }
+                Err(error)
+            }
+        }
     }
 }
 
@@ -375,7 +438,7 @@ async fn write_directory_entries<B: ArchiveBuilder>(
     builder: &mut B,
     entries: &mut TraversalStream,
     traversal: &mut DirectoryBuild,
-) -> Result<(), BuildError<B::Error>> {
+) -> Result<(), BuildFailure<B::Error>> {
     while let Some(entries) = entries.recv().await {
         for entry in entries {
             match entry.kind {
@@ -384,7 +447,8 @@ async fn write_directory_entries<B: ArchiveBuilder>(
                         &mut traversal.entries,
                         &entry.archive_path,
                         ArchivedEntry::Directory { explicit: true },
-                    )?;
+                    )
+                    .map_err(BuildFailure::recoverable)?;
                     builder.write_directory_member(&entry.archive_path).await?;
                 }
                 TraversalKind::Regular => {
@@ -392,7 +456,8 @@ async fn write_directory_entries<B: ArchiveBuilder>(
                         &mut traversal.entries,
                         &entry.archive_path,
                         ArchivedEntry::Regular,
-                    )?;
+                    )
+                    .map_err(BuildFailure::recoverable)?;
                     write_source_file(builder, &entry, traversal).await?;
                 }
                 TraversalKind::SymbolicLink { target } => {
@@ -400,7 +465,8 @@ async fn write_directory_entries<B: ArchiveBuilder>(
                         &mut traversal.entries,
                         &entry.archive_path,
                         ArchivedEntry::SymbolicLink,
-                    )?;
+                    )
+                    .map_err(BuildFailure::recoverable)?;
                     builder
                         .write_symbolic_link_member(&entry.archive_path, &target)
                         .await?;
@@ -416,16 +482,12 @@ async fn write_source_file<B: ArchiveBuilder>(
     builder: &mut B,
     entry: &TraversalEntry,
     traversal: &mut DirectoryBuild,
-) -> Result<(), BuildError<B::Error>> {
+) -> Result<(), BuildFailure<B::Error>> {
     let buffer = mem::take(&mut traversal.source_buffer);
-    let (buffer, result) = prepare_source_file(&entry.source, buffer).await;
-    let (mut payload, executable) = match result {
-        Ok(prepared) => prepared.into_payload(buffer),
-        Err(error) => {
-            traversal.source_buffer = buffer;
-            return Err(error.into_build_error());
-        }
-    };
+    let (mut payload, executable) = prepare_source_file(&entry.source, buffer)
+        .await
+        .map_err(SourceError::into_build_error)
+        .map_err(BuildFailure::recoverable)?;
     let metadata = EntryMetadata::default().executable(executable);
     let result = builder
         .write_file_member(&entry.archive_path, &mut payload, metadata)
@@ -440,60 +502,12 @@ struct DirectoryBuild {
     emitted: bool,
 }
 
-enum PreparedSourceFile {
-    Buffered {
-        size: u64,
-        executable: bool,
-    },
-    Streaming {
-        file: std::fs::File,
-        path: PathBuf,
-        size: u64,
-        executable: bool,
-    },
-}
-
-impl PreparedSourceFile {
-    fn into_payload(self, buffer: Vec<u8>) -> (EntryPayload<'static>, bool) {
-        match self {
-            Self::Buffered { size, executable } => (
-                EntryPayload {
-                    size,
-                    inner: EntryPayloadInner::Buffered {
-                        buffer,
-                        yielded: false,
-                    },
-                },
-                executable,
-            ),
-            Self::Streaming {
-                file,
-                path,
-                size,
-                executable,
-            } => (
-                EntryPayload {
-                    size,
-                    inner: EntryPayloadInner::Streaming {
-                        file: tokio::fs::File::from_std(file),
-                        path,
-                        buffer,
-                        remaining: size,
-                        validated_end: false,
-                    },
-                },
-                executable,
-            ),
-        }
-    }
-}
-
 async fn prepare_source_file(
     path: &Path,
-    buffer: Vec<u8>,
-) -> (Vec<u8>, Result<PreparedSourceFile, SourceError>) {
+    mut buffer: Vec<u8>,
+) -> Result<(EntryPayload<'static>, bool), SourceError> {
     let path = path.to_path_buf();
-    with_reusable_buffer(buffer, move |buffer| {
+    tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&path)
             .map_err(|source| SourceError::filesystem("open source file", &path, source))?;
         let metadata = file
@@ -504,50 +518,38 @@ async fn prepare_source_file(
         }
         let size = metadata.len();
         let executable = is_executable(&metadata);
-        if size > SOURCE_FILE_CHUNK_BYTES as u64 {
-            return Ok(PreparedSourceFile::Streaming {
-                file,
+        let inner = if size > SOURCE_FILE_CHUNK_BYTES as u64 {
+            EntryPayloadInner::Streaming {
+                file: tokio::fs::File::from_std(file),
                 path,
-                size,
-                executable,
-            });
-        }
-        let read_limit = size.checked_add(1).ok_or(SourceError::ArithmeticOverflow {
-            context: "buffered source file read limit",
-        })?;
-        buffer.clear();
-        file.take(read_limit)
-            .read_to_end(buffer)
-            .map_err(|source| SourceError::filesystem("read source file", &path, source))?;
-        let actual_size =
-            u64::try_from(buffer.len()).map_err(|_| SourceError::ArithmeticOverflow {
-                context: "buffered source file payload size",
+                buffer,
+                remaining: size,
+                validated_end: false,
+            }
+        } else {
+            let read_limit = size.checked_add(1).ok_or(SourceError::ArithmeticOverflow {
+                context: "buffered source file read limit",
             })?;
-        if actual_size != size {
-            return Err(SourceError::ChangedSourceFile { path });
-        }
-        Ok(PreparedSourceFile::Buffered { size, executable })
+            buffer.clear();
+            file.take(read_limit)
+                .read_to_end(&mut buffer)
+                .map_err(|source| SourceError::filesystem("read source file", &path, source))?;
+            let actual_size =
+                u64::try_from(buffer.len()).map_err(|_| SourceError::ArithmeticOverflow {
+                    context: "buffered source file payload size",
+                })?;
+            if actual_size != size {
+                return Err(SourceError::ChangedSourceFile { path });
+            }
+            EntryPayloadInner::Buffered {
+                buffer,
+                yielded: false,
+            }
+        };
+        Ok((EntryPayload { size, inner }, executable))
     })
     .await
-}
-
-async fn with_reusable_buffer<T, F>(
-    mut buffer: Vec<u8>,
-    operation: F,
-) -> (Vec<u8>, Result<T, SourceError>)
-where
-    T: Send + 'static,
-    F: FnOnce(&mut Vec<u8>) -> Result<T, SourceError> + Send + 'static,
-{
-    match tokio::task::spawn_blocking(move || {
-        let result = operation(&mut buffer);
-        (buffer, result)
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => (Vec::new(), Err(SourceError::BlockingTask(error))),
-    }
+    .map_err(SourceError::BlockingTask)?
 }
 
 enum SourceError {

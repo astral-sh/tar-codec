@@ -70,7 +70,7 @@ async fn encoded_paths(bytes: &[u8]) -> Vec<String> {
 #[tokio::test]
 async fn manual_entries_are_pax_framed_padded_terminated_and_extractable() {
     let mut bytes = Vec::new();
-    let mut encoder = TarEncoder::new(&mut bytes);
+    let mut encoder = TarEncoder::new(&mut bytes).builder();
     encoder
         .add_entry(
             "bin/tool",
@@ -134,7 +134,7 @@ async fn manual_entries_are_pax_framed_padded_terminated_and_extractable() {
 #[tokio::test]
 async fn tar_path_suffix_rejections_happen_before_output() {
     let mut bytes = Vec::new();
-    let mut encoder = TarEncoder::new(&mut bytes);
+    let mut encoder = TarEncoder::new(&mut bytes).builder();
     for path in [
         ".",
         "..",
@@ -168,7 +168,7 @@ async fn tar_path_suffix_rejections_happen_before_output() {
 
 #[tokio::test]
 async fn output_failures_poison_the_encoder() {
-    let mut encoder = TarEncoder::new(FailingWriter);
+    let mut encoder = TarEncoder::new(FailingWriter).builder();
     assert!(matches!(
         encoder
             .add_entry("file", b"contents", EntryMetadata::default())
@@ -196,7 +196,7 @@ async fn recursive_encoding_round_trips_small_and_large_files() {
         .expect("large file should be written");
 
     let mut bytes = Vec::new();
-    let mut encoder = TarEncoder::new(&mut bytes);
+    let mut encoder = TarEncoder::new(&mut bytes).builder();
     encoder
         .add_directory(&source)
         .await
@@ -237,7 +237,7 @@ async fn recursive_encoding_frames_preserved_symlinks() {
 
     let policy = BuilderPolicy::default().symlink_policy(SymlinkPolicy::Preserve);
     let mut bytes = Vec::new();
-    let mut encoder = TarEncoder::with_policy(&mut bytes, policy);
+    let mut encoder = TarEncoder::new(&mut bytes).builder_with_policy(policy);
     encoder
         .add_directory(&source)
         .await

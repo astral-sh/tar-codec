@@ -177,7 +177,7 @@ fn fixture(id: &'static str, files: Vec<(String, Vec<u8>)>) -> Fixture {
 
 async fn encode_entries_tar_codec(fixture: &Fixture) -> u64 {
     let mut sink = FramingSink::default();
-    let mut encoder = TarEncoder::new(&mut sink);
+    let mut encoder = TarEncoder::new(&mut sink).builder();
     for entry in &fixture.entries {
         encoder
             .add_entry(&entry.archive_path, &entry.data, EntryMetadata::default())
@@ -225,7 +225,7 @@ async fn encode_entries_tokio_tar(fixture: &Fixture) -> u64 {
 
 async fn encode_directory_tar_codec(fixture: &Fixture) -> u64 {
     let mut sink = FramingSink::default();
-    let mut encoder = TarEncoder::new(&mut sink);
+    let mut encoder = TarEncoder::new(&mut sink).builder();
     encoder
         .add_directory(&fixture.source)
         .await
@@ -277,7 +277,7 @@ fn configure_tokio_tar_header(header: &mut tokio_tar::Header, payload_len: usize
 
 async fn pax_archive(fixture: &Fixture) -> Vec<u8> {
     let mut bytes = Vec::new();
-    let mut encoder = TarEncoder::new(&mut bytes);
+    let mut encoder = TarEncoder::new(&mut bytes).builder();
     for entry in &fixture.entries {
         encoder
             .add_entry(&entry.archive_path, &entry.data, EntryMetadata::default())

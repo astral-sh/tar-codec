@@ -1,10 +1,11 @@
-use std::{io::Write as _, path::PathBuf};
+use std::{cell::RefCell, io::Write as _, path::PathBuf, rc::Rc};
 
 #[cfg(unix)]
 use archive_trait::builder::SymlinkPolicy;
 use archive_trait::{
-    ArchiveBuilder, BuildError, BuilderState, EntryMetadata, EntryPayload, TraversalError,
-    builder::BuilderPolicy, default_name_validator,
+    ArchiveBuilder, BuildError, EntryMetadata, TraversalError,
+    builder::{BuildFailure, BuilderPolicy, EntryPayload},
+    default_name_validator,
 };
 use tempfile::tempdir;
 use thiserror::Error;
@@ -46,25 +47,25 @@ enum SourceMutation {
     Truncate(PathBuf),
 }
 
-struct MockBuilder {
-    state: BuilderState,
-    entries: Vec<RecordedEntry>,
-    fail_path: Option<String>,
+struct MockFormat {
+    entries: Rc<RefCell<Vec<RecordedEntry>>>,
+    recoverable_failure: Option<String>,
+    poisoned_failure: Option<String>,
     source_mutation: Option<SourceMutation>,
 }
 
-impl MockBuilder {
+impl MockFormat {
     fn new() -> Self {
-        Self::with_policy(BuilderPolicy::default())
-    }
-
-    fn with_policy(policy: BuilderPolicy) -> Self {
         Self {
-            state: BuilderState::new(policy),
-            entries: Vec::new(),
-            fail_path: None,
+            entries: Rc::new(RefCell::new(Vec::new())),
+            recoverable_failure: None,
+            poisoned_failure: None,
             source_mutation: None,
         }
+    }
+
+    fn entries(&self) -> Rc<RefCell<Vec<RecordedEntry>>> {
+        Rc::clone(&self.entries)
     }
 
     fn mutate_source(&mut self) {
@@ -84,14 +85,10 @@ impl MockBuilder {
     }
 }
 
-impl ArchiveBuilder for MockBuilder {
+impl ArchiveBuilder for MockFormat {
     type Error = MockError;
 
-    fn builder_state(&mut self) -> &mut BuilderState {
-        &mut self.state
-    }
-
-    async fn finish_archive(&mut self) -> Result<(), BuildError<Self::Error>> {
+    async fn finish_archive(&mut self) -> Result<(), BuildFailure<Self::Error>> {
         Ok(())
     }
 
@@ -100,10 +97,12 @@ impl ArchiveBuilder for MockBuilder {
         path: &str,
         payload: &mut EntryPayload<'_>,
         metadata: EntryMetadata,
-    ) -> Result<(), BuildError<Self::Error>> {
-        if self.fail_path.as_deref() == Some(path) {
-            self.state.poison();
-            return Err(BuildError::Encoder(MockError));
+    ) -> Result<(), BuildFailure<Self::Error>> {
+        if self.recoverable_failure.as_deref() == Some(path) {
+            return Err(BuildFailure::recoverable(BuildError::Encoder(MockError)));
+        }
+        if self.poisoned_failure.as_deref() == Some(path) {
+            return Err(BuildFailure::poisoned(BuildError::Encoder(MockError)));
         }
         self.mutate_source();
         let mut data = Vec::new();
@@ -115,13 +114,10 @@ impl ArchiveBuilder for MockBuilder {
                     data.extend_from_slice(chunk);
                 }
                 Ok(None) => break,
-                Err(error) => {
-                    self.state.poison();
-                    return Err(error);
-                }
+                Err(error) => return Err(BuildFailure::poisoned(error)),
             }
         }
-        self.entries.push(RecordedEntry::File {
+        self.entries.borrow_mut().push(RecordedEntry::File {
             path: path.to_owned(),
             data,
             executable: metadata.is_executable(),
@@ -130,12 +126,19 @@ impl ArchiveBuilder for MockBuilder {
         Ok(())
     }
 
-    async fn write_directory_member(&mut self, path: &str) -> Result<(), BuildError<Self::Error>> {
-        if self.fail_path.as_deref() == Some(path) {
-            self.state.poison();
-            return Err(BuildError::Encoder(MockError));
+    async fn write_directory_member(
+        &mut self,
+        path: &str,
+    ) -> Result<(), BuildFailure<Self::Error>> {
+        if self.recoverable_failure.as_deref() == Some(path) {
+            return Err(BuildFailure::recoverable(BuildError::Encoder(MockError)));
         }
-        self.entries.push(RecordedEntry::Directory(path.to_owned()));
+        if self.poisoned_failure.as_deref() == Some(path) {
+            return Err(BuildFailure::poisoned(BuildError::Encoder(MockError)));
+        }
+        self.entries
+            .borrow_mut()
+            .push(RecordedEntry::Directory(path.to_owned()));
         Ok(())
     }
 
@@ -143,8 +146,8 @@ impl ArchiveBuilder for MockBuilder {
         &mut self,
         path: &str,
         target: &str,
-    ) -> Result<(), BuildError<Self::Error>> {
-        self.entries.push(RecordedEntry::SymbolicLink {
+    ) -> Result<(), BuildFailure<Self::Error>> {
+        self.entries.borrow_mut().push(RecordedEntry::SymbolicLink {
             path: path.to_owned(),
             target: target.to_owned(),
         });
@@ -154,7 +157,9 @@ impl ArchiveBuilder for MockBuilder {
 
 #[tokio::test]
 async fn manual_entries_preserve_order_metadata_and_collision_state() {
-    let mut builder = MockBuilder::new();
+    let format = MockFormat::new();
+    let entries = format.entries();
+    let mut builder = format.builder();
     builder
         .add_entry(
             "bin/tool",
@@ -187,7 +192,7 @@ async fn manual_entries_preserve_order_metadata_and_collision_state() {
         .expect("preflight failures should leave the builder usable");
 
     assert_eq!(
-        builder.entries,
+        entries.borrow().as_slice(),
         [
             RecordedEntry::file("bin/tool", b"run", true),
             RecordedEntry::file("README", b"hello", false),
@@ -223,7 +228,7 @@ async fn name_validation_supports_default_custom_and_disabled_policies() {
     ];
 
     for (policy, path, accepted, context) in policies {
-        let mut builder = MockBuilder::with_policy(policy);
+        let mut builder = MockFormat::new().builder_with_policy(policy);
         let result = builder.add_entry(path, b"", EntryMetadata::default()).await;
         assert_eq!(result.is_ok(), accepted, "{context}: {result:?}");
         if !accepted {
@@ -253,14 +258,16 @@ async fn recursive_build_is_sorted_and_streams_small_and_large_files() {
             .expect("executable permissions should be set");
     }
 
-    let mut builder = MockBuilder::new();
+    let format = MockFormat::new();
+    let entries = format.entries();
+    let mut builder = format.builder();
     builder
         .add_directory(&source)
         .await
         .expect("directory should be added");
 
-    let paths = builder
-        .entries
+    let entries = entries.borrow();
+    let paths = entries
         .iter()
         .map(|entry| match entry {
             RecordedEntry::File { path, .. }
@@ -279,18 +286,18 @@ async fn recursive_build_is_sorted_and_streams_small_and_large_files() {
             "tree/z",
         ]
     );
-    assert!(builder.entries.iter().any(|entry| matches!(
+    assert!(entries.iter().any(|entry| matches!(
         entry,
         RecordedEntry::File { path, data, chunks, .. }
             if path == "tree/sub/file" && data == b"nested" && *chunks == 1
     )));
-    assert!(builder.entries.iter().any(|entry| matches!(
+    assert!(entries.iter().any(|entry| matches!(
         entry,
         RecordedEntry::File { path, data, chunks, .. }
             if path == "tree/sub/large" && data.len() == LARGE_FILE_BYTES && *chunks == 2
     )));
     #[cfg(unix)]
-    assert!(builder.entries.iter().any(|entry| matches!(
+    assert!(entries.iter().any(|entry| matches!(
         entry,
         RecordedEntry::File { path, executable: true, .. } if path == "tree/a"
     )));
@@ -315,7 +322,10 @@ async fn recursive_build_applies_symlink_policy() {
     symlink("links", &linked_root).expect("root symbolic link should be created");
     for rejected_source in [&source, &linked_root] {
         assert!(matches!(
-            MockBuilder::new().add_directory(rejected_source).await,
+            MockFormat::new()
+                .builder()
+                .add_directory(rejected_source)
+                .await,
             Err(BuildError::Traversal(
                 TraversalError::SymbolicLinkRejected { .. }
             ))
@@ -323,17 +333,19 @@ async fn recursive_build_applies_symlink_policy() {
     }
 
     let preserve = BuilderPolicy::default().symlink_policy(SymlinkPolicy::Preserve);
-    let mut builder = MockBuilder::with_policy(preserve);
+    let format = MockFormat::new();
+    let entries = format.entries();
+    let mut builder = format.builder_with_policy(preserve);
     builder
         .add_directory(&source)
         .await
         .expect("directory should be added");
 
-    assert!(builder.entries.contains(&RecordedEntry::SymbolicLink {
+    assert!(entries.borrow().contains(&RecordedEntry::SymbolicLink {
         path: "links/link".to_owned(),
         target: "target".to_owned(),
     }));
-    assert!(builder.entries.contains(&RecordedEntry::SymbolicLink {
+    assert!(entries.borrow().contains(&RecordedEntry::SymbolicLink {
         path: "links/directory".to_owned(),
         target: "../directory-target".to_owned(),
     }));
@@ -343,7 +355,10 @@ async fn recursive_build_applies_symlink_policy() {
         default_name_validator(name) && !name.contains("blocked")
     }));
     assert!(matches!(
-        MockBuilder::with_policy(policy).add_directory(&source).await,
+        MockFormat::new()
+            .builder_with_policy(policy)
+            .add_directory(&source)
+            .await,
         Err(BuildError::Traversal(TraversalError::NameRejected {
             context: "symbolic-link target",
             value,
@@ -352,7 +367,8 @@ async fn recursive_build_applies_symlink_policy() {
 
     std::fs::remove_file(source.join("custom")).expect("custom link should be removed");
     symlink(" leading", source.join("disabled")).expect("disabled-policy link should be created");
-    MockBuilder::with_policy(preserve.name_validator(None))
+    MockFormat::new()
+        .builder_with_policy(preserve.name_validator(None))
         .add_directory(&source)
         .await
         .expect("disabled validation should accept the link target");
@@ -370,7 +386,7 @@ async fn recursive_build_reports_non_utf8_and_unsupported_sources() {
     let source = temp.path().join("file");
     std::fs::write(&source, b"contents").expect("source file should be written");
     assert!(matches!(
-        MockBuilder::new().add_directory(&source).await,
+        MockFormat::new().builder().add_directory(&source).await,
         Err(BuildError::Traversal(
             TraversalError::SourceNotDirectory { .. }
         ))
@@ -379,7 +395,7 @@ async fn recursive_build_reports_non_utf8_and_unsupported_sources() {
     let source = temp.path().join(" rejected");
     std::fs::create_dir(&source).expect("rejected source directory should be created");
     assert!(matches!(
-        MockBuilder::new().add_directory(&source).await,
+        MockFormat::new().builder().add_directory(&source).await,
         Err(BuildError::Traversal(TraversalError::NameRejected {
             context: "member path",
             ..
@@ -391,7 +407,7 @@ async fn recursive_build_reports_non_utf8_and_unsupported_sources() {
     let invalid_name = OsString::from_vec(vec![0xff]);
     if std::fs::write(source.join(&invalid_name), b"contents").is_ok() {
         assert!(matches!(
-            MockBuilder::new().add_directory(&source).await,
+            MockFormat::new().builder().add_directory(&source).await,
             Err(BuildError::Traversal(
                 TraversalError::NonUtf8SourcePath { .. }
             ))
@@ -406,7 +422,8 @@ async fn recursive_build_reports_non_utf8_and_unsupported_sources() {
     )
     .expect("non-UTF-8 symbolic link should be created");
     assert!(matches!(
-        MockBuilder::with_policy(BuilderPolicy::default().symlink_policy(SymlinkPolicy::Preserve))
+        MockFormat::new()
+            .builder_with_policy(BuilderPolicy::default().symlink_policy(SymlinkPolicy::Preserve),)
             .add_directory(&source)
             .await,
         Err(BuildError::Traversal(
@@ -419,7 +436,7 @@ async fn recursive_build_reports_non_utf8_and_unsupported_sources() {
     let _listener =
         UnixListener::bind(source.join("listener")).expect("Unix-domain socket should be created");
     assert!(matches!(
-        MockBuilder::new().add_directory(&source).await,
+        MockFormat::new().builder().add_directory(&source).await,
         Err(BuildError::Traversal(
             TraversalError::UnsupportedFilesystemType { .. }
         ))
@@ -441,14 +458,16 @@ async fn late_traversal_failures_poison_after_a_completed_batch() {
     let _listener = UnixListener::bind(source.join("unsupported"))
         .expect("Unix-domain socket should be created");
 
-    let mut builder = MockBuilder::new();
+    let format = MockFormat::new();
+    let entries = format.entries();
+    let mut builder = format.builder();
     assert!(matches!(
         builder.add_directory(&source).await,
         Err(BuildError::Traversal(
             TraversalError::UnsupportedFilesystemType { .. }
         ))
     ));
-    assert!(!builder.entries.is_empty());
+    assert!(!entries.borrow().is_empty());
     assert!(matches!(
         builder
             .add_entry("other", b"", EntryMetadata::default())
@@ -466,11 +485,12 @@ async fn source_growth_and_truncation_poison_after_member_framing() {
         let file = source.join("large");
         std::fs::write(&file, vec![b'x'; LARGE_FILE_BYTES]).expect("large file should be written");
 
-        let mut builder = MockBuilder::new();
-        builder.source_mutation = Some(match mutation {
+        let mut format = MockFormat::new();
+        format.source_mutation = Some(match mutation {
             "growth" => SourceMutation::Grow(file),
             _ => SourceMutation::Truncate(file),
         });
+        let mut builder = format.builder();
         assert!(matches!(
             builder.add_directory(&source).await,
             Err(BuildError::ChangedSourceFile { .. })
@@ -487,7 +507,7 @@ async fn source_growth_and_truncation_poison_after_member_framing() {
 #[tokio::test]
 async fn early_failures_leave_builders_usable_but_late_failures_poison_them() {
     let temp = tempdir().expect("temporary directory should be created");
-    let mut builder = MockBuilder::new();
+    let mut builder = MockFormat::new().builder();
     assert!(matches!(
         builder.add_directory(temp.path().join("missing")).await,
         Err(BuildError::Traversal(TraversalError::Filesystem { .. }))
@@ -500,7 +520,7 @@ async fn early_failures_leave_builders_usable_but_late_failures_poison_them() {
     let source = temp.path().join("tree");
     std::fs::create_dir(&source).expect("source directory should be created");
     std::fs::write(source.join("file"), b"new").expect("source file should be written");
-    let mut builder = MockBuilder::new();
+    let mut builder = MockFormat::new().builder();
     builder
         .add_entry("tree/file", b"existing", EntryMetadata::default())
         .await
@@ -516,8 +536,23 @@ async fn early_failures_leave_builders_usable_but_late_failures_poison_them() {
         Err(BuildError::Poisoned)
     ));
 
-    let mut builder = MockBuilder::new();
-    builder.fail_path = Some("failed".to_owned());
+    let mut format = MockFormat::new();
+    format.recoverable_failure = Some("failed".to_owned());
+    let mut builder = format.builder();
+    assert!(matches!(
+        builder
+            .add_entry("failed", b"payload", EntryMetadata::default())
+            .await,
+        Err(BuildError::Encoder(MockError))
+    ));
+    builder
+        .add_entry("other", b"", EntryMetadata::default())
+        .await
+        .expect("recoverable format failure should leave the builder usable");
+
+    let mut format = MockFormat::new();
+    format.poisoned_failure = Some("failed".to_owned());
+    let mut builder = format.builder();
     assert!(matches!(
         builder
             .add_entry("failed", b"payload", EntryMetadata::default())

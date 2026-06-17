@@ -25,17 +25,17 @@ format hooks.
 ```rust
 use tar_codec::{ArchiveBuilder as _, EntryMetadata, TarEncoder};
 
-let mut encoder = TarEncoder::new(&mut writer);
+let mut encoder = TarEncoder::new(&mut writer).builder();
 encoder
     .add_entry("README.md", b"hello\n", EntryMetadata::default())
     .await?;
 encoder.finish().await?;
 ```
 
-Use `TarEncoder::with_policy` and `builder::BuilderPolicy` to configure generic
-name validation and source traversal. Recursive builds reject symbolic links by
-default. Configure `builder::SymlinkPolicy::Preserve` to retain link members
-instead. Compression remains the caller's responsibility.
+Use `ArchiveBuilder::builder_with_policy` and `builder::BuilderPolicy` to
+configure generic name validation and source traversal. Recursive builds reject
+symbolic links by default. Configure `builder::SymlinkPolicy::Preserve` to
+retain link members instead. Compression remains the caller's responsibility.
 
 ```rust
 use tar_codec::{Archive as _, TarArchive, extract::ExtractPolicy};

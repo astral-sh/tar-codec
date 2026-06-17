@@ -27,7 +27,7 @@ async fn extracts_pax_and_ustar_archives_across_crates() {
 
 async fn pax_archive() -> Vec<u8> {
     let mut bytes = Vec::new();
-    let mut encoder = TarEncoder::new(&mut bytes);
+    let mut encoder = TarEncoder::new(&mut bytes).builder();
     for (path, data) in ENTRIES {
         encoder
             .add_entry(path, data, EntryMetadata::default())

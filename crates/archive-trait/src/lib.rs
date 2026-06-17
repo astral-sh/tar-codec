@@ -1,7 +1,8 @@
 //! Format-neutral, asynchronous archive construction and extraction.
 //!
-//! Archive formats implement [`ArchiveBuilder`] to reuse high-level entry
-//! addition, recursive filesystem traversal, validation, and source streaming.
+//! Archive formats implement [`ArchiveBuilder`] and call
+//! [`ArchiveBuilder::builder`] to reuse high-level entry addition, recursive
+//! filesystem traversal, validation, and source streaming.
 //! Archive formats implement [`Archive`] by projecting their entries into
 //! [`Member`] values. The default [`Archive::extract_in`] implementation then
 //! applies common extraction policy and filesystem behavior.
@@ -21,9 +22,7 @@ use std::{
 
 use thiserror::Error;
 
-pub use builder::{
-    ArchiveBuilder, BuildError, BuilderState, EntryMetadata, EntryPayload, TraversalError,
-};
+pub use builder::{ArchiveBuilder, BuildError, Builder, EntryMetadata, TraversalError};
 pub use name::{NameValidator, default_name_validator};
 
 /// Common metadata for one archive member.

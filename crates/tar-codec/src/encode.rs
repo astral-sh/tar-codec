@@ -1,13 +1,15 @@
 //! Pure-pax tar encoding for the format-neutral archive builder.
 //!
 //! [`TarEncoder`] owns tar framing, payload padding, sequence numbers, and the
-//! end marker. [`ArchiveBuilder`] supplies high-level entry addition and
-//! recursive filesystem traversal. Compression remains the caller's concern.
+//! end marker. [`archive_trait::Builder`] supplies high-level entry addition
+//! and recursive filesystem traversal. Compression remains the caller's
+//! concern.
 
 use std::io;
 
 use archive_trait::{
-    ArchiveBuilder, BuildError, BuilderState, EntryMetadata, EntryPayload, builder::BuilderPolicy,
+    ArchiveBuilder, BuildError, EntryMetadata,
+    builder::{BuildFailure, EntryPayload},
 };
 use tar_framing::{
     UstarKind,
@@ -18,10 +20,9 @@ use tar_framing::{
 use thiserror::Error;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-/// A one-pass asynchronous encoder for deterministic pure-pax tar archives.
+/// A pure-pax format writer for use with [`ArchiveBuilder::builder`].
 pub struct TarEncoder<W> {
     writer: W,
-    state: BuilderState,
     sequence: u64,
     framing_buffer: Vec<u8>,
 }
@@ -29,14 +30,8 @@ pub struct TarEncoder<W> {
 impl<W> TarEncoder<W> {
     /// Creates an encoder writing an uncompressed pax archive into `writer`.
     pub fn new(writer: W) -> Self {
-        Self::with_policy(writer, BuilderPolicy::default())
-    }
-
-    /// Creates an encoder using `policy`.
-    pub fn with_policy(writer: W, policy: BuilderPolicy) -> Self {
         Self {
             writer,
-            state: BuilderState::new(policy),
             sequence: 0,
             framing_buffer: Vec::new(),
         }
@@ -44,18 +39,23 @@ impl<W> TarEncoder<W> {
 }
 
 impl<W: AsyncWrite + Unpin> TarEncoder<W> {
-    async fn write_member(&mut self, member: PaxMember<'_>) -> Result<(), BuildError<EncodeError>> {
+    async fn write_member(
+        &mut self,
+        member: PaxMember<'_>,
+    ) -> Result<(), BuildFailure<EncodeError>> {
         let next_sequence = self.sequence.checked_add(1).ok_or_else(|| {
-            BuildError::Encoder(EncodeError::ArithmeticOverflow {
+            BuildFailure::recoverable(BuildError::Encoder(EncodeError::ArithmeticOverflow {
                 context: "pax member sequence",
-            })
+            }))
         })?;
         frame_pax_member_into(self.sequence, member, &mut self.framing_buffer)
             .map_err(EncodeError::Framing)
-            .map_err(BuildError::Encoder)?;
+            .map_err(BuildError::Encoder)
+            .map_err(BuildFailure::recoverable)?;
         if let Err(source) = self.writer.write_all(&self.framing_buffer).await {
-            self.state.poison();
-            return Err(BuildError::Encoder(EncodeError::Write { source }));
+            return Err(BuildFailure::poisoned(BuildError::Encoder(
+                EncodeError::Write { source },
+            )));
         }
         self.sequence = next_sequence;
         Ok(())
@@ -64,8 +64,8 @@ impl<W: AsyncWrite + Unpin> TarEncoder<W> {
     async fn write_payload(
         &mut self,
         payload: &mut EntryPayload<'_>,
-    ) -> Result<(), BuildError<EncodeError>> {
-        while let Some(chunk) = payload.next_chunk().await? {
+    ) -> Result<(), BuildFailure<EncodeError>> {
+        while let Some(chunk) = payload.next_chunk().await.map_err(BuildFailure::poisoned)? {
             self.write_bytes(chunk).await?;
         }
         let padding = payload_padding(payload.size());
@@ -75,10 +75,11 @@ impl<W: AsyncWrite + Unpin> TarEncoder<W> {
         Ok(())
     }
 
-    async fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), BuildError<EncodeError>> {
+    async fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), BuildFailure<EncodeError>> {
         if let Err(source) = self.writer.write_all(bytes).await {
-            self.state.poison();
-            return Err(BuildError::Encoder(EncodeError::Write { source }));
+            return Err(BuildFailure::poisoned(BuildError::Encoder(
+                EncodeError::Write { source },
+            )));
         }
         Ok(())
     }
@@ -87,11 +88,7 @@ impl<W: AsyncWrite + Unpin> TarEncoder<W> {
 impl<W: AsyncWrite + Unpin> ArchiveBuilder for TarEncoder<W> {
     type Error = EncodeError;
 
-    fn builder_state(&mut self) -> &mut BuilderState {
-        &mut self.state
-    }
-
-    async fn finish_archive(&mut self) -> Result<(), BuildError<Self::Error>> {
+    async fn finish_archive(&mut self) -> Result<(), BuildFailure<Self::Error>> {
         self.write_bytes(end_marker_bytes()).await
     }
 
@@ -100,7 +97,7 @@ impl<W: AsyncWrite + Unpin> ArchiveBuilder for TarEncoder<W> {
         path: &str,
         payload: &mut EntryPayload<'_>,
         metadata: EntryMetadata,
-    ) -> Result<(), BuildError<Self::Error>> {
+    ) -> Result<(), BuildFailure<Self::Error>> {
         self.write_member(PaxMember {
             path,
             kind: UstarKind::Regular,
@@ -109,14 +106,13 @@ impl<W: AsyncWrite + Unpin> ArchiveBuilder for TarEncoder<W> {
             executable: metadata.is_executable(),
         })
         .await?;
-        let result = self.write_payload(payload).await;
-        if result.is_err() {
-            self.state.poison();
-        }
-        result
+        self.write_payload(payload).await
     }
 
-    async fn write_directory_member(&mut self, path: &str) -> Result<(), BuildError<Self::Error>> {
+    async fn write_directory_member(
+        &mut self,
+        path: &str,
+    ) -> Result<(), BuildFailure<Self::Error>> {
         self.write_member(PaxMember {
             path,
             kind: UstarKind::Directory,
@@ -131,7 +127,7 @@ impl<W: AsyncWrite + Unpin> ArchiveBuilder for TarEncoder<W> {
         &mut self,
         path: &str,
         target: &str,
-    ) -> Result<(), BuildError<Self::Error>> {
+    ) -> Result<(), BuildFailure<Self::Error>> {
         self.write_member(PaxMember {
             path,
             kind: UstarKind::SymbolicLink,

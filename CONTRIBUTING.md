@@ -20,11 +20,12 @@ Archive reading has four abstraction layers, from lowest to highest:
 
 Archive building follows the same separation in reverse:
 
-- archive-trait: the _build_ layer owns entry addition, name validation,
-  collision tracking, recursive filesystem traversal, source streaming, and
-  poisoning semantics.
-- tar-codec: the _encode_ layer projects generic build operations into pax
-  members and owns tar framing, padding, sequence numbers, and terminators.
+- archive-trait: the _build_ layer wraps format writers in a stateful engine
+  that owns entry addition, name validation, collision tracking, recursive
+  filesystem traversal, source streaming, and poisoning semantics.
+- tar-codec: the _encode_ layer implements the format-writer hooks that project
+  generic build operations into pax members and owns tar framing, padding,
+  sequence numbers, and terminators.
 - tar-framing: the _physical_ write layer serializes individual pax members.
 
 These layers/concerns should be preserved when making changes.
