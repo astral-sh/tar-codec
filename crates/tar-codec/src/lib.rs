@@ -4,12 +4,14 @@
 //! [`Builder`] for format-neutral construction, and
 //! [`Archive::extract_in`] for format-neutral extraction.
 //!
-//! ## Security
+//! ## Security and correctness
 //!
 //! Like other tar parsers, tar-codec assumes that it has unique access
-//! to the target directory (the "extraction root") when extracting.
-//! Concurrent mutation of the target directory is outside of the threat
-//! model.
+//! to the target directory (the "extraction root") when extracting,
+//! and to any targeted inputs when building a new archive.
+//! Concurrent mutation of files under the extraction root
+//! or of files being added to an archive is outside of the threat model.
+//!
 //! See the [repository's SECURITY.md](https://github.com/astral-sh/tar-codec/blob/main/SECURITY.md)
 //! for more information.
 

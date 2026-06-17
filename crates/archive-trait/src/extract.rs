@@ -1,4 +1,4 @@
-//! Format-neutral extraction policies and filesystem implementation.
+//! Format-neutral archive extraction.
 
 use std::{
     collections::{HashMap, HashSet},

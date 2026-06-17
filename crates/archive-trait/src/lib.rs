@@ -225,11 +225,13 @@ pub trait Archive: Sized {
     where
         Self: 'a;
 
-    /// Implementation hook used by [`Members::next`].
+    /// Reads the next format-neutral member for [`Members::next`].
     ///
     /// Implementations must drain and validate an unfinished preceding payload
-    /// before returning another member.
-    #[doc(hidden)]
+    /// before returning another member. Archive consumers should use
+    /// [`Archive::members`] rather than call this hook directly: [`Members`]
+    /// wraps each payload in [`LentPayload`] to enforce the lending cursor
+    /// contract even when a concrete payload type does not retain its lifetime.
     async fn next_member<'a>(
         &'a mut self,
     ) -> Result<Option<Member<Self::Payload<'a>>>, Self::Error>;

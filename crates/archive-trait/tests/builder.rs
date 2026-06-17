@@ -1,4 +1,4 @@
-use std::{cell::RefCell, io::Write as _, path::PathBuf, rc::Rc};
+use std::{cell::RefCell, io, path::PathBuf, rc::Rc};
 
 #[cfg(unix)]
 use archive_trait::builder::SymlinkPolicy;
@@ -42,16 +42,11 @@ impl RecordedEntry {
 #[error("injected format failure")]
 struct MockError;
 
-enum SourceMutation {
-    Grow(PathBuf),
-    Truncate(PathBuf),
-}
-
 struct MockFormat {
     entries: Rc<RefCell<Vec<RecordedEntry>>>,
     recoverable_failure: Option<String>,
     poisoned_failure: Option<String>,
-    source_mutation: Option<SourceMutation>,
+    truncate_source: Option<PathBuf>,
 }
 
 impl MockFormat {
@@ -60,7 +55,7 @@ impl MockFormat {
             entries: Rc::new(RefCell::new(Vec::new())),
             recoverable_failure: None,
             poisoned_failure: None,
-            source_mutation: None,
+            truncate_source: None,
         }
     }
 
@@ -68,19 +63,15 @@ impl MockFormat {
         Rc::clone(&self.entries)
     }
 
-    fn mutate_source(&mut self) {
-        let result = match self.source_mutation.take() {
-            Some(SourceMutation::Grow(path)) => std::fs::OpenOptions::new()
-                .append(true)
-                .open(path)
-                .and_then(|mut file| file.write_all(b"growth")),
-            Some(SourceMutation::Truncate(path)) => std::fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(path)
-                .map(drop),
-            None => return,
+    fn truncate_source(&mut self) {
+        let Some(path) = self.truncate_source.take() else {
+            return;
         };
+        let result = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .map(drop);
         assert!(result.is_ok(), "source mutation should succeed: {result:?}");
     }
 }
@@ -104,7 +95,7 @@ impl ArchiveBuilder for MockFormat {
         if self.poisoned_failure.as_deref() == Some(path) {
             return Err(BuildFailure::poisoned(BuildError::Encoder(MockError)));
         }
-        self.mutate_source();
+        self.truncate_source();
         let mut data = Vec::new();
         let mut chunks = 0;
         loop {
@@ -477,31 +468,27 @@ async fn late_traversal_failures_poison_after_a_completed_batch() {
 }
 
 #[tokio::test]
-async fn source_growth_and_truncation_poison_after_member_framing() {
-    for mutation in ["growth", "truncation"] {
-        let temp = tempdir().expect("temporary directory should be created");
-        let source = temp.path().join("tree");
-        std::fs::create_dir(&source).expect("source directory should be created");
-        let file = source.join("large");
-        std::fs::write(&file, vec![b'x'; LARGE_FILE_BYTES]).expect("large file should be written");
+async fn source_truncation_poison_after_member_framing() {
+    let temp = tempdir().expect("temporary directory should be created");
+    let source = temp.path().join("tree");
+    std::fs::create_dir(&source).expect("source directory should be created");
+    let file = source.join("large");
+    std::fs::write(&file, vec![b'x'; LARGE_FILE_BYTES]).expect("large file should be written");
 
-        let mut format = MockFormat::new();
-        format.source_mutation = Some(match mutation {
-            "growth" => SourceMutation::Grow(file),
-            _ => SourceMutation::Truncate(file),
-        });
-        let mut builder = format.builder();
-        assert!(matches!(
-            builder.add_directory(&source).await,
-            Err(BuildError::ChangedSourceFile { .. })
-        ));
-        assert!(matches!(
-            builder
-                .add_entry("other", b"", EntryMetadata::default())
-                .await,
-            Err(BuildError::Poisoned)
-        ));
-    }
+    let mut format = MockFormat::new();
+    format.truncate_source = Some(file);
+    let mut builder = format.builder();
+    assert!(matches!(
+        builder.add_directory(&source).await,
+        Err(BuildError::Filesystem { source, .. })
+            if source.kind() == io::ErrorKind::UnexpectedEof
+    ));
+    assert!(matches!(
+        builder
+            .add_entry("other", b"", EntryMetadata::default())
+            .await,
+        Err(BuildError::Poisoned)
+    ));
 }
 
 #[tokio::test]

@@ -129,7 +129,6 @@ enum EntryPayloadInner<'a> {
         path: PathBuf,
         buffer: Vec<u8>,
         remaining: u64,
-        validated_end: bool,
     },
 }
 
@@ -139,7 +138,7 @@ impl EntryPayload<'_> {
         self.size
     }
 
-    /// Returns the next payload chunk and validates source-file stability.
+    /// Returns the next payload chunk.
     pub async fn next_chunk<E>(&mut self) -> Result<Option<&[u8]>, BuildError<E>> {
         match &mut self.inner {
             EntryPayloadInner::Borrowed { bytes, yielded } => {
@@ -161,22 +160,8 @@ impl EntryPayload<'_> {
                 path,
                 buffer,
                 remaining,
-                validated_end,
             } => {
                 if *remaining == 0 {
-                    if *validated_end {
-                        return Ok(None);
-                    }
-                    let mut extra = [0];
-                    if file
-                        .read(&mut extra)
-                        .await
-                        .map_err(|source| filesystem_error("read source file", path, source))?
-                        != 0
-                    {
-                        return Err(changed_source_file(path.to_path_buf()));
-                    }
-                    *validated_end = true;
                     return Ok(None);
                 }
                 let chunk_len = usize::try_from((*remaining).min(SOURCE_FILE_CHUNK_BYTES as u64))
@@ -187,7 +172,14 @@ impl EntryPayload<'_> {
                     .await
                     .map_err(|source| filesystem_error("read source file", path, source))?;
                 if length == 0 {
-                    return Err(changed_source_file(path.to_path_buf()));
+                    return Err(filesystem_error(
+                        "read source file",
+                        path,
+                        io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "source file ended before its declared size",
+                        ),
+                    ));
                 }
                 *remaining -= u64::try_from(length)
                     .map_err(|_| arithmetic_overflow("source file read size"))?;
@@ -514,7 +506,11 @@ async fn prepare_source_file(
             .metadata()
             .map_err(|source| SourceError::filesystem("inspect source file", &path, source))?;
         if !metadata.is_file() {
-            return Err(SourceError::ChangedSourceFile { path });
+            return Err(SourceError::filesystem(
+                "inspect source file",
+                &path,
+                io::Error::other("source is not a regular file"),
+            ));
         }
         let size = metadata.len();
         let executable = is_executable(&metadata);
@@ -524,23 +520,16 @@ async fn prepare_source_file(
                 path,
                 buffer,
                 remaining: size,
-                validated_end: false,
             }
         } else {
-            let read_limit = size.checked_add(1).ok_or(SourceError::ArithmeticOverflow {
-                context: "buffered source file read limit",
-            })?;
-            buffer.clear();
-            file.take(read_limit)
-                .read_to_end(&mut buffer)
-                .map_err(|source| SourceError::filesystem("read source file", &path, source))?;
-            let actual_size =
-                u64::try_from(buffer.len()).map_err(|_| SourceError::ArithmeticOverflow {
-                    context: "buffered source file payload size",
+            let payload_size =
+                usize::try_from(size).map_err(|_| SourceError::ArithmeticOverflow {
+                    context: "buffered source file size",
                 })?;
-            if actual_size != size {
-                return Err(SourceError::ChangedSourceFile { path });
-            }
+            buffer.resize(payload_size, 0);
+            (&file)
+                .read_exact(&mut buffer)
+                .map_err(|source| SourceError::filesystem("read source file", &path, source))?;
             EntryPayloadInner::Buffered {
                 buffer,
                 yielded: false,
@@ -553,9 +542,6 @@ async fn prepare_source_file(
 }
 
 enum SourceError {
-    ChangedSourceFile {
-        path: PathBuf,
-    },
     Filesystem {
         operation: &'static str,
         path: PathBuf,
@@ -578,7 +564,6 @@ impl SourceError {
 
     fn into_build_error<E>(self) -> BuildError<E> {
         match self {
-            Self::ChangedSourceFile { path } => BuildError::ChangedSourceFile { path },
             Self::Filesystem {
                 operation,
                 path,
@@ -624,12 +609,6 @@ pub enum BuildError<E> {
     PathCollision {
         /// The conflicting normalized archive path.
         path: String,
-    },
-    /// A source file changed while it was being archived.
-    #[error("source file changed while archiving: {path}")]
-    ChangedSourceFile {
-        /// The unstable source path.
-        path: PathBuf,
     },
     /// A source filesystem operation failed.
     #[error("failed to {operation} {path}: {source}")]
@@ -742,10 +721,6 @@ fn filesystem_error<E>(operation: &'static str, path: &Path, source: io::Error) 
 
 fn arithmetic_overflow<E>(context: &'static str) -> BuildError<E> {
     BuildError::ArithmeticOverflow { context }
-}
-
-fn changed_source_file<E>(path: PathBuf) -> BuildError<E> {
-    BuildError::ChangedSourceFile { path }
 }
 
 fn path_collision<E>(path: &str) -> BuildError<E> {
