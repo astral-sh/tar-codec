@@ -158,7 +158,16 @@ pub(crate) fn stream_directory_entries(
     validation: NameValidation,
     symlink_policy: SymlinkPolicy,
 ) -> Result<TraversalStream, TraversalError> {
-    let archive_path = source_archive_path(&source, validation)?;
+    let Some(archive_path) = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+    else {
+        return Err(TraversalError::NonUtf8SourcePath {
+            path: source.to_path_buf(),
+        });
+    };
+    validate_name(&archive_path, validation, "member path")?;
     let (sender, receiver) = mpsc::channel(DIRECTORY_TRAVERSAL_BUFFER_BATCHES);
     let task = tokio::task::spawn_blocking(move || {
         let mut output = TraversalSender::new(sender);
@@ -176,19 +185,6 @@ pub(crate) fn stream_directory_entries(
         entries: receiver,
         task,
     })
-}
-
-fn source_archive_path(
-    source: &Path,
-    validation: NameValidation,
-) -> Result<String, TraversalError> {
-    let Some(name) = source.file_name().and_then(|name| name.to_str()) else {
-        return Err(TraversalError::NonUtf8SourcePath {
-            path: source.to_path_buf(),
-        });
-    };
-    validate_name(name, validation, "member path")?;
-    Ok(name.to_owned())
 }
 
 fn stream_directory_entries_blocking(
