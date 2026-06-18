@@ -164,9 +164,29 @@ pub(crate) async fn extract<A: Archive>(
     let mut chunk_buffer = Vec::new();
     // Complete small-file contents, buffered so payload validation precedes file creation.
     let mut buffered_payload = Vec::new();
-    while let Some(member) = members.next().await.map_err(ExtractError::Archive)? {
-        check_member_policy(&member, policy)?;
-        let decoded = decode_member(&member, policy)?;
+    loop {
+        let member = match members.next().await {
+            // The next member is decoded and ready for policy validation.
+            Ok(Some(member)) => member,
+            // A clean end of archive proceeds to finalization below.
+            Ok(None) => break,
+            // Commit earlier validated files before reporting a later decoding error.
+            Err(error) => {
+                root.flush_buffered_files().await?;
+                return Err(ExtractError::Archive(error));
+            }
+        };
+        if let Err(error) = check_member_policy(&member, policy) {
+            root.flush_buffered_files().await?;
+            return Err(error);
+        }
+        let decoded = match decode_member(&member, policy) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                root.flush_buffered_files().await?;
+                return Err(error);
+            }
+        };
         match member {
             Member::File {
                 size,
@@ -195,6 +215,7 @@ pub(crate) async fn extract<A: Archive>(
                     .await?;
             }
             Member::Special { kind, .. } => {
+                root.flush_buffered_files().await?;
                 return Err(ExtractError::UnsupportedMember {
                     position: decoded.position,
                     path: decoded.path,

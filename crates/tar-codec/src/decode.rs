@@ -13,7 +13,10 @@ use tar_framing::{
 use thiserror::Error;
 use tokio::io::AsyncRead;
 
-pub use tar_framing::DEFAULT_MAX_PAX_EXTENSION_SIZE;
+pub use tar_framing::{
+    DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE, DEFAULT_MAX_GNU_EXTENSION_SIZE,
+    DEFAULT_MAX_PAX_EXTENSION_SIZE,
+};
 
 /// A one-pass reader for a validated pax or GNU tar archive.
 pub struct TarArchive<R> {
@@ -29,13 +32,11 @@ impl<R> TarArchive<R> {
 
     /// Creates an archive decoder using `policy`.
     pub fn new_with_policy(reader: R, policy: DecodePolicy) -> Self {
-        Self {
-            reader: TarReader::with_max_pax_extension_size(
-                reader,
-                policy.pax_policy.max_extension_size,
-            ),
-            policy,
-        }
+        let mut reader = TarReader::new(reader);
+        reader.set_max_pax_extension_size(policy.pax_policy.max_extension_size);
+        reader.set_max_global_pax_extensions_size(policy.pax_policy.max_global_extensions_size);
+        reader.set_max_gnu_extension_size(policy.max_gnu_extension_size);
+        Self { reader, policy }
     }
 }
 
@@ -45,6 +46,7 @@ impl<R> TarArchive<R> {
 #[derive(Clone, Copy, Debug)]
 pub struct DecodePolicy {
     allow_gnu: bool,
+    max_gnu_extension_size: u64,
     pax_policy: PaxDecodePolicy,
 }
 
@@ -54,6 +56,7 @@ pub struct DecodePolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PaxDecodePolicy {
     max_extension_size: u64,
+    max_global_extensions_size: u64,
     allow_global_pax_extensions: bool,
     allow_unknown_pax_vendor_records: bool,
     allow_duplicate_pax_records: bool,
@@ -64,6 +67,7 @@ impl Default for PaxDecodePolicy {
     fn default() -> Self {
         Self {
             max_extension_size: DEFAULT_MAX_PAX_EXTENSION_SIZE,
+            max_global_extensions_size: DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE,
             allow_global_pax_extensions: true,
             allow_unknown_pax_vendor_records: false,
             allow_duplicate_pax_records: false,
@@ -76,6 +80,7 @@ impl Default for DecodePolicy {
     fn default() -> Self {
         Self {
             allow_gnu: true,
+            max_gnu_extension_size: DEFAULT_MAX_GNU_EXTENSION_SIZE,
             pax_policy: PaxDecodePolicy::default(),
         }
     }
@@ -90,6 +95,18 @@ impl DecodePolicy {
     /// disable this setting.
     pub fn allow_gnu(mut self, allow: bool) -> Self {
         self.allow_gnu = allow;
+        self
+    }
+
+    /// Configures the maximum payload size accepted for one GNU metadata extension.
+    ///
+    /// The limit applies independently to long-name and long-link extensions.
+    /// An extension that declares a larger payload is rejected before its
+    /// payload is consumed. The default is [`DEFAULT_MAX_GNU_EXTENSION_SIZE`].
+    /// Setting the limit to zero rejects every nonempty GNU extension. Setting
+    /// it to [`u64::MAX`] permits unbounded metadata buffering.
+    pub fn max_gnu_extension_size(mut self, max_gnu_extension_size: u64) -> Self {
+        self.max_gnu_extension_size = max_gnu_extension_size;
         self
     }
 
@@ -160,11 +177,26 @@ impl PaxDecodePolicy {
     /// covers all records in that extension. An extension that declares a
     /// larger payload is rejected before its payload is consumed.
     ///
-    /// The default is [`DEFAULT_MAX_PAX_EXTENSION_SIZE`].
-    /// Setting the limit to zero rejects every nonempty pax extension. Setting
-    /// it to [`u64::MAX`] permits unbounded metadata buffering.
+    /// The default is [`DEFAULT_MAX_PAX_EXTENSION_SIZE`]. Setting the limit to
+    /// zero rejects every nonempty pax extension. Setting it to [`u64::MAX`]
+    /// removes the per-extension bound; global extensions remain subject to
+    /// their cumulative limit.
     pub fn max_extension_size(mut self, max_extension_size: u64) -> Self {
         self.max_extension_size = max_extension_size;
+        self
+    }
+
+    /// Configures the maximum cumulative payload size of global pax extensions.
+    ///
+    /// The total is reset after each ordinary member. A global extension that
+    /// would increase the pending total beyond this limit is rejected before
+    /// its payload is consumed. The default is
+    /// [`DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE`]. Setting the limit to zero
+    /// rejects every nonempty global extension. Setting it to [`u64::MAX`]
+    /// removes the cumulative bound; each extension remains subject to its
+    /// individual limit.
+    pub fn max_global_extensions_size(mut self, max_global_extensions_size: u64) -> Self {
+        self.max_global_extensions_size = max_global_extensions_size;
         self
     }
 

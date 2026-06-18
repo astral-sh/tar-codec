@@ -392,6 +392,39 @@ async fn symlink_members_fail_by_default_on_unsupported_platforms() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn symlink_graph_resolution_budget_is_shared_across_links() {
+    let temp = tempdir().unwrap();
+    let destination = temp.path().join("out");
+    let mut archive = ArchiveBuilder::new();
+    archive
+        .pax(
+            b'x',
+            &pax_record(
+                PaxKeyword::LinkPath,
+                &format!("missing/{}leaf", "x/".repeat(300)),
+            ),
+        )
+        .posix("chain", b'2', b"", "fallback", 0o644);
+    for index in 0..128 {
+        archive.posix(&format!("alias-{index}"), b'2', b"", "chain", 0o644);
+    }
+    let bytes = archive.finish();
+
+    assert!(matches!(
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, ExtractPolicy::default())
+            .await,
+        Err(ExtractError::InvalidLink {
+            reason: "symbolic-link target resolution work limit exceeded",
+            ..
+        })
+    ));
+    assert!(!destination.join("chain").exists());
+    assert!(!destination.join("alias-0").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn ambient_file_and_directory_targets_require_explicit_opt_in() {
     let temp = tempdir().unwrap();
     for (kind, directory) in [("file", false), ("directory", true)] {
@@ -622,6 +655,33 @@ async fn symlink_graphs_allow_finite_expansion_and_reject_cycles_and_escapes() {
         assert!(!destination.join("a").exists());
         assert!(!destination.join("b").exists());
     }
+
+    let destination = temp.path().join("growing-cycle-work-limit");
+    let suffix = "x".repeat(512);
+    let mut archive = ArchiveBuilder::new();
+    archive
+        .pax(
+            b'x',
+            &pax_record(PaxKeyword::LinkPath, &format!("b/{suffix}")),
+        )
+        .posix("a", b'2', b"", "fallback", 0o644)
+        .pax(
+            b'x',
+            &pax_record(PaxKeyword::LinkPath, &format!("a/{suffix}")),
+        )
+        .posix("b", b'2', b"", "fallback", 0o644);
+    let bytes = archive.finish();
+    assert!(matches!(
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, ExtractPolicy::default())
+            .await,
+        Err(ExtractError::InvalidLink {
+            reason: "symbolic-link target resolution work limit exceeded",
+            ..
+        })
+    ));
+    assert!(!destination.join("a").exists());
+    assert!(!destination.join("b").exists());
 
     let destination = temp.path().join("escape");
     let bytes = single_posix_member("link", b'2', b"", "../outside", 0o644);

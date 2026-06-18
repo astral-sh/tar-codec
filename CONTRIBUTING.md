@@ -36,6 +36,8 @@ change to source traversal, path containment, or filesystem behavior belongs in
 
 ## Formatting and linting
 
+Linting and formatting:
+
 ```shell
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
@@ -47,10 +49,8 @@ Run tests:
 cargo test
 ```
 
-Broad public workflows, including archive construction, encoding, extraction,
-policy interaction, and filesystem behavior, belong in crate integration
-tests. Keep unit tests beside small pure or private helpers whose behavior is
-best expressed through their internal API.
+In general, integration tests are preferred over unit tests. Unit tests
+should be used primarily for small, pure private helpers.
 
 ## Benchmarking
 
@@ -69,4 +69,4 @@ Run the larger filesystem extraction diagnostic matrix separately with:
 cargo bench -p tar-codec --bench extraction_filesystem
 ```
 
-Run both targets when refreshing the benchmark snapshot in `README.md`.
+Run both targets when refreshing the benchmark snapshot in [BENCHMARKS](./BENCHMARKS.md)
