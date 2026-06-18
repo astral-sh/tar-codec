@@ -54,7 +54,7 @@ best expressed through their internal API.
 
 ## Benchmarking
 
-Run the public API comparison benchmarks with:
+Run the headline public API comparison benchmarks with:
 
 ```shell
 cargo bench -p tar-codec --bench comparison
@@ -62,3 +62,11 @@ cargo bench -p tar-codec --bench comparison
 
 The benchmarks compare `tar-codec` against `tar` and `astral-tokio-tar` for
 uncompressed encoding and extraction.
+
+Run the larger filesystem extraction diagnostic matrix separately with:
+
+```shell
+cargo bench -p tar-codec --bench extraction_filesystem
+```
+
+Run both targets when refreshing the benchmark snapshot in `README.md`.

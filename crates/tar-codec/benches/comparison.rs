@@ -1,3 +1,5 @@
+mod support;
+
 use std::{
     fs,
     hint::black_box,
@@ -9,19 +11,18 @@ use std::{
 };
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use support::{
+    Entry, SMALL_FILE_BYTES, SMALL_FILE_COUNT, configure_tar_header, payload, payload_throughput,
+    runtime, ustar_archive_entries,
+};
 use tar_codec::{
     Archive as _, ArchiveBuilder as _, EntryMetadata, TarArchive, TarEncoder,
     extract::ExtractPolicy,
 };
 use tempfile::{TempDir, tempdir};
-use tokio::{
-    io::AsyncWrite,
-    runtime::{Builder as RuntimeBuilder, Runtime},
-};
+use tokio::{io::AsyncWrite, runtime::Runtime};
 
 const LARGE_FILE_BYTES: usize = 16 * 1024 * 1024;
-const SMALL_FILE_BYTES: usize = 1024;
-const SMALL_FILE_COUNT: usize = 1024;
 const SMALL_DIRECTORY_COUNT: usize = 32;
 
 #[derive(Default)]
@@ -70,11 +71,6 @@ impl AsyncWrite for FramingSink {
     }
 }
 
-struct Entry {
-    archive_path: String,
-    data: Vec<u8>,
-}
-
 struct Fixture {
     _temp: TempDir,
     id: &'static str,
@@ -95,32 +91,13 @@ impl Fixture {
     }
 
     fn payload_throughput(&self) -> Throughput {
-        Throughput::ElementsAndBytes {
-            elements: u64::try_from(self.entries.len())
-                .expect("fixture entry count should be representable"),
-            bytes: self.payload_bytes,
-        }
+        payload_throughput(self.entries.len(), self.payload_bytes)
     }
 }
 
 struct DecodeInput {
     id: &'static str,
     bytes: Vec<u8>,
-}
-
-fn runtime() -> Runtime {
-    RuntimeBuilder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("current-thread runtime should build")
-}
-
-fn payload(size: usize, salt: usize) -> Vec<u8> {
-    (0..size)
-        .map(|index| {
-            u8::try_from((index + salt) % 251).expect("payload byte should be representable")
-        })
-        .collect()
 }
 
 fn fixtures() -> Vec<Fixture> {
@@ -263,12 +240,6 @@ async fn encode_directory_tokio_tar(fixture: &Fixture) -> u64 {
         .bytes_written
 }
 
-fn configure_tar_header(header: &mut tar::Header, payload_len: usize) {
-    header.set_size(u64::try_from(payload_len).expect("payload length should be representable"));
-    header.set_mode(0o644);
-    header.set_cksum();
-}
-
 fn configure_tokio_tar_header(header: &mut tokio_tar::Header, payload_len: usize) {
     header.set_size(u64::try_from(payload_len).expect("payload length should be representable"));
     header.set_mode(0o644);
@@ -276,9 +247,13 @@ fn configure_tokio_tar_header(header: &mut tokio_tar::Header, payload_len: usize
 }
 
 async fn pax_archive(fixture: &Fixture) -> Vec<u8> {
+    pax_archive_entries(&fixture.entries).await
+}
+
+async fn pax_archive_entries(entries: &[Entry]) -> Vec<u8> {
     let mut bytes = Vec::new();
     let mut encoder = TarEncoder::new(&mut bytes).builder();
-    for entry in &fixture.entries {
+    for entry in entries {
         encoder
             .add_entry(&entry.archive_path, &entry.data, EntryMetadata::default())
             .await
@@ -292,17 +267,7 @@ async fn pax_archive(fixture: &Fixture) -> Vec<u8> {
 }
 
 fn ustar_archive(fixture: &Fixture) -> Vec<u8> {
-    let mut builder = tar::Builder::new(Vec::new());
-    for entry in &fixture.entries {
-        let mut header = tar::Header::new_ustar();
-        configure_tar_header(&mut header, entry.data.len());
-        builder
-            .append_data(&mut header, &entry.archive_path, entry.data.as_slice())
-            .expect("tar should encode ustar fixture entry");
-    }
-    builder
-        .into_inner()
-        .expect("tar ustar archive should finish")
+    ustar_archive_entries(&fixture.entries)
 }
 
 fn bench_encode_entries_framing(

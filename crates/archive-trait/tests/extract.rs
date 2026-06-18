@@ -14,16 +14,20 @@ use tempfile::tempdir;
 #[tokio::test]
 async fn extracts_common_members_and_streams_payload_sizes() {
     const SMALL_BYTES: usize = 128 * 1024 + 7;
+    const BUFFERED_BOUNDARY_BYTES: usize = 1024 * 1024;
     const LARGE_BYTES: usize = 1024 * 1024 + 7;
 
     let small = patterned_payload(SMALL_BYTES);
+    let buffered_boundary = patterned_payload(BUFFERED_BOUNDARY_BYTES);
     let large = patterned_payload(LARGE_BYTES);
     let archive = TestArchive::new([
         entry::directory("bin"),
         entry::executable("bin/tool", b"run"),
         entry::file("same", b"old"),
         entry::file("same", b"new"),
+        entry::file("empty", b""),
         entry::file("small", small.clone()),
+        entry::file("buffered-boundary", buffered_boundary.clone()),
         entry::file("large", large.clone()),
     ]);
     let temp = tempdir().expect("temporary directory should be created");
@@ -37,7 +41,9 @@ async fn extracts_common_members_and_streams_payload_sizes() {
     for (path, expected) in [
         ("bin/tool", &b"run"[..]),
         ("same", &b"new"[..]),
+        ("empty", &b""[..]),
         ("small", small.as_slice()),
+        ("buffered-boundary", buffered_boundary.as_slice()),
         ("large", large.as_slice()),
     ] {
         assert_eq!(
@@ -56,6 +62,25 @@ async fn extracts_common_members_and_streams_payload_sizes() {
             0
         );
     }
+}
+
+#[tokio::test]
+async fn streaming_payload_reuses_initialized_chunk_buffer() {
+    const PAYLOAD_BYTES: usize = 1024 * 1024 + 7;
+
+    let expected = patterned_payload(PAYLOAD_BYTES);
+    let archive = TestArchive::new([entry::reuse_checked_file("file", expected.clone())]);
+    let temp = tempdir().expect("temporary directory should be created");
+    let destination = temp.path().join("out");
+
+    archive
+        .extract_in(&destination, ExtractPolicy::default())
+        .await
+        .expect("streaming extraction should reuse its chunk buffer");
+    assert_eq!(
+        std::fs::read(destination.join("file")).expect("file should be readable"),
+        expected
+    );
 }
 
 fn patterned_payload(size: usize) -> Vec<u8> {

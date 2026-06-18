@@ -26,6 +26,16 @@ pub mod entry {
         file_with_options(path, data, true, false)
     }
 
+    pub fn reuse_checked_file(path: &str, data: impl Into<Vec<u8>>) -> TestEntry {
+        let data = data.into();
+        Ok(Member::File {
+            metadata: metadata(path),
+            size: data.len() as u64,
+            executable: false,
+            payload: TestPayload::new(data, false).require_buffer_reuse(),
+        })
+    }
+
     fn file_with_options(
         path: &str,
         data: impl Into<Vec<u8>>,
@@ -99,6 +109,7 @@ pub struct TestPayload {
     data: Vec<u8>,
     offset: usize,
     fail_at_end: bool,
+    require_buffer_reuse: bool,
 }
 
 impl TestPayload {
@@ -107,7 +118,13 @@ impl TestPayload {
             data,
             offset: 0,
             fail_at_end,
+            require_buffer_reuse: false,
         }
+    }
+
+    fn require_buffer_reuse(mut self) -> Self {
+        self.require_buffer_reuse = true;
+        self
     }
 }
 
@@ -119,13 +136,16 @@ impl MemberPayload for TestPayload {
         buffer: &mut Vec<u8>,
         target_len: usize,
     ) -> Result<bool, Self::Error> {
-        buffer.clear();
+        if self.require_buffer_reuse && self.offset != 0 && buffer.is_empty() {
+            return Err(TestError);
+        }
         if self.offset == self.data.len() {
             if self.fail_at_end {
                 return Err(TestError);
             }
             return Ok(false);
         }
+        buffer.clear();
         let end = self
             .offset
             .saturating_add(target_len.clamp(1, MAX_TEST_CHUNK_BYTES))

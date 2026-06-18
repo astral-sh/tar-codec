@@ -151,10 +151,11 @@ pub trait MemberPayload: Sized {
 
     /// Reads the next validated, logical payload chunk into a reusable buffer.
     ///
-    /// Returns `true` when `buffer` contains a nonempty chunk. Returns `false`
-    /// only after the payload has been fully consumed and validated. Callers
-    /// clear `buffer` before each call, and implementations may return chunks
-    /// shorter than `target_len`.
+    /// Returns `true` after replacing `buffer` with a nonempty chunk. Returns
+    /// `false` only after the payload has been fully consumed and validated,
+    /// leaving `buffer` unchanged so its initialized storage can be reused.
+    /// Callers should not clear `buffer` between calls. Implementations may
+    /// return chunks shorter than `target_len`.
     ///
     /// Successful chunks contain decoded member contents rather than stored or
     /// compressed bytes. Their total length must equal the `size` declared by
