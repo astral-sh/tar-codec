@@ -14,16 +14,20 @@ use tempfile::tempdir;
 #[tokio::test]
 async fn extracts_common_members_and_streams_payload_sizes() {
     const SMALL_BYTES: usize = 128 * 1024 + 7;
+    const BUFFERED_BOUNDARY_BYTES: usize = 1024 * 1024;
     const LARGE_BYTES: usize = 1024 * 1024 + 7;
 
     let small = patterned_payload(SMALL_BYTES);
+    let buffered_boundary = patterned_payload(BUFFERED_BOUNDARY_BYTES);
     let large = patterned_payload(LARGE_BYTES);
     let archive = TestArchive::new([
         entry::directory("bin"),
         entry::executable("bin/tool", b"run"),
         entry::file("same", b"old"),
         entry::file("same", b"new"),
+        entry::file("empty", b""),
         entry::file("small", small.clone()),
+        entry::file("buffered-boundary", buffered_boundary.clone()),
         entry::file("large", large.clone()),
     ]);
     let temp = tempdir().expect("temporary directory should be created");
@@ -37,7 +41,9 @@ async fn extracts_common_members_and_streams_payload_sizes() {
     for (path, expected) in [
         ("bin/tool", &b"run"[..]),
         ("same", &b"new"[..]),
+        ("empty", &b""[..]),
         ("small", small.as_slice()),
+        ("buffered-boundary", buffered_boundary.as_slice()),
         ("large", large.as_slice()),
     ] {
         assert_eq!(
