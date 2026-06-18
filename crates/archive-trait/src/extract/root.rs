@@ -59,7 +59,10 @@ impl PendingSymlink {
 const MAX_SYMLINK_EXPANSIONS: usize = 256;
 
 // Small files are validated in memory and written in one blocking task.
-const EXTRACTION_CHUNK_BYTES: usize = 1024 * 1024;
+const BUFFERED_PAYLOAD_MAX_BYTES: usize = 1024 * 1024;
+
+// Balance reusable-buffer initialization against blocking write cadence.
+const STREAMING_PAYLOAD_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 
 /// The latest archive-visible state and provenance of an extracted path.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -162,9 +165,8 @@ async fn write_payload<P: MemberPayload>(
     mut file: File,
 ) -> Result<(), ExtractError<P::Error>> {
     loop {
-        chunk_buffer.clear();
         if !payload
-            .next_chunk(chunk_buffer, EXTRACTION_CHUNK_BYTES)
+            .next_chunk(chunk_buffer, STREAMING_PAYLOAD_CHUNK_BYTES)
             .await
             .map_err(ExtractError::Archive)?
         {
@@ -236,21 +238,28 @@ impl<E> ExtractionRoot<E> {
         chunk_buffer: &mut Vec<u8>,
         buffered_payload: &mut Vec<u8>,
     ) -> Result<(), ExtractError<E>> {
-        if size <= EXTRACTION_CHUNK_BYTES as u64 {
-            buffered_payload.clear();
+        if size <= BUFFERED_PAYLOAD_MAX_BYTES as u64 {
             if let Ok(payload_size) = usize::try_from(size) {
-                buffered_payload.reserve(payload_size);
+                buffered_payload.reserve(payload_size.saturating_sub(buffered_payload.len()));
             }
-            loop {
-                chunk_buffer.clear();
-                if !payload
-                    .next_chunk(chunk_buffer, EXTRACTION_CHUNK_BYTES)
+            // Collect the common single-chunk case directly into the final
+            // validated buffer; only fragmented payloads need an extra copy.
+            if payload
+                .next_chunk(buffered_payload, BUFFERED_PAYLOAD_MAX_BYTES)
+                .await
+                .map_err(ExtractError::Archive)?
+            {
+                while payload
+                    .next_chunk(chunk_buffer, BUFFERED_PAYLOAD_MAX_BYTES)
                     .await
                     .map_err(ExtractError::Archive)?
                 {
-                    break;
+                    buffered_payload.extend_from_slice(chunk_buffer);
                 }
-                buffered_payload.extend_from_slice(chunk_buffer);
+            } else {
+                // `next_chunk` preserves initialized storage at EOF, but this
+                // member's validated contents are empty.
+                buffered_payload.clear();
             }
             *buffered_payload = self
                 .create_buffered_file(path, executable, mem::take(buffered_payload))
@@ -729,7 +738,10 @@ impl<E> ExtractionRoot<E> {
                     .map(|file| file.into_std())
             })
             .await?;
-        Ok(File::from_std(file))
+        let mut file = File::from_std(file);
+        // Keep each extraction chunk to one Tokio blocking write.
+        file.set_max_buf_size(STREAMING_PAYLOAD_CHUNK_BYTES);
+        Ok(file)
     }
 
     async fn create_directory(&self, path: &Path) -> Result<Dir, ExtractError<E>> {

@@ -64,6 +64,25 @@ async fn extracts_common_members_and_streams_payload_sizes() {
     }
 }
 
+#[tokio::test]
+async fn streaming_payload_reuses_initialized_chunk_buffer() {
+    const PAYLOAD_BYTES: usize = 1024 * 1024 + 7;
+
+    let expected = patterned_payload(PAYLOAD_BYTES);
+    let archive = TestArchive::new([entry::reuse_checked_file("file", expected.clone())]);
+    let temp = tempdir().expect("temporary directory should be created");
+    let destination = temp.path().join("out");
+
+    archive
+        .extract_in(&destination, ExtractPolicy::default())
+        .await
+        .expect("streaming extraction should reuse its chunk buffer");
+    assert_eq!(
+        std::fs::read(destination.join("file")).expect("file should be readable"),
+        expected
+    );
+}
+
 fn patterned_payload(size: usize) -> Vec<u8> {
     (0..size)
         .map(|index| u8::try_from(index % 251).expect("payload byte should fit"))

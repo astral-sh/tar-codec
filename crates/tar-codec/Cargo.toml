@@ -27,5 +27,9 @@ tokio = { workspace = true, features = ["macros", "rt"] }
 name = "comparison"
 harness = false
 
+[[bench]]
+name = "extraction_filesystem"
+harness = false
+
 [lib]
 doctest = false

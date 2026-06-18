@@ -404,7 +404,6 @@ impl<R: AsyncRead + Unpin> PayloadReader<R> {
         target_len: usize,
     ) -> Result<bool, FrameError> {
         if self.remaining == 0 {
-            buffer.clear();
             return Ok(false);
         }
         let position = self.stream.position();
@@ -447,13 +446,15 @@ impl<R: AsyncRead + Unpin> MemberPayload<'_, R> {
 
     /// Reads validated payload bytes into a reusable chunk buffer.
     ///
-    /// On success, the buffer's existing contents are replaced. Complete
-    /// physical blocks are read directly into it until the chunk contains at
-    /// least `target_len` bytes or the payload ends. The target is raised to one
-    /// physical block when it is smaller, and final-block padding is removed
-    /// before this returns. This preserves [`Self::next_block`] as the lossless
-    /// interface while allowing higher-level consumers to amortize per-block
-    /// bookkeeping and copies.
+    /// When this returns `true`, the buffer's existing contents are replaced.
+    /// When the payload is exhausted, it returns `false` without changing the
+    /// buffer so its initialized storage can be reused. Complete physical blocks
+    /// are read directly into it until the chunk contains at least `target_len`
+    /// bytes or the payload ends. The target is raised to one physical block
+    /// when it is smaller, and final-block padding is removed before this
+    /// returns. This preserves [`Self::next_block`] as the lossless interface
+    /// while allowing higher-level consumers to amortize per-block bookkeeping
+    /// and copies.
     pub async fn next_chunk(
         &mut self,
         buffer: &mut Vec<u8>,
@@ -1095,6 +1096,7 @@ mod tests {
                     .next_chunk(&mut chunk, BLOCK_SIZE + 1)
                     .await?
             );
+            let allocation = chunk.as_ptr();
             assert_eq!(chunk, payload[..BLOCK_SIZE * 2]);
             assert!(
                 member
@@ -1102,6 +1104,7 @@ mod tests {
                     .next_chunk(&mut chunk, BLOCK_SIZE + 1)
                     .await?
             );
+            assert_eq!(chunk.as_ptr(), allocation);
             assert_eq!(chunk, payload[BLOCK_SIZE * 2..]);
             assert!(
                 !member
@@ -1109,7 +1112,7 @@ mod tests {
                     .next_chunk(&mut chunk, BLOCK_SIZE + 1)
                     .await?
             );
-            assert!(chunk.is_empty());
+            assert_eq!(chunk, payload[BLOCK_SIZE * 2..]);
             assert!(reader.next_frame().await?.is_none());
             Ok(())
         });
