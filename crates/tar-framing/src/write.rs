@@ -7,9 +7,9 @@
 use crate::{
     BLOCK_SIZE, Block, PaxKeyword, UstarKind,
     header::{
-        GID_RANGE, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE, MTIME_RANGE, NAME_RANGE,
-        PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, UID_RANGE, USTAR_IDENTITY, encode_checksum,
-        encode_octal,
+        DEVMAJOR_RANGE, DEVMINOR_RANGE, GID_RANGE, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE,
+        MTIME_RANGE, NAME_RANGE, PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, UID_RANGE,
+        USTAR_IDENTITY, encode_checksum, encode_octal,
     },
 };
 
@@ -339,6 +339,11 @@ fn build_header_into(
         || !encode_octal(&mut block[GID_RANGE], 0)
         || !encode_octal(&mut block[SIZE_RANGE], size)
         || !encode_octal(&mut block[MTIME_RANGE], 0)
+        // pax says that all other fields are "leading zero-filled octal numbers," even
+        // if effectively unused (like devmajor and devminor are). We pedantically follow
+        // this; GNU tar doesn't.
+        || !encode_octal(&mut block[DEVMAJOR_RANGE], 0)
+        || !encode_octal(&mut block[DEVMINOR_RANGE], 0)
     {
         return Err(FramingWriteError::ExtendedHeaderTooLarge { size });
     }
@@ -591,6 +596,25 @@ mod tests {
         bytes.extend_from_slice(end_marker_bytes());
         let frames = ready(TarStream::new(ChunkedReader::new(bytes, 19)).collect::<Vec<_>>());
         assert!(frames.iter().all(Result::is_ok));
+    }
+
+    #[test]
+    fn encodes_unused_device_fields_as_octal_zero() {
+        let mut bytes = Vec::new();
+        frame_pax_member_into(
+            0,
+            pax_member("file", UstarKind::Regular, 0, None, false),
+            &mut bytes,
+        )
+        .expect("valid member");
+
+        for (kind, header) in [
+            ("pax", &bytes[..BLOCK_SIZE]),
+            ("member", &bytes[bytes.len() - BLOCK_SIZE..]),
+        ] {
+            assert_eq!(parse_octal(&header[DEVMAJOR_RANGE]), Some(0), "{kind}");
+            assert_eq!(parse_octal(&header[DEVMINOR_RANGE]), Some(0), "{kind}");
+        }
     }
 
     #[test]

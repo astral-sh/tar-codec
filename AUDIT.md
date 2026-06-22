@@ -17,7 +17,7 @@ as its conformance baseline.
 | AUDIT-03 | Medium | Extraction | Directory-to-file replacement is quadratic | Fixed with AUDIT-01 |
 | AUDIT-04 | Medium | Decoding policy | Global pax policy can be bypassed after a recoverable error | Fixed |
 | AUDIT-05 | Medium | Pax decoding | Empty ustar `name` loses the separator after `prefix` | Fixed |
-| AUDIT-06 | Medium | Pax encoding | Encoded `devmajor` and `devminor` fields are invalid | Open |
+| AUDIT-06 | Low | Pax encoding | Encoded `devmajor` and `devminor` fields are invalid | Fixed |
 | AUDIT-07 | Medium | Pax decoding | Ordinary ustar headers are incompletely validated | Open |
 | AUDIT-08 | Medium | Pax decoding | Retaining a prior `PaxState` makes global updates quadratic | Open |
 | AUDIT-09 | Medium | Encoding | Repeated `add_directory()` calls clone collision state quadratically | Open |
@@ -231,8 +231,13 @@ existing effective-path policy reject incompatible member kinds.
 
 ### AUDIT-06: Encoded `devmajor` and `devminor` fields are invalid
 
-Severity: **Medium**  
+Severity: **Low**
 Security property: encoding must always produce valid, unambiguous pax
+
+Status: **Fixed.** Every emitted pax extension and ordinary member header now
+encodes numeric zero in `devmajor` and `devminor`. Decoding remains deliberately
+tolerant of all-NUL unused device fields, which are ignored by tar-codec and
+emitted by GNU tar for non-device members.
 
 Affected code:
 
