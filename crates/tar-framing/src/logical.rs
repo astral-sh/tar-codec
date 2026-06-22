@@ -1639,7 +1639,7 @@ mod tests {
             error,
             Err(FrameError {
                 position: 0,
-                inner: FrameErrorInner::InvalidPaxRecords { .. },
+                inner: FrameErrorInner::InvalidPaxRecord { .. },
             })
         ));
     }

@@ -1,6 +1,6 @@
 use std::io;
 
-use crate::{ArchiveFormat, BLOCK_SIZE, GnuKind, UstarKind, stream::DataOwner};
+use crate::{ArchiveFormat, BLOCK_SIZE, GnuKind, UstarKind, pax::PaxError, stream::DataOwner};
 
 /// An error encountered at an absolute position in a tar stream.
 #[derive(Debug, thiserror::Error)]
@@ -33,8 +33,8 @@ impl FrameError {
         )
     }
 
-    pub(crate) fn invalid_pax_records(position: u64, reason: &'static str) -> Self {
-        Self::at(position, FrameErrorInner::InvalidPaxRecords { reason })
+    pub(crate) fn invalid_pax_record(position: u64, source: PaxError) -> Self {
+        Self::at(position, FrameErrorInner::InvalidPaxRecord { source })
     }
 
     pub(crate) fn truncated_payload(position: u64, owner: DataOwner, remaining: u64) -> Self {
@@ -121,11 +121,12 @@ pub enum FrameErrorInner {
         /// A description of the block received.
         found: &'static str,
     },
-    /// A pax payload did not consist of valid extended header records.
-    #[error("invalid pax records: {reason}")]
-    InvalidPaxRecords {
-        /// A concise description of the grammar violation.
-        reason: &'static str,
+    /// A pax extended-header record could not be parsed.
+    #[error("{source}")]
+    InvalidPaxRecord {
+        /// The pax parsing failure.
+        #[source]
+        source: PaxError,
     },
     /// A metadata extension declares more data than the configured format limit.
     #[error("{format} extension payload size {size} exceeds configured limit {limit}")]
@@ -144,37 +145,6 @@ pub enum FrameErrorInner {
         size: u64,
         /// The configured maximum cumulative payload size.
         limit: u64,
-    },
-    /// A pax text component that must be UTF-8 is not valid UTF-8.
-    #[error("pax records contain invalid UTF-8 text")]
-    InvalidPaxUtf8,
-    /// A pax record keyword is neither standard nor an accepted namespaced extension.
-    #[error("invalid or unknown pax keyword {keyword:?}")]
-    InvalidPaxKeyword {
-        /// The rejected keyword.
-        keyword: String,
-    },
-    /// A pax decimal integer field is malformed or exceeds this API's integer range.
-    #[error("invalid pax {keyword} value: {value:?}")]
-    InvalidPaxInteger {
-        /// The affected standard keyword.
-        keyword: &'static str,
-        /// The rejected textual value.
-        value: String,
-    },
-    /// A pax file-time value is malformed or exceeds this API's integer range.
-    #[error("invalid pax {keyword} time value: {value:?}")]
-    InvalidPaxTime {
-        /// The affected standard keyword.
-        keyword: &'static str,
-        /// The rejected textual value.
-        value: String,
-    },
-    /// A pax `hdrcharset` record requests text encoding unsupported by this API.
-    #[error("unsupported pax hdrcharset value {value:?}")]
-    UnsupportedPaxCharset {
-        /// The unsupported character-set identifier.
-        value: String,
     },
     /// A GNU long-name or long-link metadata payload is not a valid value.
     #[error("malformed GNU {kind:?} metadata payload: {reason}")]

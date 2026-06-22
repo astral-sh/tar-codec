@@ -84,16 +84,13 @@ use tokio_stream::Stream;
 use crate::{
     ArchiveFormat, BLOCK_SIZE, Block, DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE,
     DEFAULT_MAX_GNU_EXTENSION_SIZE, DEFAULT_MAX_PAX_EXTENSION_SIZE, FrameError, FrameErrorInner,
-    GnuKind, PaxKind, PaxRecord, PaxValue, UstarKind,
+    GnuKind, HdrCharset, PaxError, PaxKind, PaxRecord, PaxValue, UstarKind,
     header::{
         CHECKSUM_RANGE, GNU_IDENTITY, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE, NAME_RANGE,
         PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, USTAR_IDENTITY, checksum, parse_number,
         parse_octal,
     },
-    pax::{
-        SharedGlobalPaxRecords, SharedPaxRecords, apply_global as apply_global_pax_records,
-        hdrcharset as pax_hdrcharset, parse_records as parse_pax_records, size as pax_size,
-    },
+    pax::{GlobalPaxRecords, PaxRecords, SharedGlobalPaxRecords, SharedPaxRecords},
 };
 
 type PositionedBlock = (u64, Block);
@@ -229,7 +226,9 @@ impl DataFrame {
     /// This returns `Some` only for the last data block belonging to a local
     /// or global pax header.
     pub fn completed_pax_records(&self) -> Option<&[PaxRecord]> {
-        self.completed_pax_records.as_deref().map(Vec::as_slice)
+        self.completed_pax_records
+            .as_deref()
+            .map(PaxRecords::as_slice)
     }
 
     pub(crate) fn into_completed_pax_records(self) -> Option<SharedPaxRecords> {
@@ -748,11 +747,17 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 payload.extend_from_slice(&block[..len]);
                 remaining -= len as u64;
                 let completed_pax_records = if remaining == 0 {
-                    let records = Arc::new(parse_pax_records(
-                        header_position,
-                        &payload,
-                        pax_hdrcharset(self.global_pax_records.as_deref()),
-                    )?);
+                    let records = Arc::new(
+                        PaxRecords::parse(
+                            &payload,
+                            self.global_pax_records
+                                .as_deref()
+                                .map_or(HdrCharset::Utf8, GlobalPaxRecords::hdrcharset),
+                        )
+                        .map_err(|source| {
+                            FrameError::invalid_pax_record(header_position, source)
+                        })?,
+                    );
                     match kind {
                         PaxKind::Local => {
                             self.state = State::AwaitingUstarHeader {
@@ -760,7 +765,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                             };
                         }
                         PaxKind::Global => {
-                            apply_global_pax_records(&mut self.global_pax_records, &records);
+                            records.apply_global(&mut self.global_pax_records);
                             self.state = State::AwaitingHeader;
                         }
                     }
@@ -961,9 +966,11 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             self.global_pax_extensions_size = size;
         }
         if payload_size == 0 {
-            return Err(FrameError::invalid_pax_records(
+            return Err(FrameError::invalid_pax_record(
                 position,
-                "extended header payload contains no records",
+                PaxError::InvalidRecords {
+                    reason: "extended header payload contains no records",
+                },
             ));
         }
         self.state = State::ReadingPax {
@@ -993,16 +1000,14 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         local_pax_records: Option<SharedPaxRecords>,
     ) -> Result<Frame, FrameError> {
         let kind = UstarKind::try_from_framed(position, parsed.typeflag)?;
-        let local_records = local_pax_records
-            .as_deref()
-            .map_or(&[] as &[PaxRecord], Vec::as_slice);
-        let effective_size = pax_size(local_records, self.global_pax_records.as_deref()).map_or(
-            Ok(parsed.size),
-            |size| match size {
-                PaxValue::Value(size) => Ok(*size),
-                PaxValue::Deleted => Err(FrameError::deleted_pax_metadata(position, "size")),
-            },
-        )?;
+        let effective_size = PaxRecords::size(
+            local_pax_records.as_deref(),
+            self.global_pax_records.as_deref(),
+        )
+        .map_or(Ok(parsed.size), |size| match size {
+            PaxValue::Value(size) => Ok(*size),
+            PaxValue::Deleted => Err(FrameError::deleted_pax_metadata(position, "size")),
+        })?;
         validate_posix_member_size(position, kind, parsed.size, effective_size)?;
         self.global_pax_extensions_size = 0;
         self.state = member_payload_state(effective_size);
@@ -1945,7 +1950,9 @@ mod tests {
     fn rejects_invalid_pax_sequences() {
         assert!(matches!(
             last_error_inner(&collect(header(b'x', 0).to_vec(), BLOCK_SIZE)),
-            FrameErrorInner::InvalidPaxRecords { .. }
+            FrameErrorInner::InvalidPaxRecord {
+                source: PaxError::InvalidRecords { .. },
+            }
         ));
 
         let valid = record("path", "name");
@@ -1977,7 +1984,9 @@ mod tests {
             frames.last(),
             Some(Err(FrameError {
                 position,
-                inner: FrameErrorInner::InvalidPaxInteger { .. },
+                inner: FrameErrorInner::InvalidPaxRecord {
+                    source: PaxError::InvalidInteger { .. },
+                },
             })) if *position == BLOCK_SIZE as u64
         ));
     }
@@ -2022,7 +2031,9 @@ mod tests {
         append_posix(&mut bytes, b'x', &records);
         assert!(matches!(
             last_error_inner(&collect(bytes, BLOCK_SIZE)),
-            FrameErrorInner::UnsupportedPaxCharset { value } if value == "ISO-IR 8859 1 1998"
+            FrameErrorInner::InvalidPaxRecord {
+                source: PaxError::UnsupportedCharset { value },
+            } if value == "ISO-IR 8859 1 1998"
         ));
     }
 
