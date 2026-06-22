@@ -8,6 +8,7 @@ mod buffered;
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
+    ffi::{OsStr, OsString},
     fs as std_fs, io,
     marker::PhantomData,
     mem,
@@ -41,6 +42,8 @@ use crate::{ExtractError, MemberPayload};
 /// A symbolic link reserved until the completed archive graph can be validated.
 #[derive(Debug)]
 struct PendingSymlink {
+    entry: EntryId,
+    parent: EntryId,
     path: PathBuf,
     position: u64,
     target: String,
@@ -81,7 +84,131 @@ enum ExtractedEntry {
     File,
     CreatedDirectory,
     AmbientDirectory,
-    Symlink,
+    Symlink { index: usize },
+}
+
+impl ExtractedEntry {
+    fn is_directory(self) -> bool {
+        matches!(self, Self::CreatedDirectory | Self::AmbientDirectory)
+    }
+}
+
+/// A stable index into [`EntryTree`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct EntryId(usize);
+
+const ROOT_ENTRY: EntryId = EntryId(0);
+
+/// One structurally stored extraction path.
+///
+/// Component text lives in the parent node's `children` map, so a path with N
+/// components retains N component names rather than N complete textual prefixes.
+#[derive(Default)]
+struct EntryNode {
+    parent: Option<EntryId>,
+    state: Option<ExtractedEntry>,
+    children: HashMap<OsString, EntryId>,
+    active_children: usize,
+}
+
+/// Archive-owned path state stored as a component tree.
+struct EntryTree {
+    nodes: Vec<EntryNode>,
+}
+
+impl EntryTree {
+    fn new() -> Self {
+        Self {
+            nodes: vec![EntryNode {
+                parent: None,
+                state: Some(ExtractedEntry::AmbientDirectory),
+                children: HashMap::new(),
+                active_children: 0,
+            }],
+        }
+    }
+
+    fn child(&self, parent: EntryId, component: &OsStr) -> Option<EntryId> {
+        self.nodes.get(parent.0)?.children.get(component).copied()
+    }
+
+    fn ensure_child(&mut self, parent: EntryId, component: &OsStr) -> EntryId {
+        if let Some(entry) = self.child(parent, component) {
+            return entry;
+        }
+
+        let entry = EntryId(self.nodes.len());
+        self.nodes.push(EntryNode {
+            parent: Some(parent),
+            ..EntryNode::default()
+        });
+        // `parent` is either the root or an ID previously returned by this tree.
+        self.nodes[parent.0]
+            .children
+            .insert(component.to_owned(), entry);
+        entry
+    }
+
+    fn find(&self, path: &Path) -> Option<EntryId> {
+        let mut entry = ROOT_ENTRY;
+        for component in path.components() {
+            entry = self.child(entry, component.as_os_str())?;
+        }
+        Some(entry)
+    }
+
+    fn find_directory(&self, path: &Path) -> Option<EntryId> {
+        let mut entry = ROOT_ENTRY;
+        for component in path.components() {
+            entry = self.child(entry, component.as_os_str())?;
+            if !self.state(entry).is_some_and(ExtractedEntry::is_directory) {
+                return None;
+            }
+        }
+        Some(entry)
+    }
+
+    fn state(&self, entry: EntryId) -> Option<ExtractedEntry> {
+        self.nodes.get(entry.0).and_then(|node| node.state)
+    }
+
+    fn state_for_path(&self, path: &Path) -> Option<ExtractedEntry> {
+        self.find(path).and_then(|entry| self.state(entry))
+    }
+
+    fn set_state(&mut self, entry: EntryId, state: ExtractedEntry) {
+        let Some(node) = self.nodes.get_mut(entry.0) else {
+            return;
+        };
+        let activate = node.state.replace(state).is_none();
+        let parent = node.parent;
+        if activate
+            && let Some(parent) = parent
+            && let Some(parent) = self.nodes.get_mut(parent.0)
+        {
+            parent.active_children += 1;
+        }
+    }
+
+    fn clear_state(&mut self, entry: EntryId) {
+        let Some(node) = self.nodes.get_mut(entry.0) else {
+            return;
+        };
+        let deactivate = node.state.take().is_some();
+        let parent = node.parent;
+        if deactivate
+            && let Some(parent) = parent
+            && let Some(parent) = self.nodes.get_mut(parent.0)
+        {
+            parent.active_children -= 1;
+        }
+    }
+
+    fn has_active_children(&self, entry: EntryId) -> bool {
+        self.nodes
+            .get(entry.0)
+            .is_some_and(|node| node.active_children != 0)
+    }
 }
 
 /// Why extraction requires a directory at a particular path.
@@ -132,13 +259,11 @@ pub(super) struct ExtractionRoot<E> {
     directory: Arc<Dir>,
     /// The most recently opened directory capability, used to keep nearby leaf
     /// operations cheap without retaining one descriptor per directory.
-    directory_handle: Option<(PathBuf, Arc<Dir>)>,
+    directory_handle: Option<(EntryId, Arc<Dir>)>,
     /// Whether overwrites are allowed during extraction.
     allow_overwrites: bool,
     /// The latest state recorded for every path encountered by the extraction.
-    entries: HashMap<PathBuf, ExtractedEntry>,
-    /// The active pending symbolic link at each reserved path.
-    symlink_indices: HashMap<PathBuf, usize>,
+    entries: EntryTree,
     /// Append-only storage; duplicate paths invalidate earlier indices.
     symlinks: Vec<PendingSymlink>,
     /// Fully validated files awaiting ordered creation in one blocking task.
@@ -248,8 +373,7 @@ impl<E> ExtractionRoot<E> {
             directory,
             directory_handle: None,
             allow_overwrites,
-            entries: HashMap::new(),
-            symlink_indices: HashMap::new(),
+            entries: EntryTree::new(),
             symlinks: Vec::new(),
             buffered_files: Vec::new(),
             buffered_file_bytes: 0,
@@ -321,8 +445,9 @@ impl<E> ExtractionRoot<E> {
     pub(super) async fn extract_directory(&mut self, path: &Path) -> Result<(), ExtractError<E>> {
         self.flush_buffered_files().await?;
         if !path.as_os_str().is_empty() {
-            self.ensure_parents(path).await?;
-            self.ensure_directory(path, DirectoryPurpose::ExplicitMember)
+            let parent = self.ensure_parents(path).await?;
+            let entry = self.entries.ensure_child(parent, leaf_name(path));
+            self.ensure_directory(path, entry, parent, DirectoryPurpose::ExplicitMember)
                 .await?;
         }
         Ok(())
@@ -335,13 +460,16 @@ impl<E> ExtractionRoot<E> {
     ) -> Result<(), ExtractError<E>> {
         self.flush_buffered_files().await?;
         let target = validate_symlink_target(member.position, &member.path, &member.link_target)?;
-        self.ensure_parents(&member.path).await?;
-        self.replace_leaf(&member.path).await?;
+        let parent = self.ensure_parents(&member.path).await?;
+        let entry = self.entries.ensure_child(parent, leaf_name(&member.path));
+        self.replace_leaf(&member.path, entry, parent).await?;
+        let index = self.symlinks.len();
         let path = member.path.clone();
-        self.entries.insert(path.clone(), ExtractedEntry::Symlink);
-        self.symlink_indices
-            .insert(path.clone(), self.symlinks.len());
+        self.entries
+            .set_state(entry, ExtractedEntry::Symlink { index });
         self.symlinks.push(PendingSymlink {
+            entry,
+            parent,
             path,
             position: member.position,
             target: member.link_target.clone(),
@@ -371,7 +499,10 @@ impl<E> ExtractionRoot<E> {
             &target_text,
             Path::new(""),
         )?;
-        let reason = if !matches!(self.entries.get(&target), Some(ExtractedEntry::File)) {
+        let reason = if !matches!(
+            self.entries.state_for_path(&target),
+            Some(ExtractedEntry::File)
+        ) {
             Some("hard-link target is not a previously extracted file")
         } else if target == member.path {
             Some("hard-link target is the member path")
@@ -388,14 +519,14 @@ impl<E> ExtractionRoot<E> {
                 reason,
             ));
         }
-        self.ensure_parents(&member.path).await?;
-        self.replace_leaf(&member.path).await?;
+        let parent = self.ensure_parents(&member.path).await?;
+        let entry = self.entries.ensure_child(parent, leaf_name(&member.path));
+        self.replace_leaf(&member.path, entry, parent).await?;
         self.with_root("create hard link", &member.path, move |directory, path| {
             directory.hard_link(target, directory, path)
         })
         .await?;
-        self.entries
-            .insert(member.path.clone(), ExtractedEntry::File);
+        self.entries.set_state(entry, ExtractedEntry::File);
         // The new path and target now share an inode. Writing through either
         // name updates both while preserving the hard-link relationship.
         if size == 0 {
@@ -403,7 +534,12 @@ impl<E> ExtractionRoot<E> {
             Ok(())
         } else {
             let file = self
-                .open_file("truncate file", &member.path, FileOpenMode::Truncate)
+                .open_file(
+                    "truncate file",
+                    &member.path,
+                    parent,
+                    FileOpenMode::Truncate,
+                )
                 .await?;
             write_payload(payload, chunk_buffer, &member.path, file).await
         }
@@ -417,7 +553,7 @@ impl<E> ExtractionRoot<E> {
         let mut links = Vec::with_capacity(self.symlinks.len());
         let mut resolution_work_bytes = 0;
         for (index, link) in self.symlinks.iter().enumerate() {
-            if self.symlink_indices.get(&link.path) != Some(&index) {
+            if self.entries.state(link.entry) != Some(ExtractedEntry::Symlink { index }) {
                 continue;
             }
             let target = self
@@ -461,6 +597,7 @@ impl<E> ExtractionRoot<E> {
             self.with_entry_parent(
                 "create symbolic link",
                 &link.path,
+                link.parent,
                 move |directory, path| create_symlink(directory, &contents, path),
             )
             .await?;
@@ -478,13 +615,19 @@ impl<E> ExtractionRoot<E> {
         executable: bool,
         contents: Vec<u8>,
     ) -> Result<Vec<u8>, ExtractError<E>> {
-        if !self.parents_are_known(path) {
+        let parent = if let Some(parent) = self.known_parent(path) {
+            parent
+        } else {
             self.flush_buffered_files().await?;
-            self.ensure_parents(path).await?;
-        }
-        if self.symlink_indices.contains_key(path) {
+            self.ensure_parents(path).await?
+        };
+        let entry = self.entries.ensure_child(parent, leaf_name(path));
+        if matches!(
+            self.entries.state(entry),
+            Some(ExtractedEntry::Symlink { .. })
+        ) {
             self.flush_buffered_files().await?;
-            self.replace_leaf(path).await?;
+            self.replace_leaf(path, entry, parent).await?;
         }
         if !self.buffered_files.is_empty()
             && self.buffered_file_bytes.saturating_add(contents.len())
@@ -492,9 +635,9 @@ impl<E> ExtractionRoot<E> {
         {
             self.flush_buffered_files().await?;
         }
-        let replacement = if !self.can_replace(path) {
+        let replacement = if !self.can_replace(entry) {
             BufferedFileReplacement::Disallowed
-        } else if matches!(self.entries.get(path), Some(ExtractedEntry::File)) {
+        } else if self.entries.state(entry) == Some(ExtractedEntry::File) {
             BufferedFileReplacement::ExpectedFile
         } else {
             BufferedFileReplacement::Allowed
@@ -502,11 +645,11 @@ impl<E> ExtractionRoot<E> {
         if self
             .directory_handle
             .as_ref()
-            .is_some_and(|(cached_path, _)| cached_path == path)
+            .is_some_and(|(cached_entry, _)| *cached_entry == entry)
         {
             self.directory_handle = None;
         }
-        let (directory, relative_path) = self.entry_capability(path);
+        let (directory, relative_path) = self.entry_capability(path, parent);
         self.buffered_file_bytes = self.buffered_file_bytes.saturating_add(contents.len());
         self.buffered_files.push(BufferedFile {
             directory,
@@ -516,7 +659,7 @@ impl<E> ExtractionRoot<E> {
             contents,
             replacement,
         });
-        self.entries.insert(path.to_owned(), ExtractedEntry::File);
+        self.entries.set_state(entry, ExtractedEntry::File);
         if self.buffered_files.len() >= BUFFERED_FILE_BATCH_MAX_ENTRIES
             || self.buffered_file_bytes >= BUFFERED_FILE_BATCH_MAX_BYTES
         {
@@ -550,21 +693,9 @@ impl<E> ExtractionRoot<E> {
         Ok(())
     }
 
-    fn parents_are_known(&self, path: &Path) -> bool {
-        let Some(parent) = path.parent() else {
-            return true;
-        };
-        let mut current = PathBuf::new();
-        for component in parent.components() {
-            current.push(component.as_os_str());
-            if !matches!(
-                self.entries.get(&current),
-                Some(ExtractedEntry::CreatedDirectory | ExtractedEntry::AmbientDirectory)
-            ) {
-                return false;
-            }
-        }
-        true
+    fn known_parent(&self, path: &Path) -> Option<EntryId> {
+        path.parent()
+            .and_then(|parent| self.entries.find_directory(parent))
     }
 
     async fn create_file(
@@ -572,116 +703,151 @@ impl<E> ExtractionRoot<E> {
         path: &Path,
         executable: bool,
     ) -> Result<File, ExtractError<E>> {
-        self.ensure_parents(path).await?;
-        if self.symlink_indices.contains_key(path) {
-            self.replace_leaf(path).await?;
+        let parent = self.ensure_parents(path).await?;
+        let entry = self.entries.ensure_child(parent, leaf_name(path));
+        if matches!(
+            self.entries.state(entry),
+            Some(ExtractedEntry::Symlink { .. })
+        ) {
+            self.replace_leaf(path, entry, parent).await?;
         }
         let file = match self
-            .open_file("create file", path, FileOpenMode::CreateNew { executable })
+            .open_file(
+                "create file",
+                path,
+                parent,
+                FileOpenMode::CreateNew { executable },
+            )
             .await
         {
             Ok(file) => file,
             Err(error) => {
-                if !self.replace_leaf(path).await? {
+                if !self.replace_leaf(path, entry, parent).await? {
                     return Err(error);
                 }
-                self.open_file("create file", path, FileOpenMode::CreateNew { executable })
-                    .await?
+                self.open_file(
+                    "create file",
+                    path,
+                    parent,
+                    FileOpenMode::CreateNew { executable },
+                )
+                .await?
             }
         };
-        self.entries.insert(path.to_owned(), ExtractedEntry::File);
+        self.entries.set_state(entry, ExtractedEntry::File);
         Ok(file)
     }
 
-    async fn ensure_parents(&mut self, path: &Path) -> Result<(), ExtractError<E>> {
+    async fn ensure_parents(&mut self, path: &Path) -> Result<EntryId, ExtractError<E>> {
         let Some(parent) = path.parent() else {
-            return Ok(());
+            return Ok(ROOT_ENTRY);
         };
         let mut current = PathBuf::new();
+        let mut parent_entry = ROOT_ENTRY;
         for component in parent.components() {
             current.push(component.as_os_str());
-            self.ensure_directory(&current, DirectoryPurpose::ImplicitParent)
-                .await?;
+            let entry = self
+                .entries
+                .ensure_child(parent_entry, component.as_os_str());
+            self.ensure_directory(
+                &current,
+                entry,
+                parent_entry,
+                DirectoryPurpose::ImplicitParent,
+            )
+            .await?;
+            parent_entry = entry;
         }
-        Ok(())
+        Ok(parent_entry)
     }
 
     async fn ensure_directory(
         &mut self,
         path: &Path,
+        entry: EntryId,
+        parent: EntryId,
         purpose: DirectoryPurpose,
     ) -> Result<(), ExtractError<E>> {
-        if matches!(
-            self.entries.get(path),
-            Some(ExtractedEntry::CreatedDirectory | ExtractedEntry::AmbientDirectory)
-        ) {
+        if self
+            .entries
+            .state(entry)
+            .is_some_and(ExtractedEntry::is_directory)
+        {
             return Ok(());
         }
-        if self.entries.contains_key(path) {
+        if self.entries.state(entry).is_some() {
             if purpose == DirectoryPurpose::ImplicitParent {
                 return Err(ExtractError::<E>::PathCollision {
                     path: path.to_owned(),
                 });
             }
-            self.replace_leaf(path).await?;
+            self.replace_leaf(path, entry, parent).await?;
         }
         // Missing parents are common, so inspect and replace only after a collision.
-        let create_error = match self.create_directory(path).await {
+        let create_error = match self.try_create_directory(path, parent).await? {
             Ok(directory) => {
-                self.directory_handle = Some((path.to_owned(), Arc::new(directory)));
+                self.directory_handle = Some((entry, Arc::new(directory)));
                 self.entries
-                    .insert(path.to_owned(), ExtractedEntry::CreatedDirectory);
+                    .set_state(entry, ExtractedEntry::CreatedDirectory);
                 return Ok(());
             }
             Err(error) => error,
         };
-        let metadata = self.metadata(path).await?;
+        let metadata = self.metadata(path, parent).await?;
         if metadata
             .as_ref()
             .is_some_and(|metadata| metadata.is_dir() && !metadata_is_link(metadata))
         {
             let directory = self
-                .with_entry_parent("open directory", path, |directory, path| {
+                .with_entry_parent("open directory", path, parent, |directory, path| {
                     directory.open_dir(path)
                 })
                 .await?;
-            self.directory_handle = Some((path.to_owned(), Arc::new(directory)));
+            self.directory_handle = Some((entry, Arc::new(directory)));
             self.entries
-                .insert(path.to_owned(), ExtractedEntry::AmbientDirectory);
+                .set_state(entry, ExtractedEntry::AmbientDirectory);
             return Ok(());
         }
-        if metadata.is_none() && !self.entries.contains_key(path) {
-            return Err(create_error);
+        if metadata.is_none() && self.entries.state(entry).is_none() {
+            return Err(ExtractError::filesystem(
+                "create directory",
+                path.to_owned(),
+                create_error,
+            ));
         }
         if purpose == DirectoryPurpose::ImplicitParent {
             return Err(ExtractError::<E>::PathCollision {
                 path: path.to_owned(),
             });
         }
-        self.replace_leaf(path).await?;
-        let directory = self.create_directory(path).await?;
-        self.directory_handle = Some((path.to_owned(), Arc::new(directory)));
+        self.replace_leaf(path, entry, parent).await?;
+        let directory = self.create_directory(path, parent).await?;
+        self.directory_handle = Some((entry, Arc::new(directory)));
         self.entries
-            .insert(path.to_owned(), ExtractedEntry::CreatedDirectory);
+            .set_state(entry, ExtractedEntry::CreatedDirectory);
         Ok(())
     }
 
-    async fn replace_leaf(&mut self, path: &Path) -> Result<bool, ExtractError<E>> {
-        let metadata = self.metadata(path).await?;
-        if metadata.is_none() && !self.entries.contains_key(path) {
+    async fn replace_leaf(
+        &mut self,
+        path: &Path,
+        entry: EntryId,
+        parent: EntryId,
+    ) -> Result<bool, ExtractError<E>> {
+        let metadata = self.metadata(path, parent).await?;
+        if metadata.is_none() && self.entries.state(entry).is_none() {
             return Ok(false);
         }
-        self.check_replacement(path)?;
+        self.check_replacement(path, entry)?;
         if let Some(metadata) = metadata {
-            self.remove_leaf(path, &metadata).await?;
+            self.remove_leaf(path, entry, parent, &metadata).await?;
         }
-        self.entries.remove(path);
-        self.symlink_indices.remove(path);
+        self.entries.clear_state(entry);
         Ok(true)
     }
 
-    fn check_replacement(&self, path: &Path) -> Result<(), ExtractError<E>> {
-        if !self.can_replace(path) {
+    fn check_replacement(&self, path: &Path, entry: EntryId) -> Result<(), ExtractError<E>> {
+        if !self.can_replace(entry) {
             return Err(ExtractError::<E>::PathCollision {
                 path: path.to_owned(),
             });
@@ -689,22 +855,8 @@ impl<E> ExtractionRoot<E> {
         Ok(())
     }
 
-    fn can_replace(&self, path: &Path) -> bool {
-        if !self.allow_overwrites {
-            return false;
-        }
-        // Every extracted descendant records its parent directory, while files
-        // and links cannot own descendants. Only known directories need a scan.
-        if !matches!(
-            self.entries.get(path),
-            Some(ExtractedEntry::CreatedDirectory | ExtractedEntry::AmbientDirectory)
-        ) {
-            return true;
-        }
-        !self
-            .entries
-            .keys()
-            .any(|candidate| candidate != path && candidate.starts_with(path))
+    fn can_replace(&self, entry: EntryId) -> bool {
+        self.allow_overwrites && !self.entries.has_active_children(entry)
     }
 }
 
@@ -723,22 +875,27 @@ impl<E> ExtractionRoot<E> {
                 return Err("symbolic-link target cycle");
             }
             let mut components = path.components().peekable();
-            let mut prefix = PathBuf::new();
+            let mut entry = Some(ROOT_ENTRY);
             let mut rewritten = None;
             while let Some(component) = components.next() {
-                prefix.push(component.as_os_str());
-                if let Some(link_index) = self.symlink_indices.get(&prefix)
-                    && let Some(link) = self.symlinks.get(*link_index)
-                {
-                    let mut target = link.resolved_target.clone();
-                    target.extend(components.by_ref().map(|component| component.as_os_str()));
-                    rewritten = Some(target);
-                    break;
-                }
-                if components.peek().is_some()
-                    && matches!(self.entries.get(&prefix), Some(ExtractedEntry::File))
-                {
-                    return Ok(ResolvedTarget::Known(TerminalKind::Dangling));
+                entry = entry.and_then(|parent| self.entries.child(parent, component.as_os_str()));
+                if let Some(entry) = entry {
+                    match self.entries.state(entry) {
+                        Some(ExtractedEntry::Symlink { index }) => {
+                            if let Some(link) = self.symlinks.get(index) {
+                                let mut target = link.resolved_target.clone();
+                                target.extend(
+                                    components.by_ref().map(|component| component.as_os_str()),
+                                );
+                                rewritten = Some(target);
+                                break;
+                            }
+                        }
+                        Some(ExtractedEntry::File) if components.peek().is_some() => {
+                            return Ok(ResolvedTarget::Known(TerminalKind::Dangling));
+                        }
+                        _ => {}
+                    }
                 }
             }
             if let Some(rewritten) = rewritten {
@@ -747,12 +904,12 @@ impl<E> ExtractionRoot<E> {
                 if path.as_os_str().is_empty() {
                     return Ok(ResolvedTarget::Known(TerminalKind::Directory));
                 }
-                return Ok(match self.entries.get(path.as_ref()).copied() {
+                return Ok(match entry.and_then(|entry| self.entries.state(entry)) {
                     Some(ExtractedEntry::CreatedDirectory) => {
                         ResolvedTarget::Known(TerminalKind::Directory)
                     }
                     Some(ExtractedEntry::File) => ResolvedTarget::Known(TerminalKind::NonDirectory),
-                    Some(ExtractedEntry::Symlink) => continue,
+                    Some(ExtractedEntry::Symlink { .. }) => continue,
                     Some(ExtractedEntry::AmbientDirectory) | None => {
                         ResolvedTarget::Unowned(path.into_owned())
                     }
@@ -798,8 +955,12 @@ impl<E> ExtractionRoot<E> {
 
 // Capability-relative filesystem access.
 impl<E> ExtractionRoot<E> {
-    async fn metadata(&self, path: &Path) -> Result<Option<Metadata>, ExtractError<E>> {
-        self.with_entry_parent("inspect", path, |directory, path| {
+    async fn metadata(
+        &self,
+        path: &Path,
+        parent: EntryId,
+    ) -> Result<Option<Metadata>, ExtractError<E>> {
+        self.with_entry_parent("inspect", path, parent, |directory, path| {
             match directory.symlink_metadata(path) {
                 Ok(metadata) => Ok(Some(metadata)),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -812,11 +973,13 @@ impl<E> ExtractionRoot<E> {
     async fn remove_leaf(
         &mut self,
         path: &Path,
+        entry: EntryId,
+        parent: EntryId,
         metadata: &Metadata,
     ) -> Result<(), ExtractError<E>> {
         if metadata.is_dir() && !metadata_is_link(metadata) {
             let is_empty = self
-                .with_entry_parent("inspect directory", path, directory_is_empty)
+                .with_entry_parent("inspect directory", path, parent, directory_is_empty)
                 .await?;
             if !is_empty {
                 return Err(ExtractError::<E>::PathCollision {
@@ -827,17 +990,17 @@ impl<E> ExtractionRoot<E> {
             if self
                 .directory_handle
                 .as_ref()
-                .is_some_and(|(cached_path, _)| cached_path == path)
+                .is_some_and(|(cached_entry, _)| *cached_entry == entry)
             {
                 self.directory_handle = None;
             }
-            self.with_entry_parent("remove directory", path, |directory, path| {
+            self.with_entry_parent("remove directory", path, parent, |directory, path| {
                 directory.remove_dir(path)
             })
             .await
         } else {
             let is_link = metadata_is_link(metadata);
-            self.with_entry_parent("remove file", path, move |directory, path| {
+            self.with_entry_parent("remove file", path, parent, move |directory, path| {
                 remove_file_or_symlink(directory, path, is_link)
             })
             .await
@@ -848,10 +1011,11 @@ impl<E> ExtractionRoot<E> {
         &self,
         operation: &'static str,
         path: &Path,
+        parent: EntryId,
         mode: FileOpenMode,
     ) -> Result<File, ExtractError<E>> {
         let file = self
-            .with_entry_parent(operation, path, move |directory, path| {
+            .with_entry_parent(operation, path, parent, move |directory, path| {
                 let options = mode.options();
                 directory
                     .open_with(path, &options)
@@ -864,8 +1028,23 @@ impl<E> ExtractionRoot<E> {
         Ok(file)
     }
 
-    async fn create_directory(&self, path: &Path) -> Result<Dir, ExtractError<E>> {
-        self.with_entry_parent("create directory", path, |directory, path| {
+    async fn create_directory(&self, path: &Path, parent: EntryId) -> Result<Dir, ExtractError<E>> {
+        self.try_create_directory(path, parent)
+            .await?
+            .map_err(|source| ExtractError::filesystem("create directory", path.to_owned(), source))
+    }
+
+    /// Attempts a directory creation without eagerly materializing its diagnostic path.
+    ///
+    /// An `AlreadyExists` result is expected while discovering ambient parents. Keeping
+    /// that error pathless avoids copying every growing prefix before it is discarded.
+    async fn try_create_directory(
+        &self,
+        path: &Path,
+        parent: EntryId,
+    ) -> Result<io::Result<Dir>, ExtractError<E>> {
+        let (directory, relative_path) = self.entry_capability(path, parent);
+        run_blocking_io(directory, relative_path, |directory, path| {
             directory.create_dir(path)?;
             directory.open_dir(path)
         })
@@ -886,7 +1065,7 @@ impl<E> ExtractionRoot<E> {
         run_blocking(
             Arc::clone(&self.directory),
             operation,
-            path.to_owned(),
+            path,
             path.to_owned(),
             action,
         )
@@ -901,25 +1080,24 @@ impl<E> ExtractionRoot<E> {
         &self,
         operation: &'static str,
         path: &Path,
+        parent: EntryId,
         action: F,
     ) -> Result<T, ExtractError<E>>
     where
         T: Send + 'static,
         F: FnOnce(&Dir, &Path) -> io::Result<T> + Send + 'static,
     {
-        let (directory, relative_path) = self.entry_capability(path);
-        run_blocking(directory, operation, path.to_owned(), relative_path, action).await
+        let (directory, relative_path) = self.entry_capability(path, parent);
+        run_blocking(directory, operation, path, relative_path, action).await
     }
 
-    fn entry_capability(&self, path: &Path) -> (Arc<Dir>, PathBuf) {
-        if let Some(parent) = path.parent()
-            && let Some(file_name) = path.file_name()
-        {
-            if parent.as_os_str().is_empty() {
+    fn entry_capability(&self, path: &Path, parent: EntryId) -> (Arc<Dir>, PathBuf) {
+        if let Some(file_name) = path.file_name() {
+            if parent == ROOT_ENTRY {
                 return (Arc::clone(&self.directory), file_name.into());
             }
-            if let Some((cached_path, directory)) = &self.directory_handle
-                && cached_path == parent
+            if let Some((cached_entry, directory)) = &self.directory_handle
+                && *cached_entry == parent
             {
                 return (Arc::clone(directory), file_name.into());
             }
@@ -955,6 +1133,14 @@ fn check_symlink_resolution_limit(
     Ok(())
 }
 
+fn leaf_name(path: &Path) -> &OsStr {
+    if let Some(file_name) = path.file_name() {
+        file_name
+    } else {
+        path.as_os_str()
+    }
+}
+
 fn directory_is_empty(directory: &Dir, path: &Path) -> io::Result<bool> {
     let directory = directory.open_dir(path)?;
     let mut entries = directory.entries()?;
@@ -985,7 +1171,7 @@ fn remove_file_or_symlink(directory: &Dir, path: &Path, is_link: bool) -> io::Re
 async fn run_blocking<E, T, F>(
     directory: Arc<Dir>,
     operation: &'static str,
-    error_path: PathBuf,
+    error_path: &Path,
     relative_path: PathBuf,
     action: F,
 ) -> Result<T, ExtractError<E>>
@@ -993,10 +1179,24 @@ where
     T: Send + 'static,
     F: FnOnce(&Dir, &Path) -> io::Result<T> + Send + 'static,
 {
+    run_blocking_io(directory, relative_path, action)
+        .await?
+        .map_err(|source| ExtractError::filesystem(operation, error_path.to_owned(), source))
+}
+
+/// Runs one capability-relative filesystem operation without attaching a path to I/O errors.
+async fn run_blocking_io<E, T, F>(
+    directory: Arc<Dir>,
+    relative_path: PathBuf,
+    action: F,
+) -> Result<io::Result<T>, ExtractError<E>>
+where
+    T: Send + 'static,
+    F: FnOnce(&Dir, &Path) -> io::Result<T> + Send + 'static,
+{
     tokio::task::spawn_blocking(move || action(&directory, &relative_path))
         .await
-        .map_err(ExtractError::<E>::BlockingTask)?
-        .map_err(|source| ExtractError::filesystem(operation, error_path, source))
+        .map_err(ExtractError::<E>::BlockingTask)
 }
 
 #[cfg(not(windows))]
@@ -1030,4 +1230,50 @@ fn create_symlink(_directory: &Dir, _contents: &str, _path: &Path) -> io::Result
         io::ErrorKind::Unsupported,
         "symbolic links are not supported on this platform",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deep_entry_tree_stores_each_component_once() {
+        const COMPONENT: &str = "segment";
+        const DEPTH: usize = 4_096;
+
+        let mut tree = EntryTree::new();
+        let mut parent = ROOT_ENTRY;
+        for _ in 0..DEPTH {
+            parent = tree.ensure_child(parent, OsStr::new(COMPONENT));
+        }
+
+        let component_bytes = tree
+            .nodes
+            .iter()
+            .flat_map(|node| node.children.keys())
+            .map(|component| component.as_encoded_bytes().len())
+            .sum::<usize>();
+        assert_eq!(tree.nodes.len(), DEPTH + 1);
+        assert_eq!(component_bytes, DEPTH * COMPONENT.len());
+    }
+
+    #[test]
+    fn entry_tree_counts_only_active_direct_children() {
+        let mut tree = EntryTree::new();
+        let directory = tree.ensure_child(ROOT_ENTRY, OsStr::new("directory"));
+        let child = tree.ensure_child(directory, OsStr::new("child"));
+
+        tree.set_state(directory, ExtractedEntry::CreatedDirectory);
+        assert!(tree.has_active_children(ROOT_ENTRY));
+        tree.set_state(directory, ExtractedEntry::File);
+        assert!(tree.has_active_children(ROOT_ENTRY));
+
+        tree.set_state(child, ExtractedEntry::File);
+        assert!(tree.has_active_children(directory));
+        tree.clear_state(child);
+        assert!(!tree.has_active_children(directory));
+
+        tree.clear_state(directory);
+        assert!(!tree.has_active_children(ROOT_ENTRY));
+    }
 }

@@ -1,6 +1,6 @@
 pub mod support;
 
-use std::{collections::VecDeque, path::Path, sync::mpsc};
+use std::{collections::VecDeque, io::Read as _, path::Path, sync::mpsc, thread};
 #[cfg(unix)]
 use std::{env, os::unix::fs::PermissionsExt as _, process::Command};
 
@@ -8,6 +8,7 @@ use archive_trait::{
     Archive, ExtractError, ExtractPolicyViolation, Member, SpecialKind,
     extract::{ExtractPolicy, LinkPolicy, SymlinkPolicy},
 };
+use cap_std::{ambient_authority, fs::Dir};
 use support::{TestArchive, TestEntry, TestError, TestPayload, entry};
 use tempfile::tempdir;
 use tokio::{runtime::Builder, sync::oneshot};
@@ -121,6 +122,68 @@ async fn streaming_payload_reuses_initialized_chunk_buffer() {
         std::fs::read(destination.join("file")).expect("file should be readable"),
         expected
     );
+}
+
+#[tokio::test]
+async fn extracts_through_deep_ambient_and_created_path() {
+    const COMPONENT: &str = "segment";
+    const AMBIENT_DIRECTORY_COMPONENTS: usize = 320;
+    const DIRECTORY_COMPONENTS: usize = 640;
+    const CLEANUP_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+    let mut path = format!("{COMPONENT}/").repeat(DIRECTORY_COMPONENTS);
+    path.push_str("file");
+    assert!(
+        path.len() > 4_096,
+        "test path should exceed common PATH_MAX"
+    );
+    let temp = tempdir().expect("temporary directory should be created");
+    let destination = temp.path().join("out");
+    std::fs::create_dir(&destination).expect("destination should be created");
+
+    let mut directory = Dir::open_ambient_dir(&destination, ambient_authority())
+        .expect("destination capability should be opened");
+    for _ in 0..AMBIENT_DIRECTORY_COMPONENTS {
+        directory
+            .create_dir(COMPONENT)
+            .expect("deep ambient directory should be created");
+        directory = directory
+            .open_dir(COMPONENT)
+            .expect("deep ambient directory should be opened");
+    }
+    drop(directory);
+
+    TestArchive::new([entry::file(&path, b"contents")])
+        .extract_in(&destination, ExtractPolicy::default())
+        .await
+        .expect("deep path should reuse ambient parents and create missing parents");
+
+    let mut directory = Dir::open_ambient_dir(&destination, ambient_authority())
+        .expect("destination capability should be opened");
+    for _ in 0..DIRECTORY_COMPONENTS {
+        directory = directory
+            .open_dir(COMPONENT)
+            .expect("deep directory should be opened");
+    }
+    let mut contents = Vec::new();
+    directory
+        .open("file")
+        .expect("deep file should be opened")
+        .read_to_end(&mut contents)
+        .expect("deep file should be read");
+    assert_eq!(contents, b"contents");
+
+    // Recursive removal at this depth needs more than the test thread's stack.
+    drop(directory);
+    let cleanup_root = Dir::open_ambient_dir(temp.path(), ambient_authority())
+        .expect("temporary directory capability should be opened");
+    thread::Builder::new()
+        .stack_size(CLEANUP_STACK_BYTES)
+        .spawn(move || cleanup_root.remove_dir_all("out"))
+        .expect("deep cleanup thread should start")
+        .join()
+        .expect("deep cleanup thread should not panic")
+        .expect("deep destination should be removed");
 }
 
 fn patterned_payload(size: usize) -> Vec<u8> {
