@@ -84,7 +84,7 @@ use tokio_stream::Stream;
 use crate::{
     ArchiveFormat, BLOCK_SIZE, Block, DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE,
     DEFAULT_MAX_GNU_EXTENSION_SIZE, DEFAULT_MAX_PAX_EXTENSION_SIZE, FrameError, FrameErrorInner,
-    GnuKind, HdrCharset, PaxError, PaxKind, PaxRecord, PaxValue, UstarKind,
+    GnuKind, HdrCharset, PaxError, PaxKind, PaxRecord, PaxState, PaxValue, UstarKind,
     header::{
         CHECKSUM_RANGE, GNU_IDENTITY, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE, NAME_RANGE,
         PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, USTAR_IDENTITY, checksum, parse_number,
@@ -1000,7 +1000,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         local_pax_records: Option<SharedPaxRecords>,
     ) -> Result<Frame, FrameError> {
         let kind = UstarKind::try_from_framed(position, parsed.typeflag)?;
-        let effective_size = PaxRecords::size(
+        let effective_size = PaxState::effective_size(
             local_pax_records.as_deref(),
             self.global_pax_records.as_deref(),
         )

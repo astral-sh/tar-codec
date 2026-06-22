@@ -63,7 +63,7 @@ pub enum PaxError {
 pub(crate) type SharedPaxRecords = Arc<PaxRecords>;
 pub(crate) type SharedGlobalPaxRecords = Arc<GlobalPaxRecords>;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PaxRecords(Vec<PaxRecord>);
 
 /// An owned, hashable pax extended-header keyword.
@@ -145,7 +145,7 @@ impl fmt::Display for PaxKeyword {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GlobalPaxRecords {
-    records: Vec<PaxRecord>,
+    records: PaxRecords,
     indices: HashMap<PaxKeyword, usize>,
 }
 
@@ -153,10 +153,10 @@ impl GlobalPaxRecords {
     fn apply(&mut self, updates: &PaxRecords) {
         for update in updates.as_slice() {
             match self.indices.entry(update.keyword()) {
-                Entry::Occupied(entry) => self.records[*entry.get()] = update.clone(),
+                Entry::Occupied(entry) => self.records.0[*entry.get()] = update.clone(),
                 Entry::Vacant(entry) => {
-                    let index = self.records.len();
-                    self.records.push(update.clone());
+                    let index = self.records.0.len();
+                    self.records.0.push(update.clone());
                     entry.insert(index);
                 }
             }
@@ -166,7 +166,7 @@ impl GlobalPaxRecords {
     fn get(&self, keyword: &PaxKeyword) -> Option<&PaxRecord> {
         self.indices
             .get(keyword)
-            .and_then(|index| self.records.get(*index))
+            .and_then(|index| self.records.as_slice().get(*index))
     }
 
     pub(super) fn hdrcharset(&self) -> HdrCharset {
@@ -248,7 +248,29 @@ impl PaxState {
             .local_extension
             .as_ref()
             .map(|extension| extension.records.as_ref());
-        PaxRecords::effective_record(local_records, self.global_records.as_deref(), keyword)
+        Self::effective_record_from(local_records, self.global_records.as_deref(), keyword)
+    }
+
+    pub(super) fn effective_size<'a>(
+        local_records: Option<&'a PaxRecords>,
+        global_records: Option<&'a GlobalPaxRecords>,
+    ) -> Option<&'a PaxValue<u64>> {
+        Self::effective_record_from(local_records, global_records, &PaxKeyword::Size).and_then(
+            |record| match record {
+                PaxRecord::Size(value) => Some(value),
+                _ => None,
+            },
+        )
+    }
+
+    fn effective_record_from<'a>(
+        local_records: Option<&'a PaxRecords>,
+        global_records: Option<&'a GlobalPaxRecords>,
+        keyword: &PaxKeyword,
+    ) -> Option<&'a PaxRecord> {
+        local_records
+            .and_then(|records| records.get(keyword))
+            .or_else(|| global_records.and_then(|records| records.get(keyword)))
     }
 }
 
@@ -546,6 +568,8 @@ impl PaxRecords {
         inherited: HdrCharset,
     ) -> Result<HdrCharset, PaxError> {
         let mut hdrcharset = inherited;
+        // TODO: Consider finding the last `hdrcharset` with a reverse search to avoid parsing
+        // shadowed values here. All records would still be validated during typed parsing.
         for (keyword, value) in records {
             if *keyword == "hdrcharset" {
                 hdrcharset = match PaxValue::parse_hdrcharset(value)? {
@@ -562,28 +586,6 @@ impl PaxRecords {
             .iter()
             .rev()
             .find(|record| record.keyword() == *keyword)
-    }
-
-    fn effective_record<'a>(
-        local_records: Option<&'a Self>,
-        global_records: Option<&'a GlobalPaxRecords>,
-        keyword: &PaxKeyword,
-    ) -> Option<&'a PaxRecord> {
-        local_records
-            .and_then(|records| records.get(keyword))
-            .or_else(|| global_records.and_then(|records| records.get(keyword)))
-    }
-
-    pub(super) fn size<'a>(
-        local_records: Option<&'a Self>,
-        global_records: Option<&'a GlobalPaxRecords>,
-    ) -> Option<&'a PaxValue<u64>> {
-        Self::effective_record(local_records, global_records, &PaxKeyword::Size).and_then(
-            |record| match record {
-                PaxRecord::Size(value) => Some(value),
-                _ => None,
-            },
-        )
     }
 
     pub(super) fn apply_global(&self, active: &mut Option<SharedGlobalPaxRecords>) {
@@ -866,7 +868,7 @@ mod tests {
         deletion.apply_global(&mut active);
 
         let active_records = active.as_deref().expect("global state should exist");
-        assert_eq!(active_records.records.len(), 2);
+        assert_eq!(active_records.records.as_slice().len(), 2);
         let state = PaxState::new(active, Vec::new(), None);
         assert_eq!(
             state.effective_record(&PaxKeyword::Path),
@@ -1030,7 +1032,7 @@ mod tests {
         let update = Arc::new(PaxRecords(vec![vendor("first", "new"), security("new")]));
         update.apply_global(&mut active);
         let active = active.as_deref().expect("global state should exist");
-        assert_eq!(active.records.len(), 3);
+        assert_eq!(active.records.as_slice().len(), 3);
         assert_eq!(
             active.get(&PaxKeyword::Vendor {
                 vendor: text("Acme"),
