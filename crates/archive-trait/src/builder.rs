@@ -15,7 +15,7 @@ use std::{
 };
 
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
+use tokio::sync::mpsc;
 
 pub use self::traversal::TraversalError;
 use self::traversal::{TraversalEntry, TraversalKind, TraversalStream, stream_directory_entries};
@@ -138,11 +138,35 @@ enum EntryPayloadInner<'a> {
         yielded: bool,
     },
     Streaming {
-        file: tokio::fs::File,
         path: PathBuf,
+        state: StreamingPayloadState,
+    },
+}
+
+enum StreamingPayloadState {
+    // Start one persistent blocking reader lazily, after the format hook has
+    // written its member framing. Each call returns the previous buffer before
+    // waiting for the next chunk, so reads stay bounded and cancellation can
+    // resume from the channel without losing source state.
+    Ready {
+        file: std::fs::File,
         buffer: Vec<u8>,
         remaining: u64,
     },
+    Reading {
+        chunks: mpsc::Receiver<Vec<u8>>,
+        recycle: mpsc::UnboundedSender<Vec<u8>>,
+        current: Option<Vec<u8>>,
+        task: tokio::task::JoinHandle<SourceReadCompletion>,
+    },
+    Complete {
+        buffer: Vec<u8>,
+    },
+}
+
+enum SourceReadCompletion {
+    Complete(Vec<u8>),
+    Failed { buffer: Vec<u8>, source: io::Error },
 }
 
 impl EntryPayload<'_> {
@@ -164,25 +188,7 @@ impl EntryPayload<'_> {
                 *yielded = true;
                 Ok(Some(&data[..]))
             }
-            EntryPayloadInner::Streaming {
-                file,
-                path,
-                buffer,
-                remaining,
-            } => {
-                if *remaining == 0 {
-                    return Ok(None);
-                }
-                let chunk_size = (*remaining).min(SOURCE_FILE_CHUNK_BYTES as u64);
-                let chunk_len = usize::try_from(chunk_size)
-                    .map_err(|_| arithmetic_overflow("source file read buffer size"))?;
-                buffer.resize(chunk_len, 0);
-                file.read_exact(buffer)
-                    .await
-                    .map_err(|source| filesystem_error("read source file", path, source))?;
-                *remaining -= chunk_size;
-                Ok(Some(buffer))
-            }
+            EntryPayloadInner::Streaming { path, state } => state.next_chunk(path).await,
         }
     }
 
@@ -197,6 +203,128 @@ impl EntryPayload<'_> {
             },
         })
     }
+}
+
+impl StreamingPayloadState {
+    async fn next_chunk<E>(&mut self, path: &Path) -> Result<Option<&[u8]>, BuildError<E>> {
+        self.prepare_next(path).await?;
+        match self {
+            Self::Reading {
+                current: Some(buffer),
+                ..
+            } => Ok(Some(buffer)),
+            Self::Ready { .. } | Self::Reading { current: None, .. } | Self::Complete { .. } => {
+                Ok(None)
+            }
+        }
+    }
+
+    async fn prepare_next<E>(&mut self, path: &Path) -> Result<(), BuildError<E>> {
+        loop {
+            match self {
+                Self::Ready { .. } => self.start(),
+                Self::Reading {
+                    chunks,
+                    recycle,
+                    current,
+                    task,
+                } => {
+                    if let Some(buffer) = current.take()
+                        && let Err(error) = recycle.send(buffer)
+                    {
+                        *current = Some(error.0);
+                    }
+                    if let Some(buffer) = chunks.recv().await {
+                        *current = Some(buffer);
+                        return Ok(());
+                    }
+                    let completion = (&mut *task).await;
+                    let retained = current.take().unwrap_or_default();
+                    match completion {
+                        Ok(SourceReadCompletion::Complete(buffer)) => {
+                            *self = Self::Complete { buffer };
+                            return Ok(());
+                        }
+                        Ok(SourceReadCompletion::Failed { buffer, source }) => {
+                            *self = Self::Complete { buffer };
+                            return Err(filesystem_error("read source file", path, source));
+                        }
+                        Err(error) => {
+                            *self = Self::Complete { buffer: retained };
+                            return Err(BuildError::BlockingTask(error));
+                        }
+                    }
+                }
+                Self::Complete { .. } => return Ok(()),
+            }
+        }
+    }
+
+    fn start(&mut self) {
+        let state = mem::replace(self, Self::Complete { buffer: Vec::new() });
+        *self = match state {
+            Self::Ready {
+                file,
+                buffer,
+                remaining,
+            } => {
+                let (chunk_sender, chunks) = mpsc::channel(1);
+                let (recycle, recycled) = mpsc::unbounded_channel();
+                let task = tokio::task::spawn_blocking(move || {
+                    read_source_file(file, remaining, buffer, chunk_sender, recycled)
+                });
+                Self::Reading {
+                    chunks,
+                    recycle,
+                    current: None,
+                    task,
+                }
+            }
+            state => state,
+        };
+    }
+
+    fn into_buffer(self) -> Vec<u8> {
+        match self {
+            Self::Ready { buffer, .. } | Self::Complete { buffer } => buffer,
+            Self::Reading {
+                current: Some(buffer),
+                ..
+            } => buffer,
+            Self::Reading { current: None, .. } => Vec::new(),
+        }
+    }
+}
+
+fn read_source_file(
+    file: std::fs::File,
+    mut remaining: u64,
+    mut buffer: Vec<u8>,
+    chunks: mpsc::Sender<Vec<u8>>,
+    mut recycled: mpsc::UnboundedReceiver<Vec<u8>>,
+) -> SourceReadCompletion {
+    while remaining != 0 {
+        let chunk_size = remaining.min(SOURCE_FILE_CHUNK_BYTES as u64);
+        let Ok(chunk_len) = usize::try_from(chunk_size) else {
+            return SourceReadCompletion::Failed {
+                buffer,
+                source: io::Error::other("source file read buffer size cannot be represented"),
+            };
+        };
+        buffer.resize(chunk_len, 0);
+        if let Err(source) = (&file).read_exact(&mut buffer) {
+            return SourceReadCompletion::Failed { buffer, source };
+        }
+        remaining -= chunk_size;
+        if let Err(error) = chunks.blocking_send(buffer) {
+            return SourceReadCompletion::Complete(error.0);
+        }
+        let Some(recycled_buffer) = recycled.blocking_recv() else {
+            return SourceReadCompletion::Complete(Vec::new());
+        };
+        buffer = recycled_buffer;
+    }
+    SourceReadCompletion::Complete(buffer)
 }
 
 /// A failure returned by an [`ArchiveBuilder`] format hook.
@@ -520,10 +648,12 @@ async fn write_prepared_directory_entries<B: ArchiveBuilder>(
                 let mut payload = EntryPayload {
                     size,
                     inner: EntryPayloadInner::Streaming {
-                        file: tokio::fs::File::from_std(file),
                         path,
-                        buffer: mem::take(buffer),
-                        remaining: size,
+                        state: StreamingPayloadState::Ready {
+                            file,
+                            buffer: mem::take(buffer),
+                            remaining: size,
+                        },
                     },
                 };
                 let result = builder
@@ -537,8 +667,8 @@ async fn write_prepared_directory_entries<B: ArchiveBuilder>(
                     EntryPayloadInner::Buffered {
                         data: Cow::Owned(buffer),
                         ..
-                    }
-                    | EntryPayloadInner::Streaming { buffer, .. } => buffer,
+                    } => buffer,
+                    EntryPayloadInner::Streaming { state, .. } => state.into_buffer(),
                     EntryPayloadInner::Buffered {
                         data: Cow::Borrowed(_),
                         ..
