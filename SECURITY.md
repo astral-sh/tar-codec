@@ -22,6 +22,7 @@ General properties:
 - All asynchronous consumer-facing APIs should be cancellation safe. In other words,
   dropping a future produced by a direct-use API should _never_ result in state corruption that
   breaks our parsing or encoding properties.
+- All consumer-facing APIs should be deadlock safe.
 - Encoding should always produce a valid, unambiguous, pax-only tar.
 - Both encoding and decoding should remain linear in time and memory with respect to their input.
 
