@@ -482,7 +482,7 @@ async fn global_pax_headers_support_opt_out_and_ignore_trailing_updates() {
             .await,
         Err(ExtractError::Archive(DecodeError::Framing(FrameError {
             position: 0,
-            inner: FrameErrorInner::InvalidPaxRecords { .. },
+            inner: FrameErrorInner::InvalidPaxRecord { .. },
         })))
     ));
 }
