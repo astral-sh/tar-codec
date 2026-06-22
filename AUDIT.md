@@ -15,7 +15,7 @@ as its conformance baseline.
 | AUDIT-01 | High | Extraction | Deep paths cause quadratic time and memory | Fixed |
 | AUDIT-02 | High | Encoding | Deep manual builder paths cause quadratic time and memory | Fixed |
 | AUDIT-03 | Medium | Extraction | Directory-to-file replacement is quadratic | Fixed with AUDIT-01 |
-| AUDIT-04 | Medium | Decoding policy | Global pax policy can be bypassed after a recoverable error | Open |
+| AUDIT-04 | Medium | Decoding policy | Global pax policy can be bypassed after a recoverable error | Fixed |
 | AUDIT-05 | Medium | Pax decoding | Empty ustar `name` loses the separator after `prefix` | Open |
 | AUDIT-06 | Medium | Pax encoding | Encoded `devmajor` and `devminor` fields are invalid | Open |
 | AUDIT-07 | Medium | Pax decoding | Ordinary ustar headers are incompletely validated | Open |
@@ -143,6 +143,12 @@ and require O(N) aggregate work.
 
 Severity: **Medium**  
 Security property: rejected or ambiguous metadata must not become effective
+
+Status: **Fixed.** `TarArchive` member iteration is now fused after the first
+framing, policy, or projection error. Later calls return end-of-archive, so
+global state applied by the lower framing layer cannot become observable after
+the decode policy rejects its originating extension. An integration regression
+test covers the forbidden-global-path sequence below.
 
 Affected code:
 
