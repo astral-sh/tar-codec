@@ -354,7 +354,12 @@ impl<R> TarStream<R> {
         self.max_global_pax_extensions_size = max_global_pax_extensions_size;
     }
 
-    pub(crate) fn set_max_gnu_extension_size(&mut self, max_gnu_extension_size: u64) {
+    /// Sets the maximum size accepted for each GNU extension.
+    ///
+    /// A GNU extension member that declares a larger payload is rejected before
+    /// its payload is consumed. Setting the maximum to zero rejects every nonempty
+    /// GNU extension member. Setting it to [`u64::MAX`] removes the per-extension bound.
+    pub fn set_max_gnu_extension_size(&mut self, max_gnu_extension_size: u64) {
         self.max_gnu_extension_size = max_gnu_extension_size;
     }
 
