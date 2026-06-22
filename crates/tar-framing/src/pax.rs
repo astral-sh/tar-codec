@@ -266,7 +266,7 @@ impl PaxState {
         )
     }
 
-    fn effective_record_from<'a>(
+    pub(super) fn effective_record_from<'a>(
         local_records: Option<&'a PaxRecords>,
         global_records: Option<&'a GlobalPaxRecords>,
         keyword: &PaxKeyword,

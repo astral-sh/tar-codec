@@ -42,6 +42,12 @@ pub const LINK_NAME_RANGE: std::ops::Range<usize> = 157..257;
 /// This is both the tar magic and the tar version.
 pub const IDENTITY_RANGE: std::ops::Range<usize> = 257..265;
 
+/// The byte range that a member's user name appears at in a pax/ustar block.
+pub const UNAME_RANGE: std::ops::Range<usize> = 265..297;
+
+/// The byte range that a member's group name appears at in a pax/ustar block.
+pub const GNAME_RANGE: std::ops::Range<usize> = 297..329;
+
 /// The byte range that a member's device-major value appears at in a pax/ustar block.
 pub const DEVMAJOR_RANGE: std::ops::Range<usize> = 329..337;
 

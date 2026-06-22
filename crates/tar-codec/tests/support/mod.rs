@@ -1,8 +1,9 @@
 use tar_framing::{
     BLOCK_SIZE, Block, PaxKeyword,
     header::{
-        CHECKSUM_RANGE, GNU_IDENTITY, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE, NAME_RANGE,
-        PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, USTAR_IDENTITY,
+        CHECKSUM_RANGE, GID_RANGE, GNU_IDENTITY, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE,
+        MTIME_RANGE, NAME_RANGE, PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, UID_RANGE,
+        USTAR_IDENTITY,
     },
     write::append_pax_record,
 };
@@ -128,7 +129,10 @@ pub fn header(
     let mut block = [0; BLOCK_SIZE];
     set_text(&mut block[NAME_RANGE], name);
     block[MODE_RANGE].copy_from_slice(format!("{mode:07o}\0").as_bytes());
+    block[UID_RANGE].copy_from_slice(b"0000000\0");
+    block[GID_RANGE].copy_from_slice(b"0000000\0");
     block[SIZE_RANGE].copy_from_slice(format!("{size:011o}\0").as_bytes());
+    block[MTIME_RANGE].copy_from_slice(b"00000000000\0");
     block[TYPEFLAG_OFFSET] = typeflag;
     set_text(&mut block[LINK_NAME_RANGE], link_name);
     block[IDENTITY_RANGE].copy_from_slice(match format {

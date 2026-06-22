@@ -74,12 +74,18 @@ async fn tokio_tar_ustar_archive() -> Vec<u8> {
 fn configure_tar_header(header: &mut tar::Header, payload_len: usize) {
     header.set_size(u64::try_from(payload_len).expect("payload length should be representable"));
     header.set_mode(0o644);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
     header.set_cksum();
 }
 
 fn configure_tokio_tar_header(header: &mut tokio_tar::Header, payload_len: usize) {
     header.set_size(u64::try_from(payload_len).expect("payload length should be representable"));
     header.set_mode(0o644);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
     header.set_cksum();
 }
 

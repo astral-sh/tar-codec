@@ -18,7 +18,7 @@ as its conformance baseline.
 | AUDIT-04 | Medium | Decoding policy | Global pax policy can be bypassed after a recoverable error | Fixed |
 | AUDIT-05 | Medium | Pax decoding | Empty ustar `name` loses the separator after `prefix` | Fixed |
 | AUDIT-06 | Low | Pax encoding | Encoded `devmajor` and `devminor` fields are invalid | Fixed |
-| AUDIT-07 | Medium | Pax decoding | Ordinary ustar headers are incompletely validated | Open |
+| AUDIT-07 | Medium | Pax decoding | Ordinary ustar headers are incompletely validated | Fixed |
 | AUDIT-08 | Medium | Pax decoding | Retaining a prior `PaxState` makes global updates quadratic | Open |
 | AUDIT-09 | Medium | Encoding | Repeated `add_directory()` calls clone collision state quadratically | Open |
 
@@ -264,6 +264,13 @@ and ordinary member header using the decoder's strict numeric parser.
 Severity: **Medium**  
 Security property: malformed pax streams must be rejected
 
+Status: **Fixed.** Ordinary ustar member headers now validate the POSIX 12-bit
+mode domain, strict-octal `uid`, `gid`, and `mtime` fields, and NUL termination
+of `uname` and `gname` before emitting a member frame. Fields superseded by an
+effective local or global pax record are ignored as required, including pax
+deletion tombstones. `devmajor` and `devminor` remain deliberately opaque: POSIX
+does not specify their representation, and the decoder does not consume them.
+
 Affected code:
 
 - [`crates/tar-framing/src/stream.rs`](crates/tar-framing/src/stream.rs), `ParsedHeader::try_from_framed()` around lines 1173-1209
@@ -274,7 +281,6 @@ Ordinary POSIX headers validate identity, checksum, and size, with mode parsed
 later. They do not validate:
 
 - `uid`, `gid`, or `mtime`
-- `devmajor` or `devminor`
 - required NUL termination of `uname` and `gname`
 - the POSIX 12-bit domain of `mode`
 

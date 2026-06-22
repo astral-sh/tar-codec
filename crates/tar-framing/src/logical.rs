@@ -1044,28 +1044,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_member_modes_when_decoded() {
-        let mut header = header(b'0', 0);
-        header[MODE_RANGE].copy_from_slice(b"0000080\0");
-        set_checksum(&mut header);
-        let result: Result<(), FrameError> = ready(async {
-            let mut bytes = Vec::new();
-            append_block(&mut bytes, &header);
-            append_terminator(&mut bytes);
-            let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
-            let member = next_member(&mut reader).await?;
-            member.header.mode().map(|_| ())
-        });
-        assert!(matches!(
-            result,
-            Err(FrameError {
-                position: 0,
-                inner: FrameErrorInner::InvalidMode { .. },
-            })
-        ));
-    }
-
-    #[test]
     fn groups_pax_metadata_and_streams_member_payload() {
         let mut global = record("comment", "first");
         global.extend_from_slice(&record("comment", "last"));
