@@ -6,6 +6,12 @@
 > significantly by host OS and filesystem, system load, presence of
 > background processes, and so forth.
 
+> [!NOTE]
+> The encoding benchmarks are not perfect "apples-to-apples"
+> comparisons, since `tar-codec` intentionally only emits
+> pax archives while `tar` and `astral-tokio-tar` emit GNU-style
+> archives by default.
+
 The following ratios are calculated from Criterion median point estimates in
 the Ubuntu job of a
 [GitHub Actions snapshot](https://github.com/astral-sh/tar-codec/actions/runs/27961977910)
@@ -24,9 +30,3 @@ faster and values above 1.00x are slower.
 | ustar large | 1.00x | 1.34x | 2.18x |
 | pax many-small | 1.00x | 1.52x | 4.86x |
 | ustar many-small | 1.00x | 1.51x | 4.93x |
-
-> [!NOTE]
-> The encoding benchmarks are not perfect "apples-to-apples"
-> comparisons, since `tar-codec` intentionally only emits
-> pax archives while `tar` and `astral-tokio-tar` emit GNU-style
-> archives by default.
