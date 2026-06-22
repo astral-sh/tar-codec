@@ -279,22 +279,19 @@ pub(super) struct PendingGnu {
 #[derive(Default)]
 struct MemberChunk {
     buffer: Vec<u8>,
+    start_position: u64,
+    physical_len: usize,
+    meaningful_len: usize,
     state: Option<MemberChunkState>,
 }
 
 #[derive(Clone, Copy)]
 enum MemberChunkState {
     Reading {
-        start_position: u64,
         member_remaining: u64,
-        physical_len: usize,
-        meaningful_len: usize,
         filled: usize,
     },
     Ready {
-        start_position: u64,
-        physical_len: usize,
-        meaningful_len: usize,
         delivered: usize,
     },
 }
@@ -489,11 +486,11 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         if self.member_chunk.buffer.len() != physical_len {
             self.member_chunk.buffer.resize(physical_len, 0);
         }
+        self.member_chunk.start_position = self.position;
+        self.member_chunk.physical_len = physical_len;
+        self.member_chunk.meaningful_len = meaningful_len;
         self.member_chunk.state = Some(MemberChunkState::Reading {
-            start_position: self.position,
             member_remaining,
-            physical_len,
-            meaningful_len,
             filled: 0,
         });
         Ok(())
@@ -501,31 +498,24 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
 
     async fn complete_member_chunk(&mut self) -> Result<(), FrameError> {
         loop {
-            let (start_position, member_remaining, physical_len, meaningful_len, filled) =
-                match self.member_chunk.state {
-                    Some(MemberChunkState::Reading {
-                        start_position,
-                        member_remaining,
-                        physical_len,
-                        meaningful_len,
-                        filled,
-                    }) => (
-                        start_position,
-                        member_remaining,
-                        physical_len,
-                        meaningful_len,
-                        filled,
-                    ),
-                    Some(MemberChunkState::Ready { .. }) => return Ok(()),
-                    None => {
-                        self.state = State::Failed;
-                        return Err(FrameError::unexpected_order(
-                            self.position,
-                            "pending member payload chunk",
-                            "parser state without a pending chunk",
-                        ));
-                    }
-                };
+            let (member_remaining, filled) = match self.member_chunk.state {
+                Some(MemberChunkState::Reading {
+                    member_remaining,
+                    filled,
+                }) => (member_remaining, filled),
+                Some(MemberChunkState::Ready { .. }) => return Ok(()),
+                None => {
+                    self.state = State::Failed;
+                    return Err(FrameError::unexpected_order(
+                        self.position,
+                        "pending member payload chunk",
+                        "parser state without a pending chunk",
+                    ));
+                }
+            };
+            let start_position = self.member_chunk.start_position;
+            let physical_len = self.member_chunk.physical_len;
+            let meaningful_len = self.member_chunk.meaningful_len;
             if filled == physical_len {
                 self.position =
                     checked_position(start_position, physical_len).inspect_err(|_| {
@@ -543,12 +533,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                         )
                     })?;
                 self.state = member_payload_state(remaining);
-                self.member_chunk.state = Some(MemberChunkState::Ready {
-                    start_position,
-                    physical_len,
-                    meaningful_len,
-                    delivered: 0,
-                });
+                self.member_chunk.state = Some(MemberChunkState::Ready { delivered: 0 });
                 return Ok(());
             }
 
@@ -606,12 +591,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
     }
 
     fn take_member_chunk(&mut self, buffer: &mut Vec<u8>) -> Result<usize, FrameError> {
-        let Some(MemberChunkState::Ready {
-            meaningful_len,
-            delivered,
-            ..
-        }) = self.member_chunk.state.take()
-        else {
+        let Some(MemberChunkState::Ready { delivered }) = self.member_chunk.state.take() else {
             self.state = State::Failed;
             return Err(FrameError::unexpected_order(
                 self.position,
@@ -619,6 +599,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 "incomplete member payload chunk",
             ));
         };
+        let meaningful_len = self.member_chunk.meaningful_len;
         let remaining_len = meaningful_len.checked_sub(delivered).ok_or_else(|| {
             self.state = State::Failed;
             FrameError::arithmetic_overflow(self.position, "undelivered member payload length")
@@ -634,13 +615,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
     }
 
     fn take_member_block_from_chunk(&mut self) -> Result<(u64, Block, usize), FrameError> {
-        let Some(MemberChunkState::Ready {
-            start_position,
-            physical_len,
-            meaningful_len: total_meaningful_len,
-            delivered,
-        }) = self.member_chunk.state
-        else {
+        let Some(MemberChunkState::Ready { delivered }) = self.member_chunk.state else {
             self.state = State::Failed;
             return Err(FrameError::unexpected_order(
                 self.position,
@@ -648,6 +623,9 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 "incomplete member payload chunk",
             ));
         };
+        let start_position = self.member_chunk.start_position;
+        let physical_len = self.member_chunk.physical_len;
+        let total_meaningful_len = self.member_chunk.meaningful_len;
         let position = checked_position(start_position, delivered).inspect_err(|_| {
             self.state = State::Failed;
             self.member_chunk.state = None;
@@ -666,12 +644,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         if delivered == physical_len {
             self.member_chunk.state = None;
         } else {
-            self.member_chunk.state = Some(MemberChunkState::Ready {
-                start_position,
-                physical_len,
-                meaningful_len: total_meaningful_len,
-                delivered,
-            });
+            self.member_chunk.state = Some(MemberChunkState::Ready { delivered });
         }
         Ok((position, block, meaningful_len))
     }

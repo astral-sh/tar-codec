@@ -6,7 +6,6 @@
 mod traversal;
 
 use std::{
-    borrow::Cow,
     collections::{HashMap, VecDeque},
     io::{self, Read},
     mem,
@@ -133,14 +132,11 @@ pub struct EntryPayload<'a> {
 }
 
 enum EntryPayloadInner<'a> {
-    Buffered {
-        data: Cow<'a, [u8]>,
-        yielded: bool,
-    },
+    Buffered(Option<&'a [u8]>),
     Streaming {
         file: tokio::fs::File,
         path: PathBuf,
-        buffer: Vec<u8>,
+        buffer: &'a mut Vec<u8>,
         remaining: u64,
         filled: usize,
     },
@@ -158,13 +154,7 @@ impl EntryPayload<'_> {
     /// Returns the next chunk of logical, uncompressed source bytes.
     pub async fn next_chunk<E>(&mut self) -> Result<Option<&[u8]>, BuildError<E>> {
         match &mut self.inner {
-            EntryPayloadInner::Buffered { data, yielded } => {
-                if *yielded || data.is_empty() {
-                    return Ok(None);
-                }
-                *yielded = true;
-                Ok(Some(&data[..]))
-            }
+            EntryPayloadInner::Buffered(data) => Ok(data.take().filter(|data| !data.is_empty())),
             EntryPayloadInner::Streaming {
                 file,
                 path,
@@ -180,10 +170,7 @@ impl EntryPayload<'_> {
             .map_err(|_| arithmetic_overflow("manual entry payload size"))?;
         Ok(EntryPayload {
             size,
-            inner: EntryPayloadInner::Buffered {
-                data: Cow::Borrowed(bytes),
-                yielded: false,
-            },
+            inner: EntryPayloadInner::Buffered(Some(bytes)),
         })
     }
 }
@@ -489,39 +476,28 @@ async fn write_prepared_directory_entries<B: ArchiveBuilder>(
     traversal: &mut DirectoryBuild,
 ) -> Result<(), BuildFailure<B::Error>> {
     for entry in entries {
+        reserve_entry(
+            &mut traversal.entries,
+            &entry.archive_path,
+            if matches!(&entry.kind, PreparedTraversalKind::Directory) {
+                ArchivedEntry::Directory { explicit: true }
+            } else {
+                ArchivedEntry::NonDirectory
+            },
+        )
+        .map_err(BuildFailure::recoverable)?;
         match entry.kind {
             PreparedTraversalKind::Directory => {
-                reserve_entry(
-                    &mut traversal.entries,
-                    &entry.archive_path,
-                    ArchivedEntry::Directory { explicit: true },
-                )
-                .map_err(BuildFailure::recoverable)?;
                 builder.write_directory_member(&entry.archive_path).await?;
             }
-            PreparedTraversalKind::BufferedFile {
-                range,
-                size,
-                executable,
-            } => {
-                reserve_entry(
-                    &mut traversal.entries,
-                    &entry.archive_path,
-                    ArchivedEntry::NonDirectory,
-                )
-                .map_err(BuildFailure::recoverable)?;
+            PreparedTraversalKind::BufferedFile { range, executable } => {
                 let data = buffer.get(range).ok_or_else(|| {
                     BuildFailure::recoverable(arithmetic_overflow(
                         "prepared source file buffer range",
                     ))
                 })?;
-                let mut payload = EntryPayload {
-                    size,
-                    inner: EntryPayloadInner::Buffered {
-                        data: Cow::Borrowed(data),
-                        yielded: false,
-                    },
-                };
+                let mut payload =
+                    EntryPayload::borrowed::<B::Error>(data).map_err(BuildFailure::recoverable)?;
                 builder
                     .write_file_member(
                         &entry.archive_path,
@@ -536,12 +512,6 @@ async fn write_prepared_directory_entries<B: ArchiveBuilder>(
                 size,
                 executable,
             } => {
-                reserve_entry(
-                    &mut traversal.entries,
-                    &entry.archive_path,
-                    ArchivedEntry::NonDirectory,
-                )
-                .map_err(BuildFailure::recoverable)?;
                 let mut file = tokio::fs::File::from_std(file);
                 file.set_max_buf_size(SOURCE_FILE_CHUNK_BYTES);
                 let mut payload = EntryPayload {
@@ -549,38 +519,20 @@ async fn write_prepared_directory_entries<B: ArchiveBuilder>(
                     inner: EntryPayloadInner::Streaming {
                         file,
                         path,
-                        buffer: mem::take(buffer),
+                        buffer,
                         remaining: size,
                         filled: 0,
                     },
                 };
-                let result = builder
+                builder
                     .write_file_member(
                         &entry.archive_path,
                         &mut payload,
                         EntryMetadata::default().executable(executable),
                     )
-                    .await;
-                *buffer = match payload.inner {
-                    EntryPayloadInner::Buffered {
-                        data: Cow::Owned(buffer),
-                        ..
-                    } => buffer,
-                    EntryPayloadInner::Streaming { buffer, .. } => buffer,
-                    EntryPayloadInner::Buffered {
-                        data: Cow::Borrowed(_),
-                        ..
-                    } => Vec::new(),
-                };
-                result?;
+                    .await?;
             }
             PreparedTraversalKind::SymbolicLink { target } => {
-                reserve_entry(
-                    &mut traversal.entries,
-                    &entry.archive_path,
-                    ArchivedEntry::NonDirectory,
-                )
-                .map_err(BuildFailure::recoverable)?;
                 builder
                     .write_symbolic_link_member(&entry.archive_path, &target)
                     .await?;
@@ -611,7 +563,6 @@ enum PreparedTraversalKind {
     Directory,
     BufferedFile {
         range: Range<usize>,
-        size: u64,
         executable: bool,
     },
     StreamingFile {
@@ -707,7 +658,6 @@ fn prepare_regular_file(
     Ok((
         PreparedTraversalKind::BufferedFile {
             range: start..end,
-            size,
             executable,
         },
         buffer.len() >= SOURCE_FILE_PREPARATION_BATCH_BYTES,

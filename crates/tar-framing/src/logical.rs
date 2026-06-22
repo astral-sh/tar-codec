@@ -187,6 +187,15 @@ struct PendingExtensions {
     gnu_long_link: Option<GnuMetadata>,
 }
 
+impl PendingExtensions {
+    fn set_gnu(&mut self, kind: GnuKind, metadata: GnuMetadata) {
+        *match kind {
+            GnuKind::LongName => &mut self.gnu_long_name,
+            GnuKind::LongLink => &mut self.gnu_long_link,
+        } = Some(metadata);
+    }
+}
+
 /// An extension payload being assembled across physical frames.
 enum ExtensionPayload {
     Pax {
@@ -317,14 +326,7 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
                             position: frame.position,
                             payload: Vec::new(),
                         };
-                        match frame.kind {
-                            GnuKind::LongName => {
-                                self.pending_extensions.gnu_long_name = Some(metadata);
-                            }
-                            GnuKind::LongLink => {
-                                self.pending_extensions.gnu_long_link = Some(metadata);
-                            }
-                        }
+                        self.pending_extensions.set_gnu(frame.kind, metadata);
                     } else {
                         self.extension_payload = Some(ExtensionPayload::Gnu {
                             position: frame.position,
@@ -429,14 +431,7 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
                 payload.extend_from_slice(&frame.block[..frame.len]);
                 if remaining == 0 {
                     let metadata = GnuMetadata { position, payload };
-                    match kind {
-                        GnuKind::LongName => {
-                            self.pending_extensions.gnu_long_name = Some(metadata);
-                        }
-                        GnuKind::LongLink => {
-                            self.pending_extensions.gnu_long_link = Some(metadata);
-                        }
-                    }
+                    self.pending_extensions.set_gnu(kind, metadata);
                 } else {
                     self.extension_payload = Some(ExtensionPayload::Gnu {
                         position,
@@ -640,14 +635,7 @@ fn parse_gnu_metadata(metadata: &GnuMetadata, kind: GnuKind) -> Result<&[u8], Fr
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        future::Future,
-        io,
-        pin::Pin,
-        task::{Context, Poll},
-    };
-
-    use tokio::io::{AsyncRead, ReadBuf};
+    use tokio::io::AsyncRead;
 
     use super::*;
     use crate::{
@@ -657,44 +645,10 @@ mod tests {
         stream::DataOwner,
         test_support::{
             ChunkedReader, append_block, append_gnu, append_payload, append_posix,
-            append_terminator, gnu_header, header, ready, ready_ok, record, set_checksum,
+            append_terminator, cancel_pending, gnu_header, header, ready, ready_ok, record,
+            set_checksum,
         },
     };
-
-    struct PendingOnceReader {
-        bytes: Vec<u8>,
-        position: usize,
-        pending_at: usize,
-        returned_pending: bool,
-    }
-
-    impl AsyncRead for PendingOnceReader {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            context: &mut Context<'_>,
-            buffer: &mut ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
-            if self.position == self.pending_at && !self.returned_pending {
-                self.returned_pending = true;
-                context.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-            if self.position == self.bytes.len() {
-                return Poll::Ready(Ok(()));
-            }
-            let available = if self.returned_pending {
-                self.bytes.len() - self.position
-            } else {
-                self.pending_at - self.position
-            };
-            let len = buffer.remaining().min(available);
-            let start = self.position;
-            let end = start + len;
-            buffer.put_slice(&self.bytes[start..end]);
-            self.position = end;
-            Poll::Ready(Ok(()))
-        }
-    }
 
     fn set_field(block: &mut Block, range: std::ops::Range<usize>, value: &[u8]) {
         block[range.clone()].fill(0);
@@ -716,6 +670,15 @@ mod tests {
         } else {
             None
         }
+    }
+
+    fn member_followed_by_empty_member(payload: &[u8]) -> (Vec<u8>, u64) {
+        let mut bytes = Vec::new();
+        append_posix(&mut bytes, b'0', payload);
+        let next_position = u64::try_from(bytes.len()).expect("test position should fit u64");
+        append_block(&mut bytes, &header(b'0', 0));
+        append_terminator(&mut bytes);
+        (bytes, next_position)
     }
 
     #[test]
@@ -1207,18 +1170,8 @@ mod tests {
         append_terminator(&mut bytes);
 
         for pending_at in [after_extension_header, after_extension_payload] {
-            let mut reader = TarReader::new(PendingOnceReader {
-                bytes: bytes.clone(),
-                position: 0,
-                pending_at,
-                returned_pending: false,
-            });
-            {
-                let mut next = std::pin::pin!(reader.next_frame());
-                let waker = std::task::Waker::noop();
-                let mut context = Context::from_waker(waker);
-                assert!(matches!(next.as_mut().poll(&mut context), Poll::Pending));
-            }
+            let mut reader = TarReader::new(ChunkedReader::pending_once(bytes.clone(), pending_at));
+            cancel_pending(reader.next_frame());
 
             ready_ok(async {
                 let member = next_member(&mut reader).await?;
@@ -1248,18 +1201,11 @@ mod tests {
         append_block(&mut bytes, &gnu_header(b'0', 0));
         append_terminator(&mut bytes);
 
-        let mut reader = TarReader::new(PendingOnceReader {
+        let mut reader = TarReader::new(ChunkedReader::pending_once(
             bytes,
-            position: 0,
-            pending_at: after_first_payload_block,
-            returned_pending: false,
-        });
-        {
-            let mut next = std::pin::pin!(reader.next_frame());
-            let waker = std::task::Waker::noop();
-            let mut context = Context::from_waker(waker);
-            assert!(matches!(next.as_mut().poll(&mut context), Poll::Pending));
-        }
+            after_first_payload_block,
+        ));
+        cancel_pending(reader.next_frame());
 
         ready_ok(async {
             let member = next_member(&mut reader).await?;
@@ -1272,18 +1218,8 @@ mod tests {
         let after_extension_header = bytes.len();
         append_block(&mut bytes, &gnu_header(b'0', 0));
         append_terminator(&mut bytes);
-        let mut reader = TarReader::new(PendingOnceReader {
-            bytes,
-            position: 0,
-            pending_at: after_extension_header,
-            returned_pending: false,
-        });
-        {
-            let mut next = std::pin::pin!(reader.next_frame());
-            let waker = std::task::Waker::noop();
-            let mut context = Context::from_waker(waker);
-            assert!(matches!(next.as_mut().poll(&mut context), Poll::Pending));
-        }
+        let mut reader = TarReader::new(ChunkedReader::pending_once(bytes, after_extension_header));
+        cancel_pending(reader.next_frame());
 
         ready_ok(async {
             let member = next_member(&mut reader).await?;
@@ -1399,33 +1335,18 @@ mod tests {
         let payload = (0..BLOCK_SIZE * 2 + 17)
             .map(|index| u8::try_from(index % 251).expect("test byte should fit"))
             .collect::<Vec<_>>();
-        let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'0', &payload);
-        let next_member_position =
-            u64::try_from(bytes.len()).expect("test position should fit u64");
-        append_block(&mut bytes, &header(b'0', 0));
-        append_terminator(&mut bytes);
+        let (bytes, next_member_position) = member_followed_by_empty_member(&payload);
 
         ready_ok(async {
-            let mut reader = TarReader::new(PendingOnceReader {
-                bytes,
-                position: 0,
-                pending_at: BLOCK_SIZE + 73,
-                returned_pending: false,
-            });
+            let mut reader = TarReader::new(ChunkedReader::pending_once(bytes, BLOCK_SIZE + 73));
             {
                 let mut member = next_member(&mut reader).await?;
                 let mut cancelled_buffer = vec![b'x'; 17];
-                {
-                    let mut next = std::pin::pin!(
-                        member
-                            .payload
-                            .next_chunk(&mut cancelled_buffer, payload.len())
-                    );
-                    let waker = std::task::Waker::noop();
-                    let mut context = Context::from_waker(waker);
-                    assert!(matches!(next.as_mut().poll(&mut context), Poll::Pending));
-                }
+                cancel_pending(
+                    member
+                        .payload
+                        .next_chunk(&mut cancelled_buffer, payload.len()),
+                );
                 assert!(cancelled_buffer.is_empty());
 
                 let first = member
@@ -1450,28 +1371,13 @@ mod tests {
     #[test]
     fn resumes_cancelled_member_payload_block_during_automatic_drain() {
         let payload = vec![b'x'; BLOCK_SIZE * 2 + 17];
-        let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'0', &payload);
-        let next_member_position =
-            u64::try_from(bytes.len()).expect("test position should fit u64");
-        append_block(&mut bytes, &header(b'0', 0));
-        append_terminator(&mut bytes);
+        let (bytes, next_member_position) = member_followed_by_empty_member(&payload);
 
         ready_ok(async {
-            let mut reader = TarReader::new(PendingOnceReader {
-                bytes,
-                position: 0,
-                pending_at: BLOCK_SIZE + 73,
-                returned_pending: false,
-            });
+            let mut reader = TarReader::new(ChunkedReader::pending_once(bytes, BLOCK_SIZE + 73));
             {
                 let mut member = next_member(&mut reader).await?;
-                {
-                    let mut next = std::pin::pin!(member.payload.next_block());
-                    let waker = std::task::Waker::noop();
-                    let mut context = Context::from_waker(waker);
-                    assert!(matches!(next.as_mut().poll(&mut context), Poll::Pending));
-                }
+                cancel_pending(member.payload.next_block());
             }
 
             let member = next_member(&mut reader).await?;
@@ -1485,27 +1391,12 @@ mod tests {
     #[test]
     fn resumes_cancelled_automatic_payload_drain() {
         let payload = vec![b'x'; BLOCK_SIZE * 2 + 17];
-        let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'0', &payload);
-        let next_member_position =
-            u64::try_from(bytes.len()).expect("test position should fit u64");
-        append_block(&mut bytes, &header(b'0', 0));
-        append_terminator(&mut bytes);
+        let (bytes, next_member_position) = member_followed_by_empty_member(&payload);
 
         ready_ok(async {
-            let mut reader = TarReader::new(PendingOnceReader {
-                bytes,
-                position: 0,
-                pending_at: BLOCK_SIZE + 73,
-                returned_pending: false,
-            });
+            let mut reader = TarReader::new(ChunkedReader::pending_once(bytes, BLOCK_SIZE + 73));
             drop(next_member(&mut reader).await?);
-            {
-                let mut next = std::pin::pin!(reader.next_frame());
-                let waker = std::task::Waker::noop();
-                let mut context = Context::from_waker(waker);
-                assert!(matches!(next.as_mut().poll(&mut context), Poll::Pending));
-            }
+            cancel_pending(reader.next_frame());
 
             let member = next_member(&mut reader).await?;
             assert_eq!(member.header.position, next_member_position);
@@ -1534,23 +1425,13 @@ mod tests {
                 bytes.push(trailing_byte);
             }
             let error = ready(async {
-                let mut reader = TarReader::new(PendingOnceReader {
-                    bytes,
-                    position: 0,
-                    pending_at: BLOCK_SIZE + 73,
-                    returned_pending: false,
-                });
+                let mut reader =
+                    TarReader::new(ChunkedReader::pending_once(bytes, BLOCK_SIZE + 73));
                 let Ok(Some(mut member)) = reader.next_frame().await else {
                     panic!("expected member");
                 };
                 let mut buffer = Vec::new();
-                {
-                    let mut next =
-                        std::pin::pin!(member.payload.next_chunk(&mut buffer, BLOCK_SIZE * 2));
-                    let waker = std::task::Waker::noop();
-                    let mut context = Context::from_waker(waker);
-                    assert!(matches!(next.as_mut().poll(&mut context), Poll::Pending));
-                }
+                cancel_pending(member.payload.next_chunk(&mut buffer, BLOCK_SIZE * 2));
                 member.payload.next_chunk(&mut buffer, BLOCK_SIZE * 2).await
             });
             let Err(FrameError { position, inner }) = &error else {

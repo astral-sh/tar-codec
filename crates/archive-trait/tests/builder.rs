@@ -233,10 +233,18 @@ async fn name_validation_supports_default_custom_and_disabled_policies() {
 }
 
 #[tokio::test]
-async fn recursive_build_is_sorted_and_streams_small_and_large_files() {
+async fn recursive_build_sorts_entries_batches_small_files_and_streams_large_files() {
     let temp = tempdir().expect("temporary directory should be created");
     let source = temp.path().join("tree");
     std::fs::create_dir_all(source.join("sub")).expect("source tree should be created");
+    std::fs::create_dir(source.join("batch")).expect("batch directory should be created");
+    for (name, byte) in [("a", b'a'), ("b", b'b'), ("c", b'c')] {
+        std::fs::write(
+            source.join("batch").join(name),
+            vec![byte; BATCHED_FILE_BYTES],
+        )
+        .expect("buffered source file should be written");
+    }
     std::fs::write(source.join("z"), b"last").expect("z should be written");
     std::fs::write(source.join("a"), b"first").expect("a should be written");
     std::fs::write(source.join("sub/file"), b"nested").expect("small file should be written");
@@ -272,6 +280,10 @@ async fn recursive_build_is_sorted_and_streams_small_and_large_files() {
         [
             "tree",
             "tree/a",
+            "tree/batch",
+            "tree/batch/a",
+            "tree/batch/b",
+            "tree/batch/c",
             "tree/sub",
             "tree/sub/file",
             "tree/sub/large",
@@ -293,34 +305,8 @@ async fn recursive_build_is_sorted_and_streams_small_and_large_files() {
         RecordedEntry::File { path, data, chunks, .. }
             if path == "tree/z" && data == b"last" && *chunks == 1
     )));
-    #[cfg(unix)]
-    assert!(entries.iter().any(|entry| matches!(
-        entry,
-        RecordedEntry::File { path, executable: true, .. } if path == "tree/a"
-    )));
-}
-
-#[tokio::test]
-async fn recursive_build_preserves_buffered_files_across_preparation_batches() {
-    let temp = tempdir().expect("temporary directory should be created");
-    let source = temp.path().join("batched");
-    std::fs::create_dir(&source).expect("source directory should be created");
     for (name, byte) in [("a", b'a'), ("b", b'b'), ("c", b'c')] {
-        std::fs::write(source.join(name), vec![byte; BATCHED_FILE_BYTES])
-            .expect("buffered source file should be written");
-    }
-
-    let format = MockFormat::new();
-    let entries = format.entries();
-    format
-        .builder()
-        .add_directory(&source)
-        .await
-        .expect("directory should be added");
-
-    let entries = entries.borrow();
-    for (name, byte) in [("a", b'a'), ("b", b'b'), ("c", b'c')] {
-        let path = format!("batched/{name}");
+        let path = format!("tree/batch/{name}");
         assert!(entries.iter().any(|entry| matches!(
             entry,
             RecordedEntry::File {
@@ -333,6 +319,11 @@ async fn recursive_build_preserves_buffered_files_across_preparation_batches() {
                 && data.iter().all(|actual| *actual == byte)
         )));
     }
+    #[cfg(unix)]
+    assert!(entries.iter().any(|entry| matches!(
+        entry,
+        RecordedEntry::File { path, executable: true, .. } if path == "tree/a"
+    )));
 }
 
 #[cfg(unix)]

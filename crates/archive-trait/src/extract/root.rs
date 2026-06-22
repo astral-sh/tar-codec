@@ -414,7 +414,6 @@ impl<E> ExtractionRoot<E> {
         &mut self,
         policy: LinkPolicy,
     ) -> Result<(), ExtractError<E>> {
-        self.flush_buffered_files().await?;
         let mut links = Vec::with_capacity(self.symlinks.len());
         let mut resolution_work_bytes = 0;
         for (index, link) in self.symlinks.iter().enumerate() {

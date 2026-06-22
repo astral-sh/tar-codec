@@ -299,29 +299,18 @@ async fn rejects_invalid_destinations_unsafe_special_and_colliding_members() {
 }
 
 #[tokio::test]
-async fn archive_errors_preserve_prior_streaming_output() {
+async fn archive_errors_flush_prior_buffered_files() {
     let temp = tempdir().expect("temporary directory should be created");
     let destination = temp.path().join("partial");
-    let result = TestArchive::new([
-        entry::file("first", b"one"),
-        entry::file("second", b"two"),
-        entry::file("third", b"three"),
-        entry::error(),
-    ])
-    .extract_in(&destination, ExtractPolicy::default())
-    .await;
+    let result = TestArchive::new([entry::file("created", b"kept"), entry::error()])
+        .extract_in(&destination, ExtractPolicy::default())
+        .await;
 
     assert!(matches!(result, Err(ExtractError::Archive(_))));
-    for (path, contents) in [
-        ("first", &b"one"[..]),
-        ("second", &b"two"[..]),
-        ("third", &b"three"[..]),
-    ] {
-        assert_eq!(
-            std::fs::read(destination.join(path)).expect("created file should remain"),
-            contents
-        );
-    }
+    assert_eq!(
+        std::fs::read(destination.join("created")).expect("created file should remain"),
+        b"kept"
+    );
 }
 
 #[test]
