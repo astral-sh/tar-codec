@@ -82,7 +82,8 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio_stream::Stream;
 
 use crate::{
-    ArchiveFormat, BLOCK_SIZE, Block, DEFAULT_MAX_PAX_EXTENSION_SIZE, FrameError, FrameErrorInner,
+    ArchiveFormat, BLOCK_SIZE, Block, DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE,
+    DEFAULT_MAX_GNU_EXTENSION_SIZE, DEFAULT_MAX_PAX_EXTENSION_SIZE, FrameError, FrameErrorInner,
     GnuKind, PaxKind, PaxRecord, PaxValue, UstarKind,
     header::{
         CHECKSUM_RANGE, GNU_IDENTITY, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE, NAME_RANGE,
@@ -274,32 +275,49 @@ pub(super) struct PendingGnu {
     pub(super) long_link: bool,
 }
 
+/// Ordinary-member chunk storage retained across cancellation and API changes.
+#[derive(Default)]
+struct MemberChunk {
+    buffer: Vec<u8>,
+    start_position: u64,
+    physical_len: usize,
+    meaningful_len: usize,
+    state: Option<MemberChunkState>,
+}
+
+#[derive(Clone, Copy)]
+enum MemberChunkState {
+    Reading {
+        member_remaining: u64,
+        filled: usize,
+    },
+    Ready {
+        delivered: usize,
+    },
+}
+
 /// A strict stream of POSIX-pax or GNU frames sourced from an underlying reader.
 pub struct TarStream<R> {
+    /// Our current stream position.
     pub(super) position: u64,
+    /// Our interior source.
     pub(super) inner: R,
     pub(super) block: Block,
     pub(super) block_len: usize,
     pub(super) format: Option<ArchiveFormat>,
+    /// The currently effective global pax records, if any.
     pub(super) global_pax_records: Option<SharedGlobalPaxRecords>,
-    pub(super) max_pax_extension_size: u64,
+    max_pax_extension_size: u64,
+    max_global_pax_extensions_size: u64,
+    global_pax_extensions_size: u64,
+    max_gnu_extension_size: u64,
+    member_chunk: MemberChunk,
     pub(super) state: State,
 }
 
 impl<R> TarStream<R> {
     /// Creates a new [`TarStream`] from the given reader.
     pub fn new(reader: R) -> Self {
-        Self::with_max_pax_extension_size(reader, DEFAULT_MAX_PAX_EXTENSION_SIZE)
-    }
-
-    /// Creates a new [`TarStream`] with a maximum size for each pax extension.
-    ///
-    /// A local or global pax header that declares a larger payload is rejected
-    /// before any of its payload blocks are consumed.
-    ///
-    /// Setting this to zero rejects every nonempty pax extension. Setting it to
-    /// [`u64::MAX`] removes the bound and permits unbounded metadata buffering.
-    pub fn with_max_pax_extension_size(reader: R, max_pax_extension_size: u64) -> Self {
         Self {
             position: 0,
             inner: reader,
@@ -307,18 +325,50 @@ impl<R> TarStream<R> {
             block_len: 0,
             format: None,
             global_pax_records: None,
-            max_pax_extension_size,
+            max_pax_extension_size: DEFAULT_MAX_PAX_EXTENSION_SIZE,
+            max_global_pax_extensions_size: DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE,
+            global_pax_extensions_size: 0,
+            max_gnu_extension_size: DEFAULT_MAX_GNU_EXTENSION_SIZE,
+            member_chunk: MemberChunk::default(),
             state: State::AwaitingHeader,
         }
+    }
+
+    /// Sets the maximum size accepted for each subsequent pax extension.
+    ///
+    /// A local or global header that declares a larger payload is rejected
+    /// before its payload is consumed. Setting the maximum to zero rejects
+    /// every nonempty extension. Setting it to [`u64::MAX`] removes the
+    /// per-extension bound; global extensions remain subject to their
+    /// cumulative limit.
+    pub fn set_max_pax_extension_size(&mut self, max_pax_extension_size: u64) {
+        self.max_pax_extension_size = max_pax_extension_size;
+    }
+
+    /// Sets the maximum cumulative size accepted for global pax extensions
+    /// before one ordinary member.
+    ///
+    /// The total resets after each ordinary member. A global header that would
+    /// increase the pending total beyond this limit is rejected before its
+    /// payload is consumed. Setting the maximum to zero rejects every nonempty
+    /// global extension. Setting it to [`u64::MAX`] removes the cumulative
+    /// bound; each extension remains subject to its individual limit.
+    pub fn set_max_global_pax_extensions_size(&mut self, max_global_pax_extensions_size: u64) {
+        self.max_global_pax_extensions_size = max_global_pax_extensions_size;
+    }
+
+    /// Sets the maximum size accepted for each GNU extension.
+    ///
+    /// A GNU extension member that declares a larger payload is rejected before
+    /// its payload is consumed. Setting the maximum to zero rejects every nonempty
+    /// GNU extension member. Setting it to [`u64::MAX`] removes the per-extension bound.
+    pub fn set_max_gnu_extension_size(&mut self, max_gnu_extension_size: u64) {
+        self.max_gnu_extension_size = max_gnu_extension_size;
     }
 
     /// Returns the selected archive family after the first header is read.
     pub fn format(&self) -> Option<ArchiveFormat> {
         self.format
-    }
-
-    pub(crate) fn position(&self) -> u64 {
-        self.position
     }
 
     pub(crate) fn global_pax_records(&self) -> Option<SharedGlobalPaxRecords> {
@@ -331,6 +381,10 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
     ///
     /// Returns the block's position, lossless bytes, and meaningful length.
     pub(crate) async fn read_member_block(&mut self) -> Result<(u64, Block, usize), FrameError> {
+        if self.member_chunk.state.is_some() {
+            self.complete_member_chunk().await?;
+            return self.take_member_block_from_chunk();
+        }
         let remaining = match &self.state {
             State::ReadingMember { remaining } => *remaining,
             _ => {
@@ -342,15 +396,6 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 ));
             }
         };
-        if self.block_len != 0 {
-            self.state = State::Failed;
-            return Err(FrameError::unexpected_order(
-                self.position,
-                "aligned ordinary member payload",
-                "partially buffered physical block",
-            ));
-        }
-
         let (position, block) = match poll_fn(|context| self.poll_read_block(context)).await {
             Ok(Some(block)) => block,
             Ok(None) => {
@@ -377,7 +422,27 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         buffer: &mut Vec<u8>,
         target_len: usize,
     ) -> Result<usize, FrameError> {
-        let remaining = match &self.state {
+        // A cancelled block read retains its partial physical block here. Finish
+        // and deliver it before starting a direct chunk so no bytes are lost.
+        if self.member_chunk.state.is_none() && self.block_len != 0 {
+            let (_, block, meaningful_len) = self.read_member_block().await?;
+            buffer.clear();
+            buffer.extend_from_slice(&block[..meaningful_len]);
+            return Ok(meaningful_len);
+        }
+        if self.member_chunk.state.is_none() {
+            self.start_member_chunk(buffer, target_len)?;
+        }
+        self.complete_member_chunk().await?;
+        self.take_member_chunk(buffer)
+    }
+
+    fn start_member_chunk(
+        &mut self,
+        buffer: &mut Vec<u8>,
+        target_len: usize,
+    ) -> Result<(), FrameError> {
+        let member_remaining = match &self.state {
             State::ReadingMember { remaining } => *remaining,
             _ => {
                 self.state = State::Failed;
@@ -400,7 +465,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         let target_len = u64::try_from(target_len.max(BLOCK_SIZE)).map_err(|_| {
             FrameError::arithmetic_overflow(self.position, "member payload chunk target length")
         })?;
-        let physical_len = remaining
+        let physical_len = member_remaining
             .min(target_len)
             .div_ceil(BLOCK_SIZE as u64)
             .checked_mul(BLOCK_SIZE as u64)
@@ -410,7 +475,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                     "member payload chunk physical length",
                 )
             })?;
-        let meaningful_len = remaining.min(physical_len);
+        let meaningful_len = member_remaining.min(physical_len);
         let physical_len = usize::try_from(physical_len).map_err(|_| {
             FrameError::arithmetic_overflow(self.position, "member payload chunk physical length")
         })?;
@@ -418,17 +483,67 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             FrameError::arithmetic_overflow(self.position, "member payload chunk meaningful length")
         })?;
 
-        // Reuse initialized bytes so repeated chunks do not zero-fill storage
-        // immediately before the reader overwrites it.
-        if buffer.len() != physical_len {
-            buffer.clear();
-            buffer.resize(physical_len, 0);
+        // Move the caller's reusable allocation into persistent storage before
+        // reading so cancellation cannot discard partial bytes or progress.
+        self.member_chunk.buffer.clear();
+        std::mem::swap(buffer, &mut self.member_chunk.buffer);
+        if self.member_chunk.buffer.len() != physical_len {
+            self.member_chunk.buffer.resize(physical_len, 0);
         }
-        let start_position = self.position;
-        let mut filled = 0;
-        while filled < physical_len {
+        self.member_chunk.start_position = self.position;
+        self.member_chunk.physical_len = physical_len;
+        self.member_chunk.meaningful_len = meaningful_len;
+        self.member_chunk.state = Some(MemberChunkState::Reading {
+            member_remaining,
+            filled: 0,
+        });
+        Ok(())
+    }
+
+    async fn complete_member_chunk(&mut self) -> Result<(), FrameError> {
+        loop {
+            let (member_remaining, filled) = match self.member_chunk.state {
+                Some(MemberChunkState::Reading {
+                    member_remaining,
+                    filled,
+                }) => (member_remaining, filled),
+                Some(MemberChunkState::Ready { .. }) => return Ok(()),
+                None => {
+                    self.state = State::Failed;
+                    return Err(FrameError::unexpected_order(
+                        self.position,
+                        "pending member payload chunk",
+                        "parser state without a pending chunk",
+                    ));
+                }
+            };
+            let start_position = self.member_chunk.start_position;
+            let physical_len = self.member_chunk.physical_len;
+            let meaningful_len = self.member_chunk.meaningful_len;
+            if filled == physical_len {
+                self.position =
+                    checked_position(start_position, physical_len).inspect_err(|_| {
+                        self.state = State::Failed;
+                        self.member_chunk.state = None;
+                    })?;
+                let remaining = member_remaining
+                    .checked_sub(meaningful_len as u64)
+                    .ok_or_else(|| {
+                        self.state = State::Failed;
+                        self.member_chunk.state = None;
+                        FrameError::arithmetic_overflow(
+                            start_position,
+                            "remaining member payload length",
+                        )
+                    })?;
+                self.state = member_payload_state(remaining);
+                self.member_chunk.state = Some(MemberChunkState::Ready { delivered: 0 });
+                return Ok(());
+            }
+
             let read = match poll_fn(|context| {
-                let mut read_buffer = ReadBuf::new(&mut buffer[filled..]);
+                let mut read_buffer =
+                    ReadBuf::new(&mut self.member_chunk.buffer[filled..physical_len]);
                 match Pin::new(&mut self.inner).poll_read(context, &mut read_buffer) {
                     Poll::Pending => Poll::Pending,
                     Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buffer.filled().len())),
@@ -440,6 +555,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 Ok(read) => read,
                 Err(source) => {
                     self.state = State::Failed;
+                    self.member_chunk.state = None;
                     let error_position = checked_position(start_position, filled)?;
                     self.position = checked_position(start_position, filled - filled % BLOCK_SIZE)?;
                     return Err(FrameError::at(
@@ -450,6 +566,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             };
             if read == 0 {
                 self.state = State::Failed;
+                self.member_chunk.state = None;
                 let partial_len = filled % BLOCK_SIZE;
                 let completed_len = filled - partial_len;
                 self.position = checked_position(start_position, completed_len)?;
@@ -468,24 +585,72 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 return Err(FrameError::truncated_payload(
                     self.position,
                     DataOwner::Member,
-                    remaining - remaining.min(completed_len),
+                    member_remaining - member_remaining.min(completed_len),
                 ));
             }
-            filled += read;
+            if let Some(MemberChunkState::Reading { filled, .. }) = &mut self.member_chunk.state {
+                *filled += read;
+            }
         }
+    }
 
-        self.position = checked_position(start_position, physical_len).inspect_err(|_| {
+    fn take_member_chunk(&mut self, buffer: &mut Vec<u8>) -> Result<usize, FrameError> {
+        let Some(MemberChunkState::Ready { delivered }) = self.member_chunk.state.take() else {
             self.state = State::Failed;
+            return Err(FrameError::unexpected_order(
+                self.position,
+                "completed member payload chunk",
+                "incomplete member payload chunk",
+            ));
+        };
+        let meaningful_len = self.member_chunk.meaningful_len;
+        let remaining_len = meaningful_len.checked_sub(delivered).ok_or_else(|| {
+            self.state = State::Failed;
+            FrameError::arithmetic_overflow(self.position, "undelivered member payload length")
         })?;
-        let remaining = remaining
-            .checked_sub(meaningful_len as u64)
+        if delivered != 0 {
+            self.member_chunk
+                .buffer
+                .copy_within(delivered..meaningful_len, 0);
+        }
+        self.member_chunk.buffer.truncate(remaining_len);
+        std::mem::swap(buffer, &mut self.member_chunk.buffer);
+        Ok(remaining_len)
+    }
+
+    fn take_member_block_from_chunk(&mut self) -> Result<(u64, Block, usize), FrameError> {
+        let Some(MemberChunkState::Ready { delivered }) = self.member_chunk.state else {
+            self.state = State::Failed;
+            return Err(FrameError::unexpected_order(
+                self.position,
+                "completed member payload chunk",
+                "incomplete member payload chunk",
+            ));
+        };
+        let start_position = self.member_chunk.start_position;
+        let physical_len = self.member_chunk.physical_len;
+        let total_meaningful_len = self.member_chunk.meaningful_len;
+        let position = checked_position(start_position, delivered).inspect_err(|_| {
+            self.state = State::Failed;
+            self.member_chunk.state = None;
+        })?;
+        let mut block = [0; BLOCK_SIZE];
+        block.copy_from_slice(&self.member_chunk.buffer[delivered..delivered + BLOCK_SIZE]);
+        let meaningful_len = total_meaningful_len
+            .checked_sub(delivered)
             .ok_or_else(|| {
                 self.state = State::Failed;
-                FrameError::arithmetic_overflow(start_position, "remaining member payload length")
-            })?;
-        self.state = member_payload_state(remaining);
-        buffer.truncate(meaningful_len);
-        Ok(meaningful_len)
+                self.member_chunk.state = None;
+                FrameError::arithmetic_overflow(self.position, "undelivered member payload length")
+            })?
+            .min(BLOCK_SIZE);
+        let delivered = delivered + BLOCK_SIZE;
+        if delivered == physical_len {
+            self.member_chunk.state = None;
+        } else {
+            self.member_chunk.state = Some(MemberChunkState::Ready { delivered });
+        }
+        Ok((position, block, meaningful_len))
     }
 
     fn poll_read_block(
@@ -770,11 +935,30 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         if payload_size > self.max_pax_extension_size {
             return Err(FrameError::at(
                 position,
-                FrameErrorInner::PaxExtensionTooLarge {
+                FrameErrorInner::ExtensionTooLarge {
+                    format: ArchiveFormat::Pax,
                     size: payload_size,
                     limit: self.max_pax_extension_size,
                 },
             ));
+        }
+        if kind == PaxKind::Global {
+            let size = self
+                .global_pax_extensions_size
+                .checked_add(payload_size)
+                .ok_or_else(|| {
+                    FrameError::arithmetic_overflow(position, "global pax extension payload total")
+                })?;
+            if size > self.max_global_pax_extensions_size {
+                return Err(FrameError::at(
+                    position,
+                    FrameErrorInner::GlobalPaxExtensionsTooLarge {
+                        size,
+                        limit: self.max_global_pax_extensions_size,
+                    },
+                ));
+            }
+            self.global_pax_extensions_size = size;
         }
         if payload_size == 0 {
             return Err(FrameError::invalid_pax_records(
@@ -820,6 +1004,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             },
         )?;
         validate_posix_member_size(position, kind, parsed.size, effective_size)?;
+        self.global_pax_extensions_size = 0;
         self.state = member_payload_state(effective_size);
         Ok(Frame::Header(HeaderFrame {
             position,
@@ -853,6 +1038,16 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                     position,
                     "ordinary GNU member header or the other GNU metadata extension",
                     "duplicate GNU metadata extension",
+                ));
+            }
+            if parsed.size > self.max_gnu_extension_size {
+                return Err(FrameError::at(
+                    position,
+                    FrameErrorInner::ExtensionTooLarge {
+                        format: ArchiveFormat::Gnu,
+                        size: parsed.size,
+                        limit: self.max_gnu_extension_size,
+                    },
                 ));
             }
             *already_seen = true;
@@ -1111,13 +1306,9 @@ mod tests {
         max_chunk: usize,
         max_pax_extension_size: u64,
     ) -> Vec<Result<Frame, FrameError>> {
-        ready(
-            TarStream::with_max_pax_extension_size(
-                ChunkedReader::new(bytes, max_chunk),
-                max_pax_extension_size,
-            )
-            .collect(),
-        )
+        let mut stream = TarStream::new(ChunkedReader::new(bytes, max_chunk));
+        stream.set_max_pax_extension_size(max_pax_extension_size);
+        ready(stream.collect())
     }
 
     fn header_frame(frames: &[Result<Frame, FrameError>], index: usize) -> &HeaderFrame {
@@ -1312,7 +1503,8 @@ mod tests {
                 last_error(&frames),
                 FrameError {
                     position: 0,
-                    inner: FrameErrorInner::PaxExtensionTooLarge {
+                    inner: FrameErrorInner::ExtensionTooLarge {
+                        format: ArchiveFormat::Pax,
                         size,
                         limit,
                     },
@@ -1329,7 +1521,8 @@ mod tests {
             last_error(&frames),
             FrameError {
                 position: 0,
-                inner: FrameErrorInner::PaxExtensionTooLarge {
+                inner: FrameErrorInner::ExtensionTooLarge {
+                    format: ArchiveFormat::Pax,
                     size,
                     limit: DEFAULT_MAX_PAX_EXTENSION_SIZE,
                 },
@@ -1347,13 +1540,18 @@ mod tests {
             position: 0,
             consumed: Rc::clone(&consumed),
         };
-        let mut stream = TarStream::with_max_pax_extension_size(reader, 0);
+        let mut stream = TarStream::new(reader);
+        stream.set_max_pax_extension_size(0);
 
         assert!(matches!(
             ready(stream.next()),
             Some(Err(FrameError {
                 position: 0,
-                inner: FrameErrorInner::PaxExtensionTooLarge { size: 1, limit: 0 },
+                inner: FrameErrorInner::ExtensionTooLarge {
+                    format: ArchiveFormat::Pax,
+                    size: 1,
+                    limit: 0,
+                },
             }))
         ));
         assert_eq!(consumed.get(), BLOCK_SIZE);

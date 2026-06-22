@@ -10,10 +10,10 @@ use tokio::io::AsyncRead;
 use tokio_stream::StreamExt;
 
 use crate::{
-    ArchiveFormat, Block, DEFAULT_MAX_PAX_EXTENSION_SIZE, FrameError, FrameErrorInner, GnuKind,
-    PaxKeyword, PaxKind, PaxRecord, PaxString, PaxValue, UstarKind,
+    ArchiveFormat, Block, FrameError, FrameErrorInner, GnuKind, PaxKeyword, PaxKind, PaxRecord,
+    PaxString, PaxValue, UstarKind,
     header::parse_number,
-    stream::{DataOwner, Frame, GnuFrame, HeaderFrame, PaxFrame, TarStream},
+    stream::{DataFrame, DataOwner, Frame, HeaderFrame, TarStream},
 };
 
 pub use crate::{PaxExtension, PaxState};
@@ -166,6 +166,8 @@ pub struct MemberPayload<'a, R> {
 pub struct TarReader<R> {
     payload: PayloadReader<R>,
     header_storage: HeaderStorage,
+    pending_extensions: PendingExtensions,
+    extension_payload: Option<ExtensionPayload>,
 }
 
 /// Payload state kept separate so [`MemberPayload`] can borrow it mutably while
@@ -174,6 +176,38 @@ struct PayloadReader<R> {
     stream: TarStream<R>,
     remaining: u64,
     drain_buffer: Vec<u8>,
+}
+
+/// Logical member metadata retained across cancellation of [`TarReader::next_frame`].
+#[derive(Default)]
+struct PendingExtensions {
+    global_pax: Vec<PaxExtension>,
+    local_pax: Option<PaxExtension>,
+    gnu_long_name: Option<GnuMetadata>,
+    gnu_long_link: Option<GnuMetadata>,
+}
+
+impl PendingExtensions {
+    fn set_gnu(&mut self, kind: GnuKind, metadata: GnuMetadata) {
+        *match kind {
+            GnuKind::LongName => &mut self.gnu_long_name,
+            GnuKind::LongLink => &mut self.gnu_long_link,
+        } = Some(metadata);
+    }
+}
+
+/// An extension payload being assembled across physical frames.
+enum ExtensionPayload {
+    Pax {
+        position: u64,
+        kind: PaxKind,
+    },
+    Gnu {
+        position: u64,
+        kind: GnuKind,
+        remaining: u64,
+        payload: Vec<u8>,
+    },
 }
 
 #[derive(Default)]
@@ -202,32 +236,55 @@ impl HeaderStorage {
 impl<R> TarReader<R> {
     /// Creates a new logical reader from an uncompressed tar reader.
     pub fn new(reader: R) -> Self {
-        Self::with_max_pax_extension_size(reader, DEFAULT_MAX_PAX_EXTENSION_SIZE)
-    }
-
-    /// Creates a logical reader with a maximum size for each pax extension.
-    ///
-    /// Setting the maximum to [`u64::MAX`] permits unbounded metadata
-    /// buffering.
-    pub fn with_max_pax_extension_size(reader: R, max_pax_extension_size: u64) -> Self {
         Self {
             payload: PayloadReader {
-                stream: TarStream::with_max_pax_extension_size(reader, max_pax_extension_size),
+                stream: TarStream::new(reader),
                 remaining: 0,
                 drain_buffer: Vec::new(),
             },
             header_storage: HeaderStorage::default(),
+            pending_extensions: PendingExtensions::default(),
+            extension_payload: None,
         }
     }
 
     /// Sets the maximum size accepted for each subsequent pax extension.
     ///
     /// A local or global pax header that declares a larger payload is rejected
-    /// before any of its payload blocks are consumed.
-    /// Setting the maximum to [`u64::MAX`] permits unbounded metadata
-    /// buffering.
+    /// before any of its payload blocks are consumed. Setting the maximum to
+    /// [`u64::MAX`] removes the per-extension bound; global extensions remain
+    /// subject to their cumulative limit.
+    ///
+    /// See [`TarStream::set_max_pax_extension_size`].
     pub fn set_max_pax_extension_size(&mut self, max_pax_extension_size: u64) {
-        self.payload.stream.max_pax_extension_size = max_pax_extension_size;
+        self.payload
+            .stream
+            .set_max_pax_extension_size(max_pax_extension_size);
+    }
+
+    /// Sets the maximum cumulative size of global pax extensions before one member.
+    ///
+    /// A global header that would increase the pending total beyond this limit
+    /// is rejected before its payload is consumed. Setting the maximum to
+    /// [`u64::MAX`] removes the cumulative bound; each extension remains
+    /// subject to its individual limit.
+    ///
+    /// See [`TarStream::set_max_global_pax_extensions_size`].
+    pub fn set_max_global_pax_extensions_size(&mut self, max_global_pax_extensions_size: u64) {
+        self.payload
+            .stream
+            .set_max_global_pax_extensions_size(max_global_pax_extensions_size);
+    }
+
+    /// Sets the maximum size accepted for each subsequent GNU metadata extension.
+    ///
+    /// A long-name or long-link header that declares a larger payload is
+    /// rejected before any of its payload blocks are consumed. Setting the
+    /// maximum to [`u64::MAX`] permits unbounded metadata buffering.
+    pub fn set_max_gnu_extension_size(&mut self, max_gnu_extension_size: u64) {
+        self.payload
+            .stream
+            .set_max_gnu_extension_size(max_gnu_extension_size);
     }
 }
 
@@ -239,42 +296,57 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
     /// before the next member is returned. Global pax updates not followed by
     /// an ordinary member are consumed and ignored.
     pub async fn next_frame(&mut self) -> Result<Option<MemberFrame<'_, R>>, FrameError> {
-        self.payload.drain_payload().await?;
+        if let Err(error) = self.payload.drain_payload().await {
+            self.clear_extension_state();
+            return Err(error);
+        }
 
-        let mut global_extensions: Vec<PaxExtension> = Vec::new();
-        let mut local_extension = None;
-        let mut long_name = None;
-        let mut long_link = None;
         loop {
-            let Some(frame) = self.payload.stream.next().await.transpose()? else {
-                return Ok(None);
+            let frame = match self.payload.stream.next().await {
+                Some(Ok(frame)) => frame,
+                Some(Err(error)) => {
+                    self.clear_extension_state();
+                    return Err(error);
+                }
+                None => {
+                    self.clear_extension_state();
+                    return Ok(None);
+                }
             };
             match frame {
-                Frame::Pax(PaxFrame { position, kind, .. }) => {
-                    let extension = self.read_pax_extension(position, kind).await?;
-                    match kind {
-                        PaxKind::Global => global_extensions.push(extension),
-                        PaxKind::Local => local_extension = Some(extension),
-                    }
+                Frame::Pax(frame) => {
+                    self.extension_payload = Some(ExtensionPayload::Pax {
+                        position: frame.position,
+                        kind: frame.kind,
+                    });
                 }
                 Frame::Gnu(frame) => {
-                    let kind = frame.kind;
-                    let metadata = self.read_gnu_metadata(frame).await?;
-                    match kind {
-                        GnuKind::LongName => long_name = Some(metadata),
-                        GnuKind::LongLink => long_link = Some(metadata),
+                    if frame.payload_size == 0 {
+                        let metadata = GnuMetadata {
+                            position: frame.position,
+                            payload: Vec::new(),
+                        };
+                        self.pending_extensions.set_gnu(frame.kind, metadata);
+                    } else {
+                        self.extension_payload = Some(ExtensionPayload::Gnu {
+                            position: frame.position,
+                            kind: frame.kind,
+                            remaining: frame.payload_size,
+                            payload: Vec::new(),
+                        });
                     }
                 }
                 Frame::Header(header) => {
+                    let pending_extensions = mem::take(&mut self.pending_extensions);
                     let extensions = match header.format {
                         ArchiveFormat::Pax => MemberExtensions::Pax(PaxState::new(
                             self.payload.stream.global_pax_records(),
-                            global_extensions,
-                            local_extension,
+                            pending_extensions.global_pax,
+                            pending_extensions.local_pax,
                         )),
                         ArchiveFormat::Gnu => MemberExtensions::Gnu {
-                            long_name,
-                            long_link,
+                            long_name: pending_extensions.gnu_long_name,
+                            long_link: pending_extensions.gnu_long_link,
                         },
                     };
                     self.payload.remaining = header.effective_size;
@@ -288,91 +360,89 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
                     }));
                 }
                 Frame::Data(frame) => {
-                    return Err(FrameError::unexpected_order(
-                        frame.position,
-                        "extension header or ordinary member header",
-                        "unattached payload data",
-                    ));
-                }
-            }
-        }
-    }
-
-    async fn read_pax_extension(
-        &mut self,
-        position: u64,
-        kind: PaxKind,
-    ) -> Result<PaxExtension, FrameError> {
-        loop {
-            let Some(next) = self.payload.stream.next().await.transpose()? else {
-                return Err(FrameError::at(
-                    self.payload.stream.position(),
-                    FrameErrorInner::UnexpectedEof {
-                        expected: "pax extension payload",
-                    },
-                ));
-            };
-            match next {
-                Frame::Data(data) if data.owner == DataOwner::Pax(kind) => {
-                    if let Some(records) = data.into_completed_pax_records() {
-                        return Ok(PaxExtension::new(position, kind, records));
+                    if let Err(error) = self.process_extension_data(frame) {
+                        self.clear_extension_state();
+                        return Err(error);
                     }
                 }
-                other => {
-                    return Err(self.unexpected_frame(&other, "pax extension payload"));
-                }
             }
         }
     }
 
-    async fn read_gnu_metadata(&mut self, frame: GnuFrame) -> Result<GnuMetadata, FrameError> {
-        let mut remaining = frame.payload_size;
-        let mut payload = Vec::new();
-        while remaining != 0 {
-            let Some(next) = self.payload.stream.next().await.transpose()? else {
-                return Err(FrameError::at(
-                    self.payload.stream.position(),
-                    FrameErrorInner::UnexpectedEof {
-                        expected: "GNU metadata payload",
-                    },
-                ));
-            };
-            match next {
-                Frame::Data(data) if data.owner == DataOwner::Gnu(frame.kind) => {
-                    let len = u64::try_from(data.len).map_err(|_| {
-                        FrameError::arithmetic_overflow(
-                            data.position,
-                            "GNU metadata payload length",
-                        )
-                    })?;
-                    remaining = remaining.checked_sub(len).ok_or_else(|| {
-                        FrameError::unexpected_order(
-                            data.position,
-                            "bounded GNU metadata payload",
-                            "oversized GNU metadata payload",
-                        )
-                    })?;
-                    payload.extend_from_slice(&data.block[..data.len]);
-                }
-                other => {
-                    return Err(self.unexpected_frame(&other, "GNU metadata payload"));
-                }
-            }
-        }
-        Ok(GnuMetadata {
-            position: frame.position,
-            payload,
-        })
+    fn clear_extension_state(&mut self) {
+        self.pending_extensions = PendingExtensions::default();
+        self.extension_payload = None;
     }
 
-    fn unexpected_frame(&self, frame: &Frame, expected: &'static str) -> FrameError {
-        let (position, found) = match frame {
-            Frame::Pax(frame) => (frame.position, "pax extension header"),
-            Frame::Gnu(frame) => (frame.position, "GNU metadata header"),
-            Frame::Header(frame) => (frame.position, "ordinary member header"),
-            Frame::Data(frame) => (frame.position, "payload data"),
+    fn process_extension_data(&mut self, frame: DataFrame) -> Result<(), FrameError> {
+        let Some(payload) = self.extension_payload.take() else {
+            return Err(FrameError::unexpected_order(
+                frame.position,
+                "extension header or ordinary member header",
+                "unattached payload data",
+            ));
         };
-        FrameError::unexpected_order(position, expected, found)
+        match payload {
+            ExtensionPayload::Pax { position, kind } => {
+                if frame.owner != DataOwner::Pax(kind) {
+                    return Err(FrameError::unexpected_order(
+                        frame.position,
+                        "pax extension payload",
+                        "different payload data",
+                    ));
+                }
+                if let Some(records) = frame.into_completed_pax_records() {
+                    let extension = PaxExtension::new(position, kind, records);
+                    match kind {
+                        PaxKind::Global => {
+                            self.pending_extensions.global_pax.push(extension);
+                        }
+                        PaxKind::Local => {
+                            self.pending_extensions.local_pax = Some(extension);
+                        }
+                    }
+                } else {
+                    self.extension_payload = Some(ExtensionPayload::Pax { position, kind });
+                }
+            }
+            ExtensionPayload::Gnu {
+                position,
+                kind,
+                mut remaining,
+                mut payload,
+            } => {
+                if frame.owner != DataOwner::Gnu(kind) {
+                    return Err(FrameError::unexpected_order(
+                        frame.position,
+                        "GNU metadata payload",
+                        "different payload data",
+                    ));
+                }
+                let len = u64::try_from(frame.len).map_err(|_| {
+                    FrameError::arithmetic_overflow(frame.position, "GNU metadata payload length")
+                })?;
+                remaining = remaining.checked_sub(len).ok_or_else(|| {
+                    FrameError::unexpected_order(
+                        frame.position,
+                        "bounded GNU metadata payload",
+                        "oversized GNU metadata payload",
+                    )
+                })?;
+                payload.extend_from_slice(&frame.block[..frame.len]);
+                if remaining == 0 {
+                    let metadata = GnuMetadata { position, payload };
+                    self.pending_extensions.set_gnu(kind, metadata);
+                } else {
+                    self.extension_payload = Some(ExtensionPayload::Gnu {
+                        position,
+                        kind,
+                        remaining,
+                        payload,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -406,14 +476,13 @@ impl<R: AsyncRead + Unpin> PayloadReader<R> {
         if self.remaining == 0 {
             return Ok(false);
         }
-        let position = self.stream.position();
         let len = self.stream.read_member_chunk(buffer, target_len).await?;
         let len = u64::try_from(len).map_err(|_| {
-            FrameError::arithmetic_overflow(position, "member payload chunk length")
+            FrameError::arithmetic_overflow(self.stream.position, "member payload chunk length")
         })?;
         self.remaining = self.remaining.checked_sub(len).ok_or_else(|| {
             FrameError::unexpected_order(
-                position,
+                self.stream.position,
                 "bounded member payload",
                 "oversized member payload chunk",
             )
@@ -569,12 +638,14 @@ mod tests {
 
     use super::*;
     use crate::{
-        BLOCK_SIZE, FrameError, FrameErrorInner, PaxRecord, PaxValue,
+        BLOCK_SIZE, DEFAULT_MAX_GNU_EXTENSION_SIZE, FrameError, FrameErrorInner, PaxRecord,
+        PaxValue,
         header::{LINK_NAME_RANGE, MODE_RANGE, NAME_RANGE, PREFIX_RANGE, TYPEFLAG_OFFSET},
         stream::DataOwner,
         test_support::{
             ChunkedReader, append_block, append_gnu, append_payload, append_posix,
-            append_terminator, gnu_header, header, ready, ready_ok, record, set_checksum,
+            append_terminator, cancel_pending, gnu_header, header, ready, ready_ok, record,
+            set_checksum,
         },
     };
 
@@ -598,6 +669,15 @@ mod tests {
         } else {
             None
         }
+    }
+
+    fn member_followed_by_empty_member(payload: &[u8]) -> (Vec<u8>, u64) {
+        let mut bytes = Vec::new();
+        append_posix(&mut bytes, b'0', payload);
+        let next_position = u64::try_from(bytes.len()).expect("test position should fit u64");
+        append_block(&mut bytes, &header(b'0', 0));
+        append_terminator(&mut bytes);
+        (bytes, next_position)
     }
 
     #[test]
@@ -1023,6 +1103,137 @@ mod tests {
     }
 
     #[test]
+    fn bounds_cumulative_global_pax_extension_payloads() {
+        let payload = record("comment", "metadata");
+        let payload_size = u64::try_from(payload.len()).expect("payload size should fit u64");
+        let limit = payload_size
+            .checked_mul(2)
+            .expect("test payload total should fit u64");
+
+        let mut rejected = Vec::new();
+        append_posix(&mut rejected, b'g', &payload);
+        append_posix(&mut rejected, b'g', &payload);
+        let rejected_position =
+            u64::try_from(rejected.len()).expect("test position should fit u64");
+        append_block(&mut rejected, &header(b'g', payload_size));
+        let error: Result<(), FrameError> = ready(async {
+            let mut reader = TarReader::new(ChunkedReader::new(rejected, BLOCK_SIZE));
+            reader.set_max_global_pax_extensions_size(limit);
+            reader.next_frame().await.map(|_| ())
+        });
+        assert!(matches!(
+            error,
+            Err(FrameError {
+                position,
+                inner: FrameErrorInner::GlobalPaxExtensionsTooLarge {
+                    size,
+                    limit: found_limit,
+                },
+            }) if position == rejected_position
+                && size == payload_size * 3
+                && found_limit == limit
+        ));
+
+        let mut accepted = Vec::new();
+        for _ in 0..2 {
+            for _ in 0..3 {
+                append_posix(&mut accepted, b'g', &payload);
+            }
+            append_block(&mut accepted, &header(b'0', 0));
+        }
+        append_terminator(&mut accepted);
+        ready_ok(async {
+            let mut reader = TarReader::new(ChunkedReader::new(accepted, BLOCK_SIZE));
+            reader.set_max_global_pax_extensions_size(payload_size * 3);
+            for _ in 0..2 {
+                let member = next_member(&mut reader).await?;
+                assert_eq!(
+                    pax_state(&member)
+                        .expect("expected pax member metadata")
+                        .extensions()
+                        .count(),
+                    3
+                );
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn retains_global_pax_extension_across_cancelled_reads() {
+        let mut bytes = Vec::new();
+        append_posix(&mut bytes, b'g', &record("comment", "metadata"));
+        let after_extension_header = BLOCK_SIZE;
+        let after_extension_payload = bytes.len();
+        append_block(&mut bytes, &header(b'0', 0));
+        append_terminator(&mut bytes);
+
+        for pending_at in [after_extension_header, after_extension_payload] {
+            let mut reader = TarReader::new(ChunkedReader::pending_once(bytes.clone(), pending_at));
+            cancel_pending(reader.next_frame());
+
+            ready_ok(async {
+                let member = next_member(&mut reader).await?;
+                let state = pax_state(&member).expect("expected pax member metadata");
+                let extensions = state.extensions().collect::<Vec<_>>();
+                assert_eq!(extensions.len(), 1);
+                assert_eq!(extensions[0].position, 0);
+                assert_eq!(extensions[0].kind, PaxKind::Global);
+                assert_eq!(
+                    extensions[0].records(),
+                    &[PaxRecord::Comment(PaxValue::Value("metadata".into()))]
+                );
+                Ok(())
+            });
+        }
+    }
+
+    #[test]
+    fn retains_gnu_metadata_across_cancelled_reads() {
+        let expected_name = vec![b'n'; BLOCK_SIZE + 10];
+        let mut long_name = expected_name.clone();
+        long_name.push(0);
+
+        let mut bytes = Vec::new();
+        append_gnu(&mut bytes, b'L', &long_name);
+        let after_first_payload_block = BLOCK_SIZE * 2;
+        append_block(&mut bytes, &gnu_header(b'0', 0));
+        append_terminator(&mut bytes);
+
+        let mut reader = TarReader::new(ChunkedReader::pending_once(
+            bytes,
+            after_first_payload_block,
+        ));
+        cancel_pending(reader.next_frame());
+
+        ready_ok(async {
+            let member = next_member(&mut reader).await?;
+            assert_eq!(member.effective_path()?.as_ref(), expected_name);
+            Ok(())
+        });
+
+        let mut bytes = Vec::new();
+        append_gnu(&mut bytes, b'L', &[]);
+        let after_extension_header = bytes.len();
+        append_block(&mut bytes, &gnu_header(b'0', 0));
+        append_terminator(&mut bytes);
+        let mut reader = TarReader::new(ChunkedReader::pending_once(bytes, after_extension_header));
+        cancel_pending(reader.next_frame());
+
+        ready_ok(async {
+            let member = next_member(&mut reader).await?;
+            assert!(matches!(
+                &member.extensions,
+                MemberExtensions::Gnu {
+                    long_name: Some(GnuMetadata { payload, .. }),
+                    ..
+                } if payload.is_empty()
+            ));
+            Ok(())
+        });
+    }
+
+    #[test]
     fn attaches_new_global_pax_updates_without_mutating_earlier_states() {
         let first = record("comment", "first");
         let second = record("gname", "second");
@@ -1119,7 +1330,83 @@ mod tests {
     }
 
     #[test]
-    fn reports_reusable_chunk_errors_at_physical_block_boundaries() {
+    fn resumes_cancelled_member_payload_chunk_with_either_read_api() {
+        let payload = (0..BLOCK_SIZE * 2 + 17)
+            .map(|index| u8::try_from(index % 251).expect("test byte should fit"))
+            .collect::<Vec<_>>();
+        let (bytes, next_member_position) = member_followed_by_empty_member(&payload);
+
+        ready_ok(async {
+            let mut reader = TarReader::new(ChunkedReader::pending_once(bytes, BLOCK_SIZE + 73));
+            {
+                let mut member = next_member(&mut reader).await?;
+                let mut cancelled_buffer = vec![b'x'; 17];
+                cancel_pending(
+                    member
+                        .payload
+                        .next_chunk(&mut cancelled_buffer, payload.len()),
+                );
+                assert!(cancelled_buffer.is_empty());
+
+                let first = member
+                    .payload
+                    .next_block()
+                    .await?
+                    .expect("cancelled chunk should resume as a payload block");
+                let mut resumed_buffer = vec![b'y'; 23];
+                assert!(member.payload.next_chunk(&mut resumed_buffer, 1).await?);
+                let mut observed = first.block[..first.len].to_vec();
+                observed.extend_from_slice(&resumed_buffer);
+                assert_eq!(observed, payload);
+                assert!(!member.payload.next_chunk(&mut resumed_buffer, 1).await?);
+            }
+
+            let member = next_member(&mut reader).await?;
+            assert_eq!(member.header.position, next_member_position);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn resumes_cancelled_member_payload_block_during_automatic_drain() {
+        let payload = vec![b'x'; BLOCK_SIZE * 2 + 17];
+        let (bytes, next_member_position) = member_followed_by_empty_member(&payload);
+
+        ready_ok(async {
+            let mut reader = TarReader::new(ChunkedReader::pending_once(bytes, BLOCK_SIZE + 73));
+            {
+                let mut member = next_member(&mut reader).await?;
+                cancel_pending(member.payload.next_block());
+            }
+
+            let member = next_member(&mut reader).await?;
+            assert_eq!(member.header.position, next_member_position);
+            drop(member);
+            assert!(reader.next_frame().await?.is_none());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn resumes_cancelled_automatic_payload_drain() {
+        let payload = vec![b'x'; BLOCK_SIZE * 2 + 17];
+        let (bytes, next_member_position) = member_followed_by_empty_member(&payload);
+
+        ready_ok(async {
+            let mut reader = TarReader::new(ChunkedReader::pending_once(bytes, BLOCK_SIZE + 73));
+            drop(next_member(&mut reader).await?);
+            cancel_pending(reader.next_frame());
+
+            let member = next_member(&mut reader).await?;
+            assert_eq!(member.header.position, next_member_position);
+            drop(member);
+            assert!(reader.next_frame().await?.is_none());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn reports_cancelled_chunk_errors_at_physical_block_boundaries() {
         #[derive(Clone, Copy, Debug)]
         enum ExpectedError {
             TruncatedPayload,
@@ -1137,14 +1424,14 @@ mod tests {
                 bytes.push(trailing_byte);
             }
             let error = ready(async {
-                let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+                let mut reader =
+                    TarReader::new(ChunkedReader::pending_once(bytes, BLOCK_SIZE + 73));
                 let Ok(Some(mut member)) = reader.next_frame().await else {
                     panic!("expected member");
                 };
-                member
-                    .payload
-                    .next_chunk(&mut Vec::new(), BLOCK_SIZE * 2)
-                    .await
+                let mut buffer = Vec::new();
+                cancel_pending(member.payload.next_chunk(&mut buffer, BLOCK_SIZE * 2));
+                member.payload.next_chunk(&mut buffer, BLOCK_SIZE * 2).await
             });
             let Err(FrameError { position, inner }) = &error else {
                 panic!("{expected:?}: expected error, got {error:?}");
@@ -1192,6 +1479,76 @@ mod tests {
             assert_eq!(long_name.payload, b"name\0");
             assert_eq!(long_link.payload, b"link\0");
             assert!(member.payload.next_block().await?.is_none());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn rejects_oversized_gnu_extensions_before_consuming_payload() {
+        let declared_size = 9;
+        for (case, typeflag) in [("long-name", b'L'), ("long-link", b'K')] {
+            let mut reader = TarReader::new(ChunkedReader::new(
+                gnu_header(typeflag, declared_size).to_vec(),
+                BLOCK_SIZE,
+            ));
+            reader.set_max_gnu_extension_size(declared_size - 1);
+            assert!(
+                matches!(
+                    ready(reader.next_frame()),
+                    Err(FrameError {
+                        position: 0,
+                        inner: FrameErrorInner::ExtensionTooLarge {
+                            format: ArchiveFormat::Gnu,
+                            size,
+                            limit,
+                        },
+                    }) if size == declared_size && limit == declared_size - 1
+                ),
+                "{case}"
+            );
+        }
+
+        let mut reader = TarReader::new(ChunkedReader::new(
+            gnu_header(b'L', DEFAULT_MAX_GNU_EXTENSION_SIZE + 1).to_vec(),
+            BLOCK_SIZE,
+        ));
+        assert!(matches!(
+            ready(reader.next_frame()),
+            Err(FrameError {
+                position: 0,
+                inner: FrameErrorInner::ExtensionTooLarge {
+                    format: ArchiveFormat::Gnu,
+                    size,
+                    limit: DEFAULT_MAX_GNU_EXTENSION_SIZE,
+                },
+            }) if size == DEFAULT_MAX_GNU_EXTENSION_SIZE + 1
+        ));
+    }
+
+    #[test]
+    fn logical_reader_is_fused_after_oversized_gnu_extension() {
+        let payload = b"renamed\0";
+        let payload_size = u64::try_from(payload.len()).expect("payload size should fit u64");
+        let mut bytes = Vec::new();
+        append_gnu(&mut bytes, b'L', payload);
+        append_block(&mut bytes, &gnu_header(b'0', 0));
+        append_terminator(&mut bytes);
+
+        ready_ok(async {
+            let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+            reader.set_max_gnu_extension_size(payload_size - 1);
+            assert!(matches!(
+                reader.next_frame().await,
+                Err(FrameError {
+                    position: 0,
+                    inner: FrameErrorInner::ExtensionTooLarge {
+                        format: ArchiveFormat::Gnu,
+                        size,
+                        limit,
+                    },
+                }) if size == payload_size && limit == payload_size - 1
+            ));
+            assert!(reader.next_frame().await?.is_none());
             Ok(())
         });
     }

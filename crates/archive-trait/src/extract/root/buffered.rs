@@ -2,7 +2,11 @@
 
 use std::{
     io::{self, Write as _},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use cap_std::fs::{Dir, File as CapFile, Metadata};
@@ -30,6 +34,22 @@ pub(super) enum BufferedFileError {
     },
 }
 
+/// One fully validated small file prepared for ordered batch creation.
+pub(super) struct BufferedFile {
+    pub(super) directory: Arc<Dir>,
+    pub(super) relative_path: PathBuf,
+    pub(super) error_path: PathBuf,
+    pub(super) executable: bool,
+    pub(super) contents: Vec<u8>,
+    pub(super) replacement: BufferedFileReplacement,
+}
+
+/// The reusable buffers and first error produced by an ordered file batch.
+pub(super) struct BufferedFileBatchResult {
+    pub(super) buffers: Vec<Vec<u8>>,
+    pub(super) error: Option<(PathBuf, BufferedFileError)>,
+}
+
 impl BufferedFileError {
     fn filesystem(operation: &'static str, source: io::Error) -> Self {
         Self::Filesystem { operation, source }
@@ -45,6 +65,31 @@ impl BufferedFileError {
             }
         }
     }
+}
+
+/// Creates buffered files in archive order and stops after cancellation or the first failure.
+pub(super) fn write_buffered_files(
+    files: Vec<BufferedFile>,
+    cancellation: &AtomicBool,
+) -> BufferedFileBatchResult {
+    let mut buffers = Vec::with_capacity(files.len());
+    let mut error = None;
+    for file in files {
+        if error.is_none()
+            && !cancellation.load(Ordering::Acquire)
+            && let Err(source) = write_buffered_file(
+                &file.directory,
+                &file.relative_path,
+                file.executable,
+                &file.contents,
+                file.replacement,
+            )
+        {
+            error = Some((file.error_path, source));
+        }
+        buffers.push(file.contents);
+    }
+    BufferedFileBatchResult { buffers, error }
 }
 
 /// Creates or safely replaces and writes one fully validated small file.

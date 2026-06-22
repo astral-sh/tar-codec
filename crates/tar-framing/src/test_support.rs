@@ -19,6 +19,7 @@ pub(crate) struct ChunkedReader {
     bytes: Vec<u8>,
     position: usize,
     max_chunk: usize,
+    pending_at: Option<usize>,
 }
 
 impl ChunkedReader {
@@ -27,6 +28,14 @@ impl ChunkedReader {
             bytes,
             position: 0,
             max_chunk,
+            pending_at: None,
+        }
+    }
+
+    pub(crate) fn pending_once(bytes: Vec<u8>, pending_at: usize) -> Self {
+        Self {
+            pending_at: Some(pending_at),
+            ..Self::new(bytes, usize::MAX)
         }
     }
 }
@@ -34,16 +43,23 @@ impl ChunkedReader {
 impl AsyncRead for ChunkedReader {
     fn poll_read(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        context: &mut Context<'_>,
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if self.pending_at == Some(self.position) {
+            self.pending_at = None;
+            context.waker().wake_by_ref();
+            return Poll::Pending;
+        }
         if self.position == self.bytes.len() {
             return Poll::Ready(Ok(()));
         }
-        let len = self
-            .max_chunk
-            .min(buffer.remaining())
-            .min(self.bytes.len() - self.position);
+        let end = self
+            .pending_at
+            .unwrap_or(self.bytes.len())
+            .min(self.bytes.len());
+        let available = end.saturating_sub(self.position);
+        let len = self.max_chunk.min(buffer.remaining()).min(available);
         let start = self.position;
         let end = start + len;
         buffer.put_slice(&self.bytes[start..end]);
@@ -131,6 +147,13 @@ pub(crate) fn ready<F: Future>(future: F) -> F::Output {
         Poll::Ready(value) => value,
         Poll::Pending => panic!("test reader is never pending"),
     }
+}
+
+pub(crate) fn cancel_pending<F: Future>(future: F) {
+    let mut future = std::pin::pin!(future);
+    let waker = std::task::Waker::noop();
+    let mut context = Context::from_waker(waker);
+    assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
 }
 
 pub(crate) fn ready_ok<F, T>(future: F) -> T

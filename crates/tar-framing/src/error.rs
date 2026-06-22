@@ -127,12 +127,22 @@ pub enum FrameErrorInner {
         /// A concise description of the grammar violation.
         reason: &'static str,
     },
-    /// A pax extension declares more metadata than the configured limit.
-    #[error("pax extension payload size {size} exceeds configured limit {limit}")]
-    PaxExtensionTooLarge {
-        /// The extension payload size declared in its ustar header.
+    /// A metadata extension declares more data than the configured format limit.
+    #[error("{format} extension payload size {size} exceeds configured limit {limit}")]
+    ExtensionTooLarge {
+        /// The archive family containing the extension.
+        format: ArchiveFormat,
+        /// The extension payload size declared in its header.
         size: u64,
         /// The configured maximum extension payload size.
+        limit: u64,
+    },
+    /// Consecutive global pax extensions contain more metadata than the configured limit.
+    #[error("global pax extension payload total {size} exceeds configured limit {limit}")]
+    GlobalPaxExtensionsTooLarge {
+        /// The cumulative declared size including the rejected extension.
+        size: u64,
+        /// The configured maximum cumulative payload size.
         limit: u64,
     },
     /// A pax text component that must be UTF-8 is not valid UTF-8.

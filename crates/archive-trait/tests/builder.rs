@@ -10,7 +10,8 @@ use archive_trait::{
 use tempfile::tempdir;
 use thiserror::Error;
 
-const LARGE_FILE_BYTES: usize = 1024 * 1024 + 17;
+const LARGE_FILE_BYTES: usize = 2 * 1024 * 1024 + 17;
+const BATCHED_FILE_BYTES: usize = 512 * 1024 + 17;
 
 #[derive(Debug, Eq, PartialEq)]
 enum RecordedEntry {
@@ -232,10 +233,18 @@ async fn name_validation_supports_default_custom_and_disabled_policies() {
 }
 
 #[tokio::test]
-async fn recursive_build_is_sorted_and_streams_small_and_large_files() {
+async fn recursive_build_sorts_entries_batches_small_files_and_streams_large_files() {
     let temp = tempdir().expect("temporary directory should be created");
     let source = temp.path().join("tree");
     std::fs::create_dir_all(source.join("sub")).expect("source tree should be created");
+    std::fs::create_dir(source.join("batch")).expect("batch directory should be created");
+    for (name, byte) in [("a", b'a'), ("b", b'b'), ("c", b'c')] {
+        std::fs::write(
+            source.join("batch").join(name),
+            vec![byte; BATCHED_FILE_BYTES],
+        )
+        .expect("buffered source file should be written");
+    }
     std::fs::write(source.join("z"), b"last").expect("z should be written");
     std::fs::write(source.join("a"), b"first").expect("a should be written");
     std::fs::write(source.join("sub/file"), b"nested").expect("small file should be written");
@@ -271,6 +280,10 @@ async fn recursive_build_is_sorted_and_streams_small_and_large_files() {
         [
             "tree",
             "tree/a",
+            "tree/batch",
+            "tree/batch/a",
+            "tree/batch/b",
+            "tree/batch/c",
             "tree/sub",
             "tree/sub/file",
             "tree/sub/large",
@@ -287,6 +300,25 @@ async fn recursive_build_is_sorted_and_streams_small_and_large_files() {
         RecordedEntry::File { path, data, chunks, .. }
             if path == "tree/sub/large" && data.len() == LARGE_FILE_BYTES && *chunks == 2
     )));
+    assert!(entries.iter().any(|entry| matches!(
+        entry,
+        RecordedEntry::File { path, data, chunks, .. }
+            if path == "tree/z" && data == b"last" && *chunks == 1
+    )));
+    for (name, byte) in [("a", b'a'), ("b", b'b'), ("c", b'c')] {
+        let path = format!("tree/batch/{name}");
+        assert!(entries.iter().any(|entry| matches!(
+            entry,
+            RecordedEntry::File {
+                path: actual_path,
+                data,
+                chunks: 1,
+                ..
+            } if actual_path == &path
+                && data.len() == BATCHED_FILE_BYTES
+                && data.iter().all(|actual| *actual == byte)
+        )));
+    }
     #[cfg(unix)]
     assert!(entries.iter().any(|entry| matches!(
         entry,

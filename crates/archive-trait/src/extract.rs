@@ -164,45 +164,52 @@ pub(crate) async fn extract<A: Archive>(
     let mut chunk_buffer = Vec::new();
     // Complete small-file contents, buffered so payload validation precedes file creation.
     let mut buffered_payload = Vec::new();
-    while let Some(member) = members.next().await.map_err(ExtractError::Archive)? {
-        check_member_policy(&member, policy)?;
-        let decoded = decode_member(&member, policy)?;
-        match member {
-            Member::File {
-                size,
-                executable,
-                payload,
-                ..
-            } => {
-                root.extract_file(
-                    &decoded.path,
+    let result: Result<(), ExtractError<A::Error>> = async {
+        while let Some(member) = members.next().await.map_err(ExtractError::Archive)? {
+            check_member_policy(&member, policy)?;
+            let decoded = decode_member(&member, policy)?;
+            match member {
+                Member::File {
                     size,
                     executable,
                     payload,
-                    &mut chunk_buffer,
-                    &mut buffered_payload,
-                )
-                .await?;
-            }
-            Member::Directory { .. } => root.extract_directory(&decoded.path).await?,
-            Member::SymbolicLink { .. } => {
-                if policy.link_policy.symlink_policy == SymlinkPolicy::Preserve {
-                    root.reserve_symlink(&decoded).await?;
+                    ..
+                } => {
+                    root.extract_file(
+                        &decoded.path,
+                        size,
+                        executable,
+                        payload,
+                        &mut chunk_buffer,
+                        &mut buffered_payload,
+                    )
+                    .await?;
+                }
+                Member::Directory { .. } => root.extract_directory(&decoded.path).await?,
+                Member::SymbolicLink { .. } => {
+                    if policy.link_policy.symlink_policy == SymlinkPolicy::Preserve {
+                        root.reserve_symlink(&decoded).await?;
+                    }
+                }
+                Member::HardLink { size, payload, .. } => {
+                    root.extract_hard_link(&decoded, size, payload, &mut chunk_buffer)
+                        .await?;
+                }
+                Member::Special { kind, .. } => {
+                    return Err(ExtractError::UnsupportedMember {
+                        position: decoded.position,
+                        path: decoded.path,
+                        kind,
+                    });
                 }
             }
-            Member::HardLink { size, payload, .. } => {
-                root.extract_hard_link(&decoded, size, payload, &mut chunk_buffer)
-                    .await?;
-            }
-            Member::Special { kind, .. } => {
-                return Err(ExtractError::UnsupportedMember {
-                    position: decoded.position,
-                    path: decoded.path,
-                    kind,
-                });
-            }
         }
+        Ok(())
     }
+    .await;
+    // Commit earlier validated files before reporting a later member error.
+    root.flush_buffered_files().await?;
+    result?;
     root.finalize_symlinks(policy.link_policy).await
 }
 

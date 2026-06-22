@@ -91,6 +91,8 @@
 //! [POSIX.1-2004]: https://pubs.opengroup.org/onlinepubs/009695399/toc.htm
 //! ["Basic Tar Format"]: https://www.gnu.org/software/tar/manual/html_node/Standard.html
 
+use std::fmt;
+
 mod error;
 pub mod header;
 pub mod logical;
@@ -108,8 +110,18 @@ pub const BLOCK_SIZE: usize = 512;
 
 /// The default maximum size in bytes of one local or global pax extension.
 ///
+/// This is 256 KiB.
+pub const DEFAULT_MAX_PAX_EXTENSION_SIZE: u64 = 256 * 1024;
+
+/// The default maximum cumulative size of global pax extensions before one member.
+///
 /// This is 1 MiB.
-pub const DEFAULT_MAX_PAX_EXTENSION_SIZE: u64 = 1024 * 1024;
+pub const DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE: u64 = 4 * DEFAULT_MAX_PAX_EXTENSION_SIZE;
+
+/// The default maximum size in bytes of one GNU metadata extension.
+///
+/// This is 128 KiB.
+pub const DEFAULT_MAX_GNU_EXTENSION_SIZE: u64 = 128 * 1024;
 
 /// A single tar block.
 pub type Block = [u8; BLOCK_SIZE];
@@ -121,6 +133,15 @@ pub enum ArchiveFormat {
     Pax,
     /// Old GNU tar headers with optional `L` and `K` extension entries.
     Gnu,
+}
+
+impl fmt::Display for ArchiveFormat {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pax => formatter.write_str("pax"),
+            Self::Gnu => formatter.write_str("GNU"),
+        }
+    }
 }
 
 /// The scope of a pax extended header.

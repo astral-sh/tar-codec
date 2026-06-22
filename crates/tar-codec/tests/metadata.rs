@@ -12,7 +12,7 @@ use tar_codec::{
 };
 #[cfg(unix)]
 use tar_codec::{ExtractPolicyViolation, default_name_validator};
-use tar_framing::{FrameError, FrameErrorInner, PaxKeyword};
+use tar_framing::{ArchiveFormat as FramingFormat, FrameError, FrameErrorInner, PaxKeyword};
 use tempfile::tempdir;
 
 fn vendor_attribute_keyword() -> PaxKeyword {
@@ -302,7 +302,11 @@ async fn pax_extension_size_limit_is_configurable_for_extraction() {
             .await,
         Err(ExtractError::Archive(DecodeError::Framing(FrameError {
             position: 0,
-            inner: FrameErrorInner::PaxExtensionTooLarge { size, limit },
+            inner: FrameErrorInner::ExtensionTooLarge {
+                format: FramingFormat::Pax,
+                size,
+                limit,
+            },
         }))) if size == payload_size && limit == payload_size - 1
     ));
     assert!(destination.is_dir());
@@ -322,6 +326,105 @@ async fn pax_extension_size_limit_is_configurable_for_extraction() {
         .expect("extension at configured limit should extract");
     assert_eq!(
         std::fs::read_to_string(destination.join("file"))
+            .expect("extracted file should be readable"),
+        "contents"
+    );
+}
+
+#[tokio::test]
+async fn global_pax_extensions_size_limit_is_configurable_for_extraction() {
+    let temp = tempdir().expect("temporary directory should be created");
+    let payload = pax_record(PaxKeyword::Comment, "metadata");
+    let payload_size = u64::try_from(payload.len()).expect("payload size should fit u64");
+    let mut archive = ArchiveBuilder::new();
+    for _ in 0..3 {
+        archive.pax(b'g', &payload);
+    }
+    archive.posix("file", b'0', b"contents", "", 0o644);
+    let bytes = archive.finish();
+
+    let destination = temp.path().join("rejected");
+    let limit = payload_size
+        .checked_mul(2)
+        .expect("test payload total should fit u64");
+    let decode_policy = DecodePolicy::default()
+        .pax_policy(PaxDecodePolicy::default().max_global_extensions_size(limit));
+    assert!(matches!(
+        TarArchive::new_with_policy(bytes.as_slice(), decode_policy)
+            .extract_in(&destination, ExtractPolicy::default())
+            .await,
+        Err(ExtractError::Archive(DecodeError::Framing(FrameError {
+            inner: FrameErrorInner::GlobalPaxExtensionsTooLarge {
+                size,
+                limit: found_limit,
+            },
+            ..
+        }))) if size == payload_size * 3 && found_limit == limit
+    ));
+    assert!(destination.is_dir());
+    assert!(
+        std::fs::read_dir(destination)
+            .expect("rejected destination should be readable")
+            .next()
+            .is_none()
+    );
+
+    let destination = temp.path().join("accepted");
+    let decode_policy = DecodePolicy::default()
+        .pax_policy(PaxDecodePolicy::default().max_global_extensions_size(payload_size * 3));
+    TarArchive::new_with_policy(bytes.as_slice(), decode_policy)
+        .extract_in(&destination, ExtractPolicy::default())
+        .await
+        .expect("global extensions at the configured limit should extract");
+    assert_eq!(
+        std::fs::read_to_string(destination.join("file"))
+            .expect("extracted file should be readable"),
+        "contents"
+    );
+}
+
+#[tokio::test]
+async fn gnu_extension_size_limit_is_configurable_for_extraction() {
+    let temp = tempdir().expect("temporary directory should be created");
+    let payload = b"renamed\0";
+    let mut archive = ArchiveBuilder::new();
+    archive
+        .gnu("longname", b'L', payload, "", 0o644)
+        .gnu("raw", b'0', b"contents", "", 0o644);
+    let bytes = archive.finish();
+    let payload_size = u64::try_from(payload.len()).expect("payload size should fit u64");
+
+    let destination = temp.path().join("rejected");
+    let decode_policy = DecodePolicy::default().max_gnu_extension_size(payload_size - 1);
+    assert!(matches!(
+        TarArchive::new_with_policy(bytes.as_slice(), decode_policy)
+            .extract_in(&destination, ExtractPolicy::default())
+            .await,
+        Err(ExtractError::Archive(DecodeError::Framing(FrameError {
+            position: 0,
+            inner: FrameErrorInner::ExtensionTooLarge {
+                format: FramingFormat::Gnu,
+                size,
+                limit,
+            },
+        }))) if size == payload_size && limit == payload_size - 1
+    ));
+    assert!(destination.is_dir());
+    assert!(
+        std::fs::read_dir(destination)
+            .expect("rejected destination should be readable")
+            .next()
+            .is_none()
+    );
+
+    let destination = temp.path().join("accepted");
+    let decode_policy = DecodePolicy::default().max_gnu_extension_size(payload_size);
+    TarArchive::new_with_policy(bytes.as_slice(), decode_policy)
+        .extract_in(&destination, ExtractPolicy::default())
+        .await
+        .expect("extension at configured limit should extract");
+    assert_eq!(
+        std::fs::read_to_string(destination.join("renamed"))
             .expect("extracted file should be readable"),
         "contents"
     );

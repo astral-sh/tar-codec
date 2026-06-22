@@ -1,15 +1,55 @@
 pub mod support;
 
+use std::{collections::VecDeque, path::Path, sync::mpsc};
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt as _;
-use std::path::Path;
+use std::{env, os::unix::fs::PermissionsExt as _, process::Command};
 
 use archive_trait::{
-    Archive as _, ExtractError, ExtractPolicyViolation, SpecialKind,
+    Archive, ExtractError, ExtractPolicyViolation, Member, SpecialKind,
     extract::{ExtractPolicy, LinkPolicy, SymlinkPolicy},
 };
-use support::{TestArchive, entry};
+use support::{TestArchive, TestEntry, TestError, TestPayload, entry};
 use tempfile::tempdir;
+use tokio::{runtime::Builder, sync::oneshot};
+
+struct GatedArchive {
+    entries: VecDeque<TestEntry>,
+    root_opened: Option<oneshot::Sender<()>>,
+    resume: Option<oneshot::Receiver<()>>,
+    last_member: Option<oneshot::Sender<()>>,
+}
+
+impl Archive for GatedArchive {
+    type Error = TestError;
+    type Payload<'a> = TestPayload;
+
+    async fn next_member<'a>(
+        &'a mut self,
+    ) -> Result<Option<Member<Self::Payload<'a>>>, Self::Error> {
+        if let Some(root_opened) = self.root_opened.take() {
+            if root_opened.send(()).is_err() {
+                return Err(TestError);
+            }
+            if let Some(resume) = self.resume.take()
+                && resume.await.is_err()
+            {
+                return Err(TestError);
+            }
+        }
+        let entry = self.entries.pop_front();
+        if entry.is_some()
+            && self.entries.is_empty()
+            && let Some(last_member) = self.last_member.take()
+            && last_member.send(()).is_err()
+        {
+            return Err(TestError);
+        }
+        match entry {
+            Some(entry) => entry.map(Some),
+            None => Ok(None),
+        }
+    }
+}
 
 #[tokio::test]
 async fn extracts_common_members_and_streams_payload_sizes() {
@@ -89,6 +129,52 @@ fn patterned_payload(size: usize) -> Vec<u8> {
         .collect()
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn extraction_bounds_open_directory_handles() {
+    const CHILD_ENVIRONMENT: &str = "ARCHIVE_TRAIT_LOW_NOFILE_CHILD";
+    const DIRECTORY_COUNT: usize = 128;
+    const TEST_NAME: &str = "extraction_bounds_open_directory_handles";
+
+    // Lowering the process-wide descriptor limit would interfere with parallel
+    // tests, so re-run only this test in a constrained child process. The
+    // environment marker distinguishes that child from the parent invocation.
+    if env::var_os(CHILD_ENVIRONMENT).is_none() {
+        let executable = env::current_exe().expect("test executable should be available");
+        let status = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "ulimit -n 64 && exec \"$0\" --exact {TEST_NAME} --nocapture"
+            ))
+            .arg(executable)
+            .env(CHILD_ENVIRONMENT, "1")
+            .status()
+            .expect("limited test process should run");
+        assert!(status.success(), "limited test process should succeed");
+        return;
+    }
+
+    let archive = TestArchive::new(
+        (0..DIRECTORY_COUNT)
+            .map(|index| entry::file(&format!("directory-{index:03}/file"), index.to_le_bytes())),
+    );
+    let temp = tempdir().expect("temporary directory should be created");
+    let destination = temp.path().join("out");
+
+    archive
+        .extract_in(&destination, ExtractPolicy::default())
+        .await
+        .expect("archive should extract under a low file descriptor limit");
+
+    for index in 0..DIRECTORY_COUNT {
+        assert_eq!(
+            std::fs::read(destination.join(format!("directory-{index:03}/file")))
+                .expect("extracted file should be readable"),
+            index.to_le_bytes()
+        );
+    }
+}
+
 #[tokio::test]
 async fn name_validation_covers_member_and_link_values() {
     let temp = tempdir().expect("temporary directory should be created");
@@ -136,15 +222,22 @@ async fn name_validation_covers_member_and_link_values() {
 }
 
 #[tokio::test]
-async fn validates_empty_payload_before_creating_file() {
+async fn payload_errors_flush_prior_files_before_returning() {
     let temp = tempdir().expect("temporary directory should be created");
     let destination = temp.path().join("out");
 
-    let result = TestArchive::new([entry::invalid_file("invalid", b"")])
-        .extract_in(&destination, ExtractPolicy::default())
-        .await;
+    let result = TestArchive::new([
+        entry::file("created", b"kept"),
+        entry::invalid_file("invalid", b""),
+    ])
+    .extract_in(&destination, ExtractPolicy::default())
+    .await;
 
     assert!(matches!(result, Err(ExtractError::Archive(_))));
+    assert_eq!(
+        std::fs::read(destination.join("created")).expect("prior file should remain"),
+        b"kept"
+    );
     assert!(!destination.join("invalid").exists());
 }
 
@@ -206,7 +299,7 @@ async fn rejects_invalid_destinations_unsafe_special_and_colliding_members() {
 }
 
 #[tokio::test]
-async fn archive_errors_preserve_prior_streaming_output() {
+async fn archive_errors_flush_prior_buffered_files() {
     let temp = tempdir().expect("temporary directory should be created");
     let destination = temp.path().join("partial");
     let result = TestArchive::new([entry::file("created", b"kept"), entry::error()])
@@ -217,6 +310,74 @@ async fn archive_errors_preserve_prior_streaming_output() {
     assert_eq!(
         std::fs::read(destination.join("created")).expect("created file should remain"),
         b"kept"
+    );
+}
+
+#[test]
+fn cancelling_extraction_stops_pending_buffered_files() {
+    let temp = tempdir().expect("temporary directory should be created");
+    let destination = temp.path().join("out");
+    let (root_opened_sender, root_opened_receiver) = oneshot::channel();
+    let (resume_sender, resume_receiver) = oneshot::channel();
+    let (last_member_sender, last_member_receiver) = oneshot::channel();
+    let archive = GatedArchive {
+        entries: (0..64)
+            .map(|index| entry::file(&format!("file-{index}"), b"contents"))
+            .collect(),
+        root_opened: Some(root_opened_sender),
+        resume: Some(resume_receiver),
+        last_member: Some(last_member_sender),
+    };
+    let extraction_destination = destination.clone();
+
+    let runtime = Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .build()
+        .expect("test runtime should be created");
+    runtime.block_on(async move {
+        let extraction = tokio::spawn(async move {
+            archive
+                .extract_in(extraction_destination, ExtractPolicy::default())
+                .await
+        });
+        root_opened_receiver
+            .await
+            .expect("extraction root should be opened");
+
+        let (release_worker_sender, release_worker_receiver) = mpsc::channel();
+        let (worker_started_sender, worker_started_receiver) = oneshot::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            if worker_started_sender.send(()).is_err() {
+                return false;
+            }
+            release_worker_receiver.recv().is_ok()
+        });
+        let worker_started = worker_started_receiver.await;
+        let resumed = resume_sender.send(());
+        let reached_last_member = last_member_receiver.await;
+
+        extraction.abort();
+        let extraction_result = extraction.await;
+        let worker_released = release_worker_sender.send(());
+        let worker_result = worker.await;
+
+        assert!(worker_started.is_ok());
+        assert!(resumed.is_ok());
+        assert!(reached_last_member.is_ok());
+        assert!(matches!(
+            extraction_result,
+            Err(error) if error.is_cancelled()
+        ));
+        assert!(worker_released.is_ok());
+        assert!(matches!(worker_result, Ok(true)));
+    });
+    drop(runtime);
+
+    assert_eq!(
+        std::fs::read_dir(destination)
+            .expect("destination should be readable")
+            .count(),
+        0
     );
 }
 

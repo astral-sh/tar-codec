@@ -1,9 +1,13 @@
 pub mod support;
 
 use std::{
+    cell::Cell,
+    future::Future,
     io,
     pin::Pin,
+    rc::Rc,
     task::{Context, Poll},
+    time::Duration,
 };
 
 #[cfg(unix)]
@@ -18,7 +22,12 @@ use tar_framing::{
     write::FramingWriteError,
 };
 use tempfile::tempdir;
-use tokio::io::AsyncWrite;
+use tokio::{
+    fs::File,
+    io::{AsyncWrite, AsyncWriteExt},
+    runtime::Builder,
+    time::timeout,
+};
 
 #[derive(Default)]
 struct FailingWriter;
@@ -30,6 +39,42 @@ impl AsyncWrite for FailingWriter {
         _buffer: &[u8],
     ) -> Poll<io::Result<usize>> {
         Poll::Ready(Err(io::Error::other("injected write failure")))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+struct PendingOnceWriter {
+    written: Rc<Cell<usize>>,
+    wrote_prefix: bool,
+    returned_pending: bool,
+}
+
+impl AsyncWrite for PendingOnceWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if !self.wrote_prefix {
+            let len = buffer.len().min(17);
+            self.written.set(self.written.get() + len);
+            self.wrote_prefix = true;
+            return Poll::Ready(Ok(len));
+        }
+        if !self.returned_pending {
+            self.returned_pending = true;
+            context.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        self.written.set(self.written.get() + buffer.len());
+        Poll::Ready(Ok(buffer.len()))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -185,6 +230,36 @@ async fn output_failures_poison_the_encoder() {
 }
 
 #[tokio::test]
+async fn cancelled_output_write_poisons_the_encoder() {
+    let written = Rc::new(Cell::new(0));
+    let writer = PendingOnceWriter {
+        written: Rc::clone(&written),
+        wrote_prefix: false,
+        returned_pending: false,
+    };
+    let mut encoder = TarEncoder::new(writer).builder();
+    {
+        let mut addition =
+            std::pin::pin!(encoder.add_entry("cancelled", b"contents", EntryMetadata::default(),));
+        let waker = std::task::Waker::noop();
+        let mut context = Context::from_waker(waker);
+        assert!(matches!(
+            addition.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+    }
+    assert_eq!(written.get(), 17);
+
+    assert!(matches!(
+        encoder
+            .add_entry("other", b"contents", EntryMetadata::default())
+            .await,
+        Err(BuildError::Poisoned)
+    ));
+    assert!(matches!(encoder.finish().await, Err(BuildError::Poisoned)));
+}
+
+#[tokio::test]
 async fn recursive_encoding_round_trips_small_and_large_files() {
     const LARGE_FILE_BYTES: usize = 1024 * 1024 + 17;
 
@@ -222,6 +297,80 @@ async fn recursive_encoding_round_trips_small_and_large_files() {
             .len(),
         LARGE_FILE_BYTES as u64
     );
+}
+
+#[test]
+fn recursive_encoding_releases_the_blocking_pool_between_source_chunks() {
+    const LARGE_FILE_BYTES: usize = 4 * 1024 * 1024 + 17;
+
+    let temp = tempdir().expect("temporary directory should be created");
+    let source = temp.path().join("tree");
+    std::fs::create_dir(&source).expect("source directory should be created");
+    std::fs::write(source.join("large"), vec![b'x'; LARGE_FILE_BYTES])
+        .expect("large source file should be written");
+    let archive = temp.path().join("archive.tar");
+
+    let runtime = Builder::new_current_thread()
+        .enable_time()
+        .max_blocking_threads(1)
+        .build()
+        .expect("test runtime should be created");
+    runtime.block_on(async {
+        let mut writer = File::create(&archive)
+            .await
+            .expect("archive output should be created");
+        let encoding = async {
+            let mut encoder = TarEncoder::new(&mut writer).builder();
+            encoder.add_directory(&source).await?;
+            encoder.finish().await
+        };
+        timeout(Duration::from_secs(10), encoding)
+            .await
+            .expect("encoding should not exhaust the blocking pool")
+            .expect("directory should be encoded");
+        writer
+            .flush()
+            .await
+            .expect("archive output should be flushed");
+    });
+
+    assert!(
+        std::fs::metadata(archive)
+            .expect("archive metadata should be readable")
+            .len()
+            > LARGE_FILE_BYTES as u64
+    );
+}
+
+#[test]
+fn recursive_encoding_releases_the_blocking_pool_between_traversal_batches() {
+    const DIRECTORY_COUNT: usize = 3 * 256;
+
+    let temp = tempdir().expect("temporary directory should be created");
+    let source = temp.path().join("tree");
+    std::fs::create_dir(&source).expect("source directory should be created");
+    for index in 0..DIRECTORY_COUNT {
+        std::fs::create_dir(source.join(format!("directory-{index:04}")))
+            .expect("source subdirectory should be created");
+    }
+
+    let runtime = Builder::new_current_thread()
+        .enable_time()
+        .max_blocking_threads(1)
+        .build()
+        .expect("test runtime should be created");
+    runtime.block_on(async {
+        let encoding = async {
+            let mut bytes = Vec::new();
+            let mut encoder = TarEncoder::new(&mut bytes).builder();
+            encoder.add_directory(&source).await?;
+            encoder.finish().await
+        };
+        timeout(Duration::from_secs(10), encoding)
+            .await
+            .expect("traversal backpressure should not exhaust the blocking pool")
+            .expect("directory should be encoded");
+    });
 }
 
 #[cfg(unix)]
