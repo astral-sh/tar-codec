@@ -105,6 +105,16 @@ impl BuilderState {
         Ok(())
     }
 
+    // A backend write is provisionally poisoning. Completion clears this flag
+    // before the returned failure is classified; cancellation leaves it set.
+    fn begin_write(&mut self) {
+        self.poisoned = true;
+    }
+
+    fn complete_write(&mut self) {
+        self.poisoned = false;
+    }
+
     fn poison(&mut self) {
         self.poisoned = true;
     }
@@ -220,6 +230,11 @@ impl<E> BuildFailure<E> {
 
 /// A format-specific archive writer that can create a stateful [`Builder`].
 ///
+/// The asynchronous methods on this trait are implementation hooks for
+/// [`Builder`]. Archive construction callers must not invoke them directly;
+/// doing so bypasses builder policy, collision tracking, and cancellation
+/// poisoning. Use [`Self::builder`] or [`Self::builder_with_policy`] and then
+/// the [`Builder`] APIs instead.
 ///
 /// Hook implementations must return [`BuildFailure::recoverable`] only when the
 /// failed invocation wrote no output. Any failure after output may have begun
@@ -316,10 +331,12 @@ impl<B: ArchiveBuilder> Builder<B> {
         let path = path.to_owned();
         let implicit_ancestors = preflight_regular_entry(&self.state.entries, &path)?;
         let mut payload = EntryPayload::borrowed(data.as_ref())?;
+        self.state.begin_write();
         let result = self
             .backend
             .write_file_member(&path, &mut payload, metadata)
             .await;
+        self.state.complete_write();
         self.resolve_hook(result)?;
         for ancestor in implicit_ancestors {
             self.state
@@ -354,6 +371,7 @@ impl<B: ArchiveBuilder> Builder<B> {
             source_buffer: mem::take(&mut self.state.source_buffer),
             emitted: false,
         };
+        self.state.begin_write();
         let write_result =
             write_directory_entries(&mut self.backend, &mut entries, &mut traversal).await;
         let traversal_result = entries
@@ -361,6 +379,7 @@ impl<B: ArchiveBuilder> Builder<B> {
             .await
             .map_err(BuildError::Traversal)
             .map_err(BuildFailure::recoverable);
+        self.state.complete_write();
         let result = write_result.and(traversal_result);
         self.state.source_buffer = traversal.source_buffer;
         match result {

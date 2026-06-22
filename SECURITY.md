@@ -19,11 +19,15 @@ General properties:
   to allow this.
 - If a tar stream is ambiguous (i.e. not well-formed under pax or GNU rules), tar-codec
   should reject it rather than picking an arbitrary interpretation.
-- All asynchronous APIs should be cancellation safe. In other words, dropping a future
-  produced by a public API should _never_ result in state corruption that
+- All asynchronous consumer-facing APIs should be cancellation safe. In other words,
+  dropping a future produced by a direct-use API should _never_ result in state corruption that
   breaks our parsing or encoding properties.
 - Encoding should always produce a valid, unambiguous, pax-only tar.
 - Both encoding and decoding should remain linear in time and memory with respect to their input.
+
+The format-writing methods on `ArchiveBuilder` are implementation hooks, not
+direct-use APIs. Archive construction must go through `Builder` for policy,
+collision-tracking, poisoning, and cancellation-safety guarantees.
 
 In addition, the following are *never* considered security vulnerabilities
 within tar-codec:

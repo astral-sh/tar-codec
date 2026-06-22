@@ -1,8 +1,11 @@
 pub mod support;
 
 use std::{
+    cell::Cell,
+    future::Future,
     io,
     pin::Pin,
+    rc::Rc,
     task::{Context, Poll},
 };
 
@@ -30,6 +33,42 @@ impl AsyncWrite for FailingWriter {
         _buffer: &[u8],
     ) -> Poll<io::Result<usize>> {
         Poll::Ready(Err(io::Error::other("injected write failure")))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+struct PendingOnceWriter {
+    written: Rc<Cell<usize>>,
+    wrote_prefix: bool,
+    returned_pending: bool,
+}
+
+impl AsyncWrite for PendingOnceWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if !self.wrote_prefix {
+            let len = buffer.len().min(17);
+            self.written.set(self.written.get() + len);
+            self.wrote_prefix = true;
+            return Poll::Ready(Ok(len));
+        }
+        if !self.returned_pending {
+            self.returned_pending = true;
+            context.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        self.written.set(self.written.get() + buffer.len());
+        Poll::Ready(Ok(buffer.len()))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -178,6 +217,36 @@ async fn output_failures_poison_the_encoder() {
     assert!(matches!(
         encoder
             .add_entry("other", b"", EntryMetadata::default())
+            .await,
+        Err(BuildError::Poisoned)
+    ));
+    assert!(matches!(encoder.finish().await, Err(BuildError::Poisoned)));
+}
+
+#[tokio::test]
+async fn cancelled_output_write_poisons_the_encoder() {
+    let written = Rc::new(Cell::new(0));
+    let writer = PendingOnceWriter {
+        written: Rc::clone(&written),
+        wrote_prefix: false,
+        returned_pending: false,
+    };
+    let mut encoder = TarEncoder::new(writer).builder();
+    {
+        let mut addition =
+            std::pin::pin!(encoder.add_entry("cancelled", b"contents", EntryMetadata::default(),));
+        let waker = std::task::Waker::noop();
+        let mut context = Context::from_waker(waker);
+        assert!(matches!(
+            addition.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+    }
+    assert_eq!(written.get(), 17);
+
+    assert!(matches!(
+        encoder
+            .add_entry("other", b"contents", EntryMetadata::default())
             .await,
         Err(BuildError::Poisoned)
     ));
