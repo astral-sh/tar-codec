@@ -143,6 +143,9 @@ impl fmt::Display for PaxKeyword {
     }
 }
 
+/// Like [`PaxRecords`], but with an additional index of `keyword -> effective record index`
+/// to keep lookups cheap, even across pathological pax archives (e.g. multiple
+/// global extensions being merged together).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GlobalPaxRecords {
     records: PaxRecords,
