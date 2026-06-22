@@ -476,14 +476,13 @@ impl<R: AsyncRead + Unpin> PayloadReader<R> {
         if self.remaining == 0 {
             return Ok(false);
         }
-        let position = self.stream.position();
         let len = self.stream.read_member_chunk(buffer, target_len).await?;
         let len = u64::try_from(len).map_err(|_| {
-            FrameError::arithmetic_overflow(position, "member payload chunk length")
+            FrameError::arithmetic_overflow(self.stream.position, "member payload chunk length")
         })?;
         self.remaining = self.remaining.checked_sub(len).ok_or_else(|| {
             FrameError::unexpected_order(
-                position,
+                self.stream.position,
                 "bounded member payload",
                 "oversized member payload chunk",
             )

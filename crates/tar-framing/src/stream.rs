@@ -298,11 +298,14 @@ enum MemberChunkState {
 
 /// A strict stream of POSIX-pax or GNU frames sourced from an underlying reader.
 pub struct TarStream<R> {
+    /// Our current stream position.
     pub(super) position: u64,
+    /// Our interior source.
     pub(super) inner: R,
     pub(super) block: Block,
     pub(super) block_len: usize,
     pub(super) format: Option<ArchiveFormat>,
+    /// The currently effective global pax records, if any.
     pub(super) global_pax_records: Option<SharedGlobalPaxRecords>,
     max_pax_extension_size: u64,
     max_global_pax_extensions_size: u64,
@@ -366,10 +369,6 @@ impl<R> TarStream<R> {
     /// Returns the selected archive family after the first header is read.
     pub fn format(&self) -> Option<ArchiveFormat> {
         self.format
-    }
-
-    pub(crate) fn position(&self) -> u64 {
-        self.position
     }
 
     pub(crate) fn global_pax_records(&self) -> Option<SharedGlobalPaxRecords> {
