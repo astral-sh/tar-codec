@@ -83,8 +83,8 @@ use tokio_stream::Stream;
 
 use crate::{
     ArchiveFormat, BLOCK_SIZE, Block, DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE,
-    DEFAULT_MAX_PAX_EXTENSION_SIZE, FrameError, FrameErrorInner, GnuKind, PaxKind, PaxRecord,
-    PaxValue, UstarKind,
+    DEFAULT_MAX_GNU_EXTENSION_SIZE, DEFAULT_MAX_PAX_EXTENSION_SIZE, FrameError, FrameErrorInner,
+    GnuKind, PaxKind, PaxRecord, PaxValue, UstarKind,
     header::{
         CHECKSUM_RANGE, GNU_IDENTITY, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE, NAME_RANGE,
         PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, USTAR_IDENTITY, checksum, parse_number,
@@ -310,6 +310,7 @@ pub struct TarStream<R> {
     max_pax_extension_size: u64,
     max_global_pax_extensions_size: u64,
     global_pax_extensions_size: u64,
+    max_gnu_extension_size: u64,
     member_chunk: MemberChunk,
     pub(super) state: State,
 }
@@ -327,6 +328,7 @@ impl<R> TarStream<R> {
             max_pax_extension_size: DEFAULT_MAX_PAX_EXTENSION_SIZE,
             max_global_pax_extensions_size: DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE,
             global_pax_extensions_size: 0,
+            max_gnu_extension_size: DEFAULT_MAX_GNU_EXTENSION_SIZE,
             member_chunk: MemberChunk::default(),
             state: State::AwaitingHeader,
         }
@@ -353,6 +355,10 @@ impl<R> TarStream<R> {
     /// bound; each extension remains subject to its individual limit.
     pub fn set_max_global_pax_extensions_size(&mut self, max_global_pax_extensions_size: u64) {
         self.max_global_pax_extensions_size = max_global_pax_extensions_size;
+    }
+
+    pub(crate) fn set_max_gnu_extension_size(&mut self, max_gnu_extension_size: u64) {
+        self.max_gnu_extension_size = max_gnu_extension_size;
     }
 
     /// Returns the selected archive family after the first header is read.
@@ -389,15 +395,6 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 ));
             }
         };
-        if self.block_len != 0 {
-            self.state = State::Failed;
-            return Err(FrameError::unexpected_order(
-                self.position,
-                "aligned ordinary member payload",
-                "partially buffered physical block",
-            ));
-        }
-
         let (position, block) = match poll_fn(|context| self.poll_read_block(context)).await {
             Ok(Some(block)) => block,
             Ok(None) => {
@@ -424,6 +421,14 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         buffer: &mut Vec<u8>,
         target_len: usize,
     ) -> Result<usize, FrameError> {
+        // A cancelled block read retains its partial physical block here. Finish
+        // and deliver it before starting a direct chunk so no bytes are lost.
+        if self.member_chunk.state.is_none() && self.block_len != 0 {
+            let (_, block, meaningful_len) = self.read_member_block().await?;
+            buffer.clear();
+            buffer.extend_from_slice(&block[..meaningful_len]);
+            return Ok(meaningful_len);
+        }
         if self.member_chunk.state.is_none() {
             self.start_member_chunk(buffer, target_len)?;
         }
@@ -1056,6 +1061,16 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                     position,
                     "ordinary GNU member header or the other GNU metadata extension",
                     "duplicate GNU metadata extension",
+                ));
+            }
+            if parsed.size > self.max_gnu_extension_size {
+                return Err(FrameError::at(
+                    position,
+                    FrameErrorInner::ExtensionTooLarge {
+                        format: ArchiveFormat::Gnu,
+                        size: parsed.size,
+                        limit: self.max_gnu_extension_size,
+                    },
                 ));
             }
             *already_seen = true;

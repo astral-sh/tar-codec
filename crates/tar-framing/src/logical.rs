@@ -10,8 +10,8 @@ use tokio::io::AsyncRead;
 use tokio_stream::StreamExt;
 
 use crate::{
-    ArchiveFormat, Block, DEFAULT_MAX_GNU_EXTENSION_SIZE, FrameError, FrameErrorInner, GnuKind,
-    PaxKeyword, PaxKind, PaxRecord, PaxString, PaxValue, UstarKind,
+    ArchiveFormat, Block, FrameError, FrameErrorInner, GnuKind, PaxKeyword, PaxKind, PaxRecord,
+    PaxString, PaxValue, UstarKind,
     header::parse_number,
     stream::{DataFrame, DataOwner, Frame, HeaderFrame, TarStream},
 };
@@ -168,7 +168,6 @@ pub struct TarReader<R> {
     header_storage: HeaderStorage,
     pending_extensions: PendingExtensions,
     extension_payload: Option<ExtensionPayload>,
-    max_gnu_extension_size: u64,
 }
 
 /// Payload state kept separate so [`MemberPayload`] can borrow it mutably while
@@ -237,7 +236,6 @@ impl<R> TarReader<R> {
             header_storage: HeaderStorage::default(),
             pending_extensions: PendingExtensions::default(),
             extension_payload: None,
-            max_gnu_extension_size: DEFAULT_MAX_GNU_EXTENSION_SIZE,
         }
     }
 
@@ -275,7 +273,9 @@ impl<R> TarReader<R> {
     /// rejected before any of its payload blocks are consumed. Setting the
     /// maximum to [`u64::MAX`] permits unbounded metadata buffering.
     pub fn set_max_gnu_extension_size(&mut self, max_gnu_extension_size: u64) {
-        self.max_gnu_extension_size = max_gnu_extension_size;
+        self.payload
+            .stream
+            .set_max_gnu_extension_size(max_gnu_extension_size);
     }
 }
 
@@ -312,21 +312,6 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
                     });
                 }
                 Frame::Gnu(frame) => {
-                    // NOTE: pax records are buffered in `TarStream` because `size` records can change
-                    // the framing of the following member payload. GNU extension contents affect
-                    // only logical names, so `TarReader` is the first layer to buffer them and
-                    // therefore enforces their size limit here.
-                    if frame.payload_size > self.max_gnu_extension_size {
-                        self.clear_extension_state();
-                        return Err(FrameError::at(
-                            frame.position,
-                            FrameErrorInner::ExtensionTooLarge {
-                                format: ArchiveFormat::Gnu,
-                                size: frame.payload_size,
-                                limit: self.max_gnu_extension_size,
-                            },
-                        ));
-                    }
                     if frame.payload_size == 0 {
                         let metadata = GnuMetadata {
                             position: frame.position,
@@ -666,7 +651,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        BLOCK_SIZE, FrameError, FrameErrorInner, PaxRecord, PaxValue,
+        BLOCK_SIZE, DEFAULT_MAX_GNU_EXTENSION_SIZE, FrameError, FrameErrorInner, PaxRecord,
+        PaxValue,
         header::{LINK_NAME_RANGE, MODE_RANGE, NAME_RANGE, PREFIX_RANGE, TYPEFLAG_OFFSET},
         stream::DataOwner,
         test_support::{
@@ -1462,6 +1448,41 @@ mod tests {
     }
 
     #[test]
+    fn resumes_cancelled_member_payload_block_during_automatic_drain() {
+        let payload = vec![b'x'; BLOCK_SIZE * 2 + 17];
+        let mut bytes = Vec::new();
+        append_posix(&mut bytes, b'0', &payload);
+        let next_member_position =
+            u64::try_from(bytes.len()).expect("test position should fit u64");
+        append_block(&mut bytes, &header(b'0', 0));
+        append_terminator(&mut bytes);
+
+        ready_ok(async {
+            let mut reader = TarReader::new(PendingOnceReader {
+                bytes,
+                position: 0,
+                pending_at: BLOCK_SIZE + 73,
+                returned_pending: false,
+            });
+            {
+                let mut member = next_member(&mut reader).await?;
+                {
+                    let mut next = std::pin::pin!(member.payload.next_block());
+                    let waker = std::task::Waker::noop();
+                    let mut context = Context::from_waker(waker);
+                    assert!(matches!(next.as_mut().poll(&mut context), Poll::Pending));
+                }
+            }
+
+            let member = next_member(&mut reader).await?;
+            assert_eq!(member.header.position, next_member_position);
+            drop(member);
+            assert!(reader.next_frame().await?.is_none());
+            Ok(())
+        });
+    }
+
+    #[test]
     fn resumes_cancelled_automatic_payload_drain() {
         let payload = vec![b'x'; BLOCK_SIZE * 2 + 17];
         let mut bytes = Vec::new();
@@ -1622,6 +1643,34 @@ mod tests {
                 },
             }) if size == DEFAULT_MAX_GNU_EXTENSION_SIZE + 1
         ));
+    }
+
+    #[test]
+    fn logical_reader_is_fused_after_oversized_gnu_extension() {
+        let payload = b"renamed\0";
+        let payload_size = u64::try_from(payload.len()).expect("payload size should fit u64");
+        let mut bytes = Vec::new();
+        append_gnu(&mut bytes, b'L', payload);
+        append_block(&mut bytes, &gnu_header(b'0', 0));
+        append_terminator(&mut bytes);
+
+        ready_ok(async {
+            let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+            reader.set_max_gnu_extension_size(payload_size - 1);
+            assert!(matches!(
+                reader.next_frame().await,
+                Err(FrameError {
+                    position: 0,
+                    inner: FrameErrorInner::ExtensionTooLarge {
+                        format: ArchiveFormat::Gnu,
+                        size,
+                        limit,
+                    },
+                }) if size == payload_size && limit == payload_size - 1
+            ));
+            assert!(reader.next_frame().await?.is_none());
+            Ok(())
+        });
     }
 
     #[test]
