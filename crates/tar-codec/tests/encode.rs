@@ -342,6 +342,37 @@ fn recursive_encoding_releases_the_blocking_pool_between_source_chunks() {
     );
 }
 
+#[test]
+fn recursive_encoding_releases_the_blocking_pool_between_traversal_batches() {
+    const DIRECTORY_COUNT: usize = 3 * 256;
+
+    let temp = tempdir().expect("temporary directory should be created");
+    let source = temp.path().join("tree");
+    std::fs::create_dir(&source).expect("source directory should be created");
+    for index in 0..DIRECTORY_COUNT {
+        std::fs::create_dir(source.join(format!("directory-{index:04}")))
+            .expect("source subdirectory should be created");
+    }
+
+    let runtime = Builder::new_current_thread()
+        .enable_time()
+        .max_blocking_threads(1)
+        .build()
+        .expect("test runtime should be created");
+    runtime.block_on(async {
+        let encoding = async {
+            let mut bytes = Vec::new();
+            let mut encoder = TarEncoder::new(&mut bytes).builder();
+            encoder.add_directory(&source).await?;
+            encoder.finish().await
+        };
+        timeout(Duration::from_secs(10), encoding)
+            .await
+            .expect("traversal backpressure should not exhaust the blocking pool")
+            .expect("directory should be encoded");
+    });
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn recursive_encoding_frames_preserved_symlinks() {

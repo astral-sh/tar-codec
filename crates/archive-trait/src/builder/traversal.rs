@@ -16,13 +16,13 @@
 //! extraction policy.
 
 use std::{
-    io, mem,
+    io,
     path::{Path, PathBuf},
 };
 
 use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinHandle};
-use walkdir::{DirEntry, WalkDir};
+use walkdir::{DirEntry, IntoIter, WalkDir};
 
 use super::SymlinkPolicy;
 use crate::name::NameValidation;
@@ -169,20 +169,21 @@ pub(crate) fn stream_directory_entries(
     };
     validate_name(&archive_path, validation, "member path")?;
     let (sender, receiver) = mpsc::channel(DIRECTORY_TRAVERSAL_BUFFER_BATCHES);
-    let task = tokio::task::spawn_blocking(move || {
-        let mut output = TraversalSender {
-            sender,
-            entries: Vec::new(),
-        };
-        stream_directory_entries_blocking(
-            &source,
-            &archive_path,
-            validation,
-            symlink_policy,
-            &mut output,
-        )?;
-        output.flush();
-        Ok(())
+    // Await channel backpressure outside the blocking pool so source
+    // preparation and asynchronous file I/O can always acquire a worker.
+    let task = tokio::spawn(async move {
+        let mut producer = TraversalProducer::new(source, archive_path, validation, symlink_policy);
+        loop {
+            let (next_producer, entries) =
+                tokio::task::spawn_blocking(move || producer.next_batch()).await??;
+            producer = next_producer;
+            let Some(entries) = entries else {
+                return Ok(());
+            };
+            if sender.send(entries).await.is_err() {
+                return Ok(());
+            }
+        }
     });
     Ok(TraversalStream {
         entries: receiver,
@@ -190,53 +191,60 @@ pub(crate) fn stream_directory_entries(
     })
 }
 
-fn stream_directory_entries_blocking(
-    source: &Path,
-    archive_path: &str,
+/// Blocking traversal state moved through one bounded worker task per batch.
+struct TraversalProducer {
+    source: PathBuf,
+    archive_path: String,
     validation: NameValidation,
     symlink_policy: SymlinkPolicy,
-    output: &mut TraversalSender,
-) -> Result<(), TraversalError> {
-    let entries = WalkDir::new(source)
-        .follow_links(false)
-        .follow_root_links(false)
-        .sort_by_file_name();
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            let path = error.path().unwrap_or(source).to_path_buf();
-            filesystem_error("traverse source directory", &path, error.into())
-        })?;
-        if !output.push(traversal_entry(
+    entries: IntoIter,
+}
+
+impl TraversalProducer {
+    fn new(
+        source: PathBuf,
+        archive_path: String,
+        validation: NameValidation,
+        symlink_policy: SymlinkPolicy,
+    ) -> Self {
+        let entries = WalkDir::new(&source)
+            .follow_links(false)
+            .follow_root_links(false)
+            .sort_by_file_name()
+            .into_iter();
+        Self {
             source,
             archive_path,
             validation,
             symlink_policy,
-            entry,
-        )?) {
-            break;
+            entries,
         }
     }
-    Ok(())
-}
 
-/// Blocking-producer state for amortized channel sends.
-struct TraversalSender {
-    sender: mpsc::Sender<Vec<TraversalEntry>>,
-    entries: Vec<TraversalEntry>,
-}
-
-impl TraversalSender {
-    fn push(&mut self, entry: TraversalEntry) -> bool {
-        self.entries.push(entry);
-        self.entries.len() < DIRECTORY_TRAVERSAL_BATCH_ENTRIES || self.flush()
-    }
-
-    fn flush(&mut self) -> bool {
-        if self.entries.is_empty() {
-            return true;
+    fn next_batch(mut self) -> Result<(Self, Option<Vec<TraversalEntry>>), TraversalError> {
+        let mut entries = Vec::with_capacity(DIRECTORY_TRAVERSAL_BATCH_ENTRIES);
+        while entries.len() < DIRECTORY_TRAVERSAL_BATCH_ENTRIES {
+            let Some(entry) = self.entries.next() else {
+                break;
+            };
+            let entry = entry.map_err(|error| {
+                let path = error.path().unwrap_or(&self.source).to_path_buf();
+                filesystem_error("traverse source directory", &path, error.into())
+            })?;
+            entries.push(traversal_entry(
+                &self.source,
+                &self.archive_path,
+                self.validation,
+                self.symlink_policy,
+                entry,
+            )?);
         }
-        let entries = mem::take(&mut self.entries);
-        self.sender.blocking_send(entries).is_ok()
+        let entries = if entries.is_empty() {
+            None
+        } else {
+            Some(entries)
+        };
+        Ok((self, entries))
     }
 }
 
