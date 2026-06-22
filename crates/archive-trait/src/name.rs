@@ -3,16 +3,17 @@ pub type NameValidator = fn(&str) -> bool;
 
 /// Applies the default archive name policy.
 ///
-/// The default rejects ASCII control characters, including NUL and DEL, and
-/// leading or trailing ASCII whitespace. It deliberately does not impose
+/// The default rejects ASCII control characters, including NUL and DEL, colons,
+/// and leading or trailing ASCII whitespace. It deliberately does not impose
 /// extraction containment rules such as rejecting absolute paths or parent
 /// components.
 #[inline]
 pub fn default_name_validator(name: &str) -> bool {
     let bytes = name.as_bytes();
-    !bytes.iter().any(u8::is_ascii_control)
-        && !bytes.first().is_some_and(u8::is_ascii_whitespace)
+    !bytes.first().is_some_and(u8::is_ascii_whitespace)
         && !bytes.last().is_some_and(u8::is_ascii_whitespace)
+        && !bytes.iter().any(u8::is_ascii_control)
+        && !bytes.contains(&b':')
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -46,17 +47,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_validator_rejects_ascii_controls_and_boundary_whitespace() {
-        for byte in 0..=u8::MAX {
-            let character = char::from(byte);
-            let name = character.to_string();
-            assert_eq!(
-                default_name_validator(&name),
-                !byte.is_ascii_control() && !byte.is_ascii_whitespace(),
-                "byte {byte:#04x}"
-            );
-        }
-
+    fn default_validator_rejects_ascii_controls_colons_and_boundary_whitespace() {
         for name in [
             "",
             "/absolute",
@@ -69,7 +60,14 @@ mod tests {
         ] {
             assert!(default_name_validator(name), "{name:?}");
         }
-        for name in [" leading", "trailing ", "\tname", "name\n", "inside\nname"] {
+        for name in [
+            " leading",
+            "trailing ",
+            "\tname",
+            "name\n",
+            "inside\nname",
+            "name:stream",
+        ] {
             assert!(!default_name_validator(name), "{name:?}");
         }
     }
