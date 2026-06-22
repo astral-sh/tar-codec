@@ -7,6 +7,7 @@ use std::{
     pin::Pin,
     rc::Rc,
     task::{Context, Poll},
+    time::Duration,
 };
 
 #[cfg(unix)]
@@ -21,7 +22,12 @@ use tar_framing::{
     write::FramingWriteError,
 };
 use tempfile::tempdir;
-use tokio::io::AsyncWrite;
+use tokio::{
+    fs::File,
+    io::{AsyncWrite, AsyncWriteExt},
+    runtime::Builder,
+    time::timeout,
+};
 
 #[derive(Default)]
 struct FailingWriter;
@@ -290,6 +296,49 @@ async fn recursive_encoding_round_trips_small_and_large_files() {
             .expect("large file metadata should be readable")
             .len(),
         LARGE_FILE_BYTES as u64
+    );
+}
+
+#[test]
+fn recursive_encoding_releases_the_blocking_pool_between_source_chunks() {
+    const LARGE_FILE_BYTES: usize = 4 * 1024 * 1024 + 17;
+
+    let temp = tempdir().expect("temporary directory should be created");
+    let source = temp.path().join("tree");
+    std::fs::create_dir(&source).expect("source directory should be created");
+    std::fs::write(source.join("large"), vec![b'x'; LARGE_FILE_BYTES])
+        .expect("large source file should be written");
+    let archive = temp.path().join("archive.tar");
+
+    let runtime = Builder::new_current_thread()
+        .enable_time()
+        .max_blocking_threads(1)
+        .build()
+        .expect("test runtime should be created");
+    runtime.block_on(async {
+        let mut writer = File::create(&archive)
+            .await
+            .expect("archive output should be created");
+        let encoding = async {
+            let mut encoder = TarEncoder::new(&mut writer).builder();
+            encoder.add_directory(&source).await?;
+            encoder.finish().await
+        };
+        timeout(Duration::from_secs(10), encoding)
+            .await
+            .expect("encoding should not exhaust the blocking pool")
+            .expect("directory should be encoded");
+        writer
+            .flush()
+            .await
+            .expect("archive output should be flushed");
+    });
+
+    assert!(
+        std::fs::metadata(archive)
+            .expect("archive metadata should be readable")
+            .len()
+            > LARGE_FILE_BYTES as u64
     );
 }
 
