@@ -10,7 +10,7 @@ use archive_trait::{
 use tempfile::tempdir;
 use thiserror::Error;
 
-const LARGE_FILE_BYTES: usize = 1024 * 1024 + 17;
+const LARGE_FILE_BYTES: usize = 2 * 1024 * 1024 + 17;
 const BATCHED_FILE_BYTES: usize = 512 * 1024 + 17;
 
 #[derive(Debug, Eq, PartialEq)]

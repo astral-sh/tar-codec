@@ -21,10 +21,11 @@ pub use self::traversal::TraversalError;
 use self::traversal::{TraversalEntry, TraversalKind, TraversalStream, stream_directory_entries};
 use crate::{NameValidator, name::NameValidation};
 
-const SOURCE_FILE_CHUNK_BYTES: usize = 1024 * 1024;
+const BUFFERED_SOURCE_FILE_BYTES: usize = 1024 * 1024;
+const SOURCE_FILE_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 // A preparation batch may exceed this target by one buffered file, so its
 // payload storage remains below twice this value.
-const SOURCE_FILE_PREPARATION_BATCH_BYTES: usize = SOURCE_FILE_CHUNK_BYTES;
+const SOURCE_FILE_PREPARATION_BATCH_BYTES: usize = BUFFERED_SOURCE_FILE_BYTES;
 
 /// Minimal regular-file metadata accepted by [`Builder::add_entry`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -651,7 +652,7 @@ fn prepare_regular_file(
     }
     let size = metadata.len();
     let executable = is_executable(&metadata);
-    if size > SOURCE_FILE_CHUNK_BYTES as u64 {
+    if size > BUFFERED_SOURCE_FILE_BYTES as u64 {
         return Ok((
             PreparedTraversalKind::StreamingFile {
                 file,
