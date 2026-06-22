@@ -7,7 +7,10 @@ use support::EntryKind;
 use support::{ArchiveBuilder, ArchiveFormat, header, pax_record, single_posix_member};
 #[cfg(unix)]
 use tar_codec::extract::LinkPolicy;
-use tar_codec::{Archive as _, DecodeError, ExtractError, TarArchive, extract::ExtractPolicy};
+use tar_codec::{
+    Archive as _, DecodeError, ExtractError, ExtractPolicyViolation, TarArchive,
+    extract::ExtractPolicy,
+};
 use tar_framing::{FrameError, FrameErrorInner, PaxKeyword, UstarKind};
 use tempfile::tempdir;
 
@@ -27,10 +30,6 @@ async fn extracts_files_directories_large_payloads_and_archive_path_syntax() {
         .posix("empty/", b'5', b"", "", 0o755)
         .posix(".", b'5', b"", "", 0o755)
         .posix("large", b'0', &large_payload, "", 0o644);
-    #[cfg(unix)]
-    archive
-        .posix("tests/snippets/ballon:main.py", b'0', b"ok", "", 0o644)
-        .posix("C:/target", b'0', b"ok", "", 0o644);
     let bytes = archive.finish();
 
     std::fs::create_dir_all(destination.join("large")).unwrap();
@@ -56,13 +55,34 @@ async fn extracts_files_directories_large_payloads_and_archive_path_syntax() {
                 & 0o111,
             0
         );
-        for path in ["tests/snippets/ballon:main.py", "C:/target"] {
-            assert_eq!(
-                std::fs::read_to_string(destination.join(path)).unwrap(),
-                "ok"
-            );
-        }
     }
+}
+
+#[tokio::test]
+async fn default_name_policy_rejects_colons_in_regular_file_paths() {
+    let bytes = single_posix_member("file:stream", b'0', b"contents", "", 0o644);
+    let temp = tempdir().expect("temporary directory should be created");
+    let destination = temp.path().join("out");
+
+    assert!(matches!(
+        TarArchive::new(bytes.as_slice())
+            .extract_in(&destination, ExtractPolicy::default())
+            .await,
+        Err(ExtractError::PolicyViolation {
+            position: 0,
+            violation: ExtractPolicyViolation::NameRejected {
+                context: "member path",
+                value,
+            },
+        }) if value == "file:stream"
+    ));
+    assert!(destination.is_dir());
+    assert!(
+        std::fs::read_dir(destination)
+            .expect("destination should be readable")
+            .next()
+            .is_none()
+    );
 }
 
 /// Ensures that we reject a directory entry with a declared size that embeds a regular file.
