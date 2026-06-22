@@ -7,9 +7,10 @@ mod traversal;
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::{self, Read},
     mem,
+    ops::Range,
     path::{Path, PathBuf},
 };
 
@@ -21,6 +22,9 @@ use self::traversal::{TraversalEntry, TraversalKind, TraversalStream, stream_dir
 use crate::{NameValidator, name::NameValidation};
 
 const SOURCE_FILE_CHUNK_BYTES: usize = 1024 * 1024;
+// A preparation batch may exceed this target by one buffered file, so its
+// payload storage remains below twice this value.
+const SOURCE_FILE_PREPARATION_BATCH_BYTES: usize = SOURCE_FILE_CHUNK_BYTES;
 
 /// Minimal regular-file metadata accepted by [`Builder::add_entry`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -430,70 +434,132 @@ async fn write_directory_entries<B: ArchiveBuilder>(
     traversal: &mut DirectoryBuild,
 ) -> Result<(), BuildFailure<B::Error>> {
     while let Some(entries) = entries.recv().await {
-        for entry in entries {
-            match entry.kind {
-                TraversalKind::Directory => {
-                    reserve_entry(
-                        &mut traversal.entries,
-                        &entry.archive_path,
-                        ArchivedEntry::Directory { explicit: true },
-                    )
-                    .map_err(BuildFailure::recoverable)?;
-                    builder.write_directory_member(&entry.archive_path).await?;
-                }
-                TraversalKind::Regular => {
-                    reserve_entry(
-                        &mut traversal.entries,
-                        &entry.archive_path,
-                        ArchivedEntry::NonDirectory,
-                    )
-                    .map_err(BuildFailure::recoverable)?;
-                    write_source_file(builder, &entry, traversal).await?;
-                }
-                TraversalKind::SymbolicLink { target } => {
-                    reserve_entry(
-                        &mut traversal.entries,
-                        &entry.archive_path,
-                        ArchivedEntry::NonDirectory,
-                    )
-                    .map_err(BuildFailure::recoverable)?;
-                    builder
-                        .write_symbolic_link_member(&entry.archive_path, &target)
-                        .await?;
-                }
-            }
-            traversal.emitted = true;
+        let mut entries = VecDeque::from(entries);
+        while !entries.is_empty() {
+            let buffer = mem::take(&mut traversal.source_buffer);
+            let (prepared, remaining) = prepare_directory_entries(entries, buffer)
+                .await
+                .map_err(SourceError::into_build_error)
+                .map_err(BuildFailure::recoverable)?;
+            entries = remaining;
+            let PreparedDirectoryBatch {
+                entries: prepared_entries,
+                mut buffer,
+            } = prepared;
+            let result =
+                write_prepared_directory_entries(builder, prepared_entries, &mut buffer, traversal)
+                    .await;
+            traversal.source_buffer = buffer;
+            result?;
         }
     }
     Ok(())
 }
 
-async fn write_source_file<B: ArchiveBuilder>(
+async fn write_prepared_directory_entries<B: ArchiveBuilder>(
     builder: &mut B,
-    entry: &TraversalEntry,
+    entries: Vec<PreparedTraversalEntry>,
+    buffer: &mut Vec<u8>,
     traversal: &mut DirectoryBuild,
 ) -> Result<(), BuildFailure<B::Error>> {
-    let buffer = mem::take(&mut traversal.source_buffer);
-    let (mut payload, executable) = prepare_source_file(&entry.source, buffer)
-        .await
-        .map_err(SourceError::into_build_error)
-        .map_err(BuildFailure::recoverable)?;
-    let metadata = EntryMetadata::default().executable(executable);
-    let result = builder
-        .write_file_member(&entry.archive_path, &mut payload, metadata)
-        .await;
-    traversal.source_buffer = match payload.inner {
-        EntryPayloadInner::Buffered {
-            data: Cow::Owned(buffer),
-            ..
+    for entry in entries {
+        match entry.kind {
+            PreparedTraversalKind::Directory => {
+                reserve_entry(
+                    &mut traversal.entries,
+                    &entry.archive_path,
+                    ArchivedEntry::Directory { explicit: true },
+                )
+                .map_err(BuildFailure::recoverable)?;
+                builder.write_directory_member(&entry.archive_path).await?;
+            }
+            PreparedTraversalKind::BufferedFile {
+                range,
+                size,
+                executable,
+            } => {
+                reserve_entry(
+                    &mut traversal.entries,
+                    &entry.archive_path,
+                    ArchivedEntry::NonDirectory,
+                )
+                .map_err(BuildFailure::recoverable)?;
+                let data = buffer.get(range).ok_or_else(|| {
+                    BuildFailure::recoverable(arithmetic_overflow(
+                        "prepared source file buffer range",
+                    ))
+                })?;
+                let mut payload = EntryPayload {
+                    size,
+                    inner: EntryPayloadInner::Buffered {
+                        data: Cow::Borrowed(data),
+                        yielded: false,
+                    },
+                };
+                builder
+                    .write_file_member(
+                        &entry.archive_path,
+                        &mut payload,
+                        EntryMetadata::default().executable(executable),
+                    )
+                    .await?;
+            }
+            PreparedTraversalKind::StreamingFile {
+                file,
+                path,
+                size,
+                executable,
+            } => {
+                reserve_entry(
+                    &mut traversal.entries,
+                    &entry.archive_path,
+                    ArchivedEntry::NonDirectory,
+                )
+                .map_err(BuildFailure::recoverable)?;
+                let mut payload = EntryPayload {
+                    size,
+                    inner: EntryPayloadInner::Streaming {
+                        file: tokio::fs::File::from_std(file),
+                        path,
+                        buffer: mem::take(buffer),
+                        remaining: size,
+                    },
+                };
+                let result = builder
+                    .write_file_member(
+                        &entry.archive_path,
+                        &mut payload,
+                        EntryMetadata::default().executable(executable),
+                    )
+                    .await;
+                *buffer = match payload.inner {
+                    EntryPayloadInner::Buffered {
+                        data: Cow::Owned(buffer),
+                        ..
+                    }
+                    | EntryPayloadInner::Streaming { buffer, .. } => buffer,
+                    EntryPayloadInner::Buffered {
+                        data: Cow::Borrowed(_),
+                        ..
+                    } => Vec::new(),
+                };
+                result?;
+            }
+            PreparedTraversalKind::SymbolicLink { target } => {
+                reserve_entry(
+                    &mut traversal.entries,
+                    &entry.archive_path,
+                    ArchivedEntry::NonDirectory,
+                )
+                .map_err(BuildFailure::recoverable)?;
+                builder
+                    .write_symbolic_link_member(&entry.archive_path, &target)
+                    .await?;
+            }
         }
-        | EntryPayloadInner::Streaming { buffer, .. } => buffer,
-        EntryPayloadInner::Buffered {
-            data: Cow::Borrowed(_),
-            ..
-        } => Vec::new(),
-    };
-    result
+        traversal.emitted = true;
+    }
+    Ok(())
 }
 
 struct DirectoryBuild {
@@ -502,51 +568,121 @@ struct DirectoryBuild {
     emitted: bool,
 }
 
-async fn prepare_source_file(
-    path: &Path,
+struct PreparedDirectoryBatch {
+    entries: Vec<PreparedTraversalEntry>,
+    buffer: Vec<u8>,
+}
+
+struct PreparedTraversalEntry {
+    archive_path: String,
+    kind: PreparedTraversalKind,
+}
+
+enum PreparedTraversalKind {
+    Directory,
+    BufferedFile {
+        range: Range<usize>,
+        size: u64,
+        executable: bool,
+    },
+    StreamingFile {
+        file: std::fs::File,
+        path: PathBuf,
+        size: u64,
+        executable: bool,
+    },
+    SymbolicLink {
+        target: String,
+    },
+}
+
+async fn prepare_directory_entries(
+    mut entries: VecDeque<TraversalEntry>,
     mut buffer: Vec<u8>,
-) -> Result<(EntryPayload<'static>, bool), SourceError> {
-    let path = path.to_path_buf();
+) -> Result<(PreparedDirectoryBatch, VecDeque<TraversalEntry>), SourceError> {
     tokio::task::spawn_blocking(move || {
-        let file = std::fs::File::open(&path)
-            .map_err(|source| SourceError::filesystem("open source file", &path, source))?;
-        let metadata = file
-            .metadata()
-            .map_err(|source| SourceError::filesystem("inspect source file", &path, source))?;
-        if !metadata.is_file() {
-            return Err(SourceError::filesystem(
-                "inspect source file",
-                &path,
-                io::Error::other("source is not a regular file"),
-            ));
+        buffer.clear();
+        let mut prepared = Vec::with_capacity(entries.len());
+        while let Some(entry) = entries.pop_front() {
+            let TraversalEntry {
+                source,
+                archive_path,
+                kind,
+            } = entry;
+            let (kind, batch_complete) = match kind {
+                TraversalKind::Directory => (PreparedTraversalKind::Directory, false),
+                TraversalKind::Regular => prepare_regular_file(source, &mut buffer)?,
+                TraversalKind::SymbolicLink { target } => {
+                    (PreparedTraversalKind::SymbolicLink { target }, false)
+                }
+            };
+            prepared.push(PreparedTraversalEntry { archive_path, kind });
+            if batch_complete {
+                break;
+            }
         }
-        let size = metadata.len();
-        let executable = is_executable(&metadata);
-        let inner = if size > SOURCE_FILE_CHUNK_BYTES as u64 {
-            EntryPayloadInner::Streaming {
-                file: tokio::fs::File::from_std(file),
-                path,
+        Ok((
+            PreparedDirectoryBatch {
+                entries: prepared,
                 buffer,
-                remaining: size,
-            }
-        } else {
-            let payload_size =
-                usize::try_from(size).map_err(|_| SourceError::ArithmeticOverflow {
-                    context: "buffered source file size",
-                })?;
-            buffer.resize(payload_size, 0);
-            (&file)
-                .read_exact(&mut buffer)
-                .map_err(|source| SourceError::filesystem("read source file", &path, source))?;
-            EntryPayloadInner::Buffered {
-                data: Cow::Owned(buffer),
-                yielded: false,
-            }
-        };
-        Ok((EntryPayload { size, inner }, executable))
+            },
+            entries,
+        ))
     })
     .await
     .map_err(SourceError::BlockingTask)?
+}
+
+fn prepare_regular_file(
+    path: PathBuf,
+    buffer: &mut Vec<u8>,
+) -> Result<(PreparedTraversalKind, bool), SourceError> {
+    let file = std::fs::File::open(&path)
+        .map_err(|source| SourceError::filesystem("open source file", &path, source))?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| SourceError::filesystem("inspect source file", &path, source))?;
+    if !metadata.is_file() {
+        return Err(SourceError::filesystem(
+            "inspect source file",
+            &path,
+            io::Error::other("source is not a regular file"),
+        ));
+    }
+    let size = metadata.len();
+    let executable = is_executable(&metadata);
+    if size > SOURCE_FILE_CHUNK_BYTES as u64 {
+        return Ok((
+            PreparedTraversalKind::StreamingFile {
+                file,
+                path,
+                size,
+                executable,
+            },
+            true,
+        ));
+    }
+    let payload_size = usize::try_from(size).map_err(|_| SourceError::ArithmeticOverflow {
+        context: "buffered source file size",
+    })?;
+    let start = buffer.len();
+    let end = start
+        .checked_add(payload_size)
+        .ok_or(SourceError::ArithmeticOverflow {
+            context: "buffered source batch size",
+        })?;
+    buffer.resize(end, 0);
+    (&file)
+        .read_exact(&mut buffer[start..end])
+        .map_err(|source| SourceError::filesystem("read source file", &path, source))?;
+    Ok((
+        PreparedTraversalKind::BufferedFile {
+            range: start..end,
+            size,
+            executable,
+        },
+        buffer.len() >= SOURCE_FILE_PREPARATION_BATCH_BYTES,
+    ))
 }
 
 enum SourceError {

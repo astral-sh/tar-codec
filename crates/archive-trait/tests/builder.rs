@@ -11,6 +11,7 @@ use tempfile::tempdir;
 use thiserror::Error;
 
 const LARGE_FILE_BYTES: usize = 1024 * 1024 + 17;
+const BATCHED_FILE_BYTES: usize = 512 * 1024 + 17;
 
 #[derive(Debug, Eq, PartialEq)]
 enum RecordedEntry {
@@ -287,11 +288,51 @@ async fn recursive_build_is_sorted_and_streams_small_and_large_files() {
         RecordedEntry::File { path, data, chunks, .. }
             if path == "tree/sub/large" && data.len() == LARGE_FILE_BYTES && *chunks == 2
     )));
+    assert!(entries.iter().any(|entry| matches!(
+        entry,
+        RecordedEntry::File { path, data, chunks, .. }
+            if path == "tree/z" && data == b"last" && *chunks == 1
+    )));
     #[cfg(unix)]
     assert!(entries.iter().any(|entry| matches!(
         entry,
         RecordedEntry::File { path, executable: true, .. } if path == "tree/a"
     )));
+}
+
+#[tokio::test]
+async fn recursive_build_preserves_buffered_files_across_preparation_batches() {
+    let temp = tempdir().expect("temporary directory should be created");
+    let source = temp.path().join("batched");
+    std::fs::create_dir(&source).expect("source directory should be created");
+    for (name, byte) in [("a", b'a'), ("b", b'b'), ("c", b'c')] {
+        std::fs::write(source.join(name), vec![byte; BATCHED_FILE_BYTES])
+            .expect("buffered source file should be written");
+    }
+
+    let format = MockFormat::new();
+    let entries = format.entries();
+    format
+        .builder()
+        .add_directory(&source)
+        .await
+        .expect("directory should be added");
+
+    let entries = entries.borrow();
+    for (name, byte) in [("a", b'a'), ("b", b'b'), ("c", b'c')] {
+        let path = format!("batched/{name}");
+        assert!(entries.iter().any(|entry| matches!(
+            entry,
+            RecordedEntry::File {
+                path: actual_path,
+                data,
+                chunks: 1,
+                ..
+            } if actual_path == &path
+                && data.len() == BATCHED_FILE_BYTES
+                && data.iter().all(|actual| *actual == byte)
+        )));
+    }
 }
 
 #[cfg(unix)]
