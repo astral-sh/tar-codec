@@ -726,6 +726,25 @@ mod tests {
     }
 
     #[test]
+    fn preserves_ustar_separator_when_name_is_empty() {
+        let mut ustar_header = header(b'5', 0);
+        set_field(&mut ustar_header, NAME_RANGE, b"");
+        set_field(&mut ustar_header, PREFIX_RANGE, b"victim");
+        set_checksum(&mut ustar_header);
+
+        ready_ok(async {
+            let mut bytes = Vec::new();
+            append_block(&mut bytes, &ustar_header);
+            append_terminator(&mut bytes);
+            let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+            let member = next_member(&mut reader).await?;
+            assert_eq!(member.header.header_path, b"victim/");
+            assert_eq!(member.effective_path()?.as_ref(), b"victim/");
+            Ok(())
+        });
+    }
+
+    #[test]
     fn keeps_borrowed_header_metadata_available_while_streaming_payload() {
         let mut member_header = header(b'0', 1);
         set_field(&mut member_header, NAME_RANGE, b"file");

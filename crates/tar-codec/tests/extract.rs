@@ -4,7 +4,9 @@ use std::path::Path;
 
 #[cfg(unix)]
 use support::EntryKind;
-use support::{ArchiveBuilder, ArchiveFormat, header, pax_record, single_posix_member};
+use support::{
+    ArchiveBuilder, ArchiveFormat, header, pax_record, set_ustar_path, single_posix_member,
+};
 #[cfg(unix)]
 use tar_codec::extract::LinkPolicy;
 use tar_codec::{
@@ -179,6 +181,49 @@ async fn accepts_directory_required_suffix_on_directory_members() {
             .expect("directory member should be extracted");
         assert!(destination.join("directory").is_dir());
     }
+}
+
+#[tokio::test]
+async fn prefix_only_ustar_paths_are_directory_required() {
+    let temp = tempdir().expect("temporary directory should be created");
+
+    let mut directory_header = header(ArchiveFormat::Pax, "ignored", b'5', 0, "", 0o755);
+    set_ustar_path(&mut directory_header, "victim", "");
+    let mut directory_archive = ArchiveBuilder::new();
+    directory_archive.block(&directory_header);
+    let directory_bytes = directory_archive.finish();
+    let directory_destination = temp.path().join("directory");
+    TarArchive::new(directory_bytes.as_slice())
+        .extract_in(&directory_destination, ExtractPolicy::default())
+        .await
+        .expect("prefix-only directory member should be extracted");
+    assert!(directory_destination.join("victim").is_dir());
+
+    let mut file_header = header(ArchiveFormat::Pax, "ignored", b'0', 0, "", 0o644);
+    set_ustar_path(&mut file_header, "victim", "");
+    let mut file_archive = ArchiveBuilder::new();
+    file_archive.block(&file_header);
+    let file_bytes = file_archive.finish();
+    let file_destination = temp.path().join("file");
+    std::fs::create_dir(&file_destination).expect("destination should be created");
+    std::fs::write(file_destination.join("victim"), b"keep")
+        .expect("existing file should be written");
+    assert!(matches!(
+        TarArchive::new(file_bytes.as_slice())
+            .extract_in(&file_destination, ExtractPolicy::default())
+            .await,
+        Err(ExtractError::UnsafePath {
+            position: 0,
+            context: "member path",
+            value,
+            reason: "only a directory may have a directory-required path suffix",
+        }) if value == "victim/"
+    ));
+    assert_eq!(
+        std::fs::read(file_destination.join("victim"))
+            .expect("existing file should remain readable"),
+        b"keep"
+    );
 }
 
 #[tokio::test]

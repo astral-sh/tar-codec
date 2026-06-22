@@ -169,9 +169,7 @@ impl HeaderFrame {
         let prefix = trim_nul(&self.block[PREFIX_RANGE]);
         if !prefix.is_empty() {
             path.extend_from_slice(prefix);
-            if !name.is_empty() {
-                path.push(b'/');
-            }
+            path.push(b'/');
         }
         path.extend_from_slice(name);
     }

@@ -2,7 +2,7 @@ use tar_framing::{
     BLOCK_SIZE, Block, PaxKeyword,
     header::{
         CHECKSUM_RANGE, GNU_IDENTITY, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE, NAME_RANGE,
-        SIZE_RANGE, TYPEFLAG_OFFSET, USTAR_IDENTITY,
+        PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, USTAR_IDENTITY,
     },
     write::append_pax_record,
 };
@@ -147,6 +147,14 @@ pub fn set_checksum(block: &mut Block) {
 
 pub fn set_identity_byte(block: &mut Block, index: usize, byte: u8) {
     block[IDENTITY_RANGE.start + index] = byte;
+}
+
+pub fn set_ustar_path(block: &mut Block, prefix: &str, name: &str) {
+    block[NAME_RANGE].fill(0);
+    set_text(&mut block[NAME_RANGE], name);
+    block[PREFIX_RANGE].fill(0);
+    set_text(&mut block[PREFIX_RANGE], prefix);
+    set_checksum(block);
 }
 
 pub fn pax_record(keyword: PaxKeyword, value: &str) -> Vec<u8> {

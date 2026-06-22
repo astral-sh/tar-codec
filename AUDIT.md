@@ -16,7 +16,7 @@ as its conformance baseline.
 | AUDIT-02 | High | Encoding | Deep manual builder paths cause quadratic time and memory | Fixed |
 | AUDIT-03 | Medium | Extraction | Directory-to-file replacement is quadratic | Fixed with AUDIT-01 |
 | AUDIT-04 | Medium | Decoding policy | Global pax policy can be bypassed after a recoverable error | Fixed |
-| AUDIT-05 | Medium | Pax decoding | Empty ustar `name` loses the separator after `prefix` | Open |
+| AUDIT-05 | Medium | Pax decoding | Empty ustar `name` loses the separator after `prefix` | Fixed |
 | AUDIT-06 | Medium | Pax encoding | Encoded `devmajor` and `devminor` fields are invalid | Open |
 | AUDIT-07 | Medium | Pax decoding | Ordinary ustar headers are incompletely validated | Open |
 | AUDIT-08 | Medium | Pax decoding | Retaining a prior `PaxState` makes global updates quadratic | Open |
@@ -204,6 +204,12 @@ errors, or validate active global state on every member.
 
 Severity: **Medium**  
 Security property: ambiguous or malformed pax streams must be rejected instead of reinterpreted
+
+Status: **Fixed.** Ustar path reconstruction now appends the required `/`
+whenever `prefix` is nonempty, including when `name` is empty. Prefix-only
+directory members remain accepted as required by POSIX, while the extraction
+policy rejects the resulting directory-required suffix for regular files and
+other non-directory members. Regression tests cover both outcomes.
 
 Affected code:
 
