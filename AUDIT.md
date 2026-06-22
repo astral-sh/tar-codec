@@ -13,7 +13,7 @@ as its conformance baseline.
 | ID | Severity | Area | Finding | Status |
 | --- | --- | --- | --- | --- |
 | AUDIT-01 | High | Extraction | Deep paths cause quadratic time and memory | Fixed |
-| AUDIT-02 | High | Encoding | Deep manual builder paths cause quadratic time and memory | Open |
+| AUDIT-02 | High | Encoding | Deep manual builder paths cause quadratic time and memory | Fixed |
 | AUDIT-03 | Medium | Extraction | Directory-to-file replacement is quadratic | Fixed with AUDIT-01 |
 | AUDIT-04 | Medium | Decoding policy | Global pax policy can be bypassed after a recoverable error | Open |
 | AUDIT-05 | Medium | Pax decoding | Empty ustar `name` loses the separator after `prefix` | Open |
@@ -29,10 +29,11 @@ as its conformance baseline.
 Severity: **High**  
 Security property: decoding must remain linear in time and memory
 
-Status: **Fixed.** Extraction state now uses a component tree with stable node
-IDs, stores each path component once, and attaches full diagnostic paths only
-to errors that are returned. A deep ambient-path integration test exercises
-the expected create-error path without relying on platform `PATH_MAX` limits.
+Status: **Fixed.** Extraction now keeps normalized archive paths in UTF-8 and
+uses a component tree with stable node IDs, storing each path component once.
+Full native paths are attached only to errors that are returned. A deep
+ambient-path integration test exercises the expected create-error path without
+relying on platform `PATH_MAX` limits.
 
 Affected code:
 
@@ -67,6 +68,12 @@ path-state bytes or counted path work remain O(L).
 
 Severity: **High**  
 Security property: encoding must remain linear in time and memory
+
+Status: **Fixed.** Builder collision state now uses the component tree shared
+with extraction, while preserving literal `/`-separated archive path identity.
+Manual entries preflight without mutation and commit their component nodes only
+after the format hook succeeds. Whole-state cloning by `add_directory()` remains
+tracked separately as AUDIT-09.
 
 Affected code:
 
