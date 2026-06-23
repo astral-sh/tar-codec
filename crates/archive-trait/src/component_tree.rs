@@ -13,7 +13,7 @@ pub(crate) const ROOT_NODE: NodeId = NodeId(0);
 ///
 /// Component text lives in the parent node's `children` map, so a path with N
 /// components retains N component names rather than N complete textual prefixes.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct ComponentNode<C, S> {
     parent: Option<NodeId>,
     state: Option<S>,
@@ -42,7 +42,7 @@ impl<C, S> ComponentNode<C, S> {
 }
 
 /// Path state stored as an arena of component edges and stable node IDs.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct ComponentTree<C, S> {
     nodes: Vec<ComponentNode<C, S>>,
 }

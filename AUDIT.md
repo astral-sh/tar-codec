@@ -19,8 +19,8 @@ as its conformance baseline.
 | AUDIT-05 | Medium | Pax decoding | Empty ustar `name` loses the separator after `prefix` | Fixed |
 | AUDIT-06 | Low | Pax encoding | Encoded `devmajor` and `devminor` fields are invalid | Fixed |
 | AUDIT-07 | Medium | Pax decoding | Ordinary ustar headers are incompletely validated | Fixed |
-| AUDIT-08 | Medium | Pax decoding | Retaining a prior `PaxState` makes global updates quadratic | Open |
-| AUDIT-09 | Medium | Encoding | Repeated `add_directory()` calls clone collision state quadratically | Open |
+| AUDIT-08 | Medium | Pax decoding | Retaining a prior `PaxState` makes global updates quadratic | Fixed |
+| AUDIT-09 | Medium | Encoding | Repeated `add_directory()` calls clone collision state quadratically | Fixed |
 
 ## Confirmed findings
 
@@ -303,6 +303,15 @@ all non-overridden fields before emitting a member frame.
 Severity: **Medium**  
 Security property: consumer-facing decoding APIs must remain linear
 
+Status: **Fixed.** `PaxState` is now a borrowed per-member view of the logical
+reader's effective global records. Retaining that view keeps `TarReader`
+borrowed, so the type system prevents the reader from advancing to a global
+update until the view is dropped. Both the physical stream and logical reader
+now update ordinary owned global-record maps in place; no copy-on-write snapshot
+can clone accumulated state. The logical reader keeps its map separate from the
+physical stream so member payloads remain independently streamable while the
+metadata view is alive.
+
 Affected code:
 
 - [`crates/tar-framing/src/pax.rs`](crates/tar-framing/src/pax.rs), global state around lines 146-165, snapshots around lines 215-235, and `Arc::make_mut()` around lines 594-597
@@ -334,6 +343,14 @@ state, or otherwise prevent each snapshot update from cloning all prior state.
 
 Severity: **Medium**  
 Security property: encoding must remain linear in time
+
+Status: **Fixed.** Recursive directory traversal now borrows the builder's live
+component tree instead of cloning it. Every manual or recursive member uses the
+same read-only collision preflight, backend write, and post-success commit
+sequence. A recoverable failure before the first emitted member therefore
+leaves collision state untouched, while later failures retain the existing
+poisoning behavior. The component tree is no longer clonable, and regressions
+cover both first-write rollback and repeated empty-directory additions.
 
 Affected code:
 

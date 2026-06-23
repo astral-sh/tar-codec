@@ -90,7 +90,7 @@ use crate::{
         MODE_RANGE, MTIME_RANGE, NAME_RANGE, PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, UID_RANGE,
         UNAME_RANGE, USTAR_IDENTITY, checksum, parse_number, parse_octal,
     },
-    pax::{GlobalPaxRecords, PaxRecords, SharedGlobalPaxRecords, SharedPaxRecords},
+    pax::{GlobalPaxRecords, PaxRecords, SharedPaxRecords},
 };
 
 type PositionedBlock = (u64, Block);
@@ -303,7 +303,7 @@ pub struct TarStream<R> {
     pub(super) block_len: usize,
     pub(super) format: Option<ArchiveFormat>,
     /// The currently effective global pax records, if any.
-    pub(super) global_pax_records: Option<SharedGlobalPaxRecords>,
+    pub(super) global_pax_records: Option<GlobalPaxRecords>,
     max_pax_extension_size: u64,
     max_global_pax_extensions_size: u64,
     global_pax_extensions_size: u64,
@@ -366,10 +366,6 @@ impl<R> TarStream<R> {
     /// Returns the selected archive family after the first header is read.
     pub fn format(&self) -> Option<ArchiveFormat> {
         self.format
-    }
-
-    pub(crate) fn global_pax_records(&self) -> Option<SharedGlobalPaxRecords> {
-        self.global_pax_records.clone()
     }
 }
 
@@ -749,7 +745,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                         PaxRecords::parse(
                             &payload,
                             self.global_pax_records
-                                .as_deref()
+                                .as_ref()
                                 .map_or(HdrCharset::Utf8, GlobalPaxRecords::hdrcharset),
                         )
                         .map_err(|source| {
@@ -1002,11 +998,11 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             position,
             &block,
             local_pax_records.as_deref(),
-            self.global_pax_records.as_deref(),
+            self.global_pax_records.as_ref(),
         )?;
         let effective_size = PaxState::effective_size(
             local_pax_records.as_deref(),
-            self.global_pax_records.as_deref(),
+            self.global_pax_records.as_ref(),
         )
         .map_or(Ok(parsed.size), |size| match size {
             PaxValue::Value(size) => Ok(*size),
