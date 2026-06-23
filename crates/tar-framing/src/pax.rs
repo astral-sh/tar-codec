@@ -61,7 +61,6 @@ pub enum PaxError {
 }
 
 pub(crate) type SharedPaxRecords = Arc<PaxRecords>;
-pub(crate) type SharedGlobalPaxRecords = Arc<GlobalPaxRecords>;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PaxRecords(Vec<PaxRecord>);
@@ -146,7 +145,7 @@ impl fmt::Display for PaxKeyword {
 /// Like [`PaxRecords`], but with an additional index of `keyword -> effective record index`
 /// to keep lookups cheap, even across pathological pax archives (e.g. multiple
 /// global extensions being merged together).
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Debug, Default, Eq, PartialEq)]
 pub(crate) struct GlobalPaxRecords {
     records: PaxRecords,
     indices: HashMap<PaxKeyword, usize>,
@@ -215,16 +214,19 @@ impl PaxExtension {
 /// Effective values apply local records over the active global state using
 /// standard last-record-wins and deletion semantics. [`Self::extensions`]
 /// retains the positioned extension headers newly encountered for this member.
+/// The effective global state is borrowed from the originating logical reader,
+/// so retaining this view also prevents that reader from advancing to another
+/// member whose global state could differ.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PaxState {
-    global_records: Option<SharedGlobalPaxRecords>,
+pub struct PaxState<'global> {
+    global_records: Option<&'global GlobalPaxRecords>,
     global_extensions: Vec<PaxExtension>,
     local_extension: Option<PaxExtension>,
 }
 
-impl PaxState {
+impl<'global> PaxState<'global> {
     pub(crate) fn new(
-        global_records: Option<SharedGlobalPaxRecords>,
+        global_records: Option<&'global GlobalPaxRecords>,
         global_extensions: Vec<PaxExtension>,
         local_extension: Option<PaxExtension>,
     ) -> Self {
@@ -251,13 +253,13 @@ impl PaxState {
             .local_extension
             .as_ref()
             .map(|extension| extension.records.as_ref());
-        Self::effective_record_from(local_records, self.global_records.as_deref(), keyword)
+        Self::effective_record_from(local_records, self.global_records, keyword)
     }
 
-    pub(super) fn effective_size<'a>(
-        local_records: Option<&'a PaxRecords>,
-        global_records: Option<&'a GlobalPaxRecords>,
-    ) -> Option<&'a PaxValue<u64>> {
+    pub(super) fn effective_size<'records>(
+        local_records: Option<&'records PaxRecords>,
+        global_records: Option<&'records GlobalPaxRecords>,
+    ) -> Option<&'records PaxValue<u64>> {
         Self::effective_record_from(local_records, global_records, &PaxKeyword::Size).and_then(
             |record| match record {
                 PaxRecord::Size(value) => Some(value),
@@ -266,11 +268,11 @@ impl PaxState {
         )
     }
 
-    fn effective_record_from<'a>(
-        local_records: Option<&'a PaxRecords>,
-        global_records: Option<&'a GlobalPaxRecords>,
+    pub(super) fn effective_record_from<'records>(
+        local_records: Option<&'records PaxRecords>,
+        global_records: Option<&'records GlobalPaxRecords>,
         keyword: &PaxKeyword,
-    ) -> Option<&'a PaxRecord> {
+    ) -> Option<&'records PaxRecord> {
         local_records
             .and_then(|records| records.get(keyword))
             .or_else(|| global_records.and_then(|records| records.get(keyword)))
@@ -591,9 +593,8 @@ impl PaxRecords {
             .find(|record| record.keyword() == *keyword)
     }
 
-    pub(super) fn apply_global(&self, active: &mut Option<SharedGlobalPaxRecords>) {
-        let active = active.get_or_insert_with(|| Arc::new(GlobalPaxRecords::default()));
-        Arc::make_mut(active).apply(self);
+    pub(super) fn apply_global(&self, active: &mut Option<GlobalPaxRecords>) {
+        active.get_or_insert_default().apply(self);
     }
 }
 
@@ -679,6 +680,8 @@ fn decimal_u64(value: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::ptr;
+
     use super::*;
     use crate::test_support::{raw_record, record};
 
@@ -713,7 +716,7 @@ mod tests {
         }
     }
 
-    fn global_state(records: Vec<PaxRecord>) -> Option<SharedGlobalPaxRecords> {
+    fn global_state(records: Vec<PaxRecord>) -> Option<GlobalPaxRecords> {
         let mut active = None;
         PaxRecords(records).apply_global(&mut active);
         active
@@ -764,8 +767,9 @@ mod tests {
                 expected: Some(PaxRecord::Comment(PaxValue::Deleted)),
             },
         ] {
+            let global = global_state(case.global);
             let state = PaxState::new(
-                global_state(case.global),
+                global.as_ref(),
                 Vec::new(),
                 case.local
                     .map(|records| extension(0, PaxKind::Local, records)),
@@ -804,56 +808,16 @@ mod tests {
     }
 
     #[test]
-    fn shares_unchanged_global_state_and_copies_on_write() {
-        let initial = Arc::new(PaxRecords(vec![comment("initial")]));
-        let mut active = None;
-        initial.apply_global(&mut active);
-        let first_snapshot = active.clone().expect("global state should exist");
-
-        let first_state = PaxState::new(Some(first_snapshot.clone()), Vec::new(), None);
-        let second_state = PaxState::new(active.clone(), Vec::new(), None);
-        assert!(Arc::ptr_eq(
-            first_state
-                .global_records
-                .as_ref()
-                .expect("global state should exist"),
-            second_state
-                .global_records
-                .as_ref()
-                .expect("global state should exist"),
-        ));
-
-        let replacement = Arc::new(PaxRecords(vec![comment("replacement")]));
-        replacement.apply_global(&mut active);
-        let final_state = PaxState::new(active, Vec::new(), None);
-        assert!(!Arc::ptr_eq(
-            &first_snapshot,
-            final_state
-                .global_records
-                .as_ref()
-                .expect("global state should exist"),
-        ));
-        assert_eq!(
-            first_state.effective_record(&PaxKeyword::Comment),
-            Some(&comment("initial"))
-        );
-        assert_eq!(
-            final_state.effective_record(&PaxKeyword::Comment),
-            Some(&comment("replacement"))
-        );
-    }
-
-    #[test]
-    fn retaining_physical_records_does_not_copy_effective_global_state() {
+    fn updates_effective_global_state_in_place() {
         let physical_records = Arc::new(PaxRecords(vec![comment("initial")]));
         let mut active = None;
         physical_records.apply_global(&mut active);
-        let initial_state = Arc::as_ptr(active.as_ref().expect("global state should exist"));
+        let initial_state = ptr::from_ref(active.as_ref().expect("global state should exist"));
 
         PaxRecords(vec![vendor("attribute", "value")]).apply_global(&mut active);
 
         assert_eq!(
-            Arc::as_ptr(active.as_ref().expect("global state should exist")),
+            ptr::from_ref(active.as_ref().expect("global state should exist")),
             initial_state
         );
         assert_eq!(physical_records.as_slice(), [comment("initial")]);
@@ -870,9 +834,9 @@ mod tests {
         initial.apply_global(&mut active);
         deletion.apply_global(&mut active);
 
-        let active_records = active.as_deref().expect("global state should exist");
+        let active_records = active.as_ref().expect("global state should exist");
         assert_eq!(active_records.records.as_slice().len(), 2);
-        let state = PaxState::new(active, Vec::new(), None);
+        let state = PaxState::new(active.as_ref(), Vec::new(), None);
         assert_eq!(
             state.effective_record(&PaxKeyword::Path),
             Some(&PaxRecord::Path(PaxValue::Deleted))
@@ -1034,7 +998,7 @@ mod tests {
         ]);
         let update = Arc::new(PaxRecords(vec![vendor("first", "new"), security("new")]));
         update.apply_global(&mut active);
-        let active = active.as_deref().expect("global state should exist");
+        let active = active.as_ref().expect("global state should exist");
         assert_eq!(active.records.as_slice().len(), 3);
         assert_eq!(
             active.get(&PaxKeyword::Vendor {

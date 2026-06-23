@@ -13,6 +13,7 @@ use crate::{
     ArchiveFormat, Block, FrameError, FrameErrorInner, GnuKind, PaxKeyword, PaxKind, PaxRecord,
     PaxString, PaxValue, UstarKind,
     header::parse_number,
+    pax::GlobalPaxRecords,
     stream::{DataFrame, DataOwner, Frame, HeaderFrame, TarStream},
 };
 
@@ -31,9 +32,10 @@ pub struct GnuMetadata {
 
 /// Extension metadata attached to one ordinary archive member.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MemberExtensions {
-    /// Unified pax metadata applicable to an ordinary ustar member.
-    Pax(PaxState),
+pub enum MemberExtensions<'a> {
+    /// Unified pax metadata applicable to an ordinary ustar member, borrowing
+    /// effective global values from the logical reader.
+    Pax(PaxState<'a>),
     /// GNU metadata applying to an ordinary GNU member.
     Gnu {
         /// Optional GNU long-name metadata.
@@ -97,7 +99,7 @@ pub struct MemberFrame<'a, R> {
     /// The ordinary member header.
     pub header: Header<'a>,
     /// Extension metadata applying to this member.
-    pub extensions: MemberExtensions,
+    pub extensions: MemberExtensions<'a>,
     /// A cursor over the member payload bytes.
     pub payload: MemberPayload<'a, R>,
 }
@@ -164,6 +166,11 @@ pub struct MemberPayload<'a, R> {
 /// header path and link-path fallbacks are copied into reusable storage and
 /// borrowed by the returned [`Header`].
 pub struct TarReader<R> {
+    // Keep the logical effective state outside `payload` so a returned
+    // `PaxState` can borrow it while `MemberPayload` mutably borrows only the
+    // independent payload machinery. `TarStream` maintains its own physical
+    // copy for framing decisions.
+    global_pax_records: Option<GlobalPaxRecords>,
     payload: PayloadReader<R>,
     header_storage: HeaderStorage,
     pending_extensions: PendingExtensions,
@@ -237,6 +244,7 @@ impl<R> TarReader<R> {
     /// Creates a new logical reader from an uncompressed tar reader.
     pub fn new(reader: R) -> Self {
         Self {
+            global_pax_records: None,
             payload: PayloadReader {
                 stream: TarStream::new(reader),
                 remaining: 0,
@@ -294,7 +302,9 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
     /// If the preceding member payload was not fully consumed, it is first
     /// drained and validated. Extension metadata is then consumed and attached
     /// before the next member is returned. Global pax updates not followed by
-    /// an ordinary member are consumed and ignored.
+    /// an ordinary member are consumed and ignored. A returned pax state is a
+    /// view borrowing this reader; it must be dropped before requesting another
+    /// member.
     pub async fn next_frame(&mut self) -> Result<Option<MemberFrame<'_, R>>, FrameError> {
         if let Err(error) = self.payload.drain_payload().await {
             self.clear_extension_state();
@@ -340,7 +350,7 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
                     let pending_extensions = mem::take(&mut self.pending_extensions);
                     let extensions = match header.format {
                         ArchiveFormat::Pax => MemberExtensions::Pax(PaxState::new(
-                            self.payload.stream.global_pax_records(),
+                            self.global_pax_records.as_ref(),
                             pending_extensions.global_pax,
                             pending_extensions.local_pax,
                         )),
@@ -392,13 +402,16 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
                     ));
                 }
                 if let Some(records) = frame.into_completed_pax_records() {
-                    let extension = PaxExtension::new(position, kind, records);
                     match kind {
                         PaxKind::Global => {
-                            self.pending_extensions.global_pax.push(extension);
+                            records.apply_global(&mut self.global_pax_records);
+                            self.pending_extensions
+                                .global_pax
+                                .push(PaxExtension::new(position, kind, records));
                         }
                         PaxKind::Local => {
-                            self.pending_extensions.local_pax = Some(extension);
+                            self.pending_extensions.local_pax =
+                                Some(PaxExtension::new(position, kind, records));
                         }
                     }
                 } else {
@@ -540,7 +553,7 @@ impl<R: AsyncRead + Unpin> MemberPayload<'_, R> {
 
 fn effective_member_path<'a>(
     header: &Header<'a>,
-    extensions: &'a MemberExtensions,
+    extensions: &'a MemberExtensions<'_>,
 ) -> Result<Cow<'a, [u8]>, FrameError> {
     match extensions {
         MemberExtensions::Pax(state) => resolve_pax_text(
@@ -576,7 +589,7 @@ fn reject_nul(position: u64, field: &'static str, value: &[u8]) -> Result<(), Fr
 
 fn resolve_pax_text<'a>(
     position: u64,
-    state: &'a PaxState,
+    state: &'a PaxState<'_>,
     keyword: &PaxKeyword,
     field: &'static str,
     header_value: Cow<'a, [u8]>,
@@ -663,7 +676,7 @@ mod tests {
         Ok(member)
     }
 
-    fn pax_state<'a, R>(member: &'a MemberFrame<'_, R>) -> Option<&'a PaxState> {
+    fn pax_state<'a, R>(member: &'a MemberFrame<'_, R>) -> Option<&'a PaxState<'a>> {
         if let MemberExtensions::Pax(state) = &member.extensions {
             Some(state)
         } else {
@@ -721,6 +734,25 @@ mod tests {
             assert_eq!(member.header.format, ArchiveFormat::Gnu);
             assert_eq!(member.header.header_path, b"name");
             assert_eq!(member.header.mode()?, 0o755);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn preserves_ustar_separator_when_name_is_empty() {
+        let mut ustar_header = header(b'5', 0);
+        set_field(&mut ustar_header, NAME_RANGE, b"");
+        set_field(&mut ustar_header, PREFIX_RANGE, b"victim");
+        set_checksum(&mut ustar_header);
+
+        ready_ok(async {
+            let mut bytes = Vec::new();
+            append_block(&mut bytes, &ustar_header);
+            append_terminator(&mut bytes);
+            let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+            let member = next_member(&mut reader).await?;
+            assert_eq!(member.header.header_path, b"victim/");
+            assert_eq!(member.effective_path()?.as_ref(), b"victim/");
             Ok(())
         });
     }
@@ -1025,28 +1057,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_member_modes_when_decoded() {
-        let mut header = header(b'0', 0);
-        header[MODE_RANGE].copy_from_slice(b"0000080\0");
-        set_checksum(&mut header);
-        let result: Result<(), FrameError> = ready(async {
-            let mut bytes = Vec::new();
-            append_block(&mut bytes, &header);
-            append_terminator(&mut bytes);
-            let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
-            let member = next_member(&mut reader).await?;
-            member.header.mode().map(|_| ())
-        });
-        assert!(matches!(
-            result,
-            Err(FrameError {
-                position: 0,
-                inner: FrameErrorInner::InvalidMode { .. },
-            })
-        ));
-    }
-
-    #[test]
     fn groups_pax_metadata_and_streams_member_payload() {
         let mut global = record("comment", "first");
         global.extend_from_slice(&record("comment", "last"));
@@ -1234,7 +1244,7 @@ mod tests {
     }
 
     #[test]
-    fn attaches_new_global_pax_updates_without_mutating_earlier_states() {
+    fn applies_global_pax_updates_to_each_borrowed_state() {
         let first = record("comment", "first");
         let second = record("gname", "second");
         let replacement = record("comment", "replacement");
@@ -1249,7 +1259,7 @@ mod tests {
 
         ready_ok(async {
             let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
-            let first_state = {
+            {
                 let member = next_member(&mut reader).await?;
                 let state = pax_state(&member).expect("expected pax member metadata");
                 let extensions = state.extensions().collect::<Vec<_>>();
@@ -1260,16 +1270,16 @@ mod tests {
                     state.effective_record(&PaxKeyword::Comment),
                     Some(&PaxRecord::Comment(PaxValue::Value("first".into())))
                 );
-                state.clone()
-            };
-            let member = next_member(&mut reader).await?;
-            let state = pax_state(&member).expect("expected pax member metadata");
-            assert_eq!(state.extensions().count(), 0);
-            assert_eq!(
-                state.effective_record(&PaxKeyword::Comment),
-                Some(&PaxRecord::Comment(PaxValue::Value("first".into())))
-            );
-            drop(member);
+            }
+            {
+                let member = next_member(&mut reader).await?;
+                let state = pax_state(&member).expect("expected pax member metadata");
+                assert_eq!(state.extensions().count(), 0);
+                assert_eq!(
+                    state.effective_record(&PaxKeyword::Comment),
+                    Some(&PaxRecord::Comment(PaxValue::Value("first".into())))
+                );
+            }
 
             let member = next_member(&mut reader).await?;
             let state = pax_state(&member).expect("expected pax member metadata");
@@ -1279,10 +1289,6 @@ mod tests {
             assert_eq!(
                 state.effective_record(&PaxKeyword::Comment),
                 Some(&PaxRecord::Comment(PaxValue::Value("replacement".into())))
-            );
-            assert_eq!(
-                first_state.effective_record(&PaxKeyword::Comment),
-                Some(&PaxRecord::Comment(PaxValue::Value("first".into())))
             );
             Ok(())
         });

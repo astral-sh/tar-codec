@@ -84,13 +84,13 @@ use tokio_stream::Stream;
 use crate::{
     ArchiveFormat, BLOCK_SIZE, Block, DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE,
     DEFAULT_MAX_GNU_EXTENSION_SIZE, DEFAULT_MAX_PAX_EXTENSION_SIZE, FrameError, FrameErrorInner,
-    GnuKind, HdrCharset, PaxError, PaxKind, PaxRecord, PaxState, PaxValue, UstarKind,
+    GnuKind, HdrCharset, PaxError, PaxKeyword, PaxKind, PaxRecord, PaxState, PaxValue, UstarKind,
     header::{
-        CHECKSUM_RANGE, GNU_IDENTITY, IDENTITY_RANGE, LINK_NAME_RANGE, MODE_RANGE, NAME_RANGE,
-        PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, USTAR_IDENTITY, checksum, parse_number,
-        parse_octal,
+        CHECKSUM_RANGE, GID_RANGE, GNAME_RANGE, GNU_IDENTITY, IDENTITY_RANGE, LINK_NAME_RANGE,
+        MODE_RANGE, MTIME_RANGE, NAME_RANGE, PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, UID_RANGE,
+        UNAME_RANGE, USTAR_IDENTITY, checksum, parse_number, parse_octal,
     },
-    pax::{GlobalPaxRecords, PaxRecords, SharedGlobalPaxRecords, SharedPaxRecords},
+    pax::{GlobalPaxRecords, PaxRecords, SharedPaxRecords},
 };
 
 type PositionedBlock = (u64, Block);
@@ -169,9 +169,7 @@ impl HeaderFrame {
         let prefix = trim_nul(&self.block[PREFIX_RANGE]);
         if !prefix.is_empty() {
             path.extend_from_slice(prefix);
-            if !name.is_empty() {
-                path.push(b'/');
-            }
+            path.push(b'/');
         }
         path.extend_from_slice(name);
     }
@@ -305,7 +303,7 @@ pub struct TarStream<R> {
     pub(super) block_len: usize,
     pub(super) format: Option<ArchiveFormat>,
     /// The currently effective global pax records, if any.
-    pub(super) global_pax_records: Option<SharedGlobalPaxRecords>,
+    pub(super) global_pax_records: Option<GlobalPaxRecords>,
     max_pax_extension_size: u64,
     max_global_pax_extensions_size: u64,
     global_pax_extensions_size: u64,
@@ -368,10 +366,6 @@ impl<R> TarStream<R> {
     /// Returns the selected archive family after the first header is read.
     pub fn format(&self) -> Option<ArchiveFormat> {
         self.format
-    }
-
-    pub(crate) fn global_pax_records(&self) -> Option<SharedGlobalPaxRecords> {
-        self.global_pax_records.clone()
     }
 }
 
@@ -751,7 +745,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                         PaxRecords::parse(
                             &payload,
                             self.global_pax_records
-                                .as_deref()
+                                .as_ref()
                                 .map_or(HdrCharset::Utf8, GlobalPaxRecords::hdrcharset),
                         )
                         .map_err(|source| {
@@ -1000,9 +994,15 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         local_pax_records: Option<SharedPaxRecords>,
     ) -> Result<Frame, FrameError> {
         let kind = UstarKind::try_from_framed(position, parsed.typeflag)?;
+        validate_posix_member_header_fields(
+            position,
+            &block,
+            local_pax_records.as_deref(),
+            self.global_pax_records.as_ref(),
+        )?;
         let effective_size = PaxState::effective_size(
             local_pax_records.as_deref(),
-            self.global_pax_records.as_deref(),
+            self.global_pax_records.as_ref(),
         )
         .map_or(Ok(parsed.size), |size| match size {
             PaxValue::Value(size) => Ok(*size),
@@ -1258,6 +1258,62 @@ fn validate_posix_member_size(
     }
 }
 
+fn validate_posix_member_header_fields(
+    position: u64,
+    block: &Block,
+    local_records: Option<&PaxRecords>,
+    global_records: Option<&GlobalPaxRecords>,
+) -> Result<(), FrameError> {
+    let mode: [u8; 8] = block[MODE_RANGE].try_into().expect("fixed header range");
+    match parse_octal(&mode) {
+        Some(0..=0o7777) => {}
+        _ => {
+            return Err(FrameError::at(
+                position,
+                FrameErrorInner::InvalidMode { found: mode },
+            ));
+        }
+    }
+
+    for (field, range, keyword) in [
+        ("uid", UID_RANGE, PaxKeyword::Uid),
+        ("gid", GID_RANGE, PaxKeyword::Gid),
+        ("mtime", MTIME_RANGE, PaxKeyword::Mtime),
+    ] {
+        if PaxState::effective_record_from(local_records, global_records, &keyword).is_some() {
+            continue;
+        }
+        let bytes = &block[range];
+        if parse_octal(bytes).is_none() {
+            return Err(FrameError::at(
+                position,
+                FrameErrorInner::InvalidUstarNumericField {
+                    field,
+                    found: bytes.to_vec(),
+                },
+            ));
+        }
+    }
+
+    for (field, range, keyword) in [
+        ("uname", UNAME_RANGE, PaxKeyword::Uname),
+        ("gname", GNAME_RANGE, PaxKeyword::Gname),
+    ] {
+        if PaxState::effective_record_from(local_records, global_records, &keyword).is_none()
+            && !block[range].contains(&0)
+        {
+            return Err(FrameError::at(
+                position,
+                FrameErrorInner::UnterminatedUstarStringField { field },
+            ));
+        }
+    }
+
+    // POSIX deliberately leaves the representation of device numbers unspecified.
+    // We do not consume those fields, so devmajor and devminor remain opaque.
+    Ok(())
+}
+
 fn validate_gnu_member_size(position: u64, kind: UstarKind, size: u64) -> Result<(), FrameError> {
     match kind {
         UstarKind::Regular | UstarKind::Contiguous => Ok(()),
@@ -1296,6 +1352,7 @@ mod tests {
     use super::*;
     use crate::{
         ArchiveFormat, FrameError, FrameErrorInner, HdrCharset, PaxString, PaxValue,
+        header::{DEVMAJOR_RANGE, DEVMINOR_RANGE},
         test_support::{
             ChunkedReader, append_block, append_gnu, append_payload, append_posix,
             append_terminator, gnu_base256_header, gnu_header, header, ready, record, set_checksum,
@@ -1370,6 +1427,9 @@ mod tests {
         InvalidIdentity,
         InvalidChecksum,
         InvalidSize,
+        InvalidMode,
+        InvalidUstarNumericField(&'static str),
+        UnterminatedUstarStringField(&'static str),
         UnsupportedTypeflag(u8),
     }
 
@@ -1378,7 +1438,16 @@ mod tests {
             match (self, error) {
                 (Self::InvalidIdentity, FrameErrorInner::InvalidIdentity { .. })
                 | (Self::InvalidChecksum, FrameErrorInner::InvalidChecksum { .. })
-                | (Self::InvalidSize, FrameErrorInner::InvalidSize { .. }) => true,
+                | (Self::InvalidSize, FrameErrorInner::InvalidSize { .. })
+                | (Self::InvalidMode, FrameErrorInner::InvalidMode { .. }) => true,
+                (
+                    Self::InvalidUstarNumericField(field),
+                    FrameErrorInner::InvalidUstarNumericField { field: found, .. },
+                )
+                | (
+                    Self::UnterminatedUstarStringField(field),
+                    FrameErrorInner::UnterminatedUstarStringField { field: found },
+                ) => field == *found,
                 (
                     Self::UnsupportedTypeflag(typeflag),
                     FrameErrorInner::UnsupportedTypeflag { typeflag: found },
@@ -1388,6 +1457,13 @@ mod tests {
         }
     }
 
+    fn checksummed_header(mutate: impl FnOnce(&mut Block)) -> Block {
+        let mut block = header(b'0', 0);
+        mutate(&mut block);
+        set_checksum(&mut block);
+        block
+    }
+
     fn invalid_header_cases() -> Vec<(&'static str, Block, ExpectedHeaderError)> {
         let mut bad_magic = header(b'0', 0);
         bad_magic[IDENTITY_RANGE.start] = b'g';
@@ -1395,12 +1471,6 @@ mod tests {
         bad_version[IDENTITY_RANGE.end - 2..IDENTITY_RANGE.end].copy_from_slice(b"  ");
         let mut bad_checksum = header(b'0', 0);
         bad_checksum[0] = b'X';
-        let mut bad_octal_size = header(b'0', 0);
-        bad_octal_size[SIZE_RANGE].copy_from_slice(b"00000000008\0");
-        set_checksum(&mut bad_octal_size);
-        let mut bad_base256_size = header(b'0', 0);
-        bad_base256_size[SIZE_RANGE.start] = 0x80;
-        set_checksum(&mut bad_base256_size);
 
         vec![
             ("magic", bad_magic, ExpectedHeaderError::InvalidIdentity),
@@ -1412,13 +1482,58 @@ mod tests {
             ),
             (
                 "octal size",
-                bad_octal_size,
+                checksummed_header(|block| {
+                    block[SIZE_RANGE].copy_from_slice(b"00000000008\0");
+                }),
                 ExpectedHeaderError::InvalidSize,
             ),
             (
                 "base256 size",
-                bad_base256_size,
+                checksummed_header(|block| block[SIZE_RANGE.start] = 0x80),
                 ExpectedHeaderError::InvalidSize,
+            ),
+            (
+                "octal mode",
+                checksummed_header(|block| {
+                    block[MODE_RANGE].copy_from_slice(b"0000080\0");
+                }),
+                ExpectedHeaderError::InvalidMode,
+            ),
+            (
+                "oversized mode",
+                checksummed_header(|block| {
+                    block[MODE_RANGE].copy_from_slice(b"0010000\0");
+                }),
+                ExpectedHeaderError::InvalidMode,
+            ),
+            (
+                "uid",
+                checksummed_header(|block| {
+                    block[UID_RANGE].copy_from_slice(b"invalid\0");
+                }),
+                ExpectedHeaderError::InvalidUstarNumericField("uid"),
+            ),
+            (
+                "gid",
+                checksummed_header(|block| block[GID_RANGE].fill(0)),
+                ExpectedHeaderError::InvalidUstarNumericField("gid"),
+            ),
+            (
+                "mtime",
+                checksummed_header(|block| {
+                    block[MTIME_RANGE].copy_from_slice(b"00000000008\0");
+                }),
+                ExpectedHeaderError::InvalidUstarNumericField("mtime"),
+            ),
+            (
+                "uname",
+                checksummed_header(|block| block[UNAME_RANGE].fill(b'u')),
+                ExpectedHeaderError::UnterminatedUstarStringField("uname"),
+            ),
+            (
+                "gname",
+                checksummed_header(|block| block[GNAME_RANGE].fill(b'g')),
+                ExpectedHeaderError::UnterminatedUstarStringField("gname"),
             ),
             (
                 "POSIX typeflag",
@@ -1697,6 +1812,59 @@ mod tests {
     }
 
     #[test]
+    fn pax_records_override_malformed_ordinary_header_fields() {
+        let mut malformed = header(b'0', 0);
+        malformed[UID_RANGE].fill(b'u');
+        malformed[GID_RANGE].fill(b'g');
+        malformed[MTIME_RANGE].fill(b'm');
+        malformed[UNAME_RANGE].fill(b'u');
+        malformed[GNAME_RANGE].fill(b'g');
+        set_checksum(&mut malformed);
+
+        let local_values = [
+            record("uid", "1"),
+            record("gid", "2"),
+            record("mtime", "3"),
+            record("uname", "user"),
+            record("gname", "group"),
+        ]
+        .concat();
+        let global_deletions = [
+            record("uid", ""),
+            record("gid", ""),
+            record("mtime", ""),
+            record("uname", ""),
+            record("gname", ""),
+        ]
+        .concat();
+
+        for (case, typeflag, records) in [
+            ("local values", b'x', local_values),
+            ("global deletions", b'g', global_deletions),
+        ] {
+            let mut bytes = Vec::new();
+            append_posix(&mut bytes, typeflag, &records);
+            append_block(&mut bytes, &malformed);
+            append_terminator(&mut bytes);
+
+            let frames = collect(bytes, BLOCK_SIZE);
+            assert!(frames.iter().all(Result::is_ok), "{case}: {frames:?}");
+        }
+    }
+
+    #[test]
+    fn accepts_all_nul_unused_device_fields() {
+        let block = header(b'0', 0);
+        assert_eq!(parse_octal(&block[DEVMAJOR_RANGE]), None);
+        assert_eq!(parse_octal(&block[DEVMINOR_RANGE]), None);
+
+        let mut bytes = Vec::new();
+        append_block(&mut bytes, &block);
+        append_terminator(&mut bytes);
+        assert!(collect(bytes, BLOCK_SIZE).iter().all(Result::is_ok));
+    }
+
+    #[test]
     fn rejects_local_size_deletion_for_payload_free_members() {
         let global = record("size", "7");
         let local = record("size", "");
@@ -1846,7 +2014,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_header_format_and_type_errors() {
+    fn rejects_header_format_type_and_field_errors() {
         for (case, block, expected) in invalid_header_cases() {
             let frames = collect(block.to_vec(), BLOCK_SIZE);
             let error = last_error_inner(&frames);
@@ -1932,7 +2100,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_conversion_errors_preserve_later_header_positions() {
+    fn header_errors_preserve_later_header_positions() {
         let position = BLOCK_SIZE as u64;
 
         for (case, block, expected) in invalid_header_cases() {

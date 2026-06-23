@@ -99,6 +99,20 @@ pub enum FrameErrorInner {
         /// The bytes found in the mode field.
         found: [u8; 8],
     },
+    /// An ordinary ustar member header's numeric field was not strict octal.
+    #[error("invalid ustar {field} field: expected strict octal, found {found:?}")]
+    InvalidUstarNumericField {
+        /// The name of the malformed header field.
+        field: &'static str,
+        /// The bytes found in the malformed header field.
+        found: Vec<u8>,
+    },
+    /// An ordinary ustar member header's string field had no NUL terminator.
+    #[error("invalid ustar {field} field: missing NUL terminator")]
+    UnterminatedUstarStringField {
+        /// The name of the unterminated header field.
+        field: &'static str,
+    },
     /// A tar type is not supported within the selected archive family.
     #[error("unsupported tar typeflag {typeflag:?}")]
     UnsupportedTypeflag {

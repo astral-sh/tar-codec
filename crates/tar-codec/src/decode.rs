@@ -19,9 +19,13 @@ pub use tar_framing::{
 };
 
 /// A one-pass reader for a validated pax or GNU tar archive.
+///
+/// Member iteration is fused. After reaching the end of the archive or
+/// returning a decoding error, every subsequent attempt returns end-of-archive.
 pub struct TarArchive<R> {
     reader: TarReader<R>,
     policy: DecodePolicy,
+    fused: bool,
 }
 
 impl<R> TarArchive<R> {
@@ -36,7 +40,11 @@ impl<R> TarArchive<R> {
         reader.set_max_pax_extension_size(policy.pax_policy.max_extension_size);
         reader.set_max_global_pax_extensions_size(policy.pax_policy.max_global_extensions_size);
         reader.set_max_gnu_extension_size(policy.max_gnu_extension_size);
-        Self { reader, policy }
+        Self {
+            reader,
+            policy,
+            fused: false,
+        }
     }
 }
 
@@ -419,11 +427,31 @@ impl<R: AsyncRead + Unpin> ArchiveTrait for TarArchive<R> {
     async fn next_member<'a>(
         &'a mut self,
     ) -> Result<Option<Member<Self::Payload<'a>>>, Self::Error> {
-        let Some(frame) = self.reader.next_frame().await? else {
+        if self.fused {
             return Ok(None);
+        }
+        let frame = match self.reader.next_frame().await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                self.fused = true;
+                return Ok(None);
+            }
+            Err(error) => {
+                self.fused = true;
+                return Err(error.into());
+            }
         };
-        self.policy.check_member(&frame)?;
-        project_member(frame).map(Some)
+        if let Err(error) = self.policy.check_member(&frame) {
+            self.fused = true;
+            return Err(error);
+        }
+        match project_member(frame) {
+            Ok(member) => Ok(Some(member)),
+            Err(error) => {
+                self.fused = true;
+                Err(error)
+            }
+        }
     }
 }
 

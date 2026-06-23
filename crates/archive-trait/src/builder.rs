@@ -6,7 +6,7 @@
 mod traversal;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     io::{self, Read},
     mem,
     ops::Range,
@@ -18,7 +18,11 @@ use tokio::io::AsyncReadExt;
 
 pub use self::traversal::TraversalError;
 use self::traversal::{TraversalEntry, TraversalKind, TraversalStream, stream_directory_entries};
-use crate::{NameValidator, name::NameValidation};
+use crate::{
+    NameValidator,
+    component_tree::{ComponentTree, ROOT_NODE},
+    name::NameValidation,
+};
 
 const BUFFERED_SOURCE_FILE_BYTES: usize = 1024 * 1024;
 const SOURCE_FILE_CHUNK_BYTES: usize = 2 * 1024 * 1024;
@@ -87,7 +91,7 @@ impl BuilderPolicy {
 
 struct BuilderState {
     policy: BuilderPolicy,
-    entries: HashMap<String, ArchivedEntry>,
+    entries: BuildEntries,
     source_buffer: Vec<u8>,
     poisoned: bool,
 }
@@ -96,7 +100,7 @@ impl BuilderState {
     fn new(policy: BuilderPolicy) -> Self {
         Self {
             policy,
-            entries: HashMap::new(),
+            entries: BuildEntries::new(),
             source_buffer: Vec::new(),
             poisoned: false,
         }
@@ -346,7 +350,10 @@ impl<B: ArchiveBuilder> Builder<B> {
             });
         }
         let path = path.to_owned();
-        let implicit_ancestors = preflight_regular_entry(&self.state.entries, &path)?;
+        let reservation = self
+            .state
+            .entries
+            .preflight_entry(&path, ArchivedEntry::NonDirectory)?;
         let mut payload = EntryPayload::borrowed(data.as_ref())?;
         self.state.begin_write();
         let result = self
@@ -355,12 +362,7 @@ impl<B: ArchiveBuilder> Builder<B> {
             .await;
         self.state.complete_write();
         self.resolve_hook(result)?;
-        for ancestor in implicit_ancestors {
-            self.state
-                .entries
-                .insert(ancestor, ArchivedEntry::Directory { explicit: false });
-        }
-        self.state.entries.insert(path, ArchivedEntry::NonDirectory);
+        self.state.entries.commit_entry(&path, reservation);
         Ok(())
     }
 
@@ -383,12 +385,12 @@ impl<B: ArchiveBuilder> Builder<B> {
             self.state.policy.symlink_policy,
         )
         .map_err(BuildError::Traversal)?;
+        self.state.begin_write();
         let mut traversal = DirectoryBuild {
-            entries: self.state.entries.clone(),
+            entries: &mut self.state.entries,
             source_buffer: mem::take(&mut self.state.source_buffer),
             emitted: false,
         };
-        self.state.begin_write();
         let write_result =
             write_directory_entries(&mut self.backend, &mut entries, &mut traversal).await;
         let traversal_result = entries
@@ -396,17 +398,19 @@ impl<B: ArchiveBuilder> Builder<B> {
             .await
             .map_err(BuildError::Traversal)
             .map_err(BuildFailure::recoverable);
-        self.state.complete_write();
         let result = write_result.and(traversal_result);
-        self.state.source_buffer = traversal.source_buffer;
+        let DirectoryBuild {
+            entries: _,
+            source_buffer,
+            emitted,
+        } = traversal;
+        self.state.complete_write();
+        self.state.source_buffer = source_buffer;
         match result {
-            Ok(()) => {
-                self.state.entries = traversal.entries;
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(error) => {
                 let (error, hook_poisoned) = error.into_parts();
-                if traversal.emitted || hook_poisoned {
+                if emitted || hook_poisoned {
                     self.state.poison();
                 }
                 Err(error)
@@ -444,7 +448,7 @@ impl<B: ArchiveBuilder> Builder<B> {
 async fn write_directory_entries<B: ArchiveBuilder>(
     builder: &mut B,
     entries: &mut TraversalStream,
-    traversal: &mut DirectoryBuild,
+    traversal: &mut DirectoryBuild<'_>,
 ) -> Result<(), BuildFailure<B::Error>> {
     while let Some(entries) = entries.recv().await {
         let mut entries = VecDeque::from(entries);
@@ -473,19 +477,20 @@ async fn write_prepared_directory_entries<B: ArchiveBuilder>(
     builder: &mut B,
     entries: Vec<PreparedTraversalEntry>,
     buffer: &mut Vec<u8>,
-    traversal: &mut DirectoryBuild,
+    traversal: &mut DirectoryBuild<'_>,
 ) -> Result<(), BuildFailure<B::Error>> {
     for entry in entries {
-        reserve_entry(
-            &mut traversal.entries,
-            &entry.archive_path,
-            if matches!(&entry.kind, PreparedTraversalKind::Directory) {
-                ArchivedEntry::Directory { explicit: true }
-            } else {
-                ArchivedEntry::NonDirectory
-            },
-        )
-        .map_err(BuildFailure::recoverable)?;
+        let reservation = traversal
+            .entries
+            .preflight_entry(
+                &entry.archive_path,
+                if matches!(&entry.kind, PreparedTraversalKind::Directory) {
+                    ArchivedEntry::Directory { explicit: true }
+                } else {
+                    ArchivedEntry::NonDirectory
+                },
+            )
+            .map_err(BuildFailure::recoverable)?;
         match entry.kind {
             PreparedTraversalKind::Directory => {
                 builder.write_directory_member(&entry.archive_path).await?;
@@ -538,13 +543,16 @@ async fn write_prepared_directory_entries<B: ArchiveBuilder>(
                     .await?;
             }
         }
+        traversal
+            .entries
+            .commit_entry(&entry.archive_path, reservation);
         traversal.emitted = true;
     }
     Ok(())
 }
 
-struct DirectoryBuild {
-    entries: HashMap<String, ArchivedEntry>,
+struct DirectoryBuild<'entries> {
+    entries: &'entries mut BuildEntries,
     source_buffer: Vec<u8>,
     emitted: bool,
 }
@@ -758,59 +766,102 @@ pub enum BuildError<E> {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 enum ArchivedEntry {
     Directory { explicit: bool },
     NonDirectory,
 }
 
-fn reserve_entry<E>(
-    entries: &mut HashMap<String, ArchivedEntry>,
-    path: &str,
+/// Builder collision state keyed by literal `/`-separated archive components.
+#[derive(Debug)]
+struct BuildEntries(ComponentTree<Box<str>, ArchivedEntry>);
+
+/// Proof that an entry was checked against the current collision state.
+struct EntryReservation {
     entry: ArchivedEntry,
-) -> Result<(), BuildError<E>> {
-    for (separator, _) in path.match_indices('/') {
-        let ancestor = &path[..separator];
-        match entries.get(ancestor) {
-            Some(ArchivedEntry::Directory { .. }) => {}
-            Some(_) => return Err(path_collision(ancestor)),
-            None => {
-                entries.insert(
-                    ancestor.to_owned(),
-                    ArchivedEntry::Directory { explicit: false },
-                );
-            }
-        }
-    }
-    match (entries.get_mut(path), entry) {
-        (Some(ArchivedEntry::Directory { explicit: false }), ArchivedEntry::Directory { .. }) => {
-            entries.insert(path.to_owned(), ArchivedEntry::Directory { explicit: true });
-        }
-        (Some(_), _) => return Err(path_collision(path)),
-        (None, entry) => {
-            entries.insert(path.to_owned(), entry);
-        }
-    }
-    Ok(())
 }
 
-fn preflight_regular_entry<E>(
-    entries: &HashMap<String, ArchivedEntry>,
-    path: &str,
-) -> Result<Vec<String>, BuildError<E>> {
-    let mut implicit_ancestors = Vec::new();
-    for (separator, _) in path.match_indices('/') {
-        let ancestor = &path[..separator];
-        match entries.get(ancestor) {
-            Some(ArchivedEntry::Directory { .. }) => {}
-            Some(_) => return Err(path_collision(ancestor)),
-            None => implicit_ancestors.push(ancestor.to_owned()),
+impl BuildEntries {
+    fn new() -> Self {
+        Self(ComponentTree::new(None))
+    }
+
+    fn preflight_entry<E>(
+        &self,
+        path: &str,
+        entry: ArchivedEntry,
+    ) -> Result<EntryReservation, BuildError<E>> {
+        let mut parent = ROOT_NODE;
+        let mut components = archive_path_components(path).peekable();
+        while let Some((component, prefix)) = components.next() {
+            let Some(node) = self.0.child(parent, component) else {
+                return Ok(EntryReservation { entry });
+            };
+            if components.peek().is_some() {
+                match self.0.state(node) {
+                    Some(ArchivedEntry::Directory { .. }) => parent = node,
+                    Some(ArchivedEntry::NonDirectory) => return Err(path_collision(prefix)),
+                    None => return Ok(EntryReservation { entry }),
+                }
+            } else {
+                match (self.0.state(node), entry) {
+                    (
+                        Some(ArchivedEntry::Directory { explicit: false }),
+                        ArchivedEntry::Directory { .. },
+                    )
+                    | (None, _) => return Ok(EntryReservation { entry }),
+                    (Some(_), _) => return Err(path_collision(prefix)),
+                }
+            }
+        }
+        Ok(EntryReservation { entry })
+    }
+
+    fn commit_entry(&mut self, path: &str, reservation: EntryReservation) {
+        // The builder holds exclusive state access while the backend hook is
+        // awaited, so a successful reservation remains valid until this commit.
+        let mut parent = ROOT_NODE;
+        let mut components = archive_path_components(path).peekable();
+        while let Some((component, _)) = components.next() {
+            let node = self
+                .0
+                .ensure_child_with(parent, component, || component.into());
+            if components.peek().is_some() {
+                if self.0.state(node).is_none() {
+                    self.0
+                        .set_state(node, ArchivedEntry::Directory { explicit: false });
+                }
+            } else {
+                self.0.set_state(node, reservation.entry);
+            }
+            parent = node;
         }
     }
-    if entries.contains_key(path) {
-        return Err(path_collision(path));
+
+    #[cfg(test)]
+    fn node_count(&self) -> usize {
+        self.0.node_count()
     }
-    Ok(implicit_ancestors)
+
+    #[cfg(test)]
+    fn component_bytes(&self) -> usize {
+        self.0.components().map(|component| component.len()).sum()
+    }
+}
+
+/// Iterates the exact textual component and prefix at each `/` boundary.
+fn archive_path_components(path: &str) -> impl Iterator<Item = (&str, &str)> {
+    let mut component_start = 0;
+    path.split('/').map(move |component| {
+        let prefix_end = component_start + component.len();
+        let prefix = &path[..prefix_end];
+        component_start = if prefix_end < path.len() {
+            prefix_end + 1
+        } else {
+            prefix_end
+        };
+        (component, prefix)
+    })
 }
 
 fn filesystem_error<E>(operation: &'static str, path: &Path, source: io::Error) -> BuildError<E> {
@@ -841,4 +892,167 @@ fn is_executable(metadata: &std::fs::Metadata) -> bool {
 #[cfg(not(unix))]
 fn is_executable(_metadata: &std::fs::Metadata) -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct TestError;
+
+    #[derive(Default)]
+    struct NoopArchiveBuilder {
+        fail_next_file: bool,
+        fail_next_directory: bool,
+    }
+
+    impl ArchiveBuilder for NoopArchiveBuilder {
+        type Error = TestError;
+
+        async fn finish_archive(&mut self) -> Result<(), BuildFailure<Self::Error>> {
+            Ok(())
+        }
+
+        async fn write_file_member(
+            &mut self,
+            _path: &str,
+            payload: &mut EntryPayload<'_>,
+            _metadata: EntryMetadata,
+        ) -> Result<(), BuildFailure<Self::Error>> {
+            if mem::take(&mut self.fail_next_file) {
+                return Err(BuildFailure::recoverable(BuildError::Encoder(TestError)));
+            }
+            loop {
+                match payload.next_chunk::<TestError>().await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return Ok(()),
+                    Err(error) => return Err(BuildFailure::recoverable(error)),
+                }
+            }
+        }
+
+        async fn write_directory_member(
+            &mut self,
+            _path: &str,
+        ) -> Result<(), BuildFailure<Self::Error>> {
+            if mem::take(&mut self.fail_next_directory) {
+                return Err(BuildFailure::recoverable(BuildError::Encoder(TestError)));
+            }
+            Ok(())
+        }
+
+        async fn write_symbolic_link_member(
+            &mut self,
+            _path: &str,
+            _target: &str,
+        ) -> Result<(), BuildFailure<Self::Error>> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn deep_manual_entry_uses_linear_component_storage() {
+        const COMPONENT: &str = "segment";
+        const DEPTH: usize = 4_096;
+
+        let mut path = format!("{COMPONENT}/").repeat(DEPTH);
+        path.push_str("file");
+        let mut builder = NoopArchiveBuilder::default().builder();
+        builder
+            .add_entry(&path, b"", EntryMetadata::default())
+            .await
+            .expect("deep manual entry should be added");
+
+        assert_eq!(builder.state.entries.node_count(), DEPTH + 2);
+        assert_eq!(
+            builder.state.entries.component_bytes(),
+            DEPTH * COMPONENT.len() + "file".len()
+        );
+    }
+
+    #[tokio::test]
+    async fn collision_state_preserves_literal_slash_components() {
+        let mut builder = NoopArchiveBuilder::default().builder();
+        for path in ["a//b", "a/b", "/absolute", "absolute", ".", ".."] {
+            builder
+                .add_entry(path, b"", EntryMetadata::default())
+                .await
+                .expect("distinct textual path should be added");
+        }
+
+        for (path, collision) in [("a//b", "a//b"), ("a/", "a/"), ("", ""), ("./child", ".")] {
+            assert!(matches!(
+                builder
+                    .add_entry(path, b"", EntryMetadata::default())
+                    .await,
+                Err(BuildError::PathCollision { path }) if path == collision
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn recoverable_write_failure_does_not_commit_reservation() {
+        let mut builder = NoopArchiveBuilder {
+            fail_next_file: true,
+            ..Default::default()
+        }
+        .builder();
+        assert!(matches!(
+            builder
+                .add_entry("parent/file", b"", EntryMetadata::default())
+                .await,
+            Err(BuildError::Encoder(TestError))
+        ));
+        builder
+            .add_entry("parent/file", b"", EntryMetadata::default())
+            .await
+            .expect("a recoverable failure should not reserve the path");
+    }
+
+    #[tokio::test]
+    async fn recoverable_recursive_write_failure_does_not_commit_reservation() {
+        let temp = tempdir().expect("temporary directory should be created");
+        let source = temp.path().join("directory");
+        fs::create_dir(&source).expect("source directory should be created");
+        let mut builder = NoopArchiveBuilder {
+            fail_next_directory: true,
+            ..Default::default()
+        }
+        .builder();
+
+        assert!(matches!(
+            builder.add_directory(&source).await,
+            Err(BuildError::Encoder(TestError))
+        ));
+        assert_eq!(builder.state.entries.node_count(), 1);
+
+        builder
+            .add_directory(&source)
+            .await
+            .expect("a recoverable failure should not reserve the directory");
+        assert_eq!(builder.state.entries.node_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn repeated_directory_additions_use_linear_component_storage() {
+        const DIRECTORIES: usize = 256;
+
+        let temp = tempdir().expect("temporary directory should be created");
+        let mut builder = NoopArchiveBuilder::default().builder();
+        for index in 0..DIRECTORIES {
+            let source = temp.path().join(format!("directory-{index}"));
+            fs::create_dir(&source).expect("source directory should be created");
+            builder
+                .add_directory(&source)
+                .await
+                .expect("empty source directory should be added");
+        }
+
+        assert_eq!(builder.state.entries.node_count(), DIRECTORIES + 1);
+    }
 }

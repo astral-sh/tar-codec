@@ -10,8 +10,8 @@ use tokio::io::{AsyncRead, ReadBuf};
 use crate::{
     BLOCK_SIZE, Block, FrameError,
     header::{
-        GNU_IDENTITY, IDENTITY_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, USTAR_IDENTITY, encode_checksum,
-        encode_octal,
+        GID_RANGE, GNU_IDENTITY, IDENTITY_RANGE, MODE_RANGE, MTIME_RANGE, SIZE_RANGE,
+        TYPEFLAG_OFFSET, UID_RANGE, USTAR_IDENTITY, encode_checksum, encode_octal,
     },
 };
 
@@ -75,7 +75,11 @@ pub(crate) fn set_checksum(block: &mut Block) {
 pub(crate) fn header(typeflag: u8, size: u64) -> Block {
     let mut block = [0; BLOCK_SIZE];
     block[..4].copy_from_slice(b"file");
+    assert!(encode_octal(&mut block[MODE_RANGE], 0o644));
+    assert!(encode_octal(&mut block[UID_RANGE], 0));
+    assert!(encode_octal(&mut block[GID_RANGE], 0));
     assert!(encode_octal(&mut block[SIZE_RANGE], size));
+    assert!(encode_octal(&mut block[MTIME_RANGE], 0));
     block[TYPEFLAG_OFFSET] = typeflag;
     block[IDENTITY_RANGE].copy_from_slice(USTAR_IDENTITY);
     set_checksum(&mut block);

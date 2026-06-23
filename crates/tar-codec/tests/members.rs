@@ -4,8 +4,8 @@ use std::{error::Error, io};
 
 use support::{ArchiveBuilder, pax_record};
 use tar_codec::{
-    Archive as _, DecodeError, DecodePolicy, Member, MemberPayload, PaxDecodePolicy, SpecialKind,
-    TarArchive,
+    Archive as _, DecodeError, DecodePolicy, DecodePolicyViolation, Member, MemberPayload,
+    PaxDecodePolicy, SpecialKind, TarArchive,
 };
 use tar_framing::PaxKeyword;
 
@@ -194,5 +194,26 @@ async fn advancing_drains_payload_and_applies_tar_policy() -> TestResult {
     )
     .members();
     assert!(matches!(members.next().await, Err(DecodeError::Framing(_))));
+    Ok(())
+}
+
+#[tokio::test]
+async fn policy_errors_fuse_member_iteration() -> TestResult {
+    let mut archive = ArchiveBuilder::new();
+    archive
+        .pax(b'g', &pax_record(PaxKeyword::Path, "forbidden"))
+        .posix("first", b'0', b"", "", 0o644)
+        .posix("second", b'0', b"payload", "", 0o644);
+    let bytes = archive.finish();
+    let mut members = TarArchive::new(bytes.as_slice()).members();
+
+    assert!(matches!(
+        members.next().await,
+        Err(DecodeError::PolicyViolation {
+            violation: DecodePolicyViolation::GlobalPaxMemberMetadata { keyword: "path" },
+            ..
+        })
+    ));
+    assert!(members.next().await?.is_none());
     Ok(())
 }

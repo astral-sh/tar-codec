@@ -11,6 +11,7 @@
 //! mutation of that directory is outside the threat model.
 
 pub mod builder;
+mod component_tree;
 pub mod extract;
 mod name;
 

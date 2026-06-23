@@ -24,7 +24,9 @@ General properties:
   breaks our parsing or encoding properties.
 - All consumer-facing APIs should be deadlock safe.
 - Encoding should always produce a valid, unambiguous, pax-only tar.
-- Both encoding and decoding should remain linear in time and memory with respect to their input.
+- By default, both encoding and decoding should remain linear in time and memory with respect
+  to their input. Enabling non-default policies during encoding and decoding may change this
+  property.
 
 The format-writing methods on `ArchiveBuilder` are implementation hooks, not
 direct-use APIs. Archive construction must go through `Builder` for policy,
