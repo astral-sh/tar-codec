@@ -34,6 +34,12 @@ impl NormalizedPath {
         self.0.split('/').filter(|component| !component.is_empty())
     }
 
+    pub(super) fn parent_components(&self) -> impl Iterator<Item = &str> {
+        let mut components = self.components();
+        components.next_back();
+        components
+    }
+
     pub(super) fn parent(&self) -> Self {
         if let Some((parent, _)) = self.0.rsplit_once('/') {
             Self(parent.to_owned())
@@ -89,10 +95,6 @@ impl NormalizedPath {
     pub(super) fn to_path_buf(&self) -> PathBuf {
         self.components().collect()
     }
-
-    pub(super) fn into_path_buf(self) -> PathBuf {
-        self.to_path_buf()
-    }
 }
 
 /// Validates and normalizes the path-bearing fields of one member.
@@ -145,7 +147,7 @@ pub(super) fn decode_member<E, P>(
     {
         return Err(ExtractError::invalid_link(
             metadata.position,
-            path.into_path_buf(),
+            path.to_path_buf(),
             link_target.to_owned(),
             "link target is empty",
         ));

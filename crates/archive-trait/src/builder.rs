@@ -905,6 +905,7 @@ mod tests {
     #[derive(Debug)]
     struct TestError;
 
+    #[derive(Default)]
     struct NoopArchiveBuilder {
         fail_next_file: bool,
         fail_next_directory: bool,
@@ -961,11 +962,7 @@ mod tests {
 
         let mut path = format!("{COMPONENT}/").repeat(DEPTH);
         path.push_str("file");
-        let mut builder = NoopArchiveBuilder {
-            fail_next_file: false,
-            fail_next_directory: false,
-        }
-        .builder();
+        let mut builder = NoopArchiveBuilder::default().builder();
         builder
             .add_entry(&path, b"", EntryMetadata::default())
             .await
@@ -980,11 +977,7 @@ mod tests {
 
     #[tokio::test]
     async fn collision_state_preserves_literal_slash_components() {
-        let mut builder = NoopArchiveBuilder {
-            fail_next_file: false,
-            fail_next_directory: false,
-        }
-        .builder();
+        let mut builder = NoopArchiveBuilder::default().builder();
         for path in ["a//b", "a/b", "/absolute", "absolute", ".", ".."] {
             builder
                 .add_entry(path, b"", EntryMetadata::default())
@@ -1006,7 +999,7 @@ mod tests {
     async fn recoverable_write_failure_does_not_commit_reservation() {
         let mut builder = NoopArchiveBuilder {
             fail_next_file: true,
-            fail_next_directory: false,
+            ..Default::default()
         }
         .builder();
         assert!(matches!(
@@ -1027,8 +1020,8 @@ mod tests {
         let source = temp.path().join("directory");
         fs::create_dir(&source).expect("source directory should be created");
         let mut builder = NoopArchiveBuilder {
-            fail_next_file: false,
             fail_next_directory: true,
+            ..Default::default()
         }
         .builder();
 
@@ -1050,11 +1043,7 @@ mod tests {
         const DIRECTORIES: usize = 256;
 
         let temp = tempdir().expect("temporary directory should be created");
-        let mut builder = NoopArchiveBuilder {
-            fail_next_file: false,
-            fail_next_directory: false,
-        }
-        .builder();
+        let mut builder = NoopArchiveBuilder::default().builder();
         for index in 0..DIRECTORIES {
             let source = temp.path().join(format!("directory-{index}"));
             fs::create_dir(&source).expect("source directory should be created");

@@ -198,7 +198,7 @@ pub(crate) async fn extract<A: Archive>(
                 Member::Special { kind, .. } => {
                     return Err(ExtractError::UnsupportedMember {
                         position: decoded.position,
-                        path: decoded.path.into_path_buf(),
+                        path: decoded.path.to_path_buf(),
                         kind,
                     });
                 }

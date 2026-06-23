@@ -1457,6 +1457,13 @@ mod tests {
         }
     }
 
+    fn checksummed_header(mutate: impl FnOnce(&mut Block)) -> Block {
+        let mut block = header(b'0', 0);
+        mutate(&mut block);
+        set_checksum(&mut block);
+        block
+    }
+
     fn invalid_header_cases() -> Vec<(&'static str, Block, ExpectedHeaderError)> {
         let mut bad_magic = header(b'0', 0);
         bad_magic[IDENTITY_RANGE.start] = b'g';
@@ -1464,33 +1471,6 @@ mod tests {
         bad_version[IDENTITY_RANGE.end - 2..IDENTITY_RANGE.end].copy_from_slice(b"  ");
         let mut bad_checksum = header(b'0', 0);
         bad_checksum[0] = b'X';
-        let mut bad_octal_size = header(b'0', 0);
-        bad_octal_size[SIZE_RANGE].copy_from_slice(b"00000000008\0");
-        set_checksum(&mut bad_octal_size);
-        let mut bad_base256_size = header(b'0', 0);
-        bad_base256_size[SIZE_RANGE.start] = 0x80;
-        set_checksum(&mut bad_base256_size);
-        let mut bad_octal_mode = header(b'0', 0);
-        bad_octal_mode[MODE_RANGE].copy_from_slice(b"0000080\0");
-        set_checksum(&mut bad_octal_mode);
-        let mut oversized_mode = header(b'0', 0);
-        oversized_mode[MODE_RANGE].copy_from_slice(b"0010000\0");
-        set_checksum(&mut oversized_mode);
-        let mut bad_uid = header(b'0', 0);
-        bad_uid[UID_RANGE].copy_from_slice(b"invalid\0");
-        set_checksum(&mut bad_uid);
-        let mut bad_gid = header(b'0', 0);
-        bad_gid[GID_RANGE].fill(0);
-        set_checksum(&mut bad_gid);
-        let mut bad_mtime = header(b'0', 0);
-        bad_mtime[MTIME_RANGE].copy_from_slice(b"00000000008\0");
-        set_checksum(&mut bad_mtime);
-        let mut unterminated_uname = header(b'0', 0);
-        unterminated_uname[UNAME_RANGE].fill(b'u');
-        set_checksum(&mut unterminated_uname);
-        let mut unterminated_gname = header(b'0', 0);
-        unterminated_gname[GNAME_RANGE].fill(b'g');
-        set_checksum(&mut unterminated_gname);
 
         vec![
             ("magic", bad_magic, ExpectedHeaderError::InvalidIdentity),
@@ -1502,47 +1482,57 @@ mod tests {
             ),
             (
                 "octal size",
-                bad_octal_size,
+                checksummed_header(|block| {
+                    block[SIZE_RANGE].copy_from_slice(b"00000000008\0");
+                }),
                 ExpectedHeaderError::InvalidSize,
             ),
             (
                 "base256 size",
-                bad_base256_size,
+                checksummed_header(|block| block[SIZE_RANGE.start] = 0x80),
                 ExpectedHeaderError::InvalidSize,
             ),
             (
                 "octal mode",
-                bad_octal_mode,
+                checksummed_header(|block| {
+                    block[MODE_RANGE].copy_from_slice(b"0000080\0");
+                }),
                 ExpectedHeaderError::InvalidMode,
             ),
             (
                 "oversized mode",
-                oversized_mode,
+                checksummed_header(|block| {
+                    block[MODE_RANGE].copy_from_slice(b"0010000\0");
+                }),
                 ExpectedHeaderError::InvalidMode,
             ),
             (
                 "uid",
-                bad_uid,
+                checksummed_header(|block| {
+                    block[UID_RANGE].copy_from_slice(b"invalid\0");
+                }),
                 ExpectedHeaderError::InvalidUstarNumericField("uid"),
             ),
             (
                 "gid",
-                bad_gid,
+                checksummed_header(|block| block[GID_RANGE].fill(0)),
                 ExpectedHeaderError::InvalidUstarNumericField("gid"),
             ),
             (
                 "mtime",
-                bad_mtime,
+                checksummed_header(|block| {
+                    block[MTIME_RANGE].copy_from_slice(b"00000000008\0");
+                }),
                 ExpectedHeaderError::InvalidUstarNumericField("mtime"),
             ),
             (
                 "uname",
-                unterminated_uname,
+                checksummed_header(|block| block[UNAME_RANGE].fill(b'u')),
                 ExpectedHeaderError::UnterminatedUstarStringField("uname"),
             ),
             (
                 "gname",
-                unterminated_gname,
+                checksummed_header(|block| block[GNAME_RANGE].fill(b'g')),
                 ExpectedHeaderError::UnterminatedUstarStringField("gname"),
             ),
             (

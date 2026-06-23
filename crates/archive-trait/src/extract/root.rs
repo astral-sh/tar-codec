@@ -126,11 +126,7 @@ impl EntryTree {
 
     fn find_parent_directory(&self, path: &NormalizedPath) -> Option<EntryId> {
         let mut entry = ROOT_ENTRY;
-        let mut components = path.components().peekable();
-        while let Some(component) = components.next() {
-            if components.peek().is_none() {
-                break;
-            }
+        for component in path.parent_components() {
             entry = self.child(entry, component)?;
             if !self.state(entry).is_some_and(ExtractedEntry::is_directory) {
                 return None;
@@ -692,11 +688,7 @@ impl<E> ExtractionRoot<E> {
     async fn ensure_parents(&mut self, path: &NormalizedPath) -> Result<EntryId, ExtractError<E>> {
         let mut current = NormalizedPath::default();
         let mut parent_entry = ROOT_ENTRY;
-        let mut components = path.components().peekable();
-        while let Some(component) = components.next() {
-            if components.peek().is_none() {
-                break;
-            }
+        for component in path.parent_components() {
             current.push(component);
             let entry = self.entries.ensure_child(parent_entry, component);
             self.ensure_directory(
