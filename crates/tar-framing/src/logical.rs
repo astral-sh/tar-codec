@@ -13,7 +13,7 @@ use crate::{
     PaxString, PaxValue, UstarKind,
     header::{GNAME_RANGE, LINK_NAME_RANGE, UNAME_RANGE},
     pax::GlobalPaxRecords,
-    stream::{DataFrame, DataOwner, Frame, HeaderFrame, TarStream, next_stream_item},
+    stream::{DataFrame, DataOwner, Frame, HeaderFrame, TarStream},
 };
 
 pub use crate::{PaxExtension, PaxState};
@@ -361,13 +361,13 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
         }
 
         loop {
-            let frame = match next_stream_item(&mut self.payload.stream).await {
-                Some(Ok(frame)) => frame,
-                Some(Err(error)) => {
+            let frame = match self.payload.stream.next_frame().await {
+                Ok(Some(frame)) => frame,
+                Err(error) => {
                     self.clear_extension_state();
                     return Err(error);
                 }
-                None => {
+                Ok(None) => {
                     self.clear_extension_state();
                     return Ok(None);
                 }

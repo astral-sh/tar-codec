@@ -853,7 +853,6 @@ name = "tar-framing"
 version = "0.0.6"
 dependencies = [
  "criterion",
- "futures-core",
  "thiserror",
  "tokio",
 ]
@@ -864,7 +863,6 @@ version = "0.0.6"
 dependencies = [
  "async-compression",
  "clap",
- "futures-core",
  "tar-codec",
  "tar-framing",
  "thiserror",

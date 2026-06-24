@@ -20,6 +20,5 @@ tar-framing = { workspace = true }
 
 async-compression = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
-futures-core = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt"] }

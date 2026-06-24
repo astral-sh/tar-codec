@@ -492,7 +492,7 @@ mod tests {
         PaxKind, PaxRecord, PaxString, PaxValue,
         header::parse_octal,
         stream::{Frame, TarStream},
-        test_support::{ChunkedReader, collect_stream, ready},
+        test_support::{ChunkedReader, collect_frames, ready},
     };
 
     fn pax_member<'a>(
@@ -547,7 +547,7 @@ mod tests {
                 b""
             };
             let bytes = frame_archive(sequence as u64, member, payload).expect("valid member");
-            let frames = ready(collect_stream(TarStream::new(ChunkedReader::new(
+            let frames = ready(collect_frames(TarStream::new(ChunkedReader::new(
                 bytes, 19,
             ))));
             assert!(matches!(
@@ -594,7 +594,7 @@ mod tests {
         bytes.extend_from_slice(b"run");
         bytes.resize(bytes.len() + BLOCK_SIZE - 3, 0);
         bytes.extend_from_slice(end_marker_bytes());
-        let frames = ready(collect_stream(TarStream::new(ChunkedReader::new(
+        let frames = ready(collect_frames(TarStream::new(ChunkedReader::new(
             bytes, 19,
         ))));
         assert!(frames.iter().all(Result::is_ok));
@@ -733,7 +733,7 @@ mod tests {
         assert!(member_header[LINK_NAME_RANGE].iter().all(|byte| *byte == 0));
 
         bytes.extend_from_slice(end_marker_bytes());
-        let frames = ready(collect_stream(TarStream::new(ChunkedReader::new(
+        let frames = ready(collect_frames(TarStream::new(ChunkedReader::new(
             bytes, 23,
         ))));
         let records = frames

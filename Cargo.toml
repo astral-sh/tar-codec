@@ -26,7 +26,6 @@ astral-tokio-tar = "0.6.2"
 cap-std = "4.0.2"
 clap = "4.6"
 criterion = { version = "0.8.2", features = ["async_tokio"], default-features = false }
-futures-core = "0.3"
 junction = "2.0.0"
 tar = "0.4.46"
 tempfile = "3"
