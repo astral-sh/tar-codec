@@ -714,9 +714,8 @@ mod tests {
         },
         stream::DataOwner,
         test_support::{
-            ChunkedReader, append_block, append_gnu, append_payload, append_posix,
-            append_terminator, cancel_pending, gnu_header, header, ready, ready_ok, record,
-            set_checksum,
+            ChunkedReader, append_block, append_gnu, append_pax, append_payload, append_terminator,
+            cancel_pending, gnu_header, header, ready, ready_ok, record, set_checksum,
         },
     };
 
@@ -744,7 +743,7 @@ mod tests {
 
     fn member_followed_by_empty_member(payload: &[u8]) -> (Vec<u8>, u64) {
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'0', payload);
+        append_pax(&mut bytes, b'0', payload);
         let next_position = u64::try_from(bytes.len()).expect("test position should fit u64");
         append_block(&mut bytes, &header(b'0', 0));
         append_terminator(&mut bytes);
@@ -899,8 +898,8 @@ mod tests {
         let mut local = record("path", "local");
         local.extend_from_slice(&record("linkpath", ""));
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'g', &global);
-        append_posix(&mut bytes, b'x', &local);
+        append_pax(&mut bytes, b'g', &global);
+        append_pax(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'2', 0));
         append_block(&mut bytes, &header(b'2', 0));
         append_terminator(&mut bytes);
@@ -981,13 +980,13 @@ mod tests {
         for (field, mut bytes) in [
             ("path", {
                 let mut bytes = Vec::new();
-                append_posix(&mut bytes, b'x', &record("path", "bad\0name"));
+                append_pax(&mut bytes, b'x', &record("path", "bad\0name"));
                 append_block(&mut bytes, &header(b'0', 0));
                 bytes
             }),
             ("link path", {
                 let mut bytes = Vec::new();
-                append_posix(&mut bytes, b'x', &record("linkpath", "bad\0target"));
+                append_pax(&mut bytes, b'x', &record("linkpath", "bad\0target"));
                 append_block(&mut bytes, &header(b'2', 0));
                 bytes
             }),
@@ -1022,8 +1021,8 @@ mod tests {
         let mut local = record("path", "good-name");
         local.extend_from_slice(&record("linkpath", "good-target"));
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'g', &global);
-        append_posix(&mut bytes, b'x', &local);
+        append_pax(&mut bytes, b'g', &global);
+        append_pax(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'2', 0));
         append_terminator(&mut bytes);
 
@@ -1043,7 +1042,7 @@ mod tests {
                 "pax",
                 {
                     let mut bytes = Vec::new();
-                    append_posix(&mut bytes, b'x', &record("path", "pax-name"));
+                    append_pax(&mut bytes, b'x', &record("path", "pax-name"));
                     let mut member = header(b'0', 0);
                     set_field(&mut member, NAME_RANGE, b"");
                     set_field(&mut member, PREFIX_RANGE, b"");
@@ -1084,9 +1083,9 @@ mod tests {
         set_checksum(&mut physical_header);
 
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'g', &record("path", "global"));
+        append_pax(&mut bytes, b'g', &record("path", "global"));
         append_block(&mut bytes, &header(b'0', 0));
-        append_posix(&mut bytes, b'g', &record("path", ""));
+        append_pax(&mut bytes, b'g', &record("path", ""));
         append_block(&mut bytes, &physical_header);
         append_terminator(&mut bytes);
 
@@ -1171,8 +1170,8 @@ mod tests {
         let mut local = record("path", "renamed");
         local.extend_from_slice(&record("size", "513"));
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'g', &global);
-        append_posix(&mut bytes, b'x', &local);
+        append_pax(&mut bytes, b'g', &global);
+        append_pax(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'0', 1));
         append_payload(&mut bytes, &[b'a'; BLOCK_SIZE]);
         append_payload(&mut bytes, b"b");
@@ -1229,8 +1228,8 @@ mod tests {
             .expect("test payload total should fit u64");
 
         let mut rejected = Vec::new();
-        append_posix(&mut rejected, b'g', &payload);
-        append_posix(&mut rejected, b'g', &payload);
+        append_pax(&mut rejected, b'g', &payload);
+        append_pax(&mut rejected, b'g', &payload);
         let rejected_position =
             u64::try_from(rejected.len()).expect("test position should fit u64");
         append_block(&mut rejected, &header(b'g', payload_size));
@@ -1255,7 +1254,7 @@ mod tests {
         let mut accepted = Vec::new();
         for _ in 0..2 {
             for _ in 0..3 {
-                append_posix(&mut accepted, b'g', &payload);
+                append_pax(&mut accepted, b'g', &payload);
             }
             append_block(&mut accepted, &header(b'0', 0));
         }
@@ -1280,7 +1279,7 @@ mod tests {
     #[test]
     fn retains_global_pax_extension_across_cancelled_reads() {
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'g', &record("comment", "metadata"));
+        append_pax(&mut bytes, b'g', &record("comment", "metadata"));
         let after_extension_header = BLOCK_SIZE;
         let after_extension_payload = bytes.len();
         append_block(&mut bytes, &header(b'0', 0));
@@ -1357,11 +1356,11 @@ mod tests {
         let second = record("gname", "second");
         let replacement = record("comment", "replacement");
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'g', &first);
-        append_posix(&mut bytes, b'g', &second);
+        append_pax(&mut bytes, b'g', &first);
+        append_pax(&mut bytes, b'g', &second);
         append_block(&mut bytes, &header(b'0', 0));
         append_block(&mut bytes, &header(b'0', 0));
-        append_posix(&mut bytes, b'g', &replacement);
+        append_pax(&mut bytes, b'g', &replacement);
         append_block(&mut bytes, &header(b'0', 0));
         append_terminator(&mut bytes);
 
@@ -1408,7 +1407,7 @@ mod tests {
             .map(|index| u8::try_from(index % 251).unwrap())
             .collect::<Vec<_>>();
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'0', &payload);
+        append_pax(&mut bytes, b'0', &payload);
         append_terminator(&mut bytes);
 
         ready_ok(async {
@@ -1733,8 +1732,8 @@ mod tests {
         }
 
         let mut global = Vec::new();
-        append_posix(&mut global, b'g', &record("comment", "metadata"));
-        append_posix(&mut global, b'g', &record("gname", "group"));
+        append_pax(&mut global, b'g', &record("comment", "metadata"));
+        append_pax(&mut global, b'g', &record("gname", "group"));
         append_terminator(&mut global);
         ready_ok(async {
             let mut reader = TarReader::new(ChunkedReader::new(global, BLOCK_SIZE));
@@ -1743,7 +1742,7 @@ mod tests {
         });
 
         let mut malformed_global = Vec::new();
-        append_posix(&mut malformed_global, b'g', b"invalid");
+        append_pax(&mut malformed_global, b'g', b"invalid");
         append_terminator(&mut malformed_global);
         let error: Result<(), FrameError> = ready(async {
             let mut reader = TarReader::new(ChunkedReader::new(malformed_global, BLOCK_SIZE));
@@ -1763,7 +1762,7 @@ mod tests {
         for payload_len in [BLOCK_SIZE + 1, PAYLOAD_DRAIN_CHUNK_BYTES + 7] {
             let payload = vec![b'a'; payload_len];
             let mut bytes = Vec::new();
-            append_posix(&mut bytes, b'0', &payload);
+            append_pax(&mut bytes, b'0', &payload);
             append_block(&mut bytes, &header(b'0', 0));
             append_terminator(&mut bytes);
 

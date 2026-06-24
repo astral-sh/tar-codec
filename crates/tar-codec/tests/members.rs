@@ -29,14 +29,14 @@ async fn read_payload<P: MemberPayload<Error = DecodeError>>(
 async fn projects_every_member_kind_and_streams_payloads() -> TestResult {
     let mut archive = ArchiveBuilder::new();
     archive
-        .posix("file", b'0', b"contents", "", 0o755)
-        .posix("contiguous", b'7', b"contiguous", "", 0o644)
-        .posix("directory", b'5', b"", "", 0o755)
-        .posix("symbolic", b'2', b"", "file", 0o777)
-        .posix("hard", b'1', b"replacement", "file", 0o644)
-        .posix("character", b'3', b"", "", 0o644)
-        .posix("block", b'4', b"", "", 0o644)
-        .posix("fifo", b'6', b"", "", 0o644);
+        .ustar("file", b'0', b"contents", "", 0o755)
+        .ustar("contiguous", b'7', b"contiguous", "", 0o644)
+        .ustar("directory", b'5', b"", "", 0o755)
+        .ustar("symbolic", b'2', b"", "file", 0o777)
+        .ustar("hard", b'1', b"replacement", "file", 0o644)
+        .ustar("character", b'3', b"", "", 0o644)
+        .ustar("block", b'4', b"", "", 0o644)
+        .ustar("fifo", b'6', b"", "", 0o644);
     let bytes = archive.finish();
     let mut members = TarArchive::new(bytes.as_slice()).members();
 
@@ -160,7 +160,7 @@ async fn resolves_format_metadata_but_leaves_extraction_paths_raw() -> TestResul
     let mut archive = ArchiveBuilder::new();
     archive
         .pax(b'x', &records)
-        .posix("raw", b'2', b"", "ignored", 0o644);
+        .ustar("raw", b'2', b"", "ignored", 0o644);
     let bytes = archive.finish();
     let mut members = TarArchive::new(bytes.as_slice()).members();
     assert!(matches!(
@@ -188,8 +188,8 @@ async fn resolves_format_metadata_but_leaves_extraction_paths_raw() -> TestResul
 async fn advancing_drains_payload_and_applies_tar_policy() -> TestResult {
     let mut archive = ArchiveBuilder::new();
     archive
-        .posix("first", b'0', &[b'a'; 1024], "", 0o644)
-        .posix("second", b'0', b"next", "", 0o644);
+        .ustar("first", b'0', &[b'a'; 1024], "", 0o644)
+        .ustar("second", b'0', b"next", "", 0o644);
     let bytes = archive.finish();
     let mut members = TarArchive::new(bytes.as_slice()).members();
     {
@@ -205,7 +205,7 @@ async fn advancing_drains_payload_and_applies_tar_policy() -> TestResult {
     assert_eq!(read_payload(payload).await?, b"next");
 
     let mut archive = ArchiveBuilder::new();
-    archive.posix("truncated", b'0', &[b'x'; 1024], "", 0o644);
+    archive.ustar("truncated", b'0', &[b'x'; 1024], "", 0o644);
     let mut bytes = archive.finish();
     bytes.truncate(1025);
     let mut members = TarArchive::new(bytes.as_slice()).members();
@@ -232,7 +232,7 @@ async fn advancing_drains_payload_and_applies_tar_policy() -> TestResult {
     let mut archive = ArchiveBuilder::new();
     archive
         .pax(b'x', &pax_record(PaxKeyword::Comment, "metadata"))
-        .posix("file", b'0', b"", "", 0o644);
+        .ustar("file", b'0', b"", "", 0o644);
     let bytes = archive.finish();
     let mut members = TarArchive::new_with_policy(
         bytes.as_slice(),
@@ -248,8 +248,8 @@ async fn policy_errors_fuse_member_iteration() -> TestResult {
     let mut archive = ArchiveBuilder::new();
     archive
         .pax(b'g', &pax_record(PaxKeyword::Path, "forbidden"))
-        .posix("first", b'0', b"", "", 0o644)
-        .posix("second", b'0', b"payload", "", 0o644);
+        .ustar("first", b'0', b"", "", 0o644)
+        .ustar("second", b'0', b"payload", "", 0o644);
     let bytes = archive.finish();
     let mut members = TarArchive::new(bytes.as_slice()).members();
 

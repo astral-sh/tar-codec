@@ -231,7 +231,7 @@ impl HeaderFrame {
                 PaxValue::Deleted => Err(FrameError::deleted_pax_metadata(position, "size")),
             },
         )?;
-        validate_posix_member_size(position, kind, declared_size, effective_size)?;
+        validate_pax_member_size(position, kind, declared_size, effective_size)?;
 
         Ok(Self {
             position,
@@ -1069,7 +1069,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
     ) -> Result<Frame, FrameError> {
         let parsed = self.parse_format_checked_header(position, &block)?;
         match parsed.format {
-            ArchiveFormat::Pax => self.process_posix_boundary_header(position, block, parsed),
+            ArchiveFormat::Pax => self.process_pax_boundary_header(position, block, parsed),
             ArchiveFormat::Gnu => {
                 self.process_gnu_header(position, block, parsed, PendingGnu::default())
             }
@@ -1101,12 +1101,12 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         Ok(parsed)
     }
 
-    /// Processes a POSIX header at an archive-member boundary, where a new
+    /// Processes a pax/ustar header at an archive-member boundary, where a new
     /// pax extension or an ordinary ustar member may begin.
     ///
     /// Pax extension headers enter [`State::ReadingPax`]; ordinary ustar
     /// headers are delegated to [`Self::process_ustar_header`].
-    fn process_posix_boundary_header(
+    fn process_pax_boundary_header(
         &mut self,
         position: u64,
         block: Block,
@@ -1406,7 +1406,7 @@ impl TryFromFramed<u8> for UstarKind {
     }
 }
 
-fn validate_posix_member_size(
+fn validate_pax_member_size(
     position: u64,
     kind: UstarKind,
     declared_size: u64,
@@ -1475,8 +1475,8 @@ mod tests {
         ArchiveFormat, FrameError, FrameErrorInner, HdrCharset, PaxString, PaxValue,
         header::{DEVMAJOR_RANGE, DEVMINOR_RANGE},
         test_support::{
-            ChunkedReader, append_block, append_gnu, append_payload, append_posix,
-            append_terminator, gnu_base256_header, gnu_header, header, ready, record, set_checksum,
+            ChunkedReader, append_block, append_gnu, append_pax, append_payload, append_terminator,
+            gnu_base256_header, gnu_header, header, ready, record, set_checksum,
         },
     };
 
@@ -1697,7 +1697,7 @@ mod tests {
         assert!(payload.len() > BLOCK_SIZE);
 
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'x', &payload);
+        append_pax(&mut bytes, b'x', &payload);
         append_block(&mut bytes, &header(b'0', 1));
         append_payload(&mut bytes, &[b'a'; BLOCK_SIZE]);
         append_payload(&mut bytes, b"b");
@@ -1735,7 +1735,7 @@ mod tests {
         let declared_size = u64::try_from(payload.len()).expect("payload size should fit u64");
         for (case, typeflag) in [("local", b'x'), ("global", b'g')] {
             let mut bytes = Vec::new();
-            append_posix(&mut bytes, typeflag, &payload);
+            append_pax(&mut bytes, typeflag, &payload);
             let frames = collect_with_max_pax_extension_size(bytes, BLOCK_SIZE, declared_size - 1);
             assert_eq!(frames.len(), 1, "{case}");
             assert!(matches!(
@@ -1802,7 +1802,7 @@ mod tests {
         payload.extend_from_slice(&record("ACME.attribute", "value"));
         for (case, typeflag) in [("local", b'x'), ("global", b'g')] {
             let mut bytes = Vec::new();
-            append_posix(&mut bytes, typeflag, &payload);
+            append_pax(&mut bytes, typeflag, &payload);
             if typeflag == b'x' {
                 append_block(&mut bytes, &header(b'0', 0));
             }
@@ -1831,14 +1831,14 @@ mod tests {
         deletion.extend_from_slice(&record("size", ""));
 
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'g', &initial_global);
-        append_posix(&mut bytes, b'g', &replacement_global);
+        append_pax(&mut bytes, b'g', &initial_global);
+        append_pax(&mut bytes, b'g', &replacement_global);
         append_block(&mut bytes, &header(b'0', 1));
         append_payload(&mut bytes, b"ab");
-        append_posix(&mut bytes, b'x', &local);
+        append_pax(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'0', 1));
         append_payload(&mut bytes, b"abc");
-        append_posix(&mut bytes, b'g', &deletion);
+        append_pax(&mut bytes, b'g', &deletion);
         append_block(&mut bytes, &header(b'5', 1));
         append_terminator(&mut bytes);
 
@@ -1910,7 +1910,7 @@ mod tests {
         let mut local = record("size", "");
         local.extend_from_slice(&record("size", "2"));
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'x', &local);
+        append_pax(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'0', 1));
         append_payload(&mut bytes, b"ab");
         append_terminator(&mut bytes);
@@ -1972,7 +1972,7 @@ mod tests {
 
         for (case, typeflag, records, malformed, expected) in cases {
             let mut bytes = Vec::new();
-            append_posix(&mut bytes, typeflag, &records);
+            append_pax(&mut bytes, typeflag, &records);
             append_block(&mut bytes, &malformed);
             append_terminator(&mut bytes);
 
@@ -2001,8 +2001,8 @@ mod tests {
         let global = record("size", "7");
         let local = record("size", "");
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'g', &global);
-        append_posix(&mut bytes, b'x', &local);
+        append_pax(&mut bytes, b'g', &global);
+        append_pax(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'5', 3));
         append_terminator(&mut bytes);
 
@@ -2017,7 +2017,7 @@ mod tests {
         let records = record("size", "");
         for typeflag in [b'x', b'g'] {
             let mut bytes = Vec::new();
-            append_posix(&mut bytes, typeflag, &records);
+            append_pax(&mut bytes, typeflag, &records);
             append_block(&mut bytes, &header(b'0', 0));
 
             assert!(
@@ -2035,8 +2035,8 @@ mod tests {
         let global = record("size", "");
         let local = record("size", "2");
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'g', &global);
-        append_posix(&mut bytes, b'x', &local);
+        append_pax(&mut bytes, b'g', &global);
+        append_pax(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'0', 1));
         append_payload(&mut bytes, b"ab");
         append_terminator(&mut bytes);
@@ -2063,7 +2063,7 @@ mod tests {
         ] {
             let mut bytes = Vec::new();
             if let Some(override_size) = override_size {
-                append_posix(&mut bytes, b'x', &record("size", override_size));
+                append_pax(&mut bytes, b'x', &record("size", override_size));
             }
             append_block(&mut bytes, &header(b'1', declared_size));
             append_payload(&mut bytes, b"abc");
@@ -2095,7 +2095,7 @@ mod tests {
     fn zero_filled_block_inside_pax_payload_is_data() {
         let payload = record("comment", &"\0".repeat(BLOCK_SIZE * 3));
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'x', &payload);
+        append_pax(&mut bytes, b'x', &payload);
         append_block(&mut bytes, &header(b'0', 0));
         append_terminator(&mut bytes);
 
@@ -2241,7 +2241,7 @@ mod tests {
                 (b'6', UstarKind::Fifo),
             ] {
                 let mut bytes = Vec::new();
-                append_posix(&mut bytes, b'x', &record("size", override_size));
+                append_pax(&mut bytes, b'x', &record("size", override_size));
                 append_block(&mut bytes, &header(typeflag, declared_size));
 
                 assert!(
@@ -2284,7 +2284,7 @@ mod tests {
 
         let valid = record("path", "name");
         let mut consecutive = Vec::new();
-        append_posix(&mut consecutive, b'x', &valid);
+        append_pax(&mut consecutive, b'x', &valid);
         append_block(&mut consecutive, &header(b'x', valid.len() as u64));
         assert!(matches!(
             last_error_inner(&collect(consecutive, BLOCK_SIZE)),
@@ -2292,7 +2292,7 @@ mod tests {
         ));
 
         let mut missing_member = Vec::new();
-        append_posix(&mut missing_member, b'x', &valid);
+        append_pax(&mut missing_member, b'x', &valid);
         assert!(matches!(
             last_error_inner(&collect(missing_member, BLOCK_SIZE)),
             FrameErrorInner::UnexpectedEof { .. }
@@ -2304,7 +2304,7 @@ mod tests {
         let invalid = record("size", "bad");
         let mut bytes = Vec::new();
         append_block(&mut bytes, &header(b'0', 0));
-        append_posix(&mut bytes, b'x', &invalid);
+        append_pax(&mut bytes, b'x', &invalid);
 
         let frames = collect(bytes, BLOCK_SIZE);
         assert!(matches!(
@@ -2324,8 +2324,8 @@ mod tests {
         global.extend_from_slice(&record("path", "global"));
         let local = record("path", "local");
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'g', &global);
-        append_posix(&mut bytes, b'x', &local);
+        append_pax(&mut bytes, b'g', &global);
+        append_pax(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'0', 0));
         append_terminator(&mut bytes);
         let frames = collect(bytes, BLOCK_SIZE);
@@ -2355,7 +2355,7 @@ mod tests {
 
         let records = record("hdrcharset", "ISO-IR 8859 1 1998");
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'x', &records);
+        append_pax(&mut bytes, b'x', &records);
         assert!(matches!(
             last_error_inner(&collect(bytes, BLOCK_SIZE)),
             FrameErrorInner::InvalidPaxRecord {

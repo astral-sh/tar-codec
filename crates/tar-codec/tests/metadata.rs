@@ -35,9 +35,9 @@ async fn pax_precedence_and_validation_use_effective_names() {
     archive
         .pax(b'g', &global)
         .pax(b'x', &local_file)
-        .posix("raw", b'0', b"content", "", 0o644)
+        .ustar("raw", b'0', b"content", "", 0o644)
         .pax(b'x', &local_link)
-        .posix("raw-link", b'2', b"", "wrong-target", 0o644);
+        .ustar("raw-link", b'2', b"", "wrong-target", 0o644);
     let bytes = archive.finish();
     let decode_policy = DecodePolicy::default()
         .pax_policy(PaxDecodePolicy::default().allow_global_pax_member_metadata(true));
@@ -59,9 +59,9 @@ async fn pax_precedence_and_validation_use_effective_names() {
     let mut archive = ArchiveBuilder::new();
     archive
         .pax(b'x', &local_file)
-        .posix("raw-file", b'0', b"content", "", 0o644)
+        .ustar("raw-file", b'0', b"content", "", 0o644)
         .pax(b'x', &local_link)
-        .posix("raw-link", b'2', b"", "wrong-target", 0o644);
+        .ustar("raw-link", b'2', b"", "wrong-target", 0o644);
     let bytes = archive.finish();
     let policy = ExtractPolicy::default().name_validator(Some(|name| {
         !name.contains("raw") && !name.contains("wrong")
@@ -79,7 +79,7 @@ async fn pax_precedence_and_validation_use_effective_names() {
     let mut archive = ArchiveBuilder::new();
     archive
         .pax(b'x', &pax_record(PaxKeyword::Path, "blocked"))
-        .posix("allowed", b'0', b"", "", 0o644);
+        .ustar("allowed", b'0', b"", "", 0o644);
     let bytes = archive.finish();
     let policy = ExtractPolicy::default().name_validator(Some(|name| {
         default_name_validator(name) && !name.contains("blocked")
@@ -192,7 +192,7 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
     let mut archive = ArchiveBuilder::new();
     archive
         .pax(b'x', &pax_record(vendor_attribute_keyword(), "value"))
-        .posix("file", b'0', b"", "", 0o644);
+        .ustar("file", b'0', b"", "", 0o644);
     let bytes = archive.finish();
     assert!(matches!(
         TarArchive::new(bytes.as_slice())
@@ -210,9 +210,9 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
     let destination = temp.path().join("partial");
     let mut archive = ArchiveBuilder::new();
     archive
-        .posix("created", b'0', b"kept", "", 0o644)
+        .ustar("created", b'0', b"kept", "", 0o644)
         .pax(b'g', &pax_record(vendor_attribute_keyword(), "value"))
-        .posix("blocked", b'0', b"", "", 0o644);
+        .ustar("blocked", b'0', b"", "", 0o644);
     let bytes = archive.finish();
     assert!(matches!(
         TarArchive::new(bytes.as_slice())
@@ -232,7 +232,7 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
     let mut archive = ArchiveBuilder::new();
     archive
         .pax(b'x', &pax_record(vendor_attribute_keyword(), "value"))
-        .posix("file", b'0', b"ok", "", 0o644);
+        .ustar("file", b'0', b"ok", "", 0o644);
     let bytes = archive.finish();
     let decode_policy = DecodePolicy::default()
         .pax_policy(PaxDecodePolicy::default().allow_unknown_pax_vendor_records(true));
@@ -254,7 +254,7 @@ async fn duplicate_pax_records_are_rejected_by_default_and_can_use_last_value() 
     let mut archive = ArchiveBuilder::new();
     archive
         .pax(b'x', &local)
-        .posix("raw", b'0', b"contents", "", 0o644);
+        .ustar("raw", b'0', b"contents", "", 0o644);
     let bytes = archive.finish();
 
     assert!(matches!(
@@ -289,7 +289,7 @@ async fn pax_extension_size_limit_is_configurable_for_extraction() {
     let mut archive = ArchiveBuilder::new();
     archive
         .pax(b'x', &payload)
-        .posix("file", b'0', b"contents", "", 0o644);
+        .ustar("file", b'0', b"contents", "", 0o644);
     let bytes = archive.finish();
     let payload_size = u64::try_from(payload.len()).expect("payload size should fit u64");
 
@@ -340,7 +340,7 @@ async fn global_pax_extensions_size_limit_is_configurable_for_extraction() {
     for _ in 0..3 {
         archive.pax(b'g', &payload);
     }
-    archive.posix("file", b'0', b"contents", "", 0o644);
+    archive.ustar("file", b'0', b"contents", "", 0o644);
     let bytes = archive.finish();
 
     let destination = temp.path().join("rejected");
@@ -436,7 +436,7 @@ async fn global_pax_headers_support_opt_out_and_ignore_trailing_updates() {
     let mut archive = ArchiveBuilder::new();
     archive
         .pax(b'g', &pax_record(PaxKeyword::Comment, "metadata"))
-        .posix("file", b'0', b"", "", 0o644);
+        .ustar("file", b'0', b"", "", 0o644);
     let bytes = archive.finish();
     let reject_globals = DecodePolicy::default()
         .pax_policy(PaxDecodePolicy::default().allow_global_pax_extensions(false));
@@ -454,7 +454,7 @@ async fn global_pax_headers_support_opt_out_and_ignore_trailing_updates() {
     let mut archive = ArchiveBuilder::new();
     archive
         .pax(b'g', &pax_record(PaxKeyword::Comment, "metadata"))
-        .posix("file", b'0', b"contents", "", 0o644);
+        .ustar("file", b'0', b"contents", "", 0o644);
     let bytes = archive.finish();
     TarArchive::new(bytes.as_slice())
         .extract_in(&destination, ExtractPolicy::default())
@@ -498,7 +498,7 @@ async fn global_member_metadata_requires_opt_in_and_uses_pax_precedence() {
         let mut archive = ArchiveBuilder::new();
         archive
             .pax(b'g', &pax_record(keyword, value))
-            .posix("raw", b'0', b"", "", 0o644);
+            .ustar("raw", b'0', b"", "", 0o644);
         let bytes = archive.finish();
         assert!(matches!(
             TarArchive::new(bytes.as_slice())
@@ -518,7 +518,7 @@ async fn global_member_metadata_requires_opt_in_and_uses_pax_precedence() {
     archive
         .pax(b'g', &pax_record(PaxKeyword::Path, "old"))
         .pax(b'g', &pax_record(PaxKeyword::Path, "current"))
-        .posix("raw", b'0', b"contents", "", 0o644);
+        .ustar("raw", b'0', b"contents", "", 0o644);
     let bytes = archive.finish();
     let decode_policy = DecodePolicy::default()
         .pax_policy(PaxDecodePolicy::default().allow_global_pax_member_metadata(true));
@@ -542,7 +542,7 @@ async fn binary_names_are_rejected_and_streaming_failures_preserve_prior_output(
     let mut archive = ArchiveBuilder::new();
     archive
         .pax(b'x', &binary_path)
-        .posix("raw", b'0', b"", "", 0o644);
+        .ustar("raw", b'0', b"", "", 0o644);
     let binary = archive.finish();
     assert!(matches!(
         TarArchive::new(binary.as_slice())
@@ -560,7 +560,7 @@ async fn binary_names_are_rejected_and_streaming_failures_preserve_prior_output(
     set_checksum(&mut invalid);
     let mut archive = ArchiveBuilder::new();
     archive
-        .posix("created", b'0', b"kept", "", 0o644)
+        .ustar("created", b'0', b"kept", "", 0o644)
         .block(&invalid);
     let bytes = archive.into_unterminated();
     assert!(matches!(
