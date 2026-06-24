@@ -7,7 +7,6 @@
 use std::{borrow::Cow, mem, ops::Range};
 
 use tokio::io::AsyncRead;
-use tokio_stream::StreamExt;
 
 use crate::{
     ArchiveFormat, Block, FrameError, FrameErrorInner, GnuKind, PaxKeyword, PaxKind, PaxRecord,
@@ -362,13 +361,13 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
         }
 
         loop {
-            let frame = match self.payload.stream.next().await {
-                Some(Ok(frame)) => frame,
-                Some(Err(error)) => {
+            let frame = match self.payload.stream.next_frame().await {
+                Ok(Some(frame)) => frame,
+                Err(error) => {
                     self.clear_extension_state();
                     return Err(error);
                 }
-                None => {
+                Ok(None) => {
                     self.clear_extension_state();
                     return Ok(None);
                 }

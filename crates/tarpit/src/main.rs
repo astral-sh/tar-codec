@@ -17,7 +17,6 @@ use tokio::{
     fs::File,
     io::{AsyncRead, BufReader},
 };
-use tokio_stream::StreamExt;
 
 #[derive(Debug, Parser)]
 #[command(about = "Inspect and extract tar streams")]
@@ -131,9 +130,10 @@ async fn dump_frames<R: AsyncRead + Unpin, W: Write>(
     let mut started = false;
     let mut index = 0;
 
-    while let Some(result) = stream.next().await {
-        let frame = match result {
-            Ok(frame) => frame,
+    loop {
+        let frame = match stream.next_frame().await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
             Err(error) => {
                 if started {
                     output.flush()?;

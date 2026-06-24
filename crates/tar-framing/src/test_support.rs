@@ -13,6 +13,7 @@ use crate::{
         GID_RANGE, GNU_IDENTITY, IDENTITY_RANGE, MODE_RANGE, MTIME_RANGE, SIZE_RANGE,
         TYPEFLAG_OFFSET, UID_RANGE, USTAR_IDENTITY, encode_checksum, encode_octal,
     },
+    stream::{Frame, TarStream},
 };
 
 pub(crate) struct ChunkedReader {
@@ -141,6 +142,20 @@ pub(crate) fn append_gnu(bytes: &mut Vec<u8>, typeflag: u8, payload: &[u8]) {
 
 pub(crate) fn append_terminator(bytes: &mut Vec<u8>) {
     bytes.resize(bytes.len() + 2 * BLOCK_SIZE, 0);
+}
+
+pub(crate) async fn collect_frames<R>(mut stream: TarStream<R>) -> Vec<Result<Frame, FrameError>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut frames = Vec::new();
+    loop {
+        match stream.next_frame().await {
+            Ok(Some(frame)) => frames.push(Ok(frame)),
+            Ok(None) => return frames,
+            Err(error) => frames.push(Err(error)),
+        }
+    }
 }
 
 pub(crate) fn ready<F: Future>(future: F) -> F::Output {

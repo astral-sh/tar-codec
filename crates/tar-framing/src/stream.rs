@@ -80,7 +80,6 @@ use std::{
 };
 
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio_stream::Stream;
 
 use crate::{
     ArchiveFormat, BLOCK_SIZE, Block, DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE,
@@ -511,6 +510,15 @@ impl<R> TarStream<R> {
 }
 
 impl<R: AsyncRead + Unpin> TarStream<R> {
+    /// Returns the next non-terminator physical archive frame.
+    ///
+    /// Reaching the end of the archive returns [`None`]. A framing error fuses
+    /// this reader, so every subsequent call also returns [`None`]. Cancelling
+    /// this operation retains any partial block for the next call.
+    pub async fn next_frame(&mut self) -> Result<Option<Frame>, FrameError> {
+        poll_fn(|context| self.poll_next_frame(context)).await
+    }
+
     /// Reads one ordinary-member payload block without constructing a [`Frame`].
     ///
     /// Returns the block's position, lossless bytes, and meaningful length.
@@ -1211,38 +1219,36 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         self.state = member_payload_state(frame.effective_size);
         Ok(Frame::Header(frame))
     }
-}
 
-impl<R: AsyncRead + Unpin> Stream for TarStream<R> {
-    type Item = Result<Frame, FrameError>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
+    fn poll_next_frame(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<Option<Frame>, FrameError>> {
         loop {
-            if matches!(this.state, State::Complete | State::Failed) {
-                return Poll::Ready(None);
+            if matches!(self.state, State::Complete | State::Failed) {
+                return Poll::Ready(Ok(None));
             }
 
-            let (position, block) = match this.poll_read_block(cx) {
+            let (position, block) = match self.poll_read_block(context) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(Some(block))) => block,
                 Poll::Ready(Ok(None)) => {
-                    let error = this.handle_eof();
-                    this.state = State::Failed;
-                    return Poll::Ready(Some(Err(error)));
+                    let error = self.handle_eof();
+                    self.state = State::Failed;
+                    return Poll::Ready(Err(error));
                 }
                 Poll::Ready(Err(error)) => {
-                    this.state = State::Failed;
-                    return Poll::Ready(Some(Err(error)));
+                    self.state = State::Failed;
+                    return Poll::Ready(Err(error));
                 }
             };
 
-            match this.process_block(position, block) {
-                Ok(Some(frame)) => return Poll::Ready(Some(Ok(frame))),
+            match self.process_block(position, block) {
+                Ok(Some(frame)) => return Poll::Ready(Ok(Some(frame))),
                 Ok(None) => continue,
                 Err(error) => {
-                    this.state = State::Failed;
-                    return Poll::Ready(Some(Err(error)));
+                    self.state = State::Failed;
+                    return Poll::Ready(Err(error));
                 }
             }
         }
@@ -1410,7 +1416,6 @@ mod tests {
     };
 
     use tokio::io::ReadBuf;
-    use tokio_stream::{Stream, StreamExt};
 
     use super::*;
     use crate::{
@@ -1418,12 +1423,14 @@ mod tests {
         header::{DEVMAJOR_RANGE, DEVMINOR_RANGE},
         test_support::{
             ChunkedReader, append_block, append_gnu, append_pax, append_payload, append_terminator,
-            gnu_base256_header, gnu_header, header, ready, record, set_checksum,
+            collect_frames, gnu_base256_header, gnu_header, header, ready, record, set_checksum,
         },
     };
 
     fn collect(bytes: Vec<u8>, max_chunk: usize) -> Vec<Result<Frame, FrameError>> {
-        ready(TarStream::new(ChunkedReader::new(bytes, max_chunk)).collect())
+        ready(collect_frames(TarStream::new(ChunkedReader::new(
+            bytes, max_chunk,
+        ))))
     }
 
     fn collect_with_max_pax_extension_size(
@@ -1433,7 +1440,7 @@ mod tests {
     ) -> Vec<Result<Frame, FrameError>> {
         let mut stream = TarStream::new(ChunkedReader::new(bytes, max_chunk));
         stream.set_max_pax_extension_size(max_pax_extension_size);
-        ready(stream.collect())
+        ready(collect_frames(stream))
     }
 
     fn header_frame(frames: &[Result<Frame, FrameError>], index: usize) -> &HeaderFrame {
@@ -1718,15 +1725,15 @@ mod tests {
         stream.set_max_pax_extension_size(0);
 
         assert!(matches!(
-            ready(stream.next()),
-            Some(Err(FrameError {
+            ready(stream.next_frame()),
+            Err(FrameError {
                 position: 0,
                 inner: FrameErrorInner::ExtensionTooLarge {
                     format: ArchiveFormat::Pax,
                     size: 1,
                     limit: 0,
                 },
-            }))
+            })
         ));
         assert_eq!(consumed.get(), BLOCK_SIZE);
     }
@@ -2378,12 +2385,7 @@ mod tests {
         let mut empty = Vec::new();
         append_terminator(&mut empty);
         let mut stream = TarStream::new(ChunkedReader::new(empty, BLOCK_SIZE));
-        let waker = std::task::Waker::noop();
-        let mut cx = Context::from_waker(waker);
-        assert!(matches!(
-            Pin::new(&mut stream).poll_next(&mut cx),
-            Poll::Ready(None)
-        ));
+        assert!(matches!(ready(stream.next_frame()), Ok(None)));
         assert_eq!(stream.format(), None);
     }
 
@@ -2436,18 +2438,13 @@ mod tests {
     #[test]
     fn stream_is_fused_after_first_error() {
         let mut stream = TarStream::new(ChunkedReader::new(header(b'L', 0).to_vec(), BLOCK_SIZE));
-        let waker = std::task::Waker::noop();
-        let mut cx = Context::from_waker(waker);
         assert!(matches!(
-            Pin::new(&mut stream).poll_next(&mut cx),
-            Poll::Ready(Some(Err(FrameError {
+            ready(stream.next_frame()),
+            Err(FrameError {
                 position: 0,
                 inner: FrameErrorInner::UnsupportedTypeflag { typeflag: b'L' },
-            })))
+            })
         ));
-        assert!(matches!(
-            Pin::new(&mut stream).poll_next(&mut cx),
-            Poll::Ready(None)
-        ));
+        assert!(matches!(ready(stream.next_frame()), Ok(None)));
     }
 }
