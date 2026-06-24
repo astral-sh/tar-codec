@@ -28,6 +28,11 @@
 //!   of POSIX.1-2001). However, many real-world pax archives still contain it, and its
 //!   presence does not compromise or introduce ambiguity during framing.
 //!
+//! - tar-framing permits implementation-defined vendor pax records to contain arbitrary
+//!   bytes, including invalid UTF-8. POSIX requires extended-header values to default
+//!   to UTF-8, but real-world writers including star, GNU tar, and libarchive use raw
+//!   `SCHILY.xattr.*` values. Standard and reserved pax record values remain strict UTF-8.
+//!
 //! - tar-framing rejects directory entries (typeflag `'5'`) that present a nonzero size
 //!   in their ustar header or pax `size` record. pax says that this size should be treated
 //!   as a filesystem allocation hint rather than a physical size, but real-world parsers vary

@@ -401,8 +401,8 @@ pub enum PaxRecord {
         vendor: Arc<str>,
         /// Keyword suffix after the vendor namespace.
         name: Arc<str>,
-        /// Attribute value or deletion tombstone.
-        value: PaxValue<Arc<str>>,
+        /// Opaque attribute bytes or deletion tombstone.
+        value: PaxValue<Arc<[u8]>>,
     },
 }
 
@@ -471,7 +471,7 @@ impl PaxRecord {
             vendor if !vendor.is_empty() => Ok(Self::Vendor {
                 vendor: Arc::from(vendor),
                 name: Arc::from(name),
-                value: PaxValue::parse_text(value)?,
+                value: PaxValue::parse_opaque(value),
             }),
             _ => Err(invalid()),
         }
@@ -607,6 +607,16 @@ impl PaxValue<Arc<str>> {
     }
 }
 
+impl PaxValue<Arc<[u8]>> {
+    fn parse_opaque(value: &[u8]) -> Self {
+        if value.is_empty() {
+            Self::Deleted
+        } else {
+            Self::Value(Arc::from(value))
+        }
+    }
+}
+
 impl PaxValue<PaxString> {
     /// Parses a pax "string", taking the effective [`HdrCharset`] into account.
     fn parse_string(value: &[u8], hdrcharset: HdrCharset) -> Result<Self, PaxError> {
@@ -701,11 +711,15 @@ mod tests {
         PaxString::Binary(Arc::from(value))
     }
 
+    fn opaque(value: &[u8]) -> Arc<[u8]> {
+        Arc::from(value)
+    }
+
     fn vendor(name: &str, value: &str) -> PaxRecord {
         PaxRecord::Vendor {
             vendor: text("Acme"),
             name: text(name),
-            value: PaxValue::Value(text(value)),
+            value: PaxValue::Value(opaque(value.as_bytes())),
         }
     }
 
@@ -975,16 +989,45 @@ mod tests {
             ));
         }
 
-        let invalid_utf8 = raw_record(b"path", &[0xff]);
-        assert!(matches!(
-            PaxRecords::parse(&invalid_utf8, HdrCharset::Utf8),
-            Err(PaxError::InvalidUtf8)
-        ));
-
         for keyword in ["unknown", "VENDOR", "VENDOR.", "realtime.", "security."] {
             assert!(matches!(
                 PaxRecord::parse(keyword, b"value", HdrCharset::Utf8),
                 Err(PaxError::InvalidKeyword { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn accepts_opaque_vendor_values_but_rejects_invalid_utf8_text() {
+        let invalid_utf8 = [0xd6, 0xfb, 0x00];
+        let mut vendor_records = raw_record(b"SCHILY.xattr.user.data", &invalid_utf8);
+        vendor_records.extend_from_slice(&raw_record(b"SCHILY.xattr.user.deleted", b""));
+        let expected = PaxRecords(vec![
+            PaxRecord::Vendor {
+                vendor: text("SCHILY"),
+                name: text("xattr.user.data"),
+                value: PaxValue::Value(opaque(&invalid_utf8)),
+            },
+            PaxRecord::Vendor {
+                vendor: text("SCHILY"),
+                name: text("xattr.user.deleted"),
+                value: PaxValue::Deleted,
+            },
+        ]);
+        assert!(matches!(
+            PaxRecords::parse(&vendor_records, HdrCharset::Utf8),
+            Ok(records) if records == expected
+        ));
+
+        for keyword in [
+            b"path".as_slice(),
+            b"comment",
+            b"realtime.deadline",
+            b"security.label",
+        ] {
+            assert!(matches!(
+                PaxRecords::parse(&raw_record(keyword, &invalid_utf8), HdrCharset::Utf8),
+                Err(PaxError::InvalidUtf8)
             ));
         }
     }
