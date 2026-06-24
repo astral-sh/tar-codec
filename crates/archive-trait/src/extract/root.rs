@@ -540,15 +540,48 @@ impl<E> ExtractionRoot<E> {
         }
 
         for index in links {
-            let link = &self.symlinks[index];
-            let contents = link.target.clone();
-            self.with_entry_parent(
-                "create symbolic link",
-                &link.path,
-                link.parent,
-                move |directory, path| create_symlink(directory, &contents, path),
-            )
-            .await?;
+            let (entry, parent, path, contents) = {
+                let link = &self.symlinks[index];
+                (
+                    link.entry,
+                    link.parent,
+                    link.path.clone(),
+                    link.target.clone(),
+                )
+            };
+            match self
+                .try_create_symlink(&path, parent, contents.clone())
+                .await?
+            {
+                Ok(()) => continue,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(source) => {
+                    return Err(ExtractError::filesystem(
+                        "create symbolic link",
+                        path.to_path_buf(),
+                        source,
+                    ));
+                }
+            }
+
+            // Distinct archive paths can name the same filesystem leaf through
+            // case folding or Unicode normalization. Reservation flushes files
+            // and removes existing leaves, so a non-link found here belongs to
+            // a later archive member and already has precedence. A link can be
+            // an earlier deferred link, which this member may replace according
+            // to the normal overwrite policy.
+            self.check_replacement(&path, entry)?;
+            if let Some(metadata) = self.metadata(&path, parent).await? {
+                if !metadata_is_link(&metadata) {
+                    continue;
+                }
+                self.remove_leaf(&path, entry, parent, &metadata).await?;
+            }
+            self.try_create_symlink(&path, parent, contents)
+                .await?
+                .map_err(|source| {
+                    ExtractError::filesystem("create symbolic link", path.to_path_buf(), source)
+                })?;
         }
         Ok(())
     }
@@ -983,6 +1016,21 @@ impl<E> ExtractionRoot<E> {
             .map_err(|source| {
                 ExtractError::filesystem("create directory", path.to_path_buf(), source)
             })
+    }
+
+    /// Attempts symbolic-link creation without attaching a path to an expected
+    /// physical-filesystem collision.
+    async fn try_create_symlink(
+        &self,
+        path: &NormalizedPath,
+        parent: EntryId,
+        contents: String,
+    ) -> Result<io::Result<()>, ExtractError<E>> {
+        let (directory, relative_path) = self.entry_capability(path, parent);
+        run_blocking_io(directory, relative_path, move |directory, path| {
+            create_symlink(directory, &contents, path)
+        })
+        .await
     }
 
     /// Attempts a directory creation without eagerly materializing its diagnostic path.

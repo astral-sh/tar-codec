@@ -752,6 +752,96 @@ async fn later_link_entries_replace_links_of_the_same_kind() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn case_folded_deferred_symlinks_honor_overwrite_policy() {
+    let temp = tempdir().expect("temporary directory should be created");
+    let case_probe = temp.path().join("case-fold-probe-a");
+    std::fs::write(&case_probe, b"").expect("case-fold probe should be created");
+    let case_insensitive = temp.path().join("case-fold-probe-A").exists();
+    std::fs::remove_file(case_probe).expect("case-fold probe should be removed");
+    if !case_insensitive {
+        return;
+    }
+
+    let mut archive = ArchiveBuilder::new();
+    archive
+        .ustar("first", b'0', b"first", "", 0o644)
+        .ustar("second", b'0', b"second", "", 0o644)
+        .ustar("2621A", b'2', b"", "first", 0o644)
+        .ustar("2621a", b'2', b"", "second", 0o644);
+    let bytes = archive.finish();
+
+    let destination = temp.path().join("overwrites");
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, ExtractPolicy::default())
+        .await
+        .expect("later case-folded link should replace the earlier link");
+    assert_eq!(
+        std::fs::read_link(destination.join("2621A"))
+            .expect("case-folded symbolic link should be readable"),
+        Path::new("second")
+    );
+    assert_eq!(
+        std::fs::read(destination.join("2621a"))
+            .expect("case-folded symbolic link target should be readable"),
+        b"second"
+    );
+
+    let destination = temp.path().join("no-overwrites");
+    assert!(matches!(
+        TarArchive::new(bytes.as_slice())
+            .extract_in(
+                &destination,
+                ExtractPolicy::default().allow_overwrites(false),
+            )
+            .await,
+        Err(ExtractError::PathCollision { path }) if path == Path::new("2621a")
+    ));
+    assert_eq!(
+        std::fs::read_link(destination.join("2621A"))
+            .expect("first symbolic link should remain after the collision"),
+        Path::new("first")
+    );
+
+    let mut archive = ArchiveBuilder::new();
+    archive
+        .ustar("first", b'0', b"first", "", 0o644)
+        .ustar("file-A", b'2', b"", "first", 0o644)
+        .ustar("file-a", b'0', b"later", "", 0o644)
+        .ustar("directory-A", b'2', b"", "first", 0o644)
+        .ustar("directory-a", b'5', b"", "", 0o755);
+    let bytes = archive.finish();
+
+    let destination = temp.path().join("later-non-links");
+    TarArchive::new(bytes.as_slice())
+        .extract_in(&destination, ExtractPolicy::default())
+        .await
+        .expect("later non-link aliases should retain precedence");
+    assert_eq!(
+        std::fs::read(destination.join("file-A"))
+            .expect("later case-folded file should be readable"),
+        b"later"
+    );
+    assert!(destination.join("directory-A").is_dir());
+
+    let destination = temp.path().join("no-cross-kind-overwrites");
+    assert!(matches!(
+        TarArchive::new(bytes.as_slice())
+            .extract_in(
+                &destination,
+                ExtractPolicy::default().allow_overwrites(false),
+            )
+            .await,
+        Err(ExtractError::PathCollision { path }) if path == Path::new("file-A")
+    ));
+    assert_eq!(
+        std::fs::read(destination.join("file-a"))
+            .expect("later file should remain after the collision"),
+        b"later"
+    );
+}
+
 #[tokio::test]
 async fn hard_links_require_prior_archive_targets_and_apply_linkdata() {
     let temp = tempdir().unwrap();
