@@ -7,7 +7,7 @@ use archive_trait::{
     SpecialKind,
 };
 use tar_framing::{
-    ArchiveFormat, FrameError, PaxKeyword, PaxKind, PaxRecord, UstarKind,
+    ArchiveFormat, FrameError, PaxKeyword, PaxKind, PaxRecord, PaxValue, UstarKind,
     logical::{MemberExtensions, MemberFrame, MemberPayload as FramingMemberPayload, TarReader},
 };
 use thiserror::Error;
@@ -49,7 +49,7 @@ impl<R> TarArchive<R> {
     }
 }
 
-/// Controls which otherwise valid tar features member decoding may accept.
+/// Controls tar compatibility and the feature subset member decoding may accept.
 ///
 /// See each configuration API for its default.
 #[derive(Clone, Copy, Debug)]
@@ -60,13 +60,14 @@ pub struct DecodePolicy {
     pax_policy: PaxDecodePolicy,
 }
 
-/// Controls which otherwise valid pax features member decoding may accept.
+/// Controls pax compatibility and the feature subset member decoding may accept.
 ///
 /// See each allow API for its default.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PaxDecodePolicy {
     max_extension_size: u64,
     max_global_extensions_size: u64,
+    allow_non_utf8_pax_vendor_values: bool,
     allow_global_pax_extensions: bool,
     allow_unknown_pax_vendor_records: bool,
     allow_duplicate_pax_records: bool,
@@ -78,6 +79,7 @@ impl Default for PaxDecodePolicy {
         Self {
             max_extension_size: DEFAULT_MAX_PAX_EXTENSION_SIZE,
             max_global_extensions_size: DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE,
+            allow_non_utf8_pax_vendor_values: true,
             allow_global_pax_extensions: true,
             allow_unknown_pax_vendor_records: false,
             allow_duplicate_pax_records: false,
@@ -223,6 +225,20 @@ impl PaxDecodePolicy {
         self
     }
 
+    /// Configures whether vendor-namespaced pax record values may contain non-UTF-8 bytes.
+    ///
+    /// This compatibility option is enabled by default to accommodate raw extensions
+    /// incorrectly emitted by other real-world writers. Disabling it requires every vendor
+    /// record value to be valid UTF-8. Vendor values remain exposed as opaque
+    /// bytes in either mode.
+    ///
+    /// [`Self::allow_unknown_pax_vendor_records`] separately controls whether
+    /// decoding may ignore vendor records after they have been parsed.
+    pub fn allow_non_utf8_pax_vendor_values(mut self, allow: bool) -> Self {
+        self.allow_non_utf8_pax_vendor_values = allow;
+        self
+    }
+
     /// Configures whether global pax extension headers may be accepted.
     ///
     /// When enabled, [`Self::allow_global_pax_member_metadata`] separately
@@ -239,8 +255,8 @@ impl PaxDecodePolicy {
     /// Configures whether unknown vendor-namespaced pax records may be accepted.
     ///
     /// When enabled, well-formed vendor-namespaced pax records do not cause a
-    /// decoding error. Their values are parsed structurally but their semantics
-    /// are not interpreted or validated.
+    /// decoding error. Their values are parsed structurally, but their semantics
+    /// are not interpreted.
     ///
     /// This can produce output that differs from the archive's intended
     /// contents. For example, `GNU.sparse.*` records can change a member's
@@ -294,12 +310,30 @@ impl PaxDecodePolicy {
         kind: PaxKind,
         records: &[PaxRecord],
     ) -> Result<(), DecodeError> {
-        if !self.allow_unknown_pax_vendor_records {
-            for record in records {
-                if let PaxRecord::Vendor { vendor, name, .. } = record {
+        for record in records {
+            if let PaxRecord::Vendor {
+                vendor,
+                name,
+                value,
+            } = record
+            {
+                if !self.allow_unknown_pax_vendor_records {
                     return Err(DecodeError::policy_violation(
                         position,
                         DecodePolicyViolation::PaxVendorExtension {
+                            vendor: vendor.to_string(),
+                            name: name.to_string(),
+                        },
+                    ));
+                }
+
+                if !self.allow_non_utf8_pax_vendor_values
+                    && let PaxValue::Value(value) = value
+                    && std::str::from_utf8(value).is_err()
+                {
+                    return Err(DecodeError::policy_violation(
+                        position,
+                        DecodePolicyViolation::NonUtf8PaxVendorValue {
                             vendor: vendor.to_string(),
                             name: name.to_string(),
                         },
@@ -344,7 +378,7 @@ impl PaxDecodePolicy {
     }
 }
 
-/// A valid tar feature rejected by the selected [`DecodePolicy`].
+/// A tar feature accepted by framing but rejected by the selected [`DecodePolicy`].
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum DecodePolicyViolation {
     /// A GNU-family frame appeared when only POSIX-pax decoding is allowed.
@@ -356,6 +390,14 @@ pub enum DecodePolicyViolation {
     /// A vendor-namespaced POSIX pax record appeared.
     #[error("pax vendor extension {vendor}.{name} is not allowed")]
     PaxVendorExtension {
+        /// Vendor namespace.
+        vendor: String,
+        /// Keyword suffix following the vendor namespace.
+        name: String,
+    },
+    /// A vendor-namespaced POSIX pax record contains a non-UTF-8 value.
+    #[error("pax vendor extension {vendor}.{name} contains a non-UTF-8 value")]
+    NonUtf8PaxVendorValue {
         /// Vendor namespace.
         vendor: String,
         /// Keyword suffix following the vendor namespace.

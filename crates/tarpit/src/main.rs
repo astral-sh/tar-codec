@@ -227,10 +227,12 @@ fn render_pax_records(
             PaxRecord::Charset(value)
             | PaxRecord::Comment(value)
             | PaxRecord::Realtime { value, .. }
-            | PaxRecord::Security { value, .. }
-            | PaxRecord::Vendor { value, .. } => {
+            | PaxRecord::Security { value, .. } => {
                 render_pax_value(output, value, |output, value| writeln!(output, "{value:?}"))?
             }
+            PaxRecord::Vendor { value, .. } => render_pax_value(output, value, |output, value| {
+                writeln!(output, "bytes({value:?})")
+            })?,
             PaxRecord::Gname(value)
             | PaxRecord::LinkPath(value)
             | PaxRecord::Path(value)
