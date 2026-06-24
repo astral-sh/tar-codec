@@ -208,6 +208,25 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
         })) if vendor == "Acme" && name == "attribute"
     ));
 
+    let strict_pax_policy = PaxDecodePolicy::default()
+        .allow_unknown_pax_vendor_records(true)
+        .allow_non_utf8_pax_vendor_values(false);
+    assert!(matches!(
+        TarArchive::new_with_policy(
+            bytes.as_slice(),
+            DecodePolicy::default().pax_policy(strict_pax_policy),
+        )
+        .extract_in(temp.path().join("strict"), ExtractPolicy::default())
+        .await,
+        Err(ExtractError::Archive(DecodeError::PolicyViolation {
+            position: 0,
+            violation: DecodePolicyViolation::NonUtf8PaxVendorValue {
+                vendor,
+                name,
+            },
+        })) if vendor == "Acme" && name == "attribute"
+    ));
+
     let destination = temp.path().join("partial");
     let mut archive = ArchiveBuilder::new();
     archive
