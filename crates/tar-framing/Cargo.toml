@@ -1,6 +1,7 @@
 [package]
 name = "tar-framing"
 description = "A framing layer for tar archives."
+readme = "README.md"
 
 version = { workspace = true }
 edition = { workspace = true }

@@ -2,7 +2,8 @@
 
 Low-level strict tar stream framing for either POSIX pax/ustar or GNU archives.
 
-This is a dependency of `tar-codec`. Most users should not use this crate's APIs directly.
+This crate is a component of [tar-codec](https://github.com/astral-sh/tar-codec).
+Most users should not use this crate's APIs directly.
 
 ## Reading
 
