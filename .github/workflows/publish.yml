@@ -34,6 +34,6 @@ jobs:
         id: auth
 
       - name: Publish to crates.io
-        run: cargo publish --workspace
+        run: cargo +nightly-2026-06-12 publish --workspace
         env:
           CARGO_REGISTRY_TOKEN: "${{ steps.auth.outputs.token }}"
