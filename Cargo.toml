@@ -17,9 +17,9 @@ version = "0.0.1"
 readme = "README.md"
 
 [workspace.dependencies]
-archive-trait = { path = "crates/archive-trait" }
-tar-codec = { path = "crates/tar-codec" }
-tar-framing = { path = "crates/tar-framing" }
+archive-trait = { path = "crates/archive-trait", version = "0.0.1" }
+tar-codec = { path = "crates/tar-codec", version = "0.0.1" }
+tar-framing = { path = "crates/tar-framing", version = "0.0.1" }
 
 async-compression = { version = "0.4", features = ["gzip", "tokio"] }
 astral-tokio-tar = "0.6.2"
