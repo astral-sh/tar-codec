@@ -39,6 +39,9 @@ impl<R> TarArchive<R> {
         let mut reader = TarReader::new(reader);
         reader.set_max_pax_extension_size(policy.pax_policy.max_extension_size);
         reader.set_max_global_pax_extensions_size(policy.pax_policy.max_global_extensions_size);
+        reader.set_allow_all_nul_ustar_numeric_fields(
+            policy.pax_policy.allow_all_nul_ustar_numeric_fields,
+        );
         reader.set_max_gnu_extension_size(policy.max_gnu_extension_size);
         Self {
             reader,
@@ -65,6 +68,7 @@ pub struct DecodePolicy {
 pub struct PaxDecodePolicy {
     max_extension_size: u64,
     max_global_extensions_size: u64,
+    allow_all_nul_ustar_numeric_fields: bool,
     allow_global_pax_extensions: bool,
     allow_unknown_pax_vendor_records: bool,
     allow_duplicate_pax_records: bool,
@@ -76,6 +80,7 @@ impl Default for PaxDecodePolicy {
         Self {
             max_extension_size: DEFAULT_MAX_PAX_EXTENSION_SIZE,
             max_global_extensions_size: DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE,
+            allow_all_nul_ustar_numeric_fields: true,
             allow_global_pax_extensions: true,
             allow_unknown_pax_vendor_records: false,
             allow_duplicate_pax_records: false,
@@ -205,6 +210,16 @@ impl PaxDecodePolicy {
     /// individual limit.
     pub fn max_global_extensions_size(mut self, max_global_extensions_size: u64) -> Self {
         self.max_global_extensions_size = max_global_extensions_size;
+        self
+    }
+
+    /// Configures whether wholly NUL ustar numeric metadata fields may be accepted.
+    ///
+    /// This compatibility option applies to the ordinary header's `mode`, `uid`,
+    /// `gid`, and `mtime` fields. It is **enabled by default**. When disabled,
+    /// each field must contain strict octal.
+    pub fn allow_all_nul_ustar_numeric_fields(mut self, allow: bool) -> Self {
+        self.allow_all_nul_ustar_numeric_fields = allow;
         self
     }
 

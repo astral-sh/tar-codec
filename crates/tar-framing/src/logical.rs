@@ -4,7 +4,7 @@
 //! they describe. Each member carries a compact borrowed [`Header`], and each
 //! PAX member carries one unified [`PaxState`].
 
-use std::{borrow::Cow, mem};
+use std::{borrow::Cow, mem, ops::Range};
 
 use tokio::io::AsyncRead;
 use tokio_stream::StreamExt;
@@ -12,7 +12,7 @@ use tokio_stream::StreamExt;
 use crate::{
     ArchiveFormat, Block, FrameError, FrameErrorInner, GnuKind, PaxKeyword, PaxKind, PaxRecord,
     PaxString, PaxValue, UstarKind,
-    header::parse_number,
+    header::{GNAME_RANGE, LINK_NAME_RANGE, UNAME_RANGE},
     pax::GlobalPaxRecords,
     stream::{DataFrame, DataOwner, Frame, HeaderFrame, TarStream},
 };
@@ -66,20 +66,39 @@ pub struct Header<'a> {
     /// [`MemberPayload`]. Member kinds that cannot carry payload are rejected
     /// when either their declared or effective size is nonzero.
     pub effective_size: u64,
-    mode: [u8; 8],
+    mode: Result<u64, [u8; 8]>,
+    /// Numeric user identifier from the ordinary header, if usable.
+    ///
+    /// Applicable pax metadata may override or delete this fallback.
+    pub uid: Option<u64>,
+    /// Numeric group identifier from the ordinary header, if usable.
+    ///
+    /// Applicable pax metadata may override or delete this fallback.
+    pub gid: Option<u64>,
+    /// Modification time in seconds from the ordinary header, if usable.
+    ///
+    /// Applicable pax metadata may override or delete this fallback.
+    pub mtime: Option<u64>,
+    /// User name bytes from the ordinary header, empty if absent or unusable.
+    ///
+    /// Applicable pax metadata may override or delete this fallback.
+    pub uname: &'a [u8],
+    /// Group name bytes from the ordinary header, empty if absent or unusable.
+    ///
+    /// Applicable pax metadata may override or delete this fallback.
+    pub gname: &'a [u8],
     header_path: &'a [u8],
     link_name: &'a [u8],
 }
 
 impl Header<'_> {
     /// Decodes the ordinary header's numeric mode according to its archive family.
+    ///
+    /// An omitted all-NUL pax/ustar mode is reported as zero. The decoded value
+    /// is cached while framing the member, so repeated calls do not reparse it.
     pub fn mode(&self) -> Result<u64, FrameError> {
-        parse_number(self.format, &self.mode).ok_or_else(|| {
-            FrameError::at(
-                self.position,
-                FrameErrorInner::InvalidMode { found: self.mode },
-            )
-        })
+        self.mode
+            .map_err(|found| FrameError::at(self.position, FrameErrorInner::InvalidMode { found }))
     }
 }
 
@@ -221,23 +240,50 @@ enum ExtensionPayload {
 struct HeaderStorage {
     path: Vec<u8>,
     link_name: Vec<u8>,
+    uname: Vec<u8>,
+    gname: Vec<u8>,
 }
 
 impl HeaderStorage {
     fn update<'a>(&'a mut self, frame: &HeaderFrame) -> Header<'a> {
         frame.copy_header_path_into(&mut self.path);
-        frame.copy_link_name_into(&mut self.link_name);
+        frame.copy_range_into(
+            string_field_range(&frame.block, LINK_NAME_RANGE),
+            &mut self.link_name,
+        );
+        frame.copy_range_into(
+            string_field_range(&frame.block, UNAME_RANGE),
+            &mut self.uname,
+        );
+        frame.copy_range_into(
+            string_field_range(&frame.block, GNAME_RANGE),
+            &mut self.gname,
+        );
         Header {
             position: frame.position,
             format: frame.format,
             kind: frame.kind,
             declared_size: frame.declared_size,
             effective_size: frame.effective_size,
-            mode: frame.mode_bytes(),
+            mode: frame.mode,
+            uid: frame.uid,
+            gid: frame.gid,
+            mtime: frame.mtime,
+            uname: &self.uname,
+            gname: &self.gname,
             header_path: &self.path,
             link_name: &self.link_name,
         }
     }
+}
+
+fn string_field_range(block: &Block, range: Range<usize>) -> Range<usize> {
+    let field = &block[range.clone()];
+    let len = field
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(field.len());
+    range.start..range.start + len
 }
 
 impl<R> TarReader<R> {
@@ -282,6 +328,15 @@ impl<R> TarReader<R> {
         self.payload
             .stream
             .set_max_global_pax_extensions_size(max_global_pax_extensions_size);
+    }
+
+    /// Sets whether wholly NUL ustar numeric metadata fields may be accepted.
+    ///
+    /// See [`TarStream::set_allow_all_nul_ustar_numeric_fields`].
+    pub fn set_allow_all_nul_ustar_numeric_fields(&mut self, allow: bool) {
+        self.payload
+            .stream
+            .set_allow_all_nul_ustar_numeric_fields(allow);
     }
 
     /// Sets the maximum size accepted for each subsequent GNU metadata extension.
@@ -653,7 +708,10 @@ mod tests {
     use crate::{
         BLOCK_SIZE, DEFAULT_MAX_GNU_EXTENSION_SIZE, FrameError, FrameErrorInner, PaxRecord,
         PaxValue,
-        header::{LINK_NAME_RANGE, MODE_RANGE, NAME_RANGE, PREFIX_RANGE, TYPEFLAG_OFFSET},
+        header::{
+            GID_RANGE, GNAME_RANGE, LINK_NAME_RANGE, MODE_RANGE, MTIME_RANGE, NAME_RANGE,
+            PREFIX_RANGE, TYPEFLAG_OFFSET, UID_RANGE, UNAME_RANGE,
+        },
         stream::DataOwner,
         test_support::{
             ChunkedReader, append_block, append_gnu, append_payload, append_posix,
@@ -700,20 +758,53 @@ mod tests {
         set_field(&mut ustar_header, PREFIX_RANGE, b"dir");
         set_field(&mut ustar_header, LINK_NAME_RANGE, b"target");
         ustar_header[MODE_RANGE].copy_from_slice(b"0000755\0");
+        ustar_header[UID_RANGE].copy_from_slice(b"0000001\0");
+        ustar_header[GID_RANGE].copy_from_slice(b"0000002\0");
+        ustar_header[MTIME_RANGE].copy_from_slice(b"00000000003\0");
+        set_field(&mut ustar_header, UNAME_RANGE, b"user");
+        set_field(&mut ustar_header, GNAME_RANGE, b"group");
         set_checksum(&mut ustar_header);
+
+        let mut empty_header = header(b'0', 0);
+        for range in [
+            MODE_RANGE,
+            UID_RANGE,
+            GID_RANGE,
+            MTIME_RANGE,
+            UNAME_RANGE,
+            GNAME_RANGE,
+        ] {
+            empty_header[range].fill(0);
+        }
+        set_checksum(&mut empty_header);
 
         ready_ok(async {
             let mut bytes = Vec::new();
             append_block(&mut bytes, &ustar_header);
+            append_block(&mut bytes, &empty_header);
             append_terminator(&mut bytes);
             let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+            {
+                let member = next_member(&mut reader).await?;
+                assert_eq!(member.header.format, ArchiveFormat::Pax);
+                assert_eq!(member.header.header_path, b"dir/file");
+                assert_eq!(member.header.link_name, b"target");
+                assert_eq!(member.header.mode()?, 0o755);
+                assert_eq!(member.header.uid, Some(1));
+                assert_eq!(member.header.gid, Some(2));
+                assert_eq!(member.header.mtime, Some(3));
+                assert_eq!(member.header.uname, b"user");
+                assert_eq!(member.header.gname, b"group");
+                assert_eq!(member.effective_path()?.as_ref(), b"dir/file");
+                assert_eq!(member.effective_link_path()?.as_ref(), b"target");
+            }
             let member = next_member(&mut reader).await?;
-            assert_eq!(member.header.format, ArchiveFormat::Pax);
-            assert_eq!(member.header.header_path, b"dir/file");
-            assert_eq!(member.header.link_name, b"target");
-            assert_eq!(member.header.mode()?, 0o755);
-            assert_eq!(member.effective_path()?.as_ref(), b"dir/file");
-            assert_eq!(member.effective_link_path()?.as_ref(), b"target");
+            assert_eq!(member.header.mode()?, 0);
+            assert_eq!(member.header.uid, None);
+            assert_eq!(member.header.gid, None);
+            assert_eq!(member.header.mtime, None);
+            assert!(member.header.uname.is_empty());
+            assert!(member.header.gname.is_empty());
             Ok(())
         });
 
