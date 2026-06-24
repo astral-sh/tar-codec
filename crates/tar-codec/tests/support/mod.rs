@@ -8,11 +8,7 @@ use tar_framing::{
     write::append_pax_record,
 };
 
-#[derive(Clone, Copy)]
-pub enum ArchiveFormat {
-    Pax,
-    Gnu,
-}
+pub use tar_framing::ArchiveFormat;
 
 #[derive(Clone, Copy)]
 pub enum EntryKind {

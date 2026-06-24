@@ -178,33 +178,24 @@ impl HeaderFrame {
         // Some real-world pax writers encode absent ordinary-header metadata as
         // all NULs. The compatibility policy may accept these empty fields; every
         // populated fallback remains subject to strict validation.
+        let parse_numeric_field = |field, range: Range<usize>| {
+            Self::parse_numeric_field(
+                position,
+                ArchiveFormat::Pax,
+                field,
+                &block[range],
+                allow_all_nul_numeric_fields,
+            )
+        };
         let mode = Self::parse_mode(
             position,
             ArchiveFormat::Pax,
             &block[MODE_RANGE],
             allow_all_nul_numeric_fields,
         )?;
-        let uid = Self::parse_numeric_field(
-            position,
-            ArchiveFormat::Pax,
-            "uid",
-            &block[UID_RANGE],
-            allow_all_nul_numeric_fields,
-        )?;
-        let gid = Self::parse_numeric_field(
-            position,
-            ArchiveFormat::Pax,
-            "gid",
-            &block[GID_RANGE],
-            allow_all_nul_numeric_fields,
-        )?;
-        let mtime = Self::parse_numeric_field(
-            position,
-            ArchiveFormat::Pax,
-            "mtime",
-            &block[MTIME_RANGE],
-            allow_all_nul_numeric_fields,
-        )?;
+        let uid = parse_numeric_field("uid", UID_RANGE)?;
+        let gid = parse_numeric_field("gid", GID_RANGE)?;
+        let mtime = parse_numeric_field("mtime", MTIME_RANGE)?;
 
         let validate_string_field = |field: &'static str, bytes: &[u8]| {
             if bytes.contains(&0) {
@@ -264,33 +255,24 @@ impl HeaderFrame {
             ));
         }
         validate_gnu_member_size(position, kind, declared_size)?;
+        let parse_numeric_field = |field, range: Range<usize>| {
+            Self::parse_numeric_field(
+                position,
+                ArchiveFormat::Gnu,
+                field,
+                &block[range],
+                allow_all_nul_numeric_fields,
+            )
+        };
         let mode = Self::parse_mode(
             position,
             ArchiveFormat::Gnu,
             &block[MODE_RANGE],
             allow_all_nul_numeric_fields,
         )?;
-        let uid = Self::parse_numeric_field(
-            position,
-            ArchiveFormat::Gnu,
-            "uid",
-            &block[UID_RANGE],
-            allow_all_nul_numeric_fields,
-        )?;
-        let gid = Self::parse_numeric_field(
-            position,
-            ArchiveFormat::Gnu,
-            "gid",
-            &block[GID_RANGE],
-            allow_all_nul_numeric_fields,
-        )?;
-        let mtime = Self::parse_numeric_field(
-            position,
-            ArchiveFormat::Gnu,
-            "mtime",
-            &block[MTIME_RANGE],
-            allow_all_nul_numeric_fields,
-        )?;
+        let uid = parse_numeric_field("uid", UID_RANGE)?;
+        let gid = parse_numeric_field("gid", GID_RANGE)?;
+        let mtime = parse_numeric_field("mtime", MTIME_RANGE)?;
 
         Ok(Self {
             position,
@@ -365,11 +347,6 @@ impl HeaderFrame {
             path.push(b'/');
         }
         path.extend_from_slice(name);
-    }
-
-    pub(crate) fn copy_range_into(&self, range: Range<usize>, destination: &mut Vec<u8>) {
-        destination.clear();
-        destination.extend_from_slice(&self.block[range]);
     }
 }
 

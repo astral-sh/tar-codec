@@ -111,14 +111,14 @@ async fn projects_every_member_kind_and_streams_payloads() -> TestResult {
 async fn all_nul_numeric_fields_are_policy_controlled() -> TestResult {
     let strict_policy = DecodePolicy::default().allow_all_nul_numeric_fields(false);
 
-    for (format_name, format) in [("pax", ArchiveFormat::Pax), ("GNU", ArchiveFormat::Gnu)] {
+    for format in [ArchiveFormat::Pax, ArchiveFormat::Gnu] {
         for (field, range) in [
             ("mode", MODE_RANGE),
             ("uid", UID_RANGE),
             ("gid", GID_RANGE),
             ("mtime", MTIME_RANGE),
         ] {
-            let path = format!("empty-{format_name}-{field}");
+            let path = format!("empty-{format:?}-{field}");
             let mut block = header(format, &path, b'0', 0, "", 0o644);
             block[range].fill(0);
             set_checksum(&mut block);
@@ -143,7 +143,7 @@ async fn all_nul_numeric_fields_are_policy_controlled() -> TestResult {
                 TarArchive::new_with_policy(bytes.as_slice(), strict_policy).members();
             assert!(
                 matches!(members.next().await, Err(DecodeError::Framing(_))),
-                "strict policy should reject an all-NUL {format_name} {field} field"
+                "strict policy should reject an all-NUL {format:?} {field} field"
             );
         }
     }

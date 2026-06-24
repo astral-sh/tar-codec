@@ -249,18 +249,9 @@ struct HeaderStorage {
 impl HeaderStorage {
     fn update<'a>(&'a mut self, frame: &HeaderFrame) -> Header<'a> {
         frame.copy_header_path_into(&mut self.path);
-        frame.copy_range_into(
-            string_field_range(&frame.block, LINK_NAME_RANGE),
-            &mut self.link_name,
-        );
-        frame.copy_range_into(
-            string_field_range(&frame.block, UNAME_RANGE),
-            &mut self.uname,
-        );
-        frame.copy_range_into(
-            string_field_range(&frame.block, GNAME_RANGE),
-            &mut self.gname,
-        );
+        copy_string_field_into(&frame.block, LINK_NAME_RANGE, &mut self.link_name);
+        copy_string_field_into(&frame.block, UNAME_RANGE, &mut self.uname);
+        copy_string_field_into(&frame.block, GNAME_RANGE, &mut self.gname);
         Header {
             position: frame.position,
             format: frame.format,
@@ -279,13 +270,14 @@ impl HeaderStorage {
     }
 }
 
-fn string_field_range(block: &Block, range: Range<usize>) -> Range<usize> {
-    let field = &block[range.clone()];
+fn copy_string_field_into(block: &Block, range: Range<usize>, destination: &mut Vec<u8>) {
+    let field = &block[range];
     let len = field
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(field.len());
-    range.start..range.start + len
+    destination.clear();
+    destination.extend_from_slice(&field[..len]);
 }
 
 impl<R> TarReader<R> {
