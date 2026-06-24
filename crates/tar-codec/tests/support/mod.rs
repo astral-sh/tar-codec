@@ -8,11 +8,7 @@ use tar_framing::{
     write::append_pax_record,
 };
 
-#[derive(Clone, Copy)]
-pub enum ArchiveFormat {
-    Pax,
-    Gnu,
-}
+pub use tar_framing::ArchiveFormat;
 
 #[derive(Clone, Copy)]
 pub enum EntryKind {
@@ -32,7 +28,7 @@ impl ArchiveBuilder {
         Self::default()
     }
 
-    pub fn posix(
+    pub fn ustar(
         &mut self,
         name: &str,
         typeflag: u8,
@@ -61,11 +57,11 @@ impl ArchiveBuilder {
             EntryKind::SymbolicLink => (b'2', &[][..], "target"),
             EntryKind::HardLink => (b'1', &[][..], "target"),
         };
-        self.posix(name, typeflag, payload, link_name, 0o644)
+        self.ustar(name, typeflag, payload, link_name, 0o644)
     }
 
     pub fn pax(&mut self, typeflag: u8, payload: &[u8]) -> &mut Self {
-        self.posix("pax", typeflag, payload, "", 0o644)
+        self.ustar("pax", typeflag, payload, "", 0o644)
     }
 
     pub fn block(&mut self, block: &Block) -> &mut Self {
@@ -106,7 +102,7 @@ impl ArchiveBuilder {
     }
 }
 
-pub fn single_posix_member(
+pub fn single_pax_member(
     name: &str,
     typeflag: u8,
     payload: &[u8],
@@ -114,7 +110,7 @@ pub fn single_posix_member(
     mode: u32,
 ) -> Vec<u8> {
     let mut archive = ArchiveBuilder::new();
-    archive.posix(name, typeflag, payload, link_name, mode);
+    archive.ustar(name, typeflag, payload, link_name, mode);
     archive.finish()
 }
 

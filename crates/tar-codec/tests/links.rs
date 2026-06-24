@@ -3,7 +3,7 @@ pub mod support;
 #[cfg(unix)]
 use std::{io, os::unix::net::UnixListener, path::Path};
 
-use support::{ArchiveBuilder, single_posix_member};
+use support::{ArchiveBuilder, single_pax_member};
 #[cfg(unix)]
 use support::{pax_record, symlink_file};
 #[cfg(not(unix))]
@@ -23,12 +23,12 @@ async fn preserves_safe_symlink_chains_and_forward_references() {
     let destination = temp.path().join("out");
     let mut archive = ArchiveBuilder::new();
     archive
-        .posix("dir/file", b'0', b"ok", "", 0o644)
-        .posix("dir/one", b'2', b"", "file", 0o644)
-        .posix("dir/exact", b'2', b"", "./file", 0o644)
-        .posix("two", b'2', b"", "dir/one", 0o644)
-        .posix("forward", b'2', b"", "later", 0o644)
-        .posix("later", b'0', b"later", "", 0o644);
+        .ustar("dir/file", b'0', b"ok", "", 0o644)
+        .ustar("dir/one", b'2', b"", "file", 0o644)
+        .ustar("dir/exact", b'2', b"", "./file", 0o644)
+        .ustar("two", b'2', b"", "dir/one", 0o644)
+        .ustar("forward", b'2', b"", "later", 0o644)
+        .ustar("later", b'0', b"later", "", 0o644);
     let bytes = archive.finish();
     TarArchive::new(bytes.as_slice())
         .extract_in(&destination, ExtractPolicy::default())
@@ -60,7 +60,7 @@ async fn preserves_dangling_symlink_chains_by_default() {
     let temp = tempdir().unwrap();
     let destination = temp.path().join("dangling");
     std::fs::create_dir_all(destination.join("ambient")).unwrap();
-    let bytes = single_posix_member("link", b'2', b"", "ambient/missing", 0o644);
+    let bytes = single_pax_member("link", b'2', b"", "ambient/missing", 0o644);
     TarArchive::new(bytes.as_slice())
         .extract_in(&destination, ExtractPolicy::default())
         .await
@@ -73,8 +73,8 @@ async fn preserves_dangling_symlink_chains_by_default() {
     let destination = temp.path().join("dangling-chain");
     let mut archive = ArchiveBuilder::new();
     archive
-        .posix("one", b'2', b"", "two", 0o644)
-        .posix("two", b'2', b"", "missing", 0o644);
+        .ustar("one", b'2', b"", "two", 0o644)
+        .ustar("two", b'2', b"", "missing", 0o644);
     let bytes = archive.finish();
     TarArchive::new(bytes.as_slice())
         .extract_in(&destination, ExtractPolicy::default())
@@ -99,9 +99,9 @@ async fn preserves_directory_required_symlink_targets_and_rejects_file_targets()
         let destination = temp.path().join(format!("directory-{case}"));
         let mut archive = ArchiveBuilder::new();
         archive
-            .posix("target", b'5', b"", "", 0o755)
+            .ustar("target", b'5', b"", "", 0o755)
             .pax(b'x', &pax_record(PaxKeyword::LinkPath, target))
-            .posix("link", b'2', b"", "ignored", 0o644);
+            .ustar("link", b'2', b"", "ignored", 0o644);
         let bytes = archive.finish();
         TarArchive::new(bytes.as_slice())
             .extract_in(&destination, policy)
@@ -117,9 +117,9 @@ async fn preserves_directory_required_symlink_targets_and_rejects_file_targets()
         let destination = temp.path().join(format!("file-{case}"));
         let mut archive = ArchiveBuilder::new();
         archive
-            .posix("target", b'0', b"contents", "", 0o644)
+            .ustar("target", b'0', b"contents", "", 0o644)
             .pax(b'x', &pax_record(PaxKeyword::LinkPath, target))
-            .posix("link", b'2', b"", "ignored", 0o644);
+            .ustar("link", b'2', b"", "ignored", 0o644);
         let bytes = archive.finish();
         assert!(matches!(
             TarArchive::new(bytes.as_slice())
@@ -146,10 +146,10 @@ async fn rejects_ambiguous_parent_directory_traversal_in_pax_symlink_targets() {
     let destination = temp.path().join("out");
     let mut archive = ArchiveBuilder::new();
     archive
-        .posix("regular", b'0', b"regular", "", 0o644)
-        .posix("secret", b'0', b"secret", "", 0o600)
+        .ustar("regular", b'0', b"regular", "", 0o644)
+        .ustar("secret", b'0', b"secret", "", 0o600)
         .pax(b'x', &pax_record(PaxKeyword::LinkPath, "regular/../secret"))
-        .posix("link", b'2', b"", "ignored", 0o644);
+        .ustar("link", b'2', b"", "ignored", 0o644);
     let bytes = archive.finish();
 
     assert!(matches!(
@@ -178,11 +178,11 @@ async fn default_preserves_links_to_missing_root_and_directory_targets() {
         let bytes = if directory_target {
             let mut archive = ArchiveBuilder::new();
             archive
-                .posix("directory", b'5', b"", "", 0o755)
-                .posix("link", b'2', b"", target, 0o644);
+                .ustar("directory", b'5', b"", "", 0o755)
+                .ustar("link", b'2', b"", target, 0o644);
             archive.finish()
         } else {
-            single_posix_member("link", b'2', b"", target, 0o644)
+            single_pax_member("link", b'2', b"", target, 0o644)
         };
         TarArchive::new(bytes.as_slice())
             .extract_in(&destination, ExtractPolicy::default())
@@ -197,8 +197,8 @@ async fn default_preserves_links_to_missing_root_and_directory_targets() {
     let destination = temp.path().join("directory-required-file");
     let mut archive = ArchiveBuilder::new();
     archive
-        .posix("file", b'0', b"contents", "", 0o644)
-        .posix("link", b'2', b"", "file/", 0o644);
+        .ustar("file", b'0', b"contents", "", 0o644)
+        .ustar("link", b'2', b"", "file/", 0o644);
     let bytes = archive.finish();
     assert!(matches!(
         TarArchive::new(bytes.as_slice())
@@ -216,7 +216,7 @@ async fn default_preserves_links_to_missing_root_and_directory_targets() {
 async fn targets_blocked_by_archive_files_are_dangling() {
     let temp = tempdir().unwrap();
     let mut archive = ArchiveBuilder::new();
-    archive.posix("file", b'0', b"contents", "", 0o644).posix(
+    archive.ustar("file", b'0', b"contents", "", 0o644).ustar(
         "link",
         b'2',
         b"",
@@ -252,7 +252,7 @@ async fn targets_blocked_by_archive_files_are_dangling() {
 #[tokio::test]
 async fn missing_targets_can_be_forbidden() {
     let temp = tempdir().unwrap();
-    let bytes = single_posix_member("link", b'2', b"", "missing", 0o644);
+    let bytes = single_pax_member("link", b'2', b"", "missing", 0o644);
     assert!(matches!(
         TarArchive::new(bytes.as_slice())
             .extract_in(
@@ -276,7 +276,7 @@ async fn native_target_controls_are_independent() {
     let destination = temp.path().join("missing-only");
     std::fs::create_dir(&destination).unwrap();
     std::fs::write(destination.join("ambient"), b"ambient").unwrap();
-    let bytes = single_posix_member("link", b'2', b"", "ambient", 0o644);
+    let bytes = single_pax_member("link", b'2', b"", "ambient", 0o644);
     let policy = ExtractPolicy::default();
     assert!(matches!(
         TarArchive::new(bytes.as_slice())
@@ -291,7 +291,7 @@ async fn native_target_controls_are_independent() {
     let destination = temp.path().join("ambient-allowed");
     std::fs::create_dir(&destination).unwrap();
     std::fs::write(destination.join("ambient"), b"ambient").unwrap();
-    let bytes = single_posix_member("link", b'2', b"", "ambient", 0o644);
+    let bytes = single_pax_member("link", b'2', b"", "ambient", 0o644);
     let policy = ExtractPolicy::default().link_policy(
         LinkPolicy::default()
             .allow_ambient_targets(true)
@@ -307,7 +307,7 @@ async fn native_target_controls_are_independent() {
     );
 
     let destination = temp.path().join("ambient-only");
-    let bytes = single_posix_member("link", b'2', b"", "missing", 0o644);
+    let bytes = single_pax_member("link", b'2', b"", "missing", 0o644);
     assert!(matches!(
         TarArchive::new(bytes.as_slice())
             .extract_in(&destination, policy)
@@ -335,7 +335,7 @@ async fn missing_target_opt_in_does_not_allow_dangling_targets_through_ambient_s
             std::fs::create_dir(destination.join("ambient")).unwrap();
         }
         symlink_file(ambient_target, destination.join("ambient-link")).unwrap();
-        let bytes = single_posix_member("link", b'2', b"", archive_target, 0o644);
+        let bytes = single_pax_member("link", b'2', b"", archive_target, 0o644);
         let policy = ExtractPolicy::default();
 
         assert!(matches!(
@@ -362,7 +362,7 @@ async fn missing_target_opt_in_does_not_allow_dangling_targets_through_ambient_s
 #[tokio::test]
 async fn symlink_members_fail_by_default_on_unsupported_platforms() {
     let temp = tempdir().unwrap();
-    let regular = single_posix_member("file", b'0', b"contents", "", 0o644);
+    let regular = single_pax_member("file", b'0', b"contents", "", 0o644);
     TarArchive::new(regular.as_slice())
         .extract_in(temp.path().join("regular"), ExtractPolicy::default())
         .await
@@ -370,8 +370,8 @@ async fn symlink_members_fail_by_default_on_unsupported_platforms() {
 
     let mut archive = ArchiveBuilder::new();
     archive
-        .posix("target", b'0', b"contents", "", 0o644)
-        .posix("link", b'2', b"", "target", 0o644);
+        .ustar("target", b'0', b"contents", "", 0o644)
+        .ustar("link", b'2', b"", "target", 0o644);
     let bytes = archive.finish();
     let destination = temp.path().join("link");
     assert!(matches!(
@@ -404,9 +404,9 @@ async fn symlink_graph_resolution_budget_is_shared_across_links() {
                 &format!("missing/{}leaf", "x/".repeat(300)),
             ),
         )
-        .posix("chain", b'2', b"", "fallback", 0o644);
+        .ustar("chain", b'2', b"", "fallback", 0o644);
     for index in 0..128 {
-        archive.posix(&format!("alias-{index}"), b'2', b"", "chain", 0o644);
+        archive.ustar(&format!("alias-{index}"), b'2', b"", "chain", 0o644);
     }
     let bytes = archive.finish();
 
@@ -440,7 +440,7 @@ async fn ambient_file_and_directory_targets_require_explicit_opt_in() {
             } else {
                 std::fs::write(&target, b"ambient").unwrap();
             }
-            let bytes = single_posix_member("link", b'2', b"", "ambient", 0o644);
+            let bytes = single_pax_member("link", b'2', b"", "ambient", 0o644);
             let policy = if allow_ambient {
                 ExtractPolicy::default()
                     .link_policy(LinkPolicy::default().allow_ambient_targets(true))
@@ -471,7 +471,7 @@ async fn native_links_allow_ambient_non_regular_targets() {
     let destination = temp.path().join("out");
     std::fs::create_dir(&destination).unwrap();
     let _socket = UnixListener::bind(destination.join("socket")).unwrap();
-    let bytes = single_posix_member("link", b'2', b"", "socket", 0o644);
+    let bytes = single_pax_member("link", b'2', b"", "socket", 0o644);
     TarArchive::new(bytes.as_slice())
         .extract_in(
             &destination,
@@ -498,7 +498,7 @@ async fn ambient_link_components_must_resolve_beneath_the_root() {
     std::fs::create_dir(&destination).unwrap();
     std::fs::write(destination.join("target"), b"inside").unwrap();
     symlink_file(Path::new("target"), destination.join("ambient-link")).unwrap();
-    let bytes = single_posix_member("alias", b'2', b"", "ambient-link", 0o644);
+    let bytes = single_pax_member("alias", b'2', b"", "ambient-link", 0o644);
     TarArchive::new(bytes.as_slice())
         .extract_in(&destination, policy)
         .await
@@ -512,7 +512,7 @@ async fn ambient_link_components_must_resolve_beneath_the_root() {
     std::fs::create_dir_all(destination.join("target")).unwrap();
     std::fs::write(destination.join("target/file"), b"inside").unwrap();
     symlink_dir(Path::new("target"), destination.join("ambient-link")).unwrap();
-    let bytes = single_posix_member("alias", b'2', b"", "ambient-link/file", 0o644);
+    let bytes = single_pax_member("alias", b'2', b"", "ambient-link/file", 0o644);
     TarArchive::new(bytes.as_slice())
         .extract_in(&destination, policy)
         .await
@@ -529,9 +529,9 @@ async fn ambient_link_components_must_resolve_beneath_the_root() {
     symlink_file(&outside, destination.join("ambient-link")).unwrap();
     let mut archive = ArchiveBuilder::new();
     archive
-        .posix("safe", b'0', b"safe", "", 0o644)
+        .ustar("safe", b'0', b"safe", "", 0o644)
         .pax(b'x', &pax_record(PaxKeyword::LinkPath, "ambient-link"))
-        .posix("alias", b'2', b"", "safe", 0o644);
+        .ustar("alias", b'2', b"", "safe", 0o644);
     let bytes = archive.finish();
     assert!(
         TarArchive::new(bytes.as_slice())
@@ -548,7 +548,7 @@ async fn ambient_link_components_must_resolve_beneath_the_root() {
     std::fs::create_dir(&outside).unwrap();
     std::fs::write(outside.join("file"), b"outside").unwrap();
     symlink_dir(&outside, destination.join("ambient-link")).unwrap();
-    let bytes = single_posix_member("alias", b'2', b"", "ambient-link/file", 0o644);
+    let bytes = single_pax_member("alias", b'2', b"", "ambient-link/file", 0o644);
     assert!(
         TarArchive::new(bytes.as_slice())
             .extract_in(&destination, policy)
@@ -566,8 +566,8 @@ async fn default_target_policy_uses_filesystem_provenance() {
     std::fs::create_dir_all(destination.join("ambient")).unwrap();
     let mut archive = ArchiveBuilder::new();
     archive
-        .posix("ambient", b'5', b"", "", 0o755)
-        .posix("alias", b'2', b"", "ambient", 0o644);
+        .ustar("ambient", b'5', b"", "", 0o755)
+        .ustar("alias", b'2', b"", "ambient", 0o644);
     let bytes = archive.finish();
     assert!(matches!(
         TarArchive::new(bytes.as_slice())
@@ -583,8 +583,8 @@ async fn default_target_policy_uses_filesystem_provenance() {
     std::fs::create_dir_all(destination.join("ambient")).unwrap();
     let mut archive = ArchiveBuilder::new();
     archive
-        .posix("ambient/file", b'0', b"archive", "", 0o644)
-        .posix("alias", b'2', b"", "ambient/file", 0o644);
+        .ustar("ambient/file", b'0', b"archive", "", 0o644)
+        .ustar("alias", b'2', b"", "ambient/file", 0o644);
     let bytes = archive.finish();
     TarArchive::new(bytes.as_slice())
         .extract_in(&destination, ExtractPolicy::default())
@@ -603,9 +603,9 @@ async fn symlink_graphs_allow_finite_expansion_and_reject_cycles_and_escapes() {
     let destination = temp.path().join("finite");
     let mut archive = ArchiveBuilder::new();
     archive
-        .posix("file", b'0', b"ok", "", 0o644)
-        .posix("a", b'2', b"", "file", 0o644)
-        .posix("b", b'2', b"", "a", 0o644);
+        .ustar("file", b'0', b"ok", "", 0o644)
+        .ustar("a", b'2', b"", "file", 0o644)
+        .ustar("b", b'2', b"", "a", 0o644);
     let bytes = archive.finish();
     TarArchive::new(bytes.as_slice())
         .extract_in(&destination, ExtractPolicy::default())
@@ -630,7 +630,7 @@ async fn symlink_graphs_allow_finite_expansion_and_reject_cycles_and_escapes() {
     ] {
         let destination = temp.path().join(case);
         let mut archive = ArchiveBuilder::new();
-        archive.posix("a", b'2', b"", first_target, 0o644).posix(
+        archive.ustar("a", b'2', b"", first_target, 0o644).ustar(
             "b",
             b'2',
             b"",
@@ -664,12 +664,12 @@ async fn symlink_graphs_allow_finite_expansion_and_reject_cycles_and_escapes() {
             b'x',
             &pax_record(PaxKeyword::LinkPath, &format!("b/{suffix}")),
         )
-        .posix("a", b'2', b"", "fallback", 0o644)
+        .ustar("a", b'2', b"", "fallback", 0o644)
         .pax(
             b'x',
             &pax_record(PaxKeyword::LinkPath, &format!("a/{suffix}")),
         )
-        .posix("b", b'2', b"", "fallback", 0o644);
+        .ustar("b", b'2', b"", "fallback", 0o644);
     let bytes = archive.finish();
     assert!(matches!(
         TarArchive::new(bytes.as_slice())
@@ -684,7 +684,7 @@ async fn symlink_graphs_allow_finite_expansion_and_reject_cycles_and_escapes() {
     assert!(!destination.join("b").exists());
 
     let destination = temp.path().join("escape");
-    let bytes = single_posix_member("link", b'2', b"", "../outside", 0o644);
+    let bytes = single_pax_member("link", b'2', b"", "../outside", 0o644);
     assert!(matches!(
         TarArchive::new(bytes.as_slice())
             .extract_in(&destination, ExtractPolicy::default())
@@ -701,11 +701,11 @@ async fn overwritten_pending_symlinks_do_not_affect_installation_or_resolution()
     let destination = temp.path().join("out");
     let mut archive = ArchiveBuilder::new();
     archive
-        .posix("obsolete", b'2', b"", "missing", 0o644)
-        .posix("obsolete", b'0', b"file", "", 0o644)
-        .posix("alias", b'2', b"", "target", 0o644)
-        .posix("target", b'2', b"", "missing", 0o644)
-        .posix("target", b'0', b"target", "", 0o644);
+        .ustar("obsolete", b'2', b"", "missing", 0o644)
+        .ustar("obsolete", b'0', b"file", "", 0o644)
+        .ustar("alias", b'2', b"", "target", 0o644)
+        .ustar("target", b'2', b"", "missing", 0o644)
+        .ustar("target", b'0', b"target", "", 0o644);
     let bytes = archive.finish();
     TarArchive::new(bytes.as_slice())
         .extract_in(&destination, ExtractPolicy::default())
@@ -730,10 +730,10 @@ async fn later_link_entries_replace_links_of_the_same_kind() {
         let destination = temp.path().join(case);
         let mut archive = ArchiveBuilder::new();
         archive
-            .posix("first", b'0', b"first", "", 0o644)
-            .posix("second", b'0', b"second", "", 0o644)
-            .posix("same", typeflag, b"", "first", 0o644)
-            .posix("same", typeflag, b"", "second", 0o644);
+            .ustar("first", b'0', b"first", "", 0o644)
+            .ustar("second", b'0', b"second", "", 0o644)
+            .ustar("same", typeflag, b"", "first", 0o644)
+            .ustar("same", typeflag, b"", "second", 0o644);
         let bytes = archive.finish();
         TarArchive::new(bytes.as_slice())
             .extract_in(
@@ -759,8 +759,8 @@ async fn hard_links_require_prior_archive_targets_and_apply_linkdata() {
     let destination = temp.path().join("linkdata");
     let mut archive = ArchiveBuilder::new();
     archive
-        .posix("a", b'0', b"old", "", 0o644)
-        .posix("b", b'1', b"new", "a", 0o644);
+        .ustar("a", b'0', b"old", "", 0o644)
+        .ustar("b", b'1', b"new", "a", 0o644);
     let bytes = archive.finish();
     TarArchive::new(bytes.as_slice())
         .extract_in(&destination, policy)
@@ -769,7 +769,7 @@ async fn hard_links_require_prior_archive_targets_and_apply_linkdata() {
     assert_eq!(std::fs::read(destination.join("a")).unwrap(), b"new");
     assert_eq!(std::fs::read(destination.join("b")).unwrap(), b"new");
 
-    let unresolved = single_posix_member("b", b'1', b"", "a", 0o644);
+    let unresolved = single_pax_member("b", b'1', b"", "a", 0o644);
     assert!(matches!(
         TarArchive::new(unresolved.as_slice())
             .extract_in(temp.path().join("forward"), policy)
@@ -792,8 +792,8 @@ async fn hard_links_require_prior_archive_targets_and_apply_linkdata() {
     let destination = temp.path().join("different-mode");
     let mut archive = ArchiveBuilder::new();
     archive
-        .posix("a", b'0', b"", "", 0o644)
-        .posix("b", b'1', b"", "a", 0o755);
+        .ustar("a", b'0', b"", "", 0o644)
+        .ustar("b", b'1', b"", "a", 0o755);
     let bytes = archive.finish();
     TarArchive::new(bytes.as_slice())
         .extract_in(&destination, policy)
@@ -808,8 +808,8 @@ async fn hard_links_require_prior_archive_targets_and_apply_linkdata() {
         let destination = temp.path().join("linkdata-mode");
         let mut archive = ArchiveBuilder::new();
         archive
-            .posix("a", b'0', b"old", "", 0o644)
-            .posix("b", b'1', b"new", "a", 0o755);
+            .ustar("a", b'0', b"old", "", 0o644)
+            .ustar("b", b'1', b"new", "a", 0o755);
         let bytes = archive.finish();
         TarArchive::new(bytes.as_slice())
             .extract_in(&destination, policy)
@@ -833,8 +833,8 @@ async fn hard_links_cannot_replace_their_targets() {
         let destination = temp.path().join(case);
         let mut archive = ArchiveBuilder::new();
         archive
-            .posix("target", b'0', b"keep", "", 0o644)
-            .posix(path, b'1', b"", "target", 0o644);
+            .ustar("target", b'0', b"keep", "", 0o644)
+            .ustar(path, b'1', b"", "target", 0o644);
         let bytes = archive.finish();
         assert!(matches!(
             TarArchive::new(bytes.as_slice())
@@ -856,9 +856,9 @@ async fn native_symlink_and_hard_link_builders_compose() {
     let temp = tempdir().unwrap();
     let mut archive = ArchiveBuilder::new();
     archive
-        .posix("target", b'0', b"contents", "", 0o644)
-        .posix("symbolic", b'2', b"", "target", 0o644)
-        .posix("hard", b'1', b"", "target", 0o644);
+        .ustar("target", b'0', b"contents", "", 0o644)
+        .ustar("symbolic", b'2', b"", "target", 0o644)
+        .ustar("hard", b'1', b"", "target", 0o644);
     let bytes = archive.finish();
     TarArchive::new(bytes.as_slice())
         .extract_in(

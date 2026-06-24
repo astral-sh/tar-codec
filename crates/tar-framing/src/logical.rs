@@ -4,7 +4,7 @@
 //! they describe. Each member carries a compact borrowed [`Header`], and each
 //! PAX member carries one unified [`PaxState`].
 
-use std::{borrow::Cow, mem};
+use std::{borrow::Cow, mem, ops::Range};
 
 use tokio::io::AsyncRead;
 use tokio_stream::StreamExt;
@@ -12,7 +12,7 @@ use tokio_stream::StreamExt;
 use crate::{
     ArchiveFormat, Block, FrameError, FrameErrorInner, GnuKind, PaxKeyword, PaxKind, PaxRecord,
     PaxString, PaxValue, UstarKind,
-    header::parse_number,
+    header::{GNAME_RANGE, LINK_NAME_RANGE, UNAME_RANGE},
     pax::GlobalPaxRecords,
     stream::{DataFrame, DataOwner, Frame, HeaderFrame, TarStream},
 };
@@ -66,21 +66,42 @@ pub struct Header<'a> {
     /// [`MemberPayload`]. Member kinds that cannot carry payload are rejected
     /// when either their declared or effective size is nonzero.
     pub effective_size: u64,
-    mode: [u8; 8],
+    /// Permission and mode bits decoded from the ordinary header, if present.
+    ///
+    /// This is [`None`] only when the field is wholly NUL and the framing policy
+    /// permits missing numeric metadata.
+    pub mode: Option<u64>,
+    /// Numeric user identifier from the ordinary header, if present.
+    ///
+    /// This is [`None`] only when the field is wholly NUL and the framing policy
+    /// permits missing numeric metadata.
+    ///
+    /// Applicable pax metadata may override or delete this fallback.
+    pub uid: Option<u64>,
+    /// Numeric group identifier from the ordinary header, if present.
+    ///
+    /// This is [`None`] only when the field is wholly NUL and the framing policy
+    /// permits missing numeric metadata.
+    ///
+    /// Applicable pax metadata may override or delete this fallback.
+    pub gid: Option<u64>,
+    /// Modification time in seconds from the ordinary header, if present.
+    ///
+    /// This is [`None`] only when the field is wholly NUL and the framing policy
+    /// permits missing numeric metadata.
+    ///
+    /// Applicable pax metadata may override or delete this fallback.
+    pub mtime: Option<u64>,
+    /// User name bytes from the ordinary header, empty if absent or unusable.
+    ///
+    /// Applicable pax metadata may override or delete this fallback.
+    pub uname: &'a [u8],
+    /// Group name bytes from the ordinary header, empty if absent or unusable.
+    ///
+    /// Applicable pax metadata may override or delete this fallback.
+    pub gname: &'a [u8],
     header_path: &'a [u8],
     link_name: &'a [u8],
-}
-
-impl Header<'_> {
-    /// Decodes the ordinary header's numeric mode according to its archive family.
-    pub fn mode(&self) -> Result<u64, FrameError> {
-        parse_number(self.format, &self.mode).ok_or_else(|| {
-            FrameError::at(
-                self.position,
-                FrameErrorInner::InvalidMode { found: self.mode },
-            )
-        })
-    }
 }
 
 /// One meaningful payload block belonging to an ordinary archive member.
@@ -221,23 +242,42 @@ enum ExtensionPayload {
 struct HeaderStorage {
     path: Vec<u8>,
     link_name: Vec<u8>,
+    uname: Vec<u8>,
+    gname: Vec<u8>,
 }
 
 impl HeaderStorage {
     fn update<'a>(&'a mut self, frame: &HeaderFrame) -> Header<'a> {
         frame.copy_header_path_into(&mut self.path);
-        frame.copy_link_name_into(&mut self.link_name);
+        copy_string_field_into(&frame.block, LINK_NAME_RANGE, &mut self.link_name);
+        copy_string_field_into(&frame.block, UNAME_RANGE, &mut self.uname);
+        copy_string_field_into(&frame.block, GNAME_RANGE, &mut self.gname);
         Header {
             position: frame.position,
             format: frame.format,
             kind: frame.kind,
             declared_size: frame.declared_size,
             effective_size: frame.effective_size,
-            mode: frame.mode_bytes(),
+            mode: frame.mode,
+            uid: frame.uid,
+            gid: frame.gid,
+            mtime: frame.mtime,
+            uname: &self.uname,
+            gname: &self.gname,
             header_path: &self.path,
             link_name: &self.link_name,
         }
     }
+}
+
+fn copy_string_field_into(block: &Block, range: Range<usize>, destination: &mut Vec<u8>) {
+    let field = &block[range];
+    let len = field
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(field.len());
+    destination.clear();
+    destination.extend_from_slice(&field[..len]);
 }
 
 impl<R> TarReader<R> {
@@ -282,6 +322,13 @@ impl<R> TarReader<R> {
         self.payload
             .stream
             .set_max_global_pax_extensions_size(max_global_pax_extensions_size);
+    }
+
+    /// Sets whether wholly NUL numeric metadata fields may be accepted.
+    ///
+    /// See [`TarStream::set_allow_all_nul_numeric_fields`].
+    pub fn set_allow_all_nul_numeric_fields(&mut self, allow: bool) {
+        self.payload.stream.set_allow_all_nul_numeric_fields(allow);
     }
 
     /// Sets the maximum size accepted for each subsequent GNU metadata extension.
@@ -653,12 +700,14 @@ mod tests {
     use crate::{
         BLOCK_SIZE, DEFAULT_MAX_GNU_EXTENSION_SIZE, FrameError, FrameErrorInner, PaxRecord,
         PaxValue,
-        header::{LINK_NAME_RANGE, MODE_RANGE, NAME_RANGE, PREFIX_RANGE, TYPEFLAG_OFFSET},
+        header::{
+            GID_RANGE, GNAME_RANGE, LINK_NAME_RANGE, MODE_RANGE, MTIME_RANGE, NAME_RANGE,
+            PREFIX_RANGE, TYPEFLAG_OFFSET, UID_RANGE, UNAME_RANGE,
+        },
         stream::DataOwner,
         test_support::{
-            ChunkedReader, append_block, append_gnu, append_payload, append_posix,
-            append_terminator, cancel_pending, gnu_header, header, ready, ready_ok, record,
-            set_checksum,
+            ChunkedReader, append_block, append_gnu, append_pax, append_payload, append_terminator,
+            cancel_pending, gnu_header, header, ready, ready_ok, record, set_checksum,
         },
     };
 
@@ -686,7 +735,7 @@ mod tests {
 
     fn member_followed_by_empty_member(payload: &[u8]) -> (Vec<u8>, u64) {
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'0', payload);
+        append_pax(&mut bytes, b'0', payload);
         let next_position = u64::try_from(bytes.len()).expect("test position should fit u64");
         append_block(&mut bytes, &header(b'0', 0));
         append_terminator(&mut bytes);
@@ -700,40 +749,90 @@ mod tests {
         set_field(&mut ustar_header, PREFIX_RANGE, b"dir");
         set_field(&mut ustar_header, LINK_NAME_RANGE, b"target");
         ustar_header[MODE_RANGE].copy_from_slice(b"0000755\0");
+        ustar_header[UID_RANGE].copy_from_slice(b"0000001\0");
+        ustar_header[GID_RANGE].copy_from_slice(b"0000002\0");
+        ustar_header[MTIME_RANGE].copy_from_slice(b"00000000003\0");
+        set_field(&mut ustar_header, UNAME_RANGE, b"user");
+        set_field(&mut ustar_header, GNAME_RANGE, b"group");
         set_checksum(&mut ustar_header);
+
+        let mut empty_header = header(b'0', 0);
+        for range in [
+            MODE_RANGE,
+            UID_RANGE,
+            GID_RANGE,
+            MTIME_RANGE,
+            UNAME_RANGE,
+            GNAME_RANGE,
+        ] {
+            empty_header[range].fill(0);
+        }
+        set_checksum(&mut empty_header);
 
         ready_ok(async {
             let mut bytes = Vec::new();
             append_block(&mut bytes, &ustar_header);
+            append_block(&mut bytes, &empty_header);
             append_terminator(&mut bytes);
             let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+            {
+                let member = next_member(&mut reader).await?;
+                assert_eq!(member.header.format, ArchiveFormat::Pax);
+                assert_eq!(member.header.header_path, b"dir/file");
+                assert_eq!(member.header.link_name, b"target");
+                assert_eq!(member.header.mode, Some(0o755));
+                assert_eq!(member.header.uid, Some(1));
+                assert_eq!(member.header.gid, Some(2));
+                assert_eq!(member.header.mtime, Some(3));
+                assert_eq!(member.header.uname, b"user");
+                assert_eq!(member.header.gname, b"group");
+                assert_eq!(member.effective_path()?.as_ref(), b"dir/file");
+                assert_eq!(member.effective_link_path()?.as_ref(), b"target");
+            }
             let member = next_member(&mut reader).await?;
-            assert_eq!(member.header.format, ArchiveFormat::Pax);
-            assert_eq!(member.header.header_path, b"dir/file");
-            assert_eq!(member.header.link_name, b"target");
-            assert_eq!(member.header.mode()?, 0o755);
-            assert_eq!(member.effective_path()?.as_ref(), b"dir/file");
-            assert_eq!(member.effective_link_path()?.as_ref(), b"target");
+            assert_eq!(member.header.mode, None);
+            assert_eq!(member.header.uid, None);
+            assert_eq!(member.header.gid, None);
+            assert_eq!(member.header.mtime, None);
+            assert!(member.header.uname.is_empty());
+            assert!(member.header.gname.is_empty());
             Ok(())
         });
 
-        let mut gnu_header = gnu_header(b'0', 0);
-        set_field(&mut gnu_header, NAME_RANGE, b"name");
-        set_field(&mut gnu_header, PREFIX_RANGE, b"ignored");
-        gnu_header[MODE_RANGE].fill(0);
-        gnu_header[MODE_RANGE.start] = 0x80;
-        gnu_header[MODE_RANGE.end - 2..MODE_RANGE.end].copy_from_slice(&[0x01, 0xed]);
-        set_checksum(&mut gnu_header);
+        let mut gnu_member_header = gnu_header(b'0', 0);
+        set_field(&mut gnu_member_header, NAME_RANGE, b"name");
+        set_field(&mut gnu_member_header, PREFIX_RANGE, b"ignored");
+        gnu_member_header[MODE_RANGE].fill(0);
+        gnu_member_header[MODE_RANGE.start] = 0x80;
+        gnu_member_header[MODE_RANGE.end - 2..MODE_RANGE.end].copy_from_slice(&[0x01, 0xed]);
+        set_checksum(&mut gnu_member_header);
+
+        let mut empty_gnu_header = gnu_header(b'0', 0);
+        for range in [MODE_RANGE, UID_RANGE, GID_RANGE, MTIME_RANGE] {
+            empty_gnu_header[range].fill(0);
+        }
+        set_checksum(&mut empty_gnu_header);
 
         ready_ok(async {
             let mut bytes = Vec::new();
-            append_block(&mut bytes, &gnu_header);
+            append_block(&mut bytes, &gnu_member_header);
+            append_block(&mut bytes, &empty_gnu_header);
             append_terminator(&mut bytes);
             let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+            {
+                let member = next_member(&mut reader).await?;
+                assert_eq!(member.header.format, ArchiveFormat::Gnu);
+                assert_eq!(member.header.header_path, b"name");
+                assert_eq!(member.header.mode, Some(0o755));
+                assert_eq!(member.header.uid, Some(0));
+                assert_eq!(member.header.gid, Some(0));
+                assert_eq!(member.header.mtime, Some(0));
+            }
             let member = next_member(&mut reader).await?;
-            assert_eq!(member.header.format, ArchiveFormat::Gnu);
-            assert_eq!(member.header.header_path, b"name");
-            assert_eq!(member.header.mode()?, 0o755);
+            assert_eq!(member.header.mode, None);
+            assert_eq!(member.header.uid, None);
+            assert_eq!(member.header.gid, None);
+            assert_eq!(member.header.mtime, None);
             Ok(())
         });
     }
@@ -777,7 +876,7 @@ mod tests {
             assert!(member.payload.next_block().await?.is_some());
             assert_eq!(member.header.header_path, b"dir/file");
             assert_eq!(member.header.link_name, b"target");
-            assert_eq!(member.header.mode()?, 0o755);
+            assert_eq!(member.header.mode, Some(0o755));
             assert_eq!(member.effective_path()?.as_ref(), b"dir/file");
             assert_eq!(member.effective_link_path()?.as_ref(), b"target");
             Ok(())
@@ -791,8 +890,8 @@ mod tests {
         let mut local = record("path", "local");
         local.extend_from_slice(&record("linkpath", ""));
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'g', &global);
-        append_posix(&mut bytes, b'x', &local);
+        append_pax(&mut bytes, b'g', &global);
+        append_pax(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'2', 0));
         append_block(&mut bytes, &header(b'2', 0));
         append_terminator(&mut bytes);
@@ -873,13 +972,13 @@ mod tests {
         for (field, mut bytes) in [
             ("path", {
                 let mut bytes = Vec::new();
-                append_posix(&mut bytes, b'x', &record("path", "bad\0name"));
+                append_pax(&mut bytes, b'x', &record("path", "bad\0name"));
                 append_block(&mut bytes, &header(b'0', 0));
                 bytes
             }),
             ("link path", {
                 let mut bytes = Vec::new();
-                append_posix(&mut bytes, b'x', &record("linkpath", "bad\0target"));
+                append_pax(&mut bytes, b'x', &record("linkpath", "bad\0target"));
                 append_block(&mut bytes, &header(b'2', 0));
                 bytes
             }),
@@ -914,8 +1013,8 @@ mod tests {
         let mut local = record("path", "good-name");
         local.extend_from_slice(&record("linkpath", "good-target"));
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'g', &global);
-        append_posix(&mut bytes, b'x', &local);
+        append_pax(&mut bytes, b'g', &global);
+        append_pax(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'2', 0));
         append_terminator(&mut bytes);
 
@@ -935,7 +1034,7 @@ mod tests {
                 "pax",
                 {
                     let mut bytes = Vec::new();
-                    append_posix(&mut bytes, b'x', &record("path", "pax-name"));
+                    append_pax(&mut bytes, b'x', &record("path", "pax-name"));
                     let mut member = header(b'0', 0);
                     set_field(&mut member, NAME_RANGE, b"");
                     set_field(&mut member, PREFIX_RANGE, b"");
@@ -976,9 +1075,9 @@ mod tests {
         set_checksum(&mut physical_header);
 
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'g', &record("path", "global"));
+        append_pax(&mut bytes, b'g', &record("path", "global"));
         append_block(&mut bytes, &header(b'0', 0));
-        append_posix(&mut bytes, b'g', &record("path", ""));
+        append_pax(&mut bytes, b'g', &record("path", ""));
         append_block(&mut bytes, &physical_header);
         append_terminator(&mut bytes);
 
@@ -1063,8 +1162,8 @@ mod tests {
         let mut local = record("path", "renamed");
         local.extend_from_slice(&record("size", "513"));
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'g', &global);
-        append_posix(&mut bytes, b'x', &local);
+        append_pax(&mut bytes, b'g', &global);
+        append_pax(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'0', 1));
         append_payload(&mut bytes, &[b'a'; BLOCK_SIZE]);
         append_payload(&mut bytes, b"b");
@@ -1121,8 +1220,8 @@ mod tests {
             .expect("test payload total should fit u64");
 
         let mut rejected = Vec::new();
-        append_posix(&mut rejected, b'g', &payload);
-        append_posix(&mut rejected, b'g', &payload);
+        append_pax(&mut rejected, b'g', &payload);
+        append_pax(&mut rejected, b'g', &payload);
         let rejected_position =
             u64::try_from(rejected.len()).expect("test position should fit u64");
         append_block(&mut rejected, &header(b'g', payload_size));
@@ -1147,7 +1246,7 @@ mod tests {
         let mut accepted = Vec::new();
         for _ in 0..2 {
             for _ in 0..3 {
-                append_posix(&mut accepted, b'g', &payload);
+                append_pax(&mut accepted, b'g', &payload);
             }
             append_block(&mut accepted, &header(b'0', 0));
         }
@@ -1172,7 +1271,7 @@ mod tests {
     #[test]
     fn retains_global_pax_extension_across_cancelled_reads() {
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'g', &record("comment", "metadata"));
+        append_pax(&mut bytes, b'g', &record("comment", "metadata"));
         let after_extension_header = BLOCK_SIZE;
         let after_extension_payload = bytes.len();
         append_block(&mut bytes, &header(b'0', 0));
@@ -1249,11 +1348,11 @@ mod tests {
         let second = record("gname", "second");
         let replacement = record("comment", "replacement");
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'g', &first);
-        append_posix(&mut bytes, b'g', &second);
+        append_pax(&mut bytes, b'g', &first);
+        append_pax(&mut bytes, b'g', &second);
         append_block(&mut bytes, &header(b'0', 0));
         append_block(&mut bytes, &header(b'0', 0));
-        append_posix(&mut bytes, b'g', &replacement);
+        append_pax(&mut bytes, b'g', &replacement);
         append_block(&mut bytes, &header(b'0', 0));
         append_terminator(&mut bytes);
 
@@ -1300,7 +1399,7 @@ mod tests {
             .map(|index| u8::try_from(index % 251).unwrap())
             .collect::<Vec<_>>();
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'0', &payload);
+        append_pax(&mut bytes, b'0', &payload);
         append_terminator(&mut bytes);
 
         ready_ok(async {
@@ -1625,8 +1724,8 @@ mod tests {
         }
 
         let mut global = Vec::new();
-        append_posix(&mut global, b'g', &record("comment", "metadata"));
-        append_posix(&mut global, b'g', &record("gname", "group"));
+        append_pax(&mut global, b'g', &record("comment", "metadata"));
+        append_pax(&mut global, b'g', &record("gname", "group"));
         append_terminator(&mut global);
         ready_ok(async {
             let mut reader = TarReader::new(ChunkedReader::new(global, BLOCK_SIZE));
@@ -1635,7 +1734,7 @@ mod tests {
         });
 
         let mut malformed_global = Vec::new();
-        append_posix(&mut malformed_global, b'g', b"invalid");
+        append_pax(&mut malformed_global, b'g', b"invalid");
         append_terminator(&mut malformed_global);
         let error: Result<(), FrameError> = ready(async {
             let mut reader = TarReader::new(ChunkedReader::new(malformed_global, BLOCK_SIZE));
@@ -1655,7 +1754,7 @@ mod tests {
         for payload_len in [BLOCK_SIZE + 1, PAYLOAD_DRAIN_CHUNK_BYTES + 7] {
             let payload = vec![b'a'; payload_len];
             let mut bytes = Vec::new();
-            append_posix(&mut bytes, b'0', &payload);
+            append_pax(&mut bytes, b'0', &payload);
             append_block(&mut bytes, &header(b'0', 0));
             append_terminator(&mut bytes);
 

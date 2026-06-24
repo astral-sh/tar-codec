@@ -153,6 +153,10 @@ pub(crate) fn parse_octal(bytes: &[u8]) -> Option<u64> {
     (has_digits && terminated).then_some(value)
 }
 
+pub(crate) fn is_all_nul(bytes: &[u8]) -> bool {
+    bytes.iter().all(|byte| *byte == 0)
+}
+
 /// Parse a number from the given bytes, depending on the archive format.
 ///
 /// See [`parse_octal`] for the pax parsing rules and [`parse_gnu_number`]

@@ -129,7 +129,7 @@ pub(crate) fn append_payload(bytes: &mut Vec<u8>, payload: &[u8]) {
     bytes.resize(bytes.len().next_multiple_of(BLOCK_SIZE), 0);
 }
 
-pub(crate) fn append_posix(bytes: &mut Vec<u8>, typeflag: u8, payload: &[u8]) {
+pub(crate) fn append_pax(bytes: &mut Vec<u8>, typeflag: u8, payload: &[u8]) {
     append_block(bytes, &header(typeflag, payload.len() as u64));
     append_payload(bytes, payload);
 }

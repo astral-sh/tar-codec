@@ -5,7 +5,7 @@ use std::path::Path;
 #[cfg(unix)]
 use support::EntryKind;
 use support::{
-    ArchiveBuilder, ArchiveFormat, header, pax_record, set_ustar_path, single_posix_member,
+    ArchiveBuilder, ArchiveFormat, header, pax_record, set_ustar_path, single_pax_member,
 };
 #[cfg(unix)]
 use tar_codec::extract::LinkPolicy;
@@ -27,11 +27,11 @@ async fn extracts_files_directories_large_payloads_and_archive_path_syntax() {
         .collect::<Vec<_>>();
     let mut archive = ArchiveBuilder::new();
     archive
-        .posix("bin/tool", b'0', b"run", "", 0o755)
-        .posix("bin", b'5', b"", "", 0o755)
-        .posix("empty/", b'5', b"", "", 0o755)
-        .posix(".", b'5', b"", "", 0o755)
-        .posix("large", b'0', &large_payload, "", 0o644);
+        .ustar("bin/tool", b'0', b"run", "", 0o755)
+        .ustar("bin", b'5', b"", "", 0o755)
+        .ustar("empty/", b'5', b"", "", 0o755)
+        .ustar(".", b'5', b"", "", 0o755)
+        .ustar("large", b'0', &large_payload, "", 0o644);
     let bytes = archive.finish();
 
     std::fs::create_dir_all(destination.join("large")).unwrap();
@@ -62,7 +62,7 @@ async fn extracts_files_directories_large_payloads_and_archive_path_syntax() {
 
 #[tokio::test]
 async fn default_name_policy_rejects_colons_in_regular_file_paths() {
-    let bytes = single_posix_member("file:stream", b'0', b"contents", "", 0o644);
+    let bytes = single_pax_member("file:stream", b'0', b"contents", "", 0o644);
     let temp = tempdir().expect("temporary directory should be created");
     let destination = temp.path().join("out");
 
@@ -94,7 +94,7 @@ async fn default_name_policy_rejects_colons_in_regular_file_paths() {
 async fn rejects_directory_payload_without_writing_embedded_members() {
     let embedded_header = header(ArchiveFormat::Pax, "embedded.txt", b'0', 5, "", 0o644);
     let mut archive = ArchiveBuilder::new();
-    archive.posix("dir/", b'5', &embedded_header, "", 0o755);
+    archive.ustar("dir/", b'5', &embedded_header, "", 0o755);
     let bytes = archive.finish();
 
     let temp = tempdir().unwrap();
@@ -133,7 +133,7 @@ async fn rejects_directory_required_suffix_on_regular_file_without_writing_membe
         let mut archive = ArchiveBuilder::new();
         archive
             .pax(b'x', &pax_record(PaxKeyword::Path, path))
-            .posix("ignored", b'0', b"hello", "", 0o644);
+            .ustar("ignored", b'0', b"hello", "", 0o644);
         let bytes = archive.finish();
 
         let temp = tempdir().expect("temporary directory should be created");
@@ -170,7 +170,7 @@ async fn accepts_directory_required_suffix_on_directory_members() {
         let mut archive = ArchiveBuilder::new();
         archive
             .pax(b'x', &pax_record(PaxKeyword::Path, path))
-            .posix("ignored", b'5', b"", "", 0o755);
+            .ustar("ignored", b'5', b"", "", 0o755);
         let bytes = archive.finish();
 
         let temp = tempdir().expect("temporary directory should be created");
@@ -235,11 +235,11 @@ async fn later_entries_replace_duplicate_normalized_and_ambient_files() {
 
     let mut archive = ArchiveBuilder::new();
     archive
-        .posix("same", b'0', b"old", "", 0o644)
-        .posix("same", b'0', b"new", "", 0o644)
-        .posix("nested//./normalized", b'0', b"old", "", 0o644)
-        .posix("nested/normalized", b'0', b"new", "", 0o644)
-        .posix("ambient", b'0', b"archive", "", 0o644);
+        .ustar("same", b'0', b"old", "", 0o644)
+        .ustar("same", b'0', b"new", "", 0o644)
+        .ustar("nested//./normalized", b'0', b"old", "", 0o644)
+        .ustar("nested/normalized", b'0', b"new", "", 0o644)
+        .ustar("ambient", b'0', b"archive", "", 0o644);
     let bytes = archive.finish();
     TarArchive::new(bytes.as_slice())
         .extract_in(&destination, ExtractPolicy::default())
@@ -267,7 +267,7 @@ async fn ambient_file_replacement_unlinks_the_inode_and_applies_mode() {
     std::fs::create_dir(&destination).unwrap();
     std::fs::write(destination.join("same"), b"ambient").unwrap();
     std::fs::hard_link(destination.join("same"), destination.join("sibling")).unwrap();
-    let bytes = single_posix_member("same", b'0', b"archive", "", 0o755);
+    let bytes = single_pax_member("same", b'0', b"archive", "", 0o755);
 
     TarArchive::new(bytes.as_slice())
         .extract_in(&destination, ExtractPolicy::default())
@@ -305,7 +305,7 @@ async fn later_entries_replace_representative_cross_kind_paths() {
         let destination = temp.path().join(case);
         let mut archive = ArchiveBuilder::new();
         archive
-            .posix("target", b'0', b"target", "", 0o644)
+            .ustar("target", b'0', b"target", "", 0o644)
             .entry("./same", first, b"first")
             .entry("same", last, b"last");
         let bytes = archive.finish();
@@ -369,7 +369,7 @@ async fn extraction_replaces_empty_leaves_but_rejects_non_directory_parents() {
         }
         let mut archive = ArchiveBuilder::new();
         archive
-            .posix("target", b'0', b"target", "", 0o644)
+            .ustar("target", b'0', b"target", "", 0o644)
             .entry("same", archive_kind, b"archive");
         let bytes = archive.finish();
         TarArchive::new(bytes.as_slice())
@@ -405,10 +405,10 @@ async fn extraction_replaces_empty_leaves_but_rejects_non_directory_parents() {
         let destination = temp.path().join(case);
         let mut archive = ArchiveBuilder::new();
         archive
-            .posix("target", b'0', b"target", "", 0o644)
+            .ustar("target", b'0', b"target", "", 0o644)
             .entry("parent", parent, b"old")
             .pax(b'x', &pax_record(PaxKeyword::Path, "parent/child"))
-            .posix("ignored", b'0', b"new", "", 0o644);
+            .ustar("ignored", b'0', b"new", "", 0o644);
         let bytes = archive.finish();
         assert!(matches!(
             TarArchive::new(bytes.as_slice())
@@ -440,7 +440,7 @@ async fn extraction_replaces_empty_leaves_but_rejects_non_directory_parents() {
     let destination = temp.path().join("ambient-parent");
     std::fs::create_dir(&destination).unwrap();
     std::fs::write(destination.join("parent"), b"old").unwrap();
-    let bytes = single_posix_member("parent/child", b'0', b"new", "", 0o644);
+    let bytes = single_pax_member("parent/child", b'0', b"new", "", 0o644);
     assert!(matches!(
         TarArchive::new(bytes.as_slice())
             .extract_in(&destination, ExtractPolicy::default())
@@ -458,20 +458,20 @@ async fn disabled_overwrites_reject_replacements_but_reuse_directories() {
         ("duplicate", false, {
             let mut archive = ArchiveBuilder::new();
             archive
-                .posix("same", b'0', b"old", "", 0o644)
-                .posix("same", b'0', b"new", "", 0o644);
+                .ustar("same", b'0', b"old", "", 0o644)
+                .ustar("same", b'0', b"new", "", 0o644);
             archive.finish()
         }),
         ("cross-kind", false, {
             let mut archive = ArchiveBuilder::new();
             archive
-                .posix("same", b'0', b"old", "", 0o644)
-                .posix("same", b'5', b"", "", 0o755);
+                .ustar("same", b'0', b"old", "", 0o644)
+                .ustar("same", b'5', b"", "", 0o755);
             archive.finish()
         }),
         ("parent", false, {
             let mut archive = ArchiveBuilder::new();
-            archive.posix("parent", b'0', b"old", "", 0o644).posix(
+            archive.ustar("parent", b'0', b"old", "", 0o644).ustar(
                 "parent/child",
                 b'0',
                 b"new",
@@ -483,14 +483,14 @@ async fn disabled_overwrites_reject_replacements_but_reuse_directories() {
         ("pending-symlink", false, {
             let mut archive = ArchiveBuilder::new();
             archive
-                .posix("same", b'2', b"", "missing", 0o644)
-                .posix("same", b'0', b"new", "", 0o644);
+                .ustar("same", b'2', b"", "missing", 0o644)
+                .ustar("same", b'0', b"new", "", 0o644);
             archive.finish()
         }),
         (
             "ambient",
             true,
-            single_posix_member("same", b'0', b"new", "", 0o644),
+            single_pax_member("same", b'0', b"new", "", 0o644),
         ),
     ];
     for (case, preexisting_file, bytes) in archives {
@@ -514,9 +514,9 @@ async fn disabled_overwrites_reject_replacements_but_reuse_directories() {
     std::fs::create_dir_all(destination.join("same")).unwrap();
     let mut archive = ArchiveBuilder::new();
     archive
-        .posix("same/child", b'0', b"new", "", 0o644)
-        .posix("same", b'5', b"", "", 0o755)
-        .posix("same", b'5', b"", "", 0o755);
+        .ustar("same/child", b'0', b"new", "", 0o644)
+        .ustar("same", b'5', b"", "", 0o755)
+        .ustar("same", b'5', b"", "", 0o755);
     let bytes = archive.finish();
     TarArchive::new(bytes.as_slice())
         .extract_in(
@@ -539,15 +539,15 @@ async fn non_empty_directories_are_never_replaced() {
         ("archive-child", {
             let mut archive = ArchiveBuilder::new();
             archive
-                .posix("same/child", b'0', b"keep", "", 0o644)
-                .posix("same", b'0', b"replace", "", 0o644);
+                .ustar("same/child", b'0', b"keep", "", 0o644)
+                .ustar("same", b'0', b"replace", "", 0o644);
             archive.finish()
         }),
         ("pending-symlink-child", {
             let mut archive = ArchiveBuilder::new();
             archive
-                .posix("same/link", b'2', b"", "missing", 0o644)
-                .posix("same", b'0', b"replace", "", 0o644);
+                .ustar("same/link", b'2', b"", "missing", 0o644)
+                .ustar("same", b'0', b"replace", "", 0o644);
             archive.finish()
         }),
     ];
@@ -565,7 +565,7 @@ async fn non_empty_directories_are_never_replaced() {
     let destination = temp.path().join("ambient-child");
     std::fs::create_dir_all(destination.join("same")).unwrap();
     std::fs::write(destination.join("same/child"), b"keep").unwrap();
-    let bytes = single_posix_member("same", b'0', b"replace", "", 0o644);
+    let bytes = single_pax_member("same", b'0', b"replace", "", 0o644);
     assert!(matches!(
         TarArchive::new(bytes.as_slice())
             .extract_in(&destination, ExtractPolicy::default())
@@ -589,7 +589,7 @@ async fn extraction_rejects_symlink_parents_and_replaces_symlink_leaves_without_
     std::fs::create_dir_all(&destination).unwrap();
     std::fs::create_dir_all(&outside).unwrap();
     symlink_dir(&outside, destination.join("parent")).unwrap();
-    let bytes = single_posix_member("parent/file", b'0', b"good", "", 0o644);
+    let bytes = single_pax_member("parent/file", b'0', b"good", "", 0o644);
     assert!(matches!(
         TarArchive::new(bytes.as_slice())
             .extract_in(&destination, ExtractPolicy::default())
@@ -607,7 +607,7 @@ async fn extraction_rejects_symlink_parents_and_replaces_symlink_leaves_without_
     std::fs::create_dir(&destination).unwrap();
     std::fs::write(&outside, b"keep").unwrap();
     symlink_file(&outside, destination.join("same")).unwrap();
-    let bytes = single_posix_member("same", b'0', b"archive", "", 0o644);
+    let bytes = single_pax_member("same", b'0', b"archive", "", 0o644);
     TarArchive::new(bytes.as_slice())
         .extract_in(&destination, ExtractPolicy::default())
         .await
@@ -627,7 +627,7 @@ async fn rejects_a_symlink_destination_root_without_modifying_its_target() {
     std::fs::create_dir(&target).unwrap();
     std::fs::write(target.join("keep"), b"keep").unwrap();
     symlink_dir(&target, &destination).unwrap();
-    let bytes = single_posix_member("file", b'0', b"archive", "", 0o644);
+    let bytes = single_pax_member("file", b'0', b"archive", "", 0o644);
 
     assert!(matches!(
         TarArchive::new(bytes.as_slice())

@@ -73,6 +73,7 @@
 
 use std::{
     future::poll_fn,
+    ops::Range,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -84,11 +85,11 @@ use tokio_stream::Stream;
 use crate::{
     ArchiveFormat, BLOCK_SIZE, Block, DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE,
     DEFAULT_MAX_GNU_EXTENSION_SIZE, DEFAULT_MAX_PAX_EXTENSION_SIZE, FrameError, FrameErrorInner,
-    GnuKind, HdrCharset, PaxError, PaxKeyword, PaxKind, PaxRecord, PaxState, PaxValue, UstarKind,
+    GnuKind, HdrCharset, PaxError, PaxKind, PaxRecord, PaxState, PaxValue, UstarKind,
     header::{
-        CHECKSUM_RANGE, GID_RANGE, GNAME_RANGE, GNU_IDENTITY, IDENTITY_RANGE, LINK_NAME_RANGE,
-        MODE_RANGE, MTIME_RANGE, NAME_RANGE, PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, UID_RANGE,
-        UNAME_RANGE, USTAR_IDENTITY, checksum, parse_number, parse_octal,
+        CHECKSUM_RANGE, GID_RANGE, GNAME_RANGE, GNU_IDENTITY, IDENTITY_RANGE, MODE_RANGE,
+        MTIME_RANGE, NAME_RANGE, PREFIX_RANGE, SIZE_RANGE, TYPEFLAG_OFFSET, UID_RANGE, UNAME_RANGE,
+        USTAR_IDENTITY, checksum, is_all_nul, parse_number, parse_octal,
     },
     pax::{GlobalPaxRecords, PaxRecords, SharedPaxRecords},
 };
@@ -156,9 +157,183 @@ pub struct HeaderFrame {
     /// emitted. Member kinds that cannot carry payload are rejected when either
     /// their declared or effective size is nonzero.
     pub effective_size: u64,
+    pub(crate) mode: Option<u64>,
+    pub(crate) uid: Option<u64>,
+    pub(crate) gid: Option<u64>,
+    pub(crate) mtime: Option<u64>,
 }
 
 impl HeaderFrame {
+    fn ustar(
+        position: u64,
+        block: Block,
+        typeflag: u8,
+        declared_size: u64,
+        local_records: Option<&PaxRecords>,
+        global_records: Option<&GlobalPaxRecords>,
+        allow_all_nul_numeric_fields: bool,
+    ) -> Result<Self, FrameError> {
+        let kind = UstarKind::try_from_framed(position, typeflag)?;
+
+        // Some real-world pax writers encode absent ordinary-header metadata as
+        // all NULs. The compatibility policy may accept these empty fields; every
+        // populated fallback remains subject to strict validation.
+        let parse_numeric_field = |field, range: Range<usize>| {
+            Self::parse_numeric_field(
+                position,
+                ArchiveFormat::Pax,
+                field,
+                &block[range],
+                allow_all_nul_numeric_fields,
+            )
+        };
+        let mode = Self::parse_mode(
+            position,
+            ArchiveFormat::Pax,
+            &block[MODE_RANGE],
+            allow_all_nul_numeric_fields,
+        )?;
+        let uid = parse_numeric_field("uid", UID_RANGE)?;
+        let gid = parse_numeric_field("gid", GID_RANGE)?;
+        let mtime = parse_numeric_field("mtime", MTIME_RANGE)?;
+
+        let validate_string_field = |field: &'static str, bytes: &[u8]| {
+            if bytes.contains(&0) {
+                Ok(())
+            } else {
+                Err(FrameError::at(
+                    position,
+                    FrameErrorInner::UnterminatedUstarStringField { field },
+                ))
+            }
+        };
+        validate_string_field("uname", &block[UNAME_RANGE])?;
+        validate_string_field("gname", &block[GNAME_RANGE])?;
+
+        // POSIX pax deliberately leaves the representation of device numbers unspecified.
+        // We do not consume those fields, so devmajor and devminor remain opaque.
+
+        // Determine our member's actual (i.e. effective) size. This takes any pax `size`
+        // records into account, in addition to the normal header-declared size.
+        let effective_size = PaxState::effective_size(local_records, global_records).map_or(
+            Ok(declared_size),
+            |size| match size {
+                PaxValue::Value(size) => Ok(*size),
+                PaxValue::Deleted => Err(FrameError::deleted_pax_metadata(position, "size")),
+            },
+        )?;
+        validate_pax_member_size(position, kind, declared_size, effective_size)?;
+
+        Ok(Self {
+            position,
+            block,
+            format: ArchiveFormat::Pax,
+            kind,
+            declared_size,
+            effective_size,
+            mode,
+            uid,
+            gid,
+            mtime,
+        })
+    }
+
+    fn gnu(
+        position: u64,
+        block: Block,
+        typeflag: u8,
+        declared_size: u64,
+        require_link_kind: bool,
+        allow_all_nul_numeric_fields: bool,
+    ) -> Result<Self, FrameError> {
+        let kind = UstarKind::try_from_framed(position, typeflag)?;
+        if require_link_kind && !matches!(kind, UstarKind::HardLink | UstarKind::SymbolicLink) {
+            return Err(FrameError::unexpected_order(
+                position,
+                "hard-link or symbolic-link member after GNU long-link extension",
+                "non-link ordinary member",
+            ));
+        }
+        validate_gnu_member_size(position, kind, declared_size)?;
+        let parse_numeric_field = |field, range: Range<usize>| {
+            Self::parse_numeric_field(
+                position,
+                ArchiveFormat::Gnu,
+                field,
+                &block[range],
+                allow_all_nul_numeric_fields,
+            )
+        };
+        let mode = Self::parse_mode(
+            position,
+            ArchiveFormat::Gnu,
+            &block[MODE_RANGE],
+            allow_all_nul_numeric_fields,
+        )?;
+        let uid = parse_numeric_field("uid", UID_RANGE)?;
+        let gid = parse_numeric_field("gid", GID_RANGE)?;
+        let mtime = parse_numeric_field("mtime", MTIME_RANGE)?;
+
+        Ok(Self {
+            position,
+            block,
+            format: ArchiveFormat::Gnu,
+            kind,
+            declared_size,
+            effective_size: declared_size,
+            mode,
+            uid,
+            gid,
+            mtime,
+        })
+    }
+
+    fn parse_mode(
+        position: u64,
+        format: ArchiveFormat,
+        bytes: &[u8],
+        allow_all_nul_numeric_fields: bool,
+    ) -> Result<Option<u64>, FrameError> {
+        let mode = Self::parse_numeric_field(
+            position,
+            format,
+            "mode",
+            bytes,
+            allow_all_nul_numeric_fields,
+        )?;
+        if matches!(mode, Some(mode) if mode > 0o7777) {
+            return Err(FrameError::at(
+                position,
+                FrameErrorInner::InvalidNumericField {
+                    field: "mode",
+                    found: bytes.to_vec(),
+                },
+            ));
+        }
+        Ok(mode)
+    }
+
+    fn parse_numeric_field(
+        position: u64,
+        format: ArchiveFormat,
+        field: &'static str,
+        bytes: &[u8],
+        allow_all_nul_numeric_fields: bool,
+    ) -> Result<Option<u64>, FrameError> {
+        if allow_all_nul_numeric_fields && is_all_nul(bytes) {
+            return Ok(None);
+        }
+        parse_number(format, bytes).map(Some).ok_or_else(|| {
+            FrameError::at(
+                position,
+                FrameErrorInner::InvalidNumericField {
+                    field,
+                    found: bytes.to_vec(),
+                },
+            )
+        })
+    }
+
     pub(crate) fn copy_header_path_into(&self, path: &mut Vec<u8>) {
         path.clear();
         let name = trim_nul(&self.block[NAME_RANGE]);
@@ -172,17 +347,6 @@ impl HeaderFrame {
             path.push(b'/');
         }
         path.extend_from_slice(name);
-    }
-
-    pub(crate) fn copy_link_name_into(&self, link_name: &mut Vec<u8>) {
-        link_name.clear();
-        link_name.extend_from_slice(trim_nul(&self.block[LINK_NAME_RANGE]));
-    }
-
-    pub(crate) fn mode_bytes(&self) -> [u8; 8] {
-        self.block[MODE_RANGE]
-            .try_into()
-            .expect("fixed header range")
     }
 }
 
@@ -307,6 +471,7 @@ pub struct TarStream<R> {
     max_pax_extension_size: u64,
     max_global_pax_extensions_size: u64,
     global_pax_extensions_size: u64,
+    allow_all_nul_numeric_fields: bool,
     max_gnu_extension_size: u64,
     member_chunk: MemberChunk,
     pub(super) state: State,
@@ -325,6 +490,7 @@ impl<R> TarStream<R> {
             max_pax_extension_size: DEFAULT_MAX_PAX_EXTENSION_SIZE,
             max_global_pax_extensions_size: DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE,
             global_pax_extensions_size: 0,
+            allow_all_nul_numeric_fields: true,
             max_gnu_extension_size: DEFAULT_MAX_GNU_EXTENSION_SIZE,
             member_chunk: MemberChunk::default(),
             state: State::AwaitingHeader,
@@ -352,6 +518,16 @@ impl<R> TarStream<R> {
     /// bound; each extension remains subject to its individual limit.
     pub fn set_max_global_pax_extensions_size(&mut self, max_global_pax_extensions_size: u64) {
         self.max_global_pax_extensions_size = max_global_pax_extensions_size;
+    }
+
+    /// Sets whether wholly NUL numeric metadata fields may be accepted.
+    ///
+    /// This compatibility option applies to `mode`, `uid`, `gid`, and `mtime`
+    /// in both pax/ustar and GNU ordinary member headers. It is enabled by
+    /// default. Disabling it requires each field to use a valid numeric encoding
+    /// for its archive family.
+    pub fn set_allow_all_nul_numeric_fields(&mut self, allow: bool) {
+        self.allow_all_nul_numeric_fields = allow;
     }
 
     /// Sets the maximum size accepted for each GNU extension.
@@ -870,7 +1046,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
     ) -> Result<Frame, FrameError> {
         let parsed = self.parse_format_checked_header(position, &block)?;
         match parsed.format {
-            ArchiveFormat::Pax => self.process_posix_boundary_header(position, block, parsed),
+            ArchiveFormat::Pax => self.process_pax_boundary_header(position, block, parsed),
             ArchiveFormat::Gnu => {
                 self.process_gnu_header(position, block, parsed, PendingGnu::default())
             }
@@ -902,12 +1078,12 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         Ok(parsed)
     }
 
-    /// Processes a POSIX header at an archive-member boundary, where a new
+    /// Processes a pax/ustar header at an archive-member boundary, where a new
     /// pax extension or an ordinary ustar member may begin.
     ///
     /// Pax extension headers enter [`State::ReadingPax`]; ordinary ustar
     /// headers are delegated to [`Self::process_ustar_header`].
-    fn process_posix_boundary_header(
+    fn process_pax_boundary_header(
         &mut self,
         position: u64,
         block: Block,
@@ -993,32 +1169,18 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         parsed: ParsedHeader,
         local_pax_records: Option<SharedPaxRecords>,
     ) -> Result<Frame, FrameError> {
-        let kind = UstarKind::try_from_framed(position, parsed.typeflag)?;
-        validate_posix_member_header_fields(
-            position,
-            &block,
-            local_pax_records.as_deref(),
-            self.global_pax_records.as_ref(),
-        )?;
-        let effective_size = PaxState::effective_size(
-            local_pax_records.as_deref(),
-            self.global_pax_records.as_ref(),
-        )
-        .map_or(Ok(parsed.size), |size| match size {
-            PaxValue::Value(size) => Ok(*size),
-            PaxValue::Deleted => Err(FrameError::deleted_pax_metadata(position, "size")),
-        })?;
-        validate_posix_member_size(position, kind, parsed.size, effective_size)?;
-        self.global_pax_extensions_size = 0;
-        self.state = member_payload_state(effective_size);
-        Ok(Frame::Header(HeaderFrame {
+        let frame = HeaderFrame::ustar(
             position,
             block,
-            format: ArchiveFormat::Pax,
-            kind,
-            declared_size: parsed.size,
-            effective_size,
-        }))
+            parsed.typeflag,
+            parsed.size,
+            local_pax_records.as_deref(),
+            self.global_pax_records.as_ref(),
+            self.allow_all_nul_numeric_fields,
+        )?;
+        self.global_pax_extensions_size = 0;
+        self.state = member_payload_state(frame.effective_size);
+        Ok(Frame::Header(frame))
     }
 
     fn process_gnu_header(
@@ -1073,24 +1235,16 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             }));
         }
 
-        let kind = UstarKind::try_from_framed(position, parsed.typeflag)?;
-        if pending.long_link && !matches!(kind, UstarKind::HardLink | UstarKind::SymbolicLink) {
-            return Err(FrameError::unexpected_order(
-                position,
-                "hard-link or symbolic-link member after GNU long-link extension",
-                "non-link ordinary member",
-            ));
-        }
-        validate_gnu_member_size(position, kind, parsed.size)?;
-        self.state = member_payload_state(parsed.size);
-        Ok(Frame::Header(HeaderFrame {
+        let frame = HeaderFrame::gnu(
             position,
             block,
-            format: ArchiveFormat::Gnu,
-            kind,
-            declared_size: parsed.size,
-            effective_size: parsed.size,
-        }))
+            parsed.typeflag,
+            parsed.size,
+            pending.long_link,
+            self.allow_all_nul_numeric_fields,
+        )?;
+        self.state = member_payload_state(frame.effective_size);
+        Ok(Frame::Header(frame))
     }
 }
 
@@ -1229,7 +1383,7 @@ impl TryFromFramed<u8> for UstarKind {
     }
 }
 
-fn validate_posix_member_size(
+fn validate_pax_member_size(
     position: u64,
     kind: UstarKind,
     declared_size: u64,
@@ -1256,62 +1410,6 @@ fn validate_posix_member_size(
             validate_payload_free_size(position, kind, effective_size)
         }
     }
-}
-
-fn validate_posix_member_header_fields(
-    position: u64,
-    block: &Block,
-    local_records: Option<&PaxRecords>,
-    global_records: Option<&GlobalPaxRecords>,
-) -> Result<(), FrameError> {
-    let mode: [u8; 8] = block[MODE_RANGE].try_into().expect("fixed header range");
-    match parse_octal(&mode) {
-        Some(0..=0o7777) => {}
-        _ => {
-            return Err(FrameError::at(
-                position,
-                FrameErrorInner::InvalidMode { found: mode },
-            ));
-        }
-    }
-
-    for (field, range, keyword) in [
-        ("uid", UID_RANGE, PaxKeyword::Uid),
-        ("gid", GID_RANGE, PaxKeyword::Gid),
-        ("mtime", MTIME_RANGE, PaxKeyword::Mtime),
-    ] {
-        if PaxState::effective_record_from(local_records, global_records, &keyword).is_some() {
-            continue;
-        }
-        let bytes = &block[range];
-        if parse_octal(bytes).is_none() {
-            return Err(FrameError::at(
-                position,
-                FrameErrorInner::InvalidUstarNumericField {
-                    field,
-                    found: bytes.to_vec(),
-                },
-            ));
-        }
-    }
-
-    for (field, range, keyword) in [
-        ("uname", UNAME_RANGE, PaxKeyword::Uname),
-        ("gname", GNAME_RANGE, PaxKeyword::Gname),
-    ] {
-        if PaxState::effective_record_from(local_records, global_records, &keyword).is_none()
-            && !block[range].contains(&0)
-        {
-            return Err(FrameError::at(
-                position,
-                FrameErrorInner::UnterminatedUstarStringField { field },
-            ));
-        }
-    }
-
-    // POSIX deliberately leaves the representation of device numbers unspecified.
-    // We do not consume those fields, so devmajor and devminor remain opaque.
-    Ok(())
 }
 
 fn validate_gnu_member_size(position: u64, kind: UstarKind, size: u64) -> Result<(), FrameError> {
@@ -1354,8 +1452,8 @@ mod tests {
         ArchiveFormat, FrameError, FrameErrorInner, HdrCharset, PaxString, PaxValue,
         header::{DEVMAJOR_RANGE, DEVMINOR_RANGE},
         test_support::{
-            ChunkedReader, append_block, append_gnu, append_payload, append_posix,
-            append_terminator, gnu_base256_header, gnu_header, header, ready, record, set_checksum,
+            ChunkedReader, append_block, append_gnu, append_pax, append_payload, append_terminator,
+            gnu_base256_header, gnu_header, header, ready, record, set_checksum,
         },
     };
 
@@ -1427,8 +1525,7 @@ mod tests {
         InvalidIdentity,
         InvalidChecksum,
         InvalidSize,
-        InvalidMode,
-        InvalidUstarNumericField(&'static str),
+        InvalidNumericField(&'static str),
         UnterminatedUstarStringField(&'static str),
         UnsupportedTypeflag(u8),
     }
@@ -1438,11 +1535,10 @@ mod tests {
             match (self, error) {
                 (Self::InvalidIdentity, FrameErrorInner::InvalidIdentity { .. })
                 | (Self::InvalidChecksum, FrameErrorInner::InvalidChecksum { .. })
-                | (Self::InvalidSize, FrameErrorInner::InvalidSize { .. })
-                | (Self::InvalidMode, FrameErrorInner::InvalidMode { .. }) => true,
+                | (Self::InvalidSize, FrameErrorInner::InvalidSize { .. }) => true,
                 (
-                    Self::InvalidUstarNumericField(field),
-                    FrameErrorInner::InvalidUstarNumericField { field: found, .. },
+                    Self::InvalidNumericField(field),
+                    FrameErrorInner::InvalidNumericField { field: found, .. },
                 )
                 | (
                     Self::UnterminatedUstarStringField(field),
@@ -1497,33 +1593,33 @@ mod tests {
                 checksummed_header(|block| {
                     block[MODE_RANGE].copy_from_slice(b"0000080\0");
                 }),
-                ExpectedHeaderError::InvalidMode,
+                ExpectedHeaderError::InvalidNumericField("mode"),
             ),
             (
                 "oversized mode",
                 checksummed_header(|block| {
                     block[MODE_RANGE].copy_from_slice(b"0010000\0");
                 }),
-                ExpectedHeaderError::InvalidMode,
+                ExpectedHeaderError::InvalidNumericField("mode"),
             ),
             (
                 "uid",
                 checksummed_header(|block| {
                     block[UID_RANGE].copy_from_slice(b"invalid\0");
                 }),
-                ExpectedHeaderError::InvalidUstarNumericField("uid"),
+                ExpectedHeaderError::InvalidNumericField("uid"),
             ),
             (
                 "gid",
-                checksummed_header(|block| block[GID_RANGE].fill(0)),
-                ExpectedHeaderError::InvalidUstarNumericField("gid"),
+                checksummed_header(|block| block[GID_RANGE.start] = b'8'),
+                ExpectedHeaderError::InvalidNumericField("gid"),
             ),
             (
                 "mtime",
                 checksummed_header(|block| {
                     block[MTIME_RANGE].copy_from_slice(b"00000000008\0");
                 }),
-                ExpectedHeaderError::InvalidUstarNumericField("mtime"),
+                ExpectedHeaderError::InvalidNumericField("mtime"),
             ),
             (
                 "uname",
@@ -1578,7 +1674,7 @@ mod tests {
         assert!(payload.len() > BLOCK_SIZE);
 
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'x', &payload);
+        append_pax(&mut bytes, b'x', &payload);
         append_block(&mut bytes, &header(b'0', 1));
         append_payload(&mut bytes, &[b'a'; BLOCK_SIZE]);
         append_payload(&mut bytes, b"b");
@@ -1616,7 +1712,7 @@ mod tests {
         let declared_size = u64::try_from(payload.len()).expect("payload size should fit u64");
         for (case, typeflag) in [("local", b'x'), ("global", b'g')] {
             let mut bytes = Vec::new();
-            append_posix(&mut bytes, typeflag, &payload);
+            append_pax(&mut bytes, typeflag, &payload);
             let frames = collect_with_max_pax_extension_size(bytes, BLOCK_SIZE, declared_size - 1);
             assert_eq!(frames.len(), 1, "{case}");
             assert!(matches!(
@@ -1683,7 +1779,7 @@ mod tests {
         payload.extend_from_slice(&record("ACME.attribute", "value"));
         for (case, typeflag) in [("local", b'x'), ("global", b'g')] {
             let mut bytes = Vec::new();
-            append_posix(&mut bytes, typeflag, &payload);
+            append_pax(&mut bytes, typeflag, &payload);
             if typeflag == b'x' {
                 append_block(&mut bytes, &header(b'0', 0));
             }
@@ -1712,14 +1808,14 @@ mod tests {
         deletion.extend_from_slice(&record("size", ""));
 
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'g', &initial_global);
-        append_posix(&mut bytes, b'g', &replacement_global);
+        append_pax(&mut bytes, b'g', &initial_global);
+        append_pax(&mut bytes, b'g', &replacement_global);
         append_block(&mut bytes, &header(b'0', 1));
         append_payload(&mut bytes, b"ab");
-        append_posix(&mut bytes, b'x', &local);
+        append_pax(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'0', 1));
         append_payload(&mut bytes, b"abc");
-        append_posix(&mut bytes, b'g', &deletion);
+        append_pax(&mut bytes, b'g', &deletion);
         append_block(&mut bytes, &header(b'5', 1));
         append_terminator(&mut bytes);
 
@@ -1791,7 +1887,7 @@ mod tests {
         let mut local = record("size", "");
         local.extend_from_slice(&record("size", "2"));
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'x', &local);
+        append_pax(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'0', 1));
         append_payload(&mut bytes, b"ab");
         append_terminator(&mut bytes);
@@ -1812,43 +1908,56 @@ mod tests {
     }
 
     #[test]
-    fn pax_records_override_malformed_ordinary_header_fields() {
-        let mut malformed = header(b'0', 0);
-        malformed[UID_RANGE].fill(b'u');
-        malformed[GID_RANGE].fill(b'g');
-        malformed[MTIME_RANGE].fill(b'm');
-        malformed[UNAME_RANGE].fill(b'u');
-        malformed[GNAME_RANGE].fill(b'g');
-        set_checksum(&mut malformed);
+    fn pax_records_do_not_make_malformed_ordinary_header_fields_valid() {
+        let cases = [
+            (
+                "local uid",
+                b'x',
+                record("uid", "1"),
+                checksummed_header(|block| block[UID_RANGE].fill(b'u')),
+                ExpectedHeaderError::InvalidNumericField("uid"),
+            ),
+            (
+                "global gid",
+                b'g',
+                record("gid", "2"),
+                checksummed_header(|block| block[GID_RANGE].fill(b'g')),
+                ExpectedHeaderError::InvalidNumericField("gid"),
+            ),
+            (
+                "local mtime",
+                b'x',
+                record("mtime", "3"),
+                checksummed_header(|block| block[MTIME_RANGE].fill(b'm')),
+                ExpectedHeaderError::InvalidNumericField("mtime"),
+            ),
+            (
+                "global uname",
+                b'g',
+                record("uname", "user"),
+                checksummed_header(|block| block[UNAME_RANGE].fill(b'u')),
+                ExpectedHeaderError::UnterminatedUstarStringField("uname"),
+            ),
+            (
+                "local gname",
+                b'x',
+                record("gname", "group"),
+                checksummed_header(|block| block[GNAME_RANGE].fill(b'g')),
+                ExpectedHeaderError::UnterminatedUstarStringField("gname"),
+            ),
+        ];
 
-        let local_values = [
-            record("uid", "1"),
-            record("gid", "2"),
-            record("mtime", "3"),
-            record("uname", "user"),
-            record("gname", "group"),
-        ]
-        .concat();
-        let global_deletions = [
-            record("uid", ""),
-            record("gid", ""),
-            record("mtime", ""),
-            record("uname", ""),
-            record("gname", ""),
-        ]
-        .concat();
-
-        for (case, typeflag, records) in [
-            ("local values", b'x', local_values),
-            ("global deletions", b'g', global_deletions),
-        ] {
+        for (case, typeflag, records, malformed, expected) in cases {
             let mut bytes = Vec::new();
-            append_posix(&mut bytes, typeflag, &records);
+            append_pax(&mut bytes, typeflag, &records);
             append_block(&mut bytes, &malformed);
             append_terminator(&mut bytes);
 
             let frames = collect(bytes, BLOCK_SIZE);
-            assert!(frames.iter().all(Result::is_ok), "{case}: {frames:?}");
+            assert!(
+                expected.matches(last_error_inner(&frames)),
+                "{case}: {frames:?}"
+            );
         }
     }
 
@@ -1869,8 +1978,8 @@ mod tests {
         let global = record("size", "7");
         let local = record("size", "");
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'g', &global);
-        append_posix(&mut bytes, b'x', &local);
+        append_pax(&mut bytes, b'g', &global);
+        append_pax(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'5', 3));
         append_terminator(&mut bytes);
 
@@ -1885,7 +1994,7 @@ mod tests {
         let records = record("size", "");
         for typeflag in [b'x', b'g'] {
             let mut bytes = Vec::new();
-            append_posix(&mut bytes, typeflag, &records);
+            append_pax(&mut bytes, typeflag, &records);
             append_block(&mut bytes, &header(b'0', 0));
 
             assert!(
@@ -1903,8 +2012,8 @@ mod tests {
         let global = record("size", "");
         let local = record("size", "2");
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'g', &global);
-        append_posix(&mut bytes, b'x', &local);
+        append_pax(&mut bytes, b'g', &global);
+        append_pax(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'0', 1));
         append_payload(&mut bytes, b"ab");
         append_terminator(&mut bytes);
@@ -1931,7 +2040,7 @@ mod tests {
         ] {
             let mut bytes = Vec::new();
             if let Some(override_size) = override_size {
-                append_posix(&mut bytes, b'x', &record("size", override_size));
+                append_pax(&mut bytes, b'x', &record("size", override_size));
             }
             append_block(&mut bytes, &header(b'1', declared_size));
             append_payload(&mut bytes, b"abc");
@@ -1963,7 +2072,7 @@ mod tests {
     fn zero_filled_block_inside_pax_payload_is_data() {
         let payload = record("comment", &"\0".repeat(BLOCK_SIZE * 3));
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'x', &payload);
+        append_pax(&mut bytes, b'x', &payload);
         append_block(&mut bytes, &header(b'0', 0));
         append_terminator(&mut bytes);
 
@@ -2020,6 +2129,33 @@ mod tests {
             let error = last_error_inner(&frames);
             assert!(expected.matches(error), "{case}: {error:?}");
         }
+    }
+
+    #[test]
+    fn rejects_malformed_gnu_numeric_fields() {
+        for (field, range) in [
+            ("mode", MODE_RANGE),
+            ("uid", UID_RANGE),
+            ("gid", GID_RANGE),
+            ("mtime", MTIME_RANGE),
+        ] {
+            let mut block = gnu_header(b'0', 0);
+            block[range].fill(b'x');
+            set_checksum(&mut block);
+
+            assert!(matches!(
+                last_error_inner(&collect(block.to_vec(), BLOCK_SIZE)),
+                FrameErrorInner::InvalidNumericField { field: found, .. } if *found == field
+            ));
+        }
+
+        let mut oversized_mode = gnu_header(b'0', 0);
+        oversized_mode[MODE_RANGE].copy_from_slice(b"0010000\0");
+        set_checksum(&mut oversized_mode);
+        assert!(matches!(
+            last_error_inner(&collect(oversized_mode.to_vec(), BLOCK_SIZE)),
+            FrameErrorInner::InvalidNumericField { field: "mode", .. }
+        ));
     }
 
     #[test]
@@ -2082,7 +2218,7 @@ mod tests {
                 (b'6', UstarKind::Fifo),
             ] {
                 let mut bytes = Vec::new();
-                append_posix(&mut bytes, b'x', &record("size", override_size));
+                append_pax(&mut bytes, b'x', &record("size", override_size));
                 append_block(&mut bytes, &header(typeflag, declared_size));
 
                 assert!(
@@ -2125,7 +2261,7 @@ mod tests {
 
         let valid = record("path", "name");
         let mut consecutive = Vec::new();
-        append_posix(&mut consecutive, b'x', &valid);
+        append_pax(&mut consecutive, b'x', &valid);
         append_block(&mut consecutive, &header(b'x', valid.len() as u64));
         assert!(matches!(
             last_error_inner(&collect(consecutive, BLOCK_SIZE)),
@@ -2133,7 +2269,7 @@ mod tests {
         ));
 
         let mut missing_member = Vec::new();
-        append_posix(&mut missing_member, b'x', &valid);
+        append_pax(&mut missing_member, b'x', &valid);
         assert!(matches!(
             last_error_inner(&collect(missing_member, BLOCK_SIZE)),
             FrameErrorInner::UnexpectedEof { .. }
@@ -2145,7 +2281,7 @@ mod tests {
         let invalid = record("size", "bad");
         let mut bytes = Vec::new();
         append_block(&mut bytes, &header(b'0', 0));
-        append_posix(&mut bytes, b'x', &invalid);
+        append_pax(&mut bytes, b'x', &invalid);
 
         let frames = collect(bytes, BLOCK_SIZE);
         assert!(matches!(
@@ -2165,8 +2301,8 @@ mod tests {
         global.extend_from_slice(&record("path", "global"));
         let local = record("path", "local");
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'g', &global);
-        append_posix(&mut bytes, b'x', &local);
+        append_pax(&mut bytes, b'g', &global);
+        append_pax(&mut bytes, b'x', &local);
         append_block(&mut bytes, &header(b'0', 0));
         append_terminator(&mut bytes);
         let frames = collect(bytes, BLOCK_SIZE);
@@ -2196,7 +2332,7 @@ mod tests {
 
         let records = record("hdrcharset", "ISO-IR 8859 1 1998");
         let mut bytes = Vec::new();
-        append_posix(&mut bytes, b'x', &records);
+        append_pax(&mut bytes, b'x', &records);
         assert!(matches!(
             last_error_inner(&collect(bytes, BLOCK_SIZE)),
             FrameErrorInner::InvalidPaxRecord {

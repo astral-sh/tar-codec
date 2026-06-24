@@ -93,18 +93,12 @@ pub enum FrameErrorInner {
         /// The bytes found in the size field.
         found: [u8; 12],
     },
-    /// An ordinary member header's mode field cannot be decoded.
-    #[error("invalid tar mode field: found {found:?}")]
-    InvalidMode {
-        /// The bytes found in the mode field.
-        found: [u8; 8],
-    },
-    /// An ordinary ustar member header's numeric field was not strict octal.
-    #[error("invalid ustar {field} field: expected strict octal, found {found:?}")]
-    InvalidUstarNumericField {
-        /// The name of the malformed header field.
+    /// An ordinary member header's numeric metadata field was invalid.
+    #[error("invalid tar {field} field: found {found:?}")]
+    InvalidNumericField {
+        /// The name of the invalid header field.
         field: &'static str,
-        /// The bytes found in the malformed header field.
+        /// The bytes found in the invalid header field.
         found: Vec<u8>,
     },
     /// An ordinary ustar member header's string field had no NUL terminator.

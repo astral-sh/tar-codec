@@ -39,6 +39,7 @@ impl<R> TarArchive<R> {
         let mut reader = TarReader::new(reader);
         reader.set_max_pax_extension_size(policy.pax_policy.max_extension_size);
         reader.set_max_global_pax_extensions_size(policy.pax_policy.max_global_extensions_size);
+        reader.set_allow_all_nul_numeric_fields(policy.allow_all_nul_numeric_fields);
         reader.set_max_gnu_extension_size(policy.max_gnu_extension_size);
         Self {
             reader,
@@ -54,6 +55,7 @@ impl<R> TarArchive<R> {
 #[derive(Clone, Copy, Debug)]
 pub struct DecodePolicy {
     allow_gnu: bool,
+    allow_all_nul_numeric_fields: bool,
     max_gnu_extension_size: u64,
     pax_policy: PaxDecodePolicy,
 }
@@ -88,6 +90,7 @@ impl Default for DecodePolicy {
     fn default() -> Self {
         Self {
             allow_gnu: true,
+            allow_all_nul_numeric_fields: true,
             max_gnu_extension_size: DEFAULT_MAX_GNU_EXTENSION_SIZE,
             pax_policy: PaxDecodePolicy::default(),
         }
@@ -103,6 +106,18 @@ impl DecodePolicy {
     /// disable this setting.
     pub fn allow_gnu(mut self, allow: bool) -> Self {
         self.allow_gnu = allow;
+        self
+    }
+
+    /// Configures whether wholly NUL numeric metadata fields may be accepted.
+    ///
+    /// This compatibility option applies to the ordinary header's `mode`, `uid`,
+    /// `gid`, and `mtime` fields in both pax/ustar and GNU archives. It is
+    /// **enabled by default**. When enabled, a wholly NUL field is represented
+    /// as missing; every other value must be a valid numeric encoding for its
+    /// archive family.
+    pub fn allow_all_nul_numeric_fields(mut self, allow: bool) -> Self {
+        self.allow_all_nul_numeric_fields = allow;
         self
     }
 
@@ -461,7 +476,7 @@ fn project_member<'a, R>(
     let position = frame.header.position;
     let kind = frame.header.kind;
     let size = frame.header.effective_size;
-    let executable = frame.header.mode()? & 0o111 != 0;
+    let executable = frame.header.mode.unwrap_or_default() & 0o111 != 0;
     let path = std::str::from_utf8(frame.effective_path()?.as_ref())
         .map(str::to_owned)
         .map_err(|_| DecodeError::InvalidUtf8 {

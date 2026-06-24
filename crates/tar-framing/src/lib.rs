@@ -81,6 +81,11 @@
 //! Because pax and GNU both use ustar as their baseline, any compatibility aspect of pax
 //! that is derived from ustar also applies during GNU tar decoding.
 //!
+//! tar-framing accepts wholly NUL `mode`, `uid`, `gid`, and `mtime` fields by default for
+//! compatibility with real-world writers in both families. These fields are represented as
+//! missing rather than assigned a value. This can be disabled with
+//! [`stream::TarStream::set_allow_all_nul_numeric_fields`].
+//!
 //! Separately, higher-level crates (like tar-codec) may choose to apply additional
 //! restrictions when processing logical archive members. For example, a consumer
 //! of tar-framing may choose to reject vendor-specific pax records, or member names
