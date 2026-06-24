@@ -1,13 +1,18 @@
 [package]
 name = "tarpit"
 description = "A CLI for inspecting and extracting tar streams"
+readme = "README.md"
+
 edition.workspace = true
 homepage.workspace = true
 repository.workspace = true
 authors.workspace = true
 license.workspace = true
 version.workspace = true
-readme.workspace = true
+
+# NOTE: tarpit is intentionally not published,
+# as it's for debugging/testing/diagnostics only.
+publish = false
 
 [dependencies]
 tar-codec = { workspace = true }
