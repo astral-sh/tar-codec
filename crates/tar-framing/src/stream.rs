@@ -157,13 +157,201 @@ pub struct HeaderFrame {
     /// emitted. Member kinds that cannot carry payload are rejected when either
     /// their declared or effective size is nonzero.
     pub effective_size: u64,
-    pub(crate) mode: Result<u64, [u8; 8]>,
+    pub(crate) mode: Option<u64>,
     pub(crate) uid: Option<u64>,
     pub(crate) gid: Option<u64>,
     pub(crate) mtime: Option<u64>,
 }
 
 impl HeaderFrame {
+    fn ustar(
+        position: u64,
+        block: Block,
+        typeflag: u8,
+        declared_size: u64,
+        local_records: Option<&PaxRecords>,
+        global_records: Option<&GlobalPaxRecords>,
+        allow_all_nul_numeric_fields: bool,
+    ) -> Result<Self, FrameError> {
+        let kind = UstarKind::try_from_framed(position, typeflag)?;
+
+        // Some real-world pax writers encode absent ordinary-header metadata as
+        // all NULs. The compatibility policy may accept these empty fields; every
+        // populated fallback remains subject to strict validation.
+        let mode = Self::parse_mode(
+            position,
+            ArchiveFormat::Pax,
+            &block[MODE_RANGE],
+            allow_all_nul_numeric_fields,
+        )?;
+        let uid = Self::parse_numeric_field(
+            position,
+            ArchiveFormat::Pax,
+            "uid",
+            &block[UID_RANGE],
+            allow_all_nul_numeric_fields,
+        )?;
+        let gid = Self::parse_numeric_field(
+            position,
+            ArchiveFormat::Pax,
+            "gid",
+            &block[GID_RANGE],
+            allow_all_nul_numeric_fields,
+        )?;
+        let mtime = Self::parse_numeric_field(
+            position,
+            ArchiveFormat::Pax,
+            "mtime",
+            &block[MTIME_RANGE],
+            allow_all_nul_numeric_fields,
+        )?;
+
+        let validate_string_field = |field: &'static str, bytes: &[u8]| {
+            if bytes.contains(&0) {
+                Ok(())
+            } else {
+                Err(FrameError::at(
+                    position,
+                    FrameErrorInner::UnterminatedUstarStringField { field },
+                ))
+            }
+        };
+        validate_string_field("uname", &block[UNAME_RANGE])?;
+        validate_string_field("gname", &block[GNAME_RANGE])?;
+
+        // POSIX pax deliberately leaves the representation of device numbers unspecified.
+        // We do not consume those fields, so devmajor and devminor remain opaque.
+
+        // Determine our member's actual (i.e. effective) size. This takes any pax `size`
+        // records into account, in addition to the normal header-declared size.
+        let effective_size = PaxState::effective_size(local_records, global_records).map_or(
+            Ok(declared_size),
+            |size| match size {
+                PaxValue::Value(size) => Ok(*size),
+                PaxValue::Deleted => Err(FrameError::deleted_pax_metadata(position, "size")),
+            },
+        )?;
+        validate_posix_member_size(position, kind, declared_size, effective_size)?;
+
+        Ok(Self {
+            position,
+            block,
+            format: ArchiveFormat::Pax,
+            kind,
+            declared_size,
+            effective_size,
+            mode,
+            uid,
+            gid,
+            mtime,
+        })
+    }
+
+    fn gnu(
+        position: u64,
+        block: Block,
+        typeflag: u8,
+        declared_size: u64,
+        require_link_kind: bool,
+        allow_all_nul_numeric_fields: bool,
+    ) -> Result<Self, FrameError> {
+        let kind = UstarKind::try_from_framed(position, typeflag)?;
+        if require_link_kind && !matches!(kind, UstarKind::HardLink | UstarKind::SymbolicLink) {
+            return Err(FrameError::unexpected_order(
+                position,
+                "hard-link or symbolic-link member after GNU long-link extension",
+                "non-link ordinary member",
+            ));
+        }
+        validate_gnu_member_size(position, kind, declared_size)?;
+        let mode = Self::parse_mode(
+            position,
+            ArchiveFormat::Gnu,
+            &block[MODE_RANGE],
+            allow_all_nul_numeric_fields,
+        )?;
+        let uid = Self::parse_numeric_field(
+            position,
+            ArchiveFormat::Gnu,
+            "uid",
+            &block[UID_RANGE],
+            allow_all_nul_numeric_fields,
+        )?;
+        let gid = Self::parse_numeric_field(
+            position,
+            ArchiveFormat::Gnu,
+            "gid",
+            &block[GID_RANGE],
+            allow_all_nul_numeric_fields,
+        )?;
+        let mtime = Self::parse_numeric_field(
+            position,
+            ArchiveFormat::Gnu,
+            "mtime",
+            &block[MTIME_RANGE],
+            allow_all_nul_numeric_fields,
+        )?;
+
+        Ok(Self {
+            position,
+            block,
+            format: ArchiveFormat::Gnu,
+            kind,
+            declared_size,
+            effective_size: declared_size,
+            mode,
+            uid,
+            gid,
+            mtime,
+        })
+    }
+
+    fn parse_mode(
+        position: u64,
+        format: ArchiveFormat,
+        bytes: &[u8],
+        allow_all_nul_numeric_fields: bool,
+    ) -> Result<Option<u64>, FrameError> {
+        let mode = Self::parse_numeric_field(
+            position,
+            format,
+            "mode",
+            bytes,
+            allow_all_nul_numeric_fields,
+        )?;
+        if matches!(mode, Some(mode) if mode > 0o7777) {
+            return Err(FrameError::at(
+                position,
+                FrameErrorInner::InvalidNumericField {
+                    field: "mode",
+                    found: bytes.to_vec(),
+                },
+            ));
+        }
+        Ok(mode)
+    }
+
+    fn parse_numeric_field(
+        position: u64,
+        format: ArchiveFormat,
+        field: &'static str,
+        bytes: &[u8],
+        allow_all_nul_numeric_fields: bool,
+    ) -> Result<Option<u64>, FrameError> {
+        if allow_all_nul_numeric_fields && is_all_nul(bytes) {
+            return Ok(None);
+        }
+        parse_number(format, bytes).map(Some).ok_or_else(|| {
+            FrameError::at(
+                position,
+                FrameErrorInner::InvalidNumericField {
+                    field,
+                    found: bytes.to_vec(),
+                },
+            )
+        })
+    }
+
     pub(crate) fn copy_header_path_into(&self, path: &mut Vec<u8>) {
         path.clear();
         let name = trim_nul(&self.block[NAME_RANGE]);
@@ -306,7 +494,7 @@ pub struct TarStream<R> {
     max_pax_extension_size: u64,
     max_global_pax_extensions_size: u64,
     global_pax_extensions_size: u64,
-    allow_all_nul_ustar_numeric_fields: bool,
+    allow_all_nul_numeric_fields: bool,
     max_gnu_extension_size: u64,
     member_chunk: MemberChunk,
     pub(super) state: State,
@@ -325,7 +513,7 @@ impl<R> TarStream<R> {
             max_pax_extension_size: DEFAULT_MAX_PAX_EXTENSION_SIZE,
             max_global_pax_extensions_size: DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE,
             global_pax_extensions_size: 0,
-            allow_all_nul_ustar_numeric_fields: true,
+            allow_all_nul_numeric_fields: true,
             max_gnu_extension_size: DEFAULT_MAX_GNU_EXTENSION_SIZE,
             member_chunk: MemberChunk::default(),
             state: State::AwaitingHeader,
@@ -355,13 +543,14 @@ impl<R> TarStream<R> {
         self.max_global_pax_extensions_size = max_global_pax_extensions_size;
     }
 
-    /// Sets whether wholly NUL ustar numeric metadata fields may be accepted.
+    /// Sets whether wholly NUL numeric metadata fields may be accepted.
     ///
-    /// This compatibility option applies to `mode`, `uid`, `gid`, and `mtime`.
-    /// It is enabled by default. Disabling it requires each field to contain a
-    /// strict octal value.
-    pub fn set_allow_all_nul_ustar_numeric_fields(&mut self, allow: bool) {
-        self.allow_all_nul_ustar_numeric_fields = allow;
+    /// This compatibility option applies to `mode`, `uid`, `gid`, and `mtime`
+    /// in both pax/ustar and GNU ordinary member headers. It is enabled by
+    /// default. Disabling it requires each field to use a valid numeric encoding
+    /// for its archive family.
+    pub fn set_allow_all_nul_numeric_fields(&mut self, allow: bool) {
+        self.allow_all_nul_numeric_fields = allow;
     }
 
     /// Sets the maximum size accepted for each GNU extension.
@@ -1003,33 +1192,17 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         parsed: ParsedHeader,
         local_pax_records: Option<SharedPaxRecords>,
     ) -> Result<Frame, FrameError> {
-        let kind = UstarKind::try_from_framed(position, parsed.typeflag)?;
-        let mode = Err(block[MODE_RANGE].try_into().expect("fixed header range"));
-        let mut frame = HeaderFrame {
+        let frame = HeaderFrame::ustar(
             position,
             block,
-            format: ArchiveFormat::Pax,
-            kind,
-            declared_size: parsed.size,
-            effective_size: parsed.size,
-            mode,
-            uid: None,
-            gid: None,
-            mtime: None,
-        };
-        validate_posix_member_header_fields(&mut frame, self.allow_all_nul_ustar_numeric_fields)?;
-        let effective_size = PaxState::effective_size(
+            parsed.typeflag,
+            parsed.size,
             local_pax_records.as_deref(),
             self.global_pax_records.as_ref(),
-        )
-        .map_or(Ok(parsed.size), |size| match size {
-            PaxValue::Value(size) => Ok(*size),
-            PaxValue::Deleted => Err(FrameError::deleted_pax_metadata(position, "size")),
-        })?;
-        validate_posix_member_size(position, kind, parsed.size, effective_size)?;
-        frame.effective_size = effective_size;
+            self.allow_all_nul_numeric_fields,
+        )?;
         self.global_pax_extensions_size = 0;
-        self.state = member_payload_state(effective_size);
+        self.state = member_payload_state(frame.effective_size);
         Ok(Frame::Header(frame))
     }
 
@@ -1085,33 +1258,16 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             }));
         }
 
-        let kind = UstarKind::try_from_framed(position, parsed.typeflag)?;
-        if pending.long_link && !matches!(kind, UstarKind::HardLink | UstarKind::SymbolicLink) {
-            return Err(FrameError::unexpected_order(
-                position,
-                "hard-link or symbolic-link member after GNU long-link extension",
-                "non-link ordinary member",
-            ));
-        }
-        validate_gnu_member_size(position, kind, parsed.size)?;
-        let mode_bytes: [u8; 8] = block[MODE_RANGE].try_into().expect("fixed header range");
-        let mode = parse_number(ArchiveFormat::Gnu, &mode_bytes).ok_or(mode_bytes);
-        let uid = parse_number(ArchiveFormat::Gnu, &block[UID_RANGE]);
-        let gid = parse_number(ArchiveFormat::Gnu, &block[GID_RANGE]);
-        let mtime = parse_number(ArchiveFormat::Gnu, &block[MTIME_RANGE]);
-        self.state = member_payload_state(parsed.size);
-        Ok(Frame::Header(HeaderFrame {
+        let frame = HeaderFrame::gnu(
             position,
             block,
-            format: ArchiveFormat::Gnu,
-            kind,
-            declared_size: parsed.size,
-            effective_size: parsed.size,
-            mode,
-            uid,
-            gid,
-            mtime,
-        }))
+            parsed.typeflag,
+            parsed.size,
+            pending.long_link,
+            self.allow_all_nul_numeric_fields,
+        )?;
+        self.state = member_payload_state(frame.effective_size);
+        Ok(Frame::Header(frame))
     }
 }
 
@@ -1279,69 +1435,6 @@ fn validate_posix_member_size(
     }
 }
 
-fn validate_posix_member_header_fields(
-    frame: &mut HeaderFrame,
-    allow_all_nul_numeric_fields: bool,
-) -> Result<(), FrameError> {
-    let position = frame.position;
-    let block = &frame.block;
-    // Some real-world pax writers encode absent ordinary-header metadata as
-    // all NULs. The compatibility policy may accept these empty fields; every
-    // populated fallback remains subject to strict validation.
-    let mode_bytes: [u8; 8] = block[MODE_RANGE].try_into().expect("fixed header range");
-    let mode = if allow_all_nul_numeric_fields && is_all_nul(&mode_bytes) {
-        0
-    } else if let Some(mode @ 0..=0o7777) = parse_octal(&mode_bytes) {
-        mode
-    } else {
-        return Err(FrameError::at(
-            position,
-            FrameErrorInner::InvalidMode { found: mode_bytes },
-        ));
-    };
-
-    let parse_numeric_field =
-        |field: &'static str, bytes: &[u8]| -> Result<Option<u64>, FrameError> {
-            if allow_all_nul_numeric_fields && is_all_nul(bytes) {
-                Ok(None)
-            } else if let Some(value) = parse_octal(bytes) {
-                Ok(Some(value))
-            } else {
-                Err(FrameError::at(
-                    position,
-                    FrameErrorInner::InvalidUstarNumericField {
-                        field,
-                        found: bytes.to_vec(),
-                    },
-                ))
-            }
-        };
-    let uid = parse_numeric_field("uid", &block[UID_RANGE])?;
-    let gid = parse_numeric_field("gid", &block[GID_RANGE])?;
-    let mtime = parse_numeric_field("mtime", &block[MTIME_RANGE])?;
-
-    let validate_string_field = |field: &'static str, bytes: &[u8]| {
-        if bytes.contains(&0) {
-            Ok(())
-        } else {
-            Err(FrameError::at(
-                position,
-                FrameErrorInner::UnterminatedUstarStringField { field },
-            ))
-        }
-    };
-    validate_string_field("uname", &block[UNAME_RANGE])?;
-    validate_string_field("gname", &block[GNAME_RANGE])?;
-
-    // POSIX deliberately leaves the representation of device numbers unspecified.
-    // We do not consume those fields, so devmajor and devminor remain opaque.
-    frame.mode = Ok(mode);
-    frame.uid = uid;
-    frame.gid = gid;
-    frame.mtime = mtime;
-    Ok(())
-}
-
 fn validate_gnu_member_size(position: u64, kind: UstarKind, size: u64) -> Result<(), FrameError> {
     match kind {
         UstarKind::Regular | UstarKind::Contiguous => Ok(()),
@@ -1455,8 +1548,7 @@ mod tests {
         InvalidIdentity,
         InvalidChecksum,
         InvalidSize,
-        InvalidMode,
-        InvalidUstarNumericField(&'static str),
+        InvalidNumericField(&'static str),
         UnterminatedUstarStringField(&'static str),
         UnsupportedTypeflag(u8),
     }
@@ -1466,11 +1558,10 @@ mod tests {
             match (self, error) {
                 (Self::InvalidIdentity, FrameErrorInner::InvalidIdentity { .. })
                 | (Self::InvalidChecksum, FrameErrorInner::InvalidChecksum { .. })
-                | (Self::InvalidSize, FrameErrorInner::InvalidSize { .. })
-                | (Self::InvalidMode, FrameErrorInner::InvalidMode { .. }) => true,
+                | (Self::InvalidSize, FrameErrorInner::InvalidSize { .. }) => true,
                 (
-                    Self::InvalidUstarNumericField(field),
-                    FrameErrorInner::InvalidUstarNumericField { field: found, .. },
+                    Self::InvalidNumericField(field),
+                    FrameErrorInner::InvalidNumericField { field: found, .. },
                 )
                 | (
                     Self::UnterminatedUstarStringField(field),
@@ -1525,33 +1616,33 @@ mod tests {
                 checksummed_header(|block| {
                     block[MODE_RANGE].copy_from_slice(b"0000080\0");
                 }),
-                ExpectedHeaderError::InvalidMode,
+                ExpectedHeaderError::InvalidNumericField("mode"),
             ),
             (
                 "oversized mode",
                 checksummed_header(|block| {
                     block[MODE_RANGE].copy_from_slice(b"0010000\0");
                 }),
-                ExpectedHeaderError::InvalidMode,
+                ExpectedHeaderError::InvalidNumericField("mode"),
             ),
             (
                 "uid",
                 checksummed_header(|block| {
                     block[UID_RANGE].copy_from_slice(b"invalid\0");
                 }),
-                ExpectedHeaderError::InvalidUstarNumericField("uid"),
+                ExpectedHeaderError::InvalidNumericField("uid"),
             ),
             (
                 "gid",
                 checksummed_header(|block| block[GID_RANGE.start] = b'8'),
-                ExpectedHeaderError::InvalidUstarNumericField("gid"),
+                ExpectedHeaderError::InvalidNumericField("gid"),
             ),
             (
                 "mtime",
                 checksummed_header(|block| {
                     block[MTIME_RANGE].copy_from_slice(b"00000000008\0");
                 }),
-                ExpectedHeaderError::InvalidUstarNumericField("mtime"),
+                ExpectedHeaderError::InvalidNumericField("mtime"),
             ),
             (
                 "uname",
@@ -1847,21 +1938,21 @@ mod tests {
                 b'x',
                 record("uid", "1"),
                 checksummed_header(|block| block[UID_RANGE].fill(b'u')),
-                ExpectedHeaderError::InvalidUstarNumericField("uid"),
+                ExpectedHeaderError::InvalidNumericField("uid"),
             ),
             (
                 "global gid",
                 b'g',
                 record("gid", "2"),
                 checksummed_header(|block| block[GID_RANGE].fill(b'g')),
-                ExpectedHeaderError::InvalidUstarNumericField("gid"),
+                ExpectedHeaderError::InvalidNumericField("gid"),
             ),
             (
                 "local mtime",
                 b'x',
                 record("mtime", "3"),
                 checksummed_header(|block| block[MTIME_RANGE].fill(b'm')),
-                ExpectedHeaderError::InvalidUstarNumericField("mtime"),
+                ExpectedHeaderError::InvalidNumericField("mtime"),
             ),
             (
                 "global uname",
@@ -2061,6 +2152,33 @@ mod tests {
             let error = last_error_inner(&frames);
             assert!(expected.matches(error), "{case}: {error:?}");
         }
+    }
+
+    #[test]
+    fn rejects_malformed_gnu_numeric_fields() {
+        for (field, range) in [
+            ("mode", MODE_RANGE),
+            ("uid", UID_RANGE),
+            ("gid", GID_RANGE),
+            ("mtime", MTIME_RANGE),
+        ] {
+            let mut block = gnu_header(b'0', 0);
+            block[range].fill(b'x');
+            set_checksum(&mut block);
+
+            assert!(matches!(
+                last_error_inner(&collect(block.to_vec(), BLOCK_SIZE)),
+                FrameErrorInner::InvalidNumericField { field: found, .. } if *found == field
+            ));
+        }
+
+        let mut oversized_mode = gnu_header(b'0', 0);
+        oversized_mode[MODE_RANGE].copy_from_slice(b"0010000\0");
+        set_checksum(&mut oversized_mode);
+        assert!(matches!(
+            last_error_inner(&collect(oversized_mode.to_vec(), BLOCK_SIZE)),
+            FrameErrorInner::InvalidNumericField { field: "mode", .. }
+        ));
     }
 
     #[test]

@@ -66,16 +66,29 @@ pub struct Header<'a> {
     /// [`MemberPayload`]. Member kinds that cannot carry payload are rejected
     /// when either their declared or effective size is nonzero.
     pub effective_size: u64,
-    mode: Result<u64, [u8; 8]>,
-    /// Numeric user identifier from the ordinary header, if usable.
+    /// Permission and mode bits decoded from the ordinary header, if present.
+    ///
+    /// This is [`None`] only when the field is wholly NUL and the framing policy
+    /// permits missing numeric metadata.
+    pub mode: Option<u64>,
+    /// Numeric user identifier from the ordinary header, if present.
+    ///
+    /// This is [`None`] only when the field is wholly NUL and the framing policy
+    /// permits missing numeric metadata.
     ///
     /// Applicable pax metadata may override or delete this fallback.
     pub uid: Option<u64>,
-    /// Numeric group identifier from the ordinary header, if usable.
+    /// Numeric group identifier from the ordinary header, if present.
+    ///
+    /// This is [`None`] only when the field is wholly NUL and the framing policy
+    /// permits missing numeric metadata.
     ///
     /// Applicable pax metadata may override or delete this fallback.
     pub gid: Option<u64>,
-    /// Modification time in seconds from the ordinary header, if usable.
+    /// Modification time in seconds from the ordinary header, if present.
+    ///
+    /// This is [`None`] only when the field is wholly NUL and the framing policy
+    /// permits missing numeric metadata.
     ///
     /// Applicable pax metadata may override or delete this fallback.
     pub mtime: Option<u64>,
@@ -89,17 +102,6 @@ pub struct Header<'a> {
     pub gname: &'a [u8],
     header_path: &'a [u8],
     link_name: &'a [u8],
-}
-
-impl Header<'_> {
-    /// Decodes the ordinary header's numeric mode according to its archive family.
-    ///
-    /// An omitted all-NUL pax/ustar mode is reported as zero. The decoded value
-    /// is cached while framing the member, so repeated calls do not reparse it.
-    pub fn mode(&self) -> Result<u64, FrameError> {
-        self.mode
-            .map_err(|found| FrameError::at(self.position, FrameErrorInner::InvalidMode { found }))
-    }
 }
 
 /// One meaningful payload block belonging to an ordinary archive member.
@@ -330,13 +332,11 @@ impl<R> TarReader<R> {
             .set_max_global_pax_extensions_size(max_global_pax_extensions_size);
     }
 
-    /// Sets whether wholly NUL ustar numeric metadata fields may be accepted.
+    /// Sets whether wholly NUL numeric metadata fields may be accepted.
     ///
-    /// See [`TarStream::set_allow_all_nul_ustar_numeric_fields`].
-    pub fn set_allow_all_nul_ustar_numeric_fields(&mut self, allow: bool) {
-        self.payload
-            .stream
-            .set_allow_all_nul_ustar_numeric_fields(allow);
+    /// See [`TarStream::set_allow_all_nul_numeric_fields`].
+    pub fn set_allow_all_nul_numeric_fields(&mut self, allow: bool) {
+        self.payload.stream.set_allow_all_nul_numeric_fields(allow);
     }
 
     /// Sets the maximum size accepted for each subsequent GNU metadata extension.
@@ -789,7 +789,7 @@ mod tests {
                 assert_eq!(member.header.format, ArchiveFormat::Pax);
                 assert_eq!(member.header.header_path, b"dir/file");
                 assert_eq!(member.header.link_name, b"target");
-                assert_eq!(member.header.mode()?, 0o755);
+                assert_eq!(member.header.mode, Some(0o755));
                 assert_eq!(member.header.uid, Some(1));
                 assert_eq!(member.header.gid, Some(2));
                 assert_eq!(member.header.mtime, Some(3));
@@ -799,7 +799,7 @@ mod tests {
                 assert_eq!(member.effective_link_path()?.as_ref(), b"target");
             }
             let member = next_member(&mut reader).await?;
-            assert_eq!(member.header.mode()?, 0);
+            assert_eq!(member.header.mode, None);
             assert_eq!(member.header.uid, None);
             assert_eq!(member.header.gid, None);
             assert_eq!(member.header.mtime, None);
@@ -808,23 +808,40 @@ mod tests {
             Ok(())
         });
 
-        let mut gnu_header = gnu_header(b'0', 0);
-        set_field(&mut gnu_header, NAME_RANGE, b"name");
-        set_field(&mut gnu_header, PREFIX_RANGE, b"ignored");
-        gnu_header[MODE_RANGE].fill(0);
-        gnu_header[MODE_RANGE.start] = 0x80;
-        gnu_header[MODE_RANGE.end - 2..MODE_RANGE.end].copy_from_slice(&[0x01, 0xed]);
-        set_checksum(&mut gnu_header);
+        let mut gnu_member_header = gnu_header(b'0', 0);
+        set_field(&mut gnu_member_header, NAME_RANGE, b"name");
+        set_field(&mut gnu_member_header, PREFIX_RANGE, b"ignored");
+        gnu_member_header[MODE_RANGE].fill(0);
+        gnu_member_header[MODE_RANGE.start] = 0x80;
+        gnu_member_header[MODE_RANGE.end - 2..MODE_RANGE.end].copy_from_slice(&[0x01, 0xed]);
+        set_checksum(&mut gnu_member_header);
+
+        let mut empty_gnu_header = gnu_header(b'0', 0);
+        for range in [MODE_RANGE, UID_RANGE, GID_RANGE, MTIME_RANGE] {
+            empty_gnu_header[range].fill(0);
+        }
+        set_checksum(&mut empty_gnu_header);
 
         ready_ok(async {
             let mut bytes = Vec::new();
-            append_block(&mut bytes, &gnu_header);
+            append_block(&mut bytes, &gnu_member_header);
+            append_block(&mut bytes, &empty_gnu_header);
             append_terminator(&mut bytes);
             let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
+            {
+                let member = next_member(&mut reader).await?;
+                assert_eq!(member.header.format, ArchiveFormat::Gnu);
+                assert_eq!(member.header.header_path, b"name");
+                assert_eq!(member.header.mode, Some(0o755));
+                assert_eq!(member.header.uid, Some(0));
+                assert_eq!(member.header.gid, Some(0));
+                assert_eq!(member.header.mtime, Some(0));
+            }
             let member = next_member(&mut reader).await?;
-            assert_eq!(member.header.format, ArchiveFormat::Gnu);
-            assert_eq!(member.header.header_path, b"name");
-            assert_eq!(member.header.mode()?, 0o755);
+            assert_eq!(member.header.mode, None);
+            assert_eq!(member.header.uid, None);
+            assert_eq!(member.header.gid, None);
+            assert_eq!(member.header.mtime, None);
             Ok(())
         });
     }
@@ -868,7 +885,7 @@ mod tests {
             assert!(member.payload.next_block().await?.is_some());
             assert_eq!(member.header.header_path, b"dir/file");
             assert_eq!(member.header.link_name, b"target");
-            assert_eq!(member.header.mode()?, 0o755);
+            assert_eq!(member.header.mode, Some(0o755));
             assert_eq!(member.effective_path()?.as_ref(), b"dir/file");
             assert_eq!(member.effective_link_path()?.as_ref(), b"target");
             Ok(())

@@ -108,44 +108,44 @@ async fn projects_every_member_kind_and_streams_payloads() -> TestResult {
 }
 
 #[tokio::test]
-async fn all_nul_ustar_numeric_fields_are_policy_controlled() -> TestResult {
-    let strict_policy = DecodePolicy::default()
-        .pax_policy(PaxDecodePolicy::default().allow_all_nul_ustar_numeric_fields(false));
+async fn all_nul_numeric_fields_are_policy_controlled() -> TestResult {
+    let strict_policy = DecodePolicy::default().allow_all_nul_numeric_fields(false);
 
-    for (field, range) in [
-        ("mode", MODE_RANGE),
-        ("uid", UID_RANGE),
-        ("gid", GID_RANGE),
-        ("mtime", MTIME_RANGE),
-    ] {
-        let mut block = header(ArchiveFormat::Pax, "fallback", b'0', 0, "", 0o644);
-        block[range].fill(0);
-        set_checksum(&mut block);
+    for (format_name, format) in [("pax", ArchiveFormat::Pax), ("GNU", ArchiveFormat::Gnu)] {
+        for (field, range) in [
+            ("mode", MODE_RANGE),
+            ("uid", UID_RANGE),
+            ("gid", GID_RANGE),
+            ("mtime", MTIME_RANGE),
+        ] {
+            let path = format!("empty-{format_name}-{field}");
+            let mut block = header(format, &path, b'0', 0, "", 0o644);
+            block[range].fill(0);
+            set_checksum(&mut block);
 
-        let path = format!("empty-{field}");
-        let mut archive = ArchiveBuilder::new();
-        archive
-            .pax(b'x', &pax_record(PaxKeyword::Path, &path))
-            .block(&block);
-        let bytes = archive.finish();
-        {
-            let mut members = TarArchive::new(bytes.as_slice()).members();
-            assert!(matches!(
-                members.next().await?,
-                Some(Member::File {
-                    metadata,
-                    executable: false,
-                    ..
-                }) if metadata.path == path
-            ));
-            assert!(members.next().await?.is_none());
+            let mut archive = ArchiveBuilder::new();
+            archive.block(&block);
+            let bytes = archive.finish();
+            {
+                let mut members = TarArchive::new(bytes.as_slice()).members();
+                assert!(matches!(
+                    members.next().await?,
+                    Some(Member::File {
+                        metadata,
+                        executable: false,
+                        ..
+                    }) if metadata.path == path
+                ));
+                assert!(members.next().await?.is_none());
+            }
+
+            let mut members =
+                TarArchive::new_with_policy(bytes.as_slice(), strict_policy).members();
+            assert!(
+                matches!(members.next().await, Err(DecodeError::Framing(_))),
+                "strict policy should reject an all-NUL {format_name} {field} field"
+            );
         }
-
-        let mut members = TarArchive::new_with_policy(bytes.as_slice(), strict_policy).members();
-        assert!(
-            matches!(members.next().await, Err(DecodeError::Framing(_))),
-            "strict policy should reject an all-NUL {field} field"
-        );
     }
     Ok(())
 }

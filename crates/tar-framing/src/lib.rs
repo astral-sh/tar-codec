@@ -47,11 +47,6 @@
 //! - tar-framing silently removes fractional components from parsed timestamps. Timestamps
 //!   are truncated to second precision.
 //!
-//! - tar-framing accepts wholly NUL `mode`, `uid`, `gid`, and `mtime` fields by default for
-//!   compatibility with real-world pax writers. The missing mode is interpreted as zero and
-//!   the other fields remain absent. This can be disabled with
-//!   [`stream::TarStream::set_allow_all_nul_ustar_numeric_fields`].
-//!
 //! - tar-framing rejects typeflags that are not explicitly defined in pax. pax says to handle
 //!   these as regular files (i.e. assuming their size is a physical size), but this has marginal
 //!   benefit in practice.
@@ -85,6 +80,11 @@
 //!
 //! Because pax and GNU both use ustar as their baseline, any compatibility aspect of pax
 //! that is derived from ustar also applies during GNU tar decoding.
+//!
+//! tar-framing accepts wholly NUL `mode`, `uid`, `gid`, and `mtime` fields by default for
+//! compatibility with real-world writers in both families. These fields are represented as
+//! missing rather than assigned a value. This can be disabled with
+//! [`stream::TarStream::set_allow_all_nul_numeric_fields`].
 //!
 //! Separately, higher-level crates (like tar-codec) may choose to apply additional
 //! restrictions when processing logical archive members. For example, a consumer
