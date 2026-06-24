@@ -11,9 +11,9 @@ authors = { workspace = true }
 license = { workspace = true }
 
 [dependencies]
+futures-core = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tokio-stream = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

@@ -1,11 +1,14 @@
 use std::{
+    future::poll_fn,
     io::{self, Write},
     path::{Path, PathBuf},
+    pin::Pin,
     process::ExitCode,
 };
 
 use async_compression::tokio::bufread::GzipDecoder;
 use clap::{Parser, Subcommand};
+use futures_core::Stream;
 use tar_codec::{Archive as _, DecodeError, ExtractError, TarArchive, extract::ExtractPolicy};
 use tar_framing::{
     ArchiveFormat, FrameError, GnuKind, HdrCharset, PaxKind, PaxRecord, PaxString, PaxValue,
@@ -17,7 +20,6 @@ use tokio::{
     fs::File,
     io::{AsyncRead, BufReader},
 };
-use tokio_stream::StreamExt;
 
 #[derive(Debug, Parser)]
 #[command(about = "Inspect and extract tar streams")]
@@ -131,7 +133,9 @@ async fn dump_frames<R: AsyncRead + Unpin, W: Write>(
     let mut started = false;
     let mut index = 0;
 
-    while let Some(result) = stream.next().await {
+    while let Some(result) =
+        poll_fn(|context| Stream::poll_next(Pin::new(&mut stream), context)).await
+    {
         let frame = match result {
             Ok(frame) => frame,
             Err(error) => {

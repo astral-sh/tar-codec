@@ -25,13 +25,13 @@ async-compression = { version = "0.4", features = ["gzip", "tokio"] }
 astral-tokio-tar = "0.6.2"
 cap-std = "4.0.2"
 clap = "4.6"
-criterion = { version = "0.8.2", features = ["async_tokio"] }
+criterion = { version = "0.8.2", features = ["async_tokio"], default-features = false }
+futures-core = "0.3"
 junction = "2.0.0"
 tar = "0.4.46"
 tempfile = "3"
 thiserror = "2"
 tokio = "1"
-tokio-stream = "0.1"
 walkdir = "2.5.0"
 windows-sys = { version = "0.60.2", features = ["Win32_Storage_FileSystem"] }
 

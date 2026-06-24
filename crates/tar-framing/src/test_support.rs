@@ -5,6 +5,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use futures_core::Stream;
 use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::{
@@ -13,6 +14,7 @@ use crate::{
         GID_RANGE, GNU_IDENTITY, IDENTITY_RANGE, MODE_RANGE, MTIME_RANGE, SIZE_RANGE,
         TYPEFLAG_OFFSET, UID_RANGE, USTAR_IDENTITY, encode_checksum, encode_octal,
     },
+    stream::next_stream_item,
 };
 
 pub(crate) struct ChunkedReader {
@@ -141,6 +143,17 @@ pub(crate) fn append_gnu(bytes: &mut Vec<u8>, typeflag: u8, payload: &[u8]) {
 
 pub(crate) fn append_terminator(bytes: &mut Vec<u8>) {
     bytes.resize(bytes.len() + 2 * BLOCK_SIZE, 0);
+}
+
+pub(crate) async fn collect_stream<S>(mut stream: S) -> Vec<S::Item>
+where
+    S: Stream + Unpin,
+{
+    let mut items = Vec::new();
+    while let Some(item) = next_stream_item(&mut stream).await {
+        items.push(item);
+    }
+    items
 }
 
 pub(crate) fn ready<F: Future>(future: F) -> F::Output {

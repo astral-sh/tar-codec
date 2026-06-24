@@ -7,14 +7,13 @@
 use std::{borrow::Cow, mem, ops::Range};
 
 use tokio::io::AsyncRead;
-use tokio_stream::StreamExt;
 
 use crate::{
     ArchiveFormat, Block, FrameError, FrameErrorInner, GnuKind, PaxKeyword, PaxKind, PaxRecord,
     PaxString, PaxValue, UstarKind,
     header::{GNAME_RANGE, LINK_NAME_RANGE, UNAME_RANGE},
     pax::GlobalPaxRecords,
-    stream::{DataFrame, DataOwner, Frame, HeaderFrame, TarStream},
+    stream::{DataFrame, DataOwner, Frame, HeaderFrame, TarStream, next_stream_item},
 };
 
 pub use crate::{PaxExtension, PaxState};
@@ -362,7 +361,7 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
         }
 
         loop {
-            let frame = match self.payload.stream.next().await {
+            let frame = match next_stream_item(&mut self.payload.stream).await {
                 Some(Ok(frame)) => frame,
                 Some(Err(error)) => {
                     self.clear_extension_state();

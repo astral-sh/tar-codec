@@ -79,8 +79,8 @@ use std::{
     task::{Context, Poll},
 };
 
+use futures_core::Stream;
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio_stream::Stream;
 
 use crate::{
     ArchiveFormat, BLOCK_SIZE, Block, DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE,
@@ -95,6 +95,13 @@ use crate::{
 };
 
 type PositionedBlock = (u64, Block);
+
+pub(crate) async fn next_stream_item<S>(stream: &mut S) -> Option<S::Item>
+where
+    S: Stream + Unpin,
+{
+    poll_fn(|context| Stream::poll_next(Pin::new(&mut *stream), context)).await
+}
 
 /// Represents a single non-terminator physical block in a tar stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1409,8 +1416,8 @@ mod tests {
         task::{Context, Poll},
     };
 
+    use futures_core::Stream;
     use tokio::io::ReadBuf;
-    use tokio_stream::{Stream, StreamExt};
 
     use super::*;
     use crate::{
@@ -1418,12 +1425,14 @@ mod tests {
         header::{DEVMAJOR_RANGE, DEVMINOR_RANGE},
         test_support::{
             ChunkedReader, append_block, append_gnu, append_pax, append_payload, append_terminator,
-            gnu_base256_header, gnu_header, header, ready, record, set_checksum,
+            collect_stream, gnu_base256_header, gnu_header, header, ready, record, set_checksum,
         },
     };
 
     fn collect(bytes: Vec<u8>, max_chunk: usize) -> Vec<Result<Frame, FrameError>> {
-        ready(TarStream::new(ChunkedReader::new(bytes, max_chunk)).collect())
+        ready(collect_stream(TarStream::new(ChunkedReader::new(
+            bytes, max_chunk,
+        ))))
     }
 
     fn collect_with_max_pax_extension_size(
@@ -1433,7 +1442,7 @@ mod tests {
     ) -> Vec<Result<Frame, FrameError>> {
         let mut stream = TarStream::new(ChunkedReader::new(bytes, max_chunk));
         stream.set_max_pax_extension_size(max_pax_extension_size);
-        ready(stream.collect())
+        ready(collect_stream(stream))
     }
 
     fn header_frame(frames: &[Result<Frame, FrameError>], index: usize) -> &HeaderFrame {
@@ -1718,7 +1727,7 @@ mod tests {
         stream.set_max_pax_extension_size(0);
 
         assert!(matches!(
-            ready(stream.next()),
+            ready(next_stream_item(&mut stream)),
             Some(Err(FrameError {
                 position: 0,
                 inner: FrameErrorInner::ExtensionTooLarge {
