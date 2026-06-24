@@ -68,6 +68,9 @@ pub struct Header<'a> {
     pub effective_size: u64,
     /// Permission and mode bits decoded from the ordinary header, if present.
     ///
+    /// Note that pax only defines the semantics of the lower 12 bits of this
+    /// field. Higher bits may or may not be set, and have no assigned semantics.
+    ///
     /// This is [`None`] only when the field is wholly NUL and the framing policy
     /// permits missing numeric metadata.
     pub mode: Option<u64>,
@@ -748,7 +751,7 @@ mod tests {
         set_field(&mut ustar_header, NAME_RANGE, b"file");
         set_field(&mut ustar_header, PREFIX_RANGE, b"dir");
         set_field(&mut ustar_header, LINK_NAME_RANGE, b"target");
-        ustar_header[MODE_RANGE].copy_from_slice(b"0000755\0");
+        ustar_header[MODE_RANGE].copy_from_slice(b"0100644\0");
         ustar_header[UID_RANGE].copy_from_slice(b"0000001\0");
         ustar_header[GID_RANGE].copy_from_slice(b"0000002\0");
         ustar_header[MTIME_RANGE].copy_from_slice(b"00000000003\0");
@@ -780,7 +783,7 @@ mod tests {
                 assert_eq!(member.header.format, ArchiveFormat::Pax);
                 assert_eq!(member.header.header_path, b"dir/file");
                 assert_eq!(member.header.link_name, b"target");
-                assert_eq!(member.header.mode, Some(0o755));
+                assert_eq!(member.header.mode, Some(0o100644));
                 assert_eq!(member.header.uid, Some(1));
                 assert_eq!(member.header.gid, Some(2));
                 assert_eq!(member.header.mtime, Some(3));
@@ -804,7 +807,7 @@ mod tests {
         set_field(&mut gnu_member_header, PREFIX_RANGE, b"ignored");
         gnu_member_header[MODE_RANGE].fill(0);
         gnu_member_header[MODE_RANGE.start] = 0x80;
-        gnu_member_header[MODE_RANGE.end - 2..MODE_RANGE.end].copy_from_slice(&[0x01, 0xed]);
+        gnu_member_header[MODE_RANGE.end - 2..MODE_RANGE.end].copy_from_slice(&[0x81, 0xa4]);
         set_checksum(&mut gnu_member_header);
 
         let mut empty_gnu_header = gnu_header(b'0', 0);
@@ -823,7 +826,7 @@ mod tests {
                 let member = next_member(&mut reader).await?;
                 assert_eq!(member.header.format, ArchiveFormat::Gnu);
                 assert_eq!(member.header.header_path, b"name");
-                assert_eq!(member.header.mode, Some(0o755));
+                assert_eq!(member.header.mode, Some(0o100644));
                 assert_eq!(member.header.uid, Some(0));
                 assert_eq!(member.header.gid, Some(0));
                 assert_eq!(member.header.mtime, Some(0));
