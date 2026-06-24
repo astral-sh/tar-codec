@@ -187,12 +187,7 @@ impl HeaderFrame {
                 allow_all_nul_numeric_fields,
             )
         };
-        let mode = Self::parse_mode(
-            position,
-            ArchiveFormat::Pax,
-            &block[MODE_RANGE],
-            allow_all_nul_numeric_fields,
-        )?;
+        let mode = parse_numeric_field("mode", MODE_RANGE)?;
         let uid = parse_numeric_field("uid", UID_RANGE)?;
         let gid = parse_numeric_field("gid", GID_RANGE)?;
         let mtime = parse_numeric_field("mtime", MTIME_RANGE)?;
@@ -264,12 +259,7 @@ impl HeaderFrame {
                 allow_all_nul_numeric_fields,
             )
         };
-        let mode = Self::parse_mode(
-            position,
-            ArchiveFormat::Gnu,
-            &block[MODE_RANGE],
-            allow_all_nul_numeric_fields,
-        )?;
+        let mode = parse_numeric_field("mode", MODE_RANGE)?;
         let uid = parse_numeric_field("uid", UID_RANGE)?;
         let gid = parse_numeric_field("gid", GID_RANGE)?;
         let mtime = parse_numeric_field("mtime", MTIME_RANGE)?;
@@ -286,31 +276,6 @@ impl HeaderFrame {
             gid,
             mtime,
         })
-    }
-
-    fn parse_mode(
-        position: u64,
-        format: ArchiveFormat,
-        bytes: &[u8],
-        allow_all_nul_numeric_fields: bool,
-    ) -> Result<Option<u64>, FrameError> {
-        let mode = Self::parse_numeric_field(
-            position,
-            format,
-            "mode",
-            bytes,
-            allow_all_nul_numeric_fields,
-        )?;
-        if matches!(mode, Some(mode) if mode > 0o7777) {
-            return Err(FrameError::at(
-                position,
-                FrameErrorInner::InvalidNumericField {
-                    field: "mode",
-                    found: bytes.to_vec(),
-                },
-            ));
-        }
-        Ok(mode)
     }
 
     fn parse_numeric_field(
@@ -1596,13 +1561,6 @@ mod tests {
                 ExpectedHeaderError::InvalidNumericField("mode"),
             ),
             (
-                "oversized mode",
-                checksummed_header(|block| {
-                    block[MODE_RANGE].copy_from_slice(b"0010000\0");
-                }),
-                ExpectedHeaderError::InvalidNumericField("mode"),
-            ),
-            (
                 "uid",
                 checksummed_header(|block| {
                     block[UID_RANGE].copy_from_slice(b"invalid\0");
@@ -2148,14 +2106,6 @@ mod tests {
                 FrameErrorInner::InvalidNumericField { field: found, .. } if *found == field
             ));
         }
-
-        let mut oversized_mode = gnu_header(b'0', 0);
-        oversized_mode[MODE_RANGE].copy_from_slice(b"0010000\0");
-        set_checksum(&mut oversized_mode);
-        assert!(matches!(
-            last_error_inner(&collect(oversized_mode.to_vec(), BLOCK_SIZE)),
-            FrameErrorInner::InvalidNumericField { field: "mode", .. }
-        ));
     }
 
     #[test]
