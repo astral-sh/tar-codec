@@ -1,4 +1,12 @@
-use std::{cell::RefCell, io, path::PathBuf, rc::Rc};
+use std::{
+    cell::RefCell,
+    future::Future,
+    io,
+    path::PathBuf,
+    pin::Pin,
+    rc::Rc,
+    task::{Context, Poll},
+};
 
 #[cfg(unix)]
 use archive_trait::builder::SymlinkPolicy;
@@ -9,7 +17,7 @@ use archive_trait::{
 };
 use tempfile::tempdir;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, ReadBuf};
 
 const LARGE_FILE_BYTES: usize = 2 * 1024 * 1024 + 17;
 const BATCHED_FILE_BYTES: usize = 512 * 1024 + 17;
@@ -49,6 +57,26 @@ struct MockFormat {
     recoverable_failure: Option<String>,
     poisoned_failure: Option<String>,
     truncate_source: Option<PathBuf>,
+}
+
+struct PendingAfterPrefix {
+    returned_prefix: bool,
+}
+
+impl AsyncRead for PendingAfterPrefix {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if !self.returned_prefix {
+            buffer.put_slice(b"prefix");
+            self.returned_prefix = true;
+            return Poll::Ready(Ok(()));
+        }
+        context.waker().wake_by_ref();
+        Poll::Pending
+    }
 }
 
 impl MockFormat {
@@ -227,6 +255,41 @@ async fn manual_entries_stream_async_sources_in_bounded_chunks() {
             && data.len() == LARGE_FILE_BYTES
             && data.iter().all(|byte| *byte == b'x')
     ));
+}
+
+#[tokio::test]
+async fn previously_started_file_payloads_are_rejected_without_poisoning() {
+    let mut payload = FilePayload::new(
+        7,
+        PendingAfterPrefix {
+            returned_prefix: false,
+        },
+    );
+    {
+        let mut read = std::pin::pin!(payload.next_chunk::<MockError>());
+        let waker = std::task::Waker::noop();
+        let mut context = Context::from_waker(waker);
+        assert!(matches!(read.as_mut().poll(&mut context), Poll::Pending));
+    }
+
+    let format = MockFormat::new();
+    let entries = format.entries();
+    let mut builder = format.builder();
+    assert!(matches!(
+        builder
+            .add_file("started", payload, EntryMetadata::default())
+            .await,
+        Err(BuildError::FilePayloadAlreadyRead)
+    ));
+    builder
+        .add_file("started", b"ok".as_slice(), EntryMetadata::default())
+        .await
+        .expect("a rejected payload should leave the builder usable");
+
+    assert_eq!(
+        entries.borrow().as_slice(),
+        [RecordedEntry::file("started", b"ok", false)]
+    );
 }
 
 #[tokio::test]

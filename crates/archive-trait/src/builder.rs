@@ -133,6 +133,7 @@ impl BuilderState {
 /// implementation.
 pub struct FilePayload<'a> {
     size: u64,
+    started: bool,
     inner: FilePayloadInner<'a>,
 }
 
@@ -173,7 +174,11 @@ impl<'a> FilePayload<'a> {
     }
 
     /// Returns the next chunk of logical, uncompressed source bytes.
+    ///
+    /// Once this method has been called, the payload cannot be passed to
+    /// [`Builder::add_file`].
     pub async fn next_chunk<E>(&mut self) -> Result<Option<&[u8]>, BuildError<E>> {
+        self.started = true;
         match &mut self.inner {
             FilePayloadInner::Buffered(bytes) => Ok(bytes.take().filter(|bytes| !bytes.is_empty())),
             FilePayloadInner::Reader {
@@ -197,6 +202,7 @@ impl<'a> FilePayload<'a> {
     {
         Self {
             size,
+            started: false,
             inner: FilePayloadInner::Reader {
                 source: Box::pin(source),
                 filesystem_path,
@@ -246,6 +252,7 @@ impl<'a> From<&'a [u8]> for FilePayload<'a> {
         let size = bytes.len() as u64;
         Self {
             size,
+            started: false,
             inner: FilePayloadInner::Buffered(Some(bytes)),
         }
     }
@@ -406,6 +413,9 @@ impl<B: ArchiveBuilder> Builder<B> {
     /// If the payload ends before its declared size or returns an error, the
     /// addition fails and the builder is poisoned if the archive member's
     /// output may already have begun.
+    ///
+    /// The payload must not have been read through [`FilePayload::next_chunk`]
+    /// before this method is called.
     pub async fn add_file<'a, P>(
         &mut self,
         path: P,
@@ -435,6 +445,9 @@ impl<B: ArchiveBuilder> Builder<B> {
             .entries
             .preflight_entry(&path, ArchivedEntry::NonDirectory)?;
         let mut payload = payload.into();
+        if payload.started {
+            return Err(BuildError::FilePayloadAlreadyRead);
+        }
         payload.swap_buffer(&mut self.state.source_buffer);
         self.state.begin_write();
         let result = self
@@ -852,6 +865,9 @@ pub enum BuildError<E> {
         /// The conflicting normalized archive path.
         path: String,
     },
+    /// A file payload was read before it was passed to [`Builder::add_file`].
+    #[error("file payload was already read before being added to the archive")]
+    FilePayloadAlreadyRead,
     /// A source filesystem operation failed.
     #[error("failed to {operation} {path}: {source}")]
     Filesystem {
