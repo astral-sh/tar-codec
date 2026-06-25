@@ -117,15 +117,15 @@ async fn manual_entries_are_pax_framed_padded_terminated_and_extractable() {
     let mut bytes = Vec::new();
     let mut encoder = TarEncoder::new(&mut bytes).builder();
     encoder
-        .add_entry(
+        .add_file(
             "bin/tool",
-            b"run",
+            b"run".as_slice(),
             EntryMetadata::default().executable(true),
         )
         .await
         .expect("executable entry should be added");
     encoder
-        .add_entry("README", b"hello", EntryMetadata::default())
+        .add_file("README", b"hello".as_slice(), EntryMetadata::default())
         .await
         .expect("readme entry should be added");
     encoder.finish().await.expect("archive should finish");
@@ -177,6 +177,44 @@ async fn manual_entries_are_pax_framed_padded_terminated_and_extractable() {
 }
 
 #[tokio::test]
+async fn manual_directory_encodes_only_the_named_member() {
+    let mut bytes = Vec::new();
+    let mut encoder = TarEncoder::new(&mut bytes).builder();
+    encoder
+        .add_directory("virtual/tree")
+        .await
+        .expect("directory should be added");
+    encoder.finish().await.expect("archive should finish");
+
+    let mut reader = TarReader::new(bytes.as_slice());
+    let member = reader
+        .next_frame()
+        .await
+        .expect("encoded archive should be readable")
+        .expect("directory member should be present");
+    assert_eq!(member.header.kind, UstarKind::Directory);
+    assert_eq!(
+        member
+            .effective_path()
+            .expect("directory path should be valid")
+            .as_ref(),
+        b"virtual/tree"
+    );
+    member
+        .payload
+        .skip()
+        .await
+        .expect("directory payload should be valid");
+    assert!(
+        reader
+            .next_frame()
+            .await
+            .expect("encoded archive should be readable")
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn tar_path_suffix_rejections_happen_before_output() {
     let mut bytes = Vec::new();
     let mut encoder = TarEncoder::new(&mut bytes).builder();
@@ -193,7 +231,7 @@ async fn tar_path_suffix_rejections_happen_before_output() {
     ] {
         assert!(matches!(
             encoder
-                .add_entry(path, b"rejected", EntryMetadata::default())
+                .add_file(path, b"rejected".as_slice(), EntryMetadata::default(),)
                 .await,
             Err(BuildError::Encoder(EncodeError::Framing(
                 FramingWriteError::DirectoryRequiredPathSuffix {
@@ -204,7 +242,7 @@ async fn tar_path_suffix_rejections_happen_before_output() {
     }
 
     encoder
-        .add_entry("accepted", b"contents", EntryMetadata::default())
+        .add_file("accepted", b"contents".as_slice(), EntryMetadata::default())
         .await
         .expect("framing preflight failures should leave the encoder usable");
     encoder.finish().await.expect("archive should finish");
@@ -216,13 +254,13 @@ async fn output_failures_poison_the_encoder() {
     let mut encoder = TarEncoder::new(FailingWriter).builder();
     assert!(matches!(
         encoder
-            .add_entry("file", b"contents", EntryMetadata::default())
+            .add_file("file", b"contents".as_slice(), EntryMetadata::default(),)
             .await,
         Err(BuildError::Encoder(EncodeError::Write { .. }))
     ));
     assert!(matches!(
         encoder
-            .add_entry("other", b"", EntryMetadata::default())
+            .add_file("other", b"".as_slice(), EntryMetadata::default(),)
             .await,
         Err(BuildError::Poisoned)
     ));
@@ -239,8 +277,11 @@ async fn cancelled_output_write_poisons_the_encoder() {
     };
     let mut encoder = TarEncoder::new(writer).builder();
     {
-        let mut addition =
-            std::pin::pin!(encoder.add_entry("cancelled", b"contents", EntryMetadata::default(),));
+        let mut addition = std::pin::pin!(encoder.add_file(
+            "cancelled",
+            b"contents".as_slice(),
+            EntryMetadata::default(),
+        ));
         let waker = std::task::Waker::noop();
         let mut context = Context::from_waker(waker);
         assert!(matches!(
@@ -252,7 +293,7 @@ async fn cancelled_output_write_poisons_the_encoder() {
 
     assert!(matches!(
         encoder
-            .add_entry("other", b"contents", EntryMetadata::default())
+            .add_file("other", b"contents".as_slice(), EntryMetadata::default(),)
             .await,
         Err(BuildError::Poisoned)
     ));
@@ -273,7 +314,7 @@ async fn recursive_encoding_round_trips_small_and_large_files() {
     let mut bytes = Vec::new();
     let mut encoder = TarEncoder::new(&mut bytes).builder();
     encoder
-        .add_directory(&source)
+        .add_directory_all(&source)
         .await
         .expect("directory should be added");
     encoder.finish().await.expect("archive should finish");
@@ -321,7 +362,7 @@ fn recursive_encoding_releases_the_blocking_pool_between_source_chunks() {
             .expect("archive output should be created");
         let encoding = async {
             let mut encoder = TarEncoder::new(&mut writer).builder();
-            encoder.add_directory(&source).await?;
+            encoder.add_directory_all(&source).await?;
             encoder.finish().await
         };
         timeout(Duration::from_secs(10), encoding)
@@ -363,7 +404,7 @@ fn recursive_encoding_releases_the_blocking_pool_between_traversal_batches() {
         let encoding = async {
             let mut bytes = Vec::new();
             let mut encoder = TarEncoder::new(&mut bytes).builder();
-            encoder.add_directory(&source).await?;
+            encoder.add_directory_all(&source).await?;
             encoder.finish().await
         };
         timeout(Duration::from_secs(10), encoding)
@@ -388,7 +429,7 @@ async fn recursive_encoding_frames_preserved_symlinks() {
     let mut bytes = Vec::new();
     let mut encoder = TarEncoder::new(&mut bytes).builder_with_policy(policy);
     encoder
-        .add_directory(&source)
+        .add_directory_all(&source)
         .await
         .expect("directory should be added");
     encoder.finish().await.expect("archive should finish");

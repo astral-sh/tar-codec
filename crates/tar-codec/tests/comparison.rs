@@ -30,7 +30,7 @@ async fn pax_archive() -> Vec<u8> {
     let mut encoder = TarEncoder::new(&mut bytes).builder();
     for (path, data) in ENTRIES {
         encoder
-            .add_entry(path, data, EntryMetadata::default())
+            .add_file(path, *data, EntryMetadata::default())
             .await
             .expect("tar-codec should encode pax test entry");
     }

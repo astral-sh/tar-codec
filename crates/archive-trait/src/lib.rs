@@ -23,7 +23,9 @@ use std::{
 
 use thiserror::Error;
 
-pub use builder::{ArchiveBuilder, BuildError, Builder, EntryMetadata, TraversalError};
+pub use builder::{
+    ArchiveBuilder, BuildError, Builder, EntryMetadata, FilePayload, TraversalError,
+};
 pub use name::{NameValidator, default_name_validator};
 
 /// Common metadata for one archive member.

@@ -13,19 +13,21 @@ homepage = "https://github.com/astral-sh/tar-codec"
 repository = "https://github.com/astral-sh/tar-codec"
 authors = ["William Woodruff <william@astral.sh>"]
 license = "MIT OR Apache-2.0"
-version = "0.0.7"
+version = "0.0.8"
 readme = "README.md"
 
 [workspace.dependencies]
-archive-trait = { path = "crates/archive-trait", version = "0.0.7" }
-tar-codec = { path = "crates/tar-codec", version = "0.0.7" }
-tar-framing = { path = "crates/tar-framing", version = "0.0.7" }
+archive-trait = { path = "crates/archive-trait", version = "0.0.8" }
+tar-codec = { path = "crates/tar-codec", version = "0.0.8" }
+tar-framing = { path = "crates/tar-framing", version = "0.0.8" }
 
 async-compression = { version = "0.4", features = ["gzip", "tokio"] }
 astral-tokio-tar = "0.6.2"
 cap-std = "4.0.2"
 clap = "4.6"
-criterion = { version = "0.8.2", features = ["async_tokio"], default-features = false }
+criterion = { version = "0.8.2", features = [
+    "async_tokio",
+], default-features = false }
 junction = "2.0.0"
 tar = "0.4.46"
 tempfile = "3"
