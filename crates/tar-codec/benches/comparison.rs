@@ -16,7 +16,7 @@ use support::{
     runtime, ustar_archive_entries,
 };
 use tar_codec::{
-    Archive as _, ArchiveBuilder as _, EntryMetadata, FilePayload, TarArchive, TarEncoder,
+    Archive as _, ArchiveBuilder as _, EntryMetadata, TarArchive, TarEncoder,
     extract::ExtractPolicy,
 };
 use tempfile::{TempDir, tempdir};
@@ -159,11 +159,7 @@ async fn encode_entries_tar_codec(fixture: &Fixture) -> u64 {
         encoder
             .add_file(
                 &entry.archive_path,
-                FilePayload::new(
-                    u64::try_from(entry.data.len())
-                        .expect("fixture payload size should be representable"),
-                    entry.data.as_slice(),
-                ),
+                entry.data.as_slice(),
                 EntryMetadata::default(),
             )
             .await
@@ -265,11 +261,7 @@ async fn pax_archive_entries(entries: &[Entry]) -> Vec<u8> {
         encoder
             .add_file(
                 &entry.archive_path,
-                FilePayload::new(
-                    u64::try_from(entry.data.len())
-                        .expect("fixture payload size should be representable"),
-                    entry.data.as_slice(),
-                ),
+                entry.data.as_slice(),
                 EntryMetadata::default(),
             )
             .await

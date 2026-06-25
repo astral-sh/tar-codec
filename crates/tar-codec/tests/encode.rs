@@ -13,8 +13,8 @@ use std::{
 #[cfg(unix)]
 use tar_codec::builder::{BuilderPolicy, SymlinkPolicy};
 use tar_codec::{
-    Archive as _, ArchiveBuilder as _, BuildError, EncodeError, EntryMetadata, FilePayload,
-    TarArchive, TarEncoder, extract::ExtractPolicy,
+    Archive as _, ArchiveBuilder as _, BuildError, EncodeError, EntryMetadata, TarArchive,
+    TarEncoder, extract::ExtractPolicy,
 };
 use tar_framing::{
     UstarKind,
@@ -119,17 +119,13 @@ async fn manual_entries_are_pax_framed_padded_terminated_and_extractable() {
     encoder
         .add_file(
             "bin/tool",
-            FilePayload::new(3, b"run".as_slice()),
+            b"run".as_slice(),
             EntryMetadata::default().executable(true),
         )
         .await
         .expect("executable entry should be added");
     encoder
-        .add_file(
-            "README",
-            FilePayload::new(5, b"hello".as_slice()),
-            EntryMetadata::default(),
-        )
+        .add_file("README", b"hello".as_slice(), EntryMetadata::default())
         .await
         .expect("readme entry should be added");
     encoder.finish().await.expect("archive should finish");
@@ -235,11 +231,7 @@ async fn tar_path_suffix_rejections_happen_before_output() {
     ] {
         assert!(matches!(
             encoder
-                .add_file(
-                    path,
-                    FilePayload::new(8, b"rejected".as_slice()),
-                    EntryMetadata::default(),
-                )
+                .add_file(path, b"rejected".as_slice(), EntryMetadata::default(),)
                 .await,
             Err(BuildError::Encoder(EncodeError::Framing(
                 FramingWriteError::DirectoryRequiredPathSuffix {
@@ -250,11 +242,7 @@ async fn tar_path_suffix_rejections_happen_before_output() {
     }
 
     encoder
-        .add_file(
-            "accepted",
-            FilePayload::new(8, b"contents".as_slice()),
-            EntryMetadata::default(),
-        )
+        .add_file("accepted", b"contents".as_slice(), EntryMetadata::default())
         .await
         .expect("framing preflight failures should leave the encoder usable");
     encoder.finish().await.expect("archive should finish");
@@ -266,21 +254,13 @@ async fn output_failures_poison_the_encoder() {
     let mut encoder = TarEncoder::new(FailingWriter).builder();
     assert!(matches!(
         encoder
-            .add_file(
-                "file",
-                FilePayload::new(8, b"contents".as_slice()),
-                EntryMetadata::default(),
-            )
+            .add_file("file", b"contents".as_slice(), EntryMetadata::default(),)
             .await,
         Err(BuildError::Encoder(EncodeError::Write { .. }))
     ));
     assert!(matches!(
         encoder
-            .add_file(
-                "other",
-                FilePayload::new(0, b"".as_slice()),
-                EntryMetadata::default(),
-            )
+            .add_file("other", b"".as_slice(), EntryMetadata::default(),)
             .await,
         Err(BuildError::Poisoned)
     ));
@@ -299,7 +279,7 @@ async fn cancelled_output_write_poisons_the_encoder() {
     {
         let mut addition = std::pin::pin!(encoder.add_file(
             "cancelled",
-            FilePayload::new(8, b"contents".as_slice()),
+            b"contents".as_slice(),
             EntryMetadata::default(),
         ));
         let waker = std::task::Waker::noop();
@@ -313,11 +293,7 @@ async fn cancelled_output_write_poisons_the_encoder() {
 
     assert!(matches!(
         encoder
-            .add_file(
-                "other",
-                FilePayload::new(8, b"contents".as_slice()),
-                EntryMetadata::default(),
-            )
+            .add_file("other", b"contents".as_slice(), EntryMetadata::default(),)
             .await,
         Err(BuildError::Poisoned)
     ));

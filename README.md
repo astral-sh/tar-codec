@@ -34,10 +34,10 @@ encoder
 encoder.finish().await?;
 ```
 
-`FilePayload::new` accepts a declared size and any asynchronous reader, while
-`FilePayload::from_path` and `FilePayload::from_file` determine file sizes.
-`Builder::add_directory` writes one directory member without filesystem access;
-`Builder::add_directory_all` recursively imports a filesystem directory.
+Apart from `Builder::add_file`, you can use:
+
+- `Builder::add_directory` to add a single directory (just the directory, not any contents)
+- `Builder::add_directory_all` to recursively add an on-filesystem directory
 
 See `ArchiveBuilder::builder_with_policy` for policy knobs that
 can be changed during building.

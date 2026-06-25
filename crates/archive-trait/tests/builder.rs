@@ -156,7 +156,7 @@ async fn manual_files_and_directories_preserve_order_metadata_and_collision_stat
     builder
         .add_file(
             "bin/tool",
-            FilePayload::new(3, b"run".as_slice()),
+            b"run".as_slice(),
             EntryMetadata::default().executable(true),
         )
         .await
@@ -176,11 +176,7 @@ async fn manual_files_and_directories_preserve_order_metadata_and_collision_stat
     for path in ["bin/tool", "bin/tool/child"] {
         assert!(matches!(
             builder
-                .add_file(
-                    path,
-                    FilePayload::new(0, b"".as_slice()),
-                    EntryMetadata::default(),
-                )
+                .add_file(path, b"".as_slice(), EntryMetadata::default(),)
                 .await,
             Err(BuildError::PathCollision { .. })
         ));
@@ -190,11 +186,7 @@ async fn manual_files_and_directories_preserve_order_metadata_and_collision_stat
         .await
         .expect("an implicit ancestor should accept its explicit directory member");
     builder
-        .add_file(
-            "bin/other",
-            FilePayload::new(5, b"other".as_slice()),
-            EntryMetadata::default(),
-        )
+        .add_file("bin/other", b"other".as_slice(), EntryMetadata::default())
         .await
         .expect("preflight failures should leave the builder usable");
 
@@ -293,11 +285,7 @@ async fn short_manual_file_sources_poison_the_builder() {
     ));
     assert!(matches!(
         builder
-            .add_file(
-                "other",
-                FilePayload::new(0, b"".as_slice()),
-                EntryMetadata::default(),
-            )
+            .add_file("other", b"".as_slice(), EntryMetadata::default(),)
             .await,
         Err(BuildError::Poisoned)
     ));
@@ -331,20 +319,12 @@ async fn name_validation_supports_default_custom_and_disabled_policies() {
     for (policy, path, accepted, context) in policies {
         let mut builder = MockFormat::new().builder_with_policy(policy);
         let result = builder
-            .add_file(
-                path,
-                FilePayload::new(0, b"".as_slice()),
-                EntryMetadata::default(),
-            )
+            .add_file(path, b"".as_slice(), EntryMetadata::default())
             .await;
         assert_eq!(result.is_ok(), accepted, "{context}: {result:?}");
         if !accepted {
             builder
-                .add_file(
-                    "accepted",
-                    FilePayload::new(2, b"ok".as_slice()),
-                    EntryMetadata::default(),
-                )
+                .add_file("accepted", b"ok".as_slice(), EntryMetadata::default())
                 .await
                 .expect("name rejection should leave the builder usable");
         }
@@ -612,11 +592,7 @@ async fn late_traversal_failures_poison_after_a_completed_batch() {
     assert!(!entries.borrow().is_empty());
     assert!(matches!(
         builder
-            .add_file(
-                "other",
-                FilePayload::new(0, b"".as_slice()),
-                EntryMetadata::default(),
-            )
+            .add_file("other", b"".as_slice(), EntryMetadata::default(),)
             .await,
         Err(BuildError::Poisoned)
     ));
@@ -640,11 +616,7 @@ async fn source_truncation_poison_after_member_framing() {
     ));
     assert!(matches!(
         builder
-            .add_file(
-                "other",
-                FilePayload::new(0, b"".as_slice()),
-                EntryMetadata::default(),
-            )
+            .add_file("other", b"".as_slice(), EntryMetadata::default(),)
             .await,
         Err(BuildError::Poisoned)
     ));
@@ -659,11 +631,7 @@ async fn early_failures_leave_builders_usable_but_late_failures_poison_them() {
         Err(BuildError::Traversal(TraversalError::Filesystem { .. }))
     ));
     builder
-        .add_file(
-            "kept",
-            FilePayload::new(2, b"ok".as_slice()),
-            EntryMetadata::default(),
-        )
+        .add_file("kept", b"ok".as_slice(), EntryMetadata::default())
         .await
         .expect("early traversal failure should leave the builder usable");
 
@@ -674,7 +642,7 @@ async fn early_failures_leave_builders_usable_but_late_failures_poison_them() {
     builder
         .add_file(
             "tree/file",
-            FilePayload::new(8, b"existing".as_slice()),
+            b"existing".as_slice(),
             EntryMetadata::default(),
         )
         .await
@@ -685,11 +653,7 @@ async fn early_failures_leave_builders_usable_but_late_failures_poison_them() {
     ));
     assert!(matches!(
         builder
-            .add_file(
-                "other",
-                FilePayload::new(0, b"".as_slice()),
-                EntryMetadata::default(),
-            )
+            .add_file("other", b"".as_slice(), EntryMetadata::default(),)
             .await,
         Err(BuildError::Poisoned)
     ));
@@ -699,20 +663,12 @@ async fn early_failures_leave_builders_usable_but_late_failures_poison_them() {
     let mut builder = format.builder();
     assert!(matches!(
         builder
-            .add_file(
-                "failed",
-                FilePayload::new(7, b"payload".as_slice()),
-                EntryMetadata::default(),
-            )
+            .add_file("failed", b"payload".as_slice(), EntryMetadata::default(),)
             .await,
         Err(BuildError::Encoder(MockError))
     ));
     builder
-        .add_file(
-            "other",
-            FilePayload::new(0, b"".as_slice()),
-            EntryMetadata::default(),
-        )
+        .add_file("other", b"".as_slice(), EntryMetadata::default())
         .await
         .expect("recoverable format failure should leave the builder usable");
 
@@ -721,21 +677,13 @@ async fn early_failures_leave_builders_usable_but_late_failures_poison_them() {
     let mut builder = format.builder();
     assert!(matches!(
         builder
-            .add_file(
-                "failed",
-                FilePayload::new(7, b"payload".as_slice()),
-                EntryMetadata::default(),
-            )
+            .add_file("failed", b"payload".as_slice(), EntryMetadata::default(),)
             .await,
         Err(BuildError::Encoder(MockError))
     ));
     assert!(matches!(
         builder
-            .add_file(
-                "other",
-                FilePayload::new(0, b"".as_slice()),
-                EntryMetadata::default(),
-            )
+            .add_file("other", b"".as_slice(), EntryMetadata::default(),)
             .await,
         Err(BuildError::Poisoned)
     ));

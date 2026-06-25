@@ -129,7 +129,7 @@ impl BuilderState {
     }
 }
 
-/// A format-neutral, uncompressed payload supplied to an [`ArchiveBuilder`]
+/// A format-neutral, uncompressed file payload supplied to an [`ArchiveBuilder`]
 /// implementation.
 pub struct FilePayload<'a> {
     size: u64,
@@ -137,6 +137,10 @@ pub struct FilePayload<'a> {
 }
 
 enum FilePayloadInner<'a> {
+    /// A pre-buffered payload.
+    ///
+    /// Observe that this is stored as an `Option` so that we can use the `None`
+    /// state to communicate that the payload has been consumed.
     Buffered(Option<&'a [u8]>),
     Reader {
         source: Pin<Box<dyn AsyncRead + 'a>>,
@@ -171,7 +175,7 @@ impl<'a> FilePayload<'a> {
     /// Returns the next chunk of logical, uncompressed source bytes.
     pub async fn next_chunk<E>(&mut self) -> Result<Option<&[u8]>, BuildError<E>> {
         match &mut self.inner {
-            FilePayloadInner::Buffered(data) => Ok(data.take().filter(|data| !data.is_empty())),
+            FilePayloadInner::Buffered(bytes) => Ok(bytes.take().filter(|bytes| !bytes.is_empty())),
             FilePayloadInner::Reader {
                 source,
                 filesystem_path,
@@ -180,15 +184,6 @@ impl<'a> FilePayload<'a> {
                 filled,
             } => read_streaming_chunk(source, buffer, remaining, filled, *filesystem_path).await,
         }
-    }
-
-    fn borrowed<E>(bytes: &[u8]) -> Result<FilePayload<'_>, BuildError<E>> {
-        let size = u64::try_from(bytes.len())
-            .map_err(|_| arithmetic_overflow("buffered file payload size"))?;
-        Ok(FilePayload {
-            size,
-            inner: FilePayloadInner::Buffered(Some(bytes)),
-        })
     }
 
     fn streaming<R>(
@@ -243,6 +238,16 @@ impl FilePayload<'static> {
         }
         let position = file.stream_position().await?;
         Ok(Self::new(metadata.len().saturating_sub(position), file))
+    }
+}
+
+impl<'a> From<&'a [u8]> for FilePayload<'a> {
+    fn from(bytes: &'a [u8]) -> Self {
+        let size = bytes.len() as u64;
+        Self {
+            size,
+            inner: FilePayloadInner::Buffered(Some(bytes)),
+        }
     }
 }
 
@@ -401,10 +406,10 @@ impl<B: ArchiveBuilder> Builder<B> {
     /// If the payload ends before its declared size or returns an error, the
     /// addition fails and the builder is poisoned if the archive member's
     /// output may already have begun.
-    pub async fn add_file<P>(
+    pub async fn add_file<'a, P>(
         &mut self,
         path: P,
-        mut payload: FilePayload<'_>,
+        payload: impl Into<FilePayload<'a>>,
         metadata: EntryMetadata,
     ) -> Result<(), BuildError<B::Error>>
     where
@@ -429,6 +434,7 @@ impl<B: ArchiveBuilder> Builder<B> {
             .state
             .entries
             .preflight_entry(&path, ArchivedEntry::NonDirectory)?;
+        let mut payload = payload.into();
         payload.swap_buffer(&mut self.state.source_buffer);
         self.state.begin_write();
         let result = self
@@ -613,8 +619,7 @@ async fn write_prepared_directory_entries<B: ArchiveBuilder>(
                         "prepared source file buffer range",
                     ))
                 })?;
-                let mut payload =
-                    FilePayload::borrowed::<B::Error>(data).map_err(BuildFailure::recoverable)?;
+                let mut payload = FilePayload::from(data);
                 builder
                     .write_file_member(
                         &entry.archive_path,
@@ -1081,11 +1086,7 @@ mod tests {
         path.push_str("file");
         let mut builder = NoopArchiveBuilder::default().builder();
         builder
-            .add_file(
-                &path,
-                FilePayload::new(0, b"".as_slice()),
-                EntryMetadata::default(),
-            )
+            .add_file(&path, b"".as_slice(), EntryMetadata::default())
             .await
             .expect("deep manual file should be added");
 
@@ -1101,11 +1102,7 @@ mod tests {
         let mut builder = NoopArchiveBuilder::default().builder();
         for path in ["a//b", "a/b", "/absolute", "absolute", ".", ".."] {
             builder
-                .add_file(
-                    path,
-                    FilePayload::new(0, b"".as_slice()),
-                    EntryMetadata::default(),
-                )
+                .add_file(path, b"".as_slice(), EntryMetadata::default())
                 .await
                 .expect("distinct textual path should be added");
         }
@@ -1115,7 +1112,7 @@ mod tests {
                 builder
                     .add_file(
                         path,
-                        FilePayload::new(0, b"".as_slice()),
+                        b"".as_slice(),
                         EntryMetadata::default(),
                     )
                     .await,
@@ -1133,20 +1130,12 @@ mod tests {
         .builder();
         assert!(matches!(
             builder
-                .add_file(
-                    "parent/file",
-                    FilePayload::new(0, b"".as_slice()),
-                    EntryMetadata::default(),
-                )
+                .add_file("parent/file", b"".as_slice(), EntryMetadata::default(),)
                 .await,
             Err(BuildError::Encoder(TestError))
         ));
         builder
-            .add_file(
-                "parent/file",
-                FilePayload::new(0, b"".as_slice()),
-                EntryMetadata::default(),
-            )
+            .add_file("parent/file", b"".as_slice(), EntryMetadata::default())
             .await
             .expect("a recoverable failure should not reserve the path");
     }
