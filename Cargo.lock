@@ -96,7 +96,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "archive-trait"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "cap-std",
  "junction",
@@ -836,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "tar-codec"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "archive-trait",
  "astral-tokio-tar",
@@ -850,7 +850,7 @@ dependencies = [
 
 [[package]]
 name = "tar-framing"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "criterion",
  "thiserror",
@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "tarpit"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "async-compression",
  "clap",
