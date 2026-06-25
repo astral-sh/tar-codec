@@ -11,10 +11,11 @@ use std::{
     mem,
     ops::Range,
     path::{Path, PathBuf},
+    pin::Pin,
 };
 
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
 
 pub use self::traversal::TraversalError;
 use self::traversal::{TraversalEntry, TraversalKind, TraversalStream, stream_directory_entries};
@@ -25,12 +26,12 @@ use crate::{
 };
 
 const BUFFERED_SOURCE_FILE_BYTES: usize = 1024 * 1024;
-const SOURCE_FILE_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+const FILE_PAYLOAD_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 // A preparation batch may exceed this target by one buffered file, so its
 // payload storage remains below twice this value.
 const SOURCE_FILE_PREPARATION_BATCH_BYTES: usize = BUFFERED_SOURCE_FILE_BYTES;
 
-/// Minimal regular-file metadata accepted by [`Builder::add_entry`].
+/// Minimal regular-file metadata accepted by [`Builder::add_file`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct EntryMetadata {
     executable: bool,
@@ -130,23 +131,35 @@ impl BuilderState {
 
 /// A format-neutral, uncompressed payload supplied to an [`ArchiveBuilder`]
 /// implementation.
-pub struct EntryPayload<'a> {
+pub struct FilePayload<'a> {
     size: u64,
-    inner: EntryPayloadInner<'a>,
+    inner: FilePayloadInner<'a>,
 }
 
-enum EntryPayloadInner<'a> {
+enum FilePayloadInner<'a> {
     Buffered(Option<&'a [u8]>),
-    Streaming {
-        file: tokio::fs::File,
-        path: PathBuf,
-        buffer: &'a mut Vec<u8>,
+    Reader {
+        source: Pin<Box<dyn AsyncRead + 'a>>,
+        filesystem_path: Option<&'a Path>,
+        buffer: Vec<u8>,
         remaining: u64,
         filled: usize,
     },
 }
 
-impl EntryPayload<'_> {
+impl<'a> FilePayload<'a> {
+    /// Creates a payload with a declared logical size and [`AsyncRead`] source.
+    ///
+    /// The builder reads exactly `size` bytes from `source`. Additional bytes
+    /// remain unread, while a source that ends early causes the addition to
+    /// fail.
+    pub fn new<R>(size: u64, source: R) -> Self
+    where
+        R: AsyncRead + 'a,
+    {
+        Self::streaming(size, source, Vec::new(), None)
+    }
+
     /// Returns the logical, uncompressed source size in bytes.
     ///
     /// This is the total number of bytes yielded by [`Self::next_chunk`], not
@@ -158,54 +171,113 @@ impl EntryPayload<'_> {
     /// Returns the next chunk of logical, uncompressed source bytes.
     pub async fn next_chunk<E>(&mut self) -> Result<Option<&[u8]>, BuildError<E>> {
         match &mut self.inner {
-            EntryPayloadInner::Buffered(data) => Ok(data.take().filter(|data| !data.is_empty())),
-            EntryPayloadInner::Streaming {
-                file,
-                path,
+            FilePayloadInner::Buffered(data) => Ok(data.take().filter(|data| !data.is_empty())),
+            FilePayloadInner::Reader {
+                source,
+                filesystem_path,
                 buffer,
                 remaining,
                 filled,
-            } => read_streaming_chunk(file, path, buffer, remaining, filled).await,
+            } => read_streaming_chunk(source, buffer, remaining, filled, *filesystem_path).await,
         }
     }
 
-    fn borrowed<E>(bytes: &[u8]) -> Result<EntryPayload<'_>, BuildError<E>> {
+    fn borrowed<E>(bytes: &[u8]) -> Result<FilePayload<'_>, BuildError<E>> {
         let size = u64::try_from(bytes.len())
-            .map_err(|_| arithmetic_overflow("manual entry payload size"))?;
-        Ok(EntryPayload {
+            .map_err(|_| arithmetic_overflow("buffered file payload size"))?;
+        Ok(FilePayload {
             size,
-            inner: EntryPayloadInner::Buffered(Some(bytes)),
+            inner: FilePayloadInner::Buffered(Some(bytes)),
         })
+    }
+
+    fn streaming<R>(
+        size: u64,
+        source: R,
+        buffer: Vec<u8>,
+        filesystem_path: Option<&'a Path>,
+    ) -> Self
+    where
+        R: AsyncRead + 'a,
+    {
+        Self {
+            size,
+            inner: FilePayloadInner::Reader {
+                source: Box::pin(source),
+                filesystem_path,
+                buffer,
+                remaining: size,
+                filled: 0,
+            },
+        }
+    }
+
+    fn swap_buffer(&mut self, buffer: &mut Vec<u8>) {
+        if let FilePayloadInner::Reader {
+            buffer: payload_buffer,
+            ..
+        } = &mut self.inner
+        {
+            mem::swap(payload_buffer, buffer);
+        }
     }
 }
 
-async fn read_streaming_chunk<'a, E>(
-    file: &mut tokio::fs::File,
-    path: &Path,
+impl FilePayload<'static> {
+    /// Opens `path` and creates a payload from the complete regular file.
+    pub async fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let file = tokio::fs::File::open(path).await?;
+        Self::from_file(file).await
+    }
+
+    /// Creates a payload from the unread contents of a [`tokio::fs::File`].
+    ///
+    /// The declared size is the file length minus its current stream position.
+    /// This constructor rejects filesystem objects that are not regular files.
+    pub async fn from_file(mut file: tokio::fs::File) -> io::Result<Self> {
+        let metadata = file.metadata().await?;
+        if !metadata.is_file() {
+            return Err(io::Error::other(
+                "file payload source is not a regular file",
+            ));
+        }
+        let position = file.stream_position().await?;
+        Ok(Self::new(metadata.len().saturating_sub(position), file))
+    }
+}
+
+async fn read_streaming_chunk<'a, E, R>(
+    source: &mut R,
     buffer: &'a mut Vec<u8>,
     remaining: &mut u64,
     filled: &mut usize,
-) -> Result<Option<&'a [u8]>, BuildError<E>> {
+    filesystem_path: Option<&Path>,
+) -> Result<Option<&'a [u8]>, BuildError<E>>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
     if *remaining == 0 {
         return Ok(None);
     }
 
-    let chunk_size = (*remaining).min(SOURCE_FILE_CHUNK_BYTES as u64);
+    let chunk_size = (*remaining).min(FILE_PAYLOAD_CHUNK_BYTES as u64);
     let chunk_len = usize::try_from(chunk_size)
-        .map_err(|_| arithmetic_overflow("source file read buffer size"))?;
+        .map_err(|_| arithmetic_overflow("file payload read buffer size"))?;
     buffer.resize(chunk_len, 0);
     // Progress lives in the payload rather than this future, so cancelling and
-    // retrying `EntryPayload::next_chunk` cannot discard completed reads.
+    // retrying `FilePayload::next_chunk` cannot discard completed reads.
     while *filled < chunk_len {
-        let read = file
+        let read = source
             .read(&mut buffer[*filled..])
             .await
-            .map_err(|source| filesystem_error("read source file", path, source))?;
+            .map_err(|source| file_payload_read_error(filesystem_path, source))?;
         if read == 0 {
-            return Err(filesystem_error(
-                "read source file",
-                path,
-                io::Error::new(io::ErrorKind::UnexpectedEof, "source file was truncated"),
+            return Err(file_payload_read_error(
+                filesystem_path,
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "file payload source ended before its declared size",
+                ),
             ));
         }
         *filled += read;
@@ -293,12 +365,12 @@ pub trait ArchiveBuilder: Sized {
 
     /// Writes one regular-file member and its complete payload.
     ///
-    /// Implementations must call [`EntryPayload::next_chunk`] through
+    /// Implementations must call [`FilePayload::next_chunk`] through
     /// completion and classify failures using [`BuildFailure`].
     async fn write_file_member(
         &mut self,
         path: &str,
-        payload: &mut EntryPayload<'_>,
+        payload: &mut FilePayload<'_>,
         metadata: EntryMetadata,
     ) -> Result<(), BuildFailure<Self::Error>>;
 
@@ -324,16 +396,19 @@ pub struct Builder<B> {
 }
 
 impl<B: ArchiveBuilder> Builder<B> {
-    /// Adds one regular file from an in-memory byte buffer.
-    pub async fn add_entry<P, D>(
+    /// Adds one regular file from a [`FilePayload`].
+    ///
+    /// If the payload ends before its declared size or returns an error, the
+    /// addition fails and the builder is poisoned if the archive member's
+    /// output may already have begun.
+    pub async fn add_file<P>(
         &mut self,
         path: P,
-        data: D,
+        mut payload: FilePayload<'_>,
         metadata: EntryMetadata,
     ) -> Result<(), BuildError<B::Error>>
     where
         P: AsRef<Path>,
-        D: AsRef<[u8]>,
     {
         self.state.ensure_active()?;
         let archive_path = path.as_ref();
@@ -354,12 +429,49 @@ impl<B: ArchiveBuilder> Builder<B> {
             .state
             .entries
             .preflight_entry(&path, ArchivedEntry::NonDirectory)?;
-        let mut payload = EntryPayload::borrowed(data.as_ref())?;
+        payload.swap_buffer(&mut self.state.source_buffer);
         self.state.begin_write();
         let result = self
             .backend
             .write_file_member(&path, &mut payload, metadata)
             .await;
+        self.state.complete_write();
+        payload.swap_buffer(&mut self.state.source_buffer);
+        self.resolve_hook(result)?;
+        self.state.entries.commit_entry(&path, reservation);
+        Ok(())
+    }
+
+    /// Adds one directory member without reading from the filesystem.
+    ///
+    /// This creates only the named directory member. It does not add any child
+    /// members; use [`Self::add_directory_all`] to recursively add a filesystem
+    /// directory and its contents.
+    pub async fn add_directory<P: AsRef<Path>>(
+        &mut self,
+        path: P,
+    ) -> Result<(), BuildError<B::Error>> {
+        self.state.ensure_active()?;
+        let archive_path = path.as_ref();
+        let Some(path) = archive_path.to_str() else {
+            return Err(BuildError::InvalidArchivePath {
+                path: archive_path.to_path_buf(),
+                reason: "path is not valid UTF-8",
+            });
+        };
+        if !self.state.policy.name_validation.accepts(path) {
+            return Err(BuildError::NameRejected {
+                context: "member path",
+                value: path.to_owned(),
+            });
+        }
+        let path = path.to_owned();
+        let reservation = self
+            .state
+            .entries
+            .preflight_entry(&path, ArchivedEntry::Directory { explicit: true })?;
+        self.state.begin_write();
+        let result = self.backend.write_directory_member(&path).await;
         self.state.complete_write();
         self.resolve_hook(result)?;
         self.state.entries.commit_entry(&path, reservation);
@@ -373,7 +485,7 @@ impl<B: ArchiveBuilder> Builder<B> {
     /// [`BuilderPolicy::symlink_policy`] can instead preserve them. A late
     /// traversal or validation failure may leave partial output and poison
     /// this builder.
-    pub async fn add_directory<P: AsRef<Path>>(
+    pub async fn add_directory_all<P: AsRef<Path>>(
         &mut self,
         source: P,
     ) -> Result<(), BuildError<B::Error>> {
@@ -502,7 +614,7 @@ async fn write_prepared_directory_entries<B: ArchiveBuilder>(
                     ))
                 })?;
                 let mut payload =
-                    EntryPayload::borrowed::<B::Error>(data).map_err(BuildFailure::recoverable)?;
+                    FilePayload::borrowed::<B::Error>(data).map_err(BuildFailure::recoverable)?;
                 builder
                     .write_file_member(
                         &entry.archive_path,
@@ -518,24 +630,18 @@ async fn write_prepared_directory_entries<B: ArchiveBuilder>(
                 executable,
             } => {
                 let mut file = tokio::fs::File::from_std(file);
-                file.set_max_buf_size(SOURCE_FILE_CHUNK_BYTES);
-                let mut payload = EntryPayload {
-                    size,
-                    inner: EntryPayloadInner::Streaming {
-                        file,
-                        path,
-                        buffer,
-                        remaining: size,
-                        filled: 0,
-                    },
-                };
-                builder
+                file.set_max_buf_size(FILE_PAYLOAD_CHUNK_BYTES);
+                let mut payload =
+                    FilePayload::streaming(size, file, mem::take(buffer), Some(path.as_path()));
+                let result = builder
                     .write_file_member(
                         &entry.archive_path,
                         &mut payload,
                         EntryMetadata::default().executable(executable),
                     )
-                    .await?;
+                    .await;
+                payload.swap_buffer(buffer);
+                result?;
             }
             PreparedTraversalKind::SymbolicLink { target } => {
                 builder
@@ -752,6 +858,13 @@ pub enum BuildError<E> {
         #[source]
         source: io::Error,
     },
+    /// Reading an asynchronous file payload source failed.
+    #[error("failed to read archive file payload source")]
+    SourceRead {
+        /// The underlying I/O error.
+        #[source]
+        source: io::Error,
+    },
     /// A blocking filesystem operation failed to complete.
     #[error("failed to complete blocking archive filesystem operation: {0}")]
     BlockingTask(#[from] tokio::task::JoinError),
@@ -864,11 +977,15 @@ fn archive_path_components(path: &str) -> impl Iterator<Item = (&str, &str)> {
     })
 }
 
-fn filesystem_error<E>(operation: &'static str, path: &Path, source: io::Error) -> BuildError<E> {
-    BuildError::Filesystem {
-        operation,
-        path: path.to_path_buf(),
-        source,
+fn file_payload_read_error<E>(filesystem_path: Option<&Path>, source: io::Error) -> BuildError<E> {
+    if let Some(path) = filesystem_path {
+        BuildError::Filesystem {
+            operation: "read source file",
+            path: path.to_path_buf(),
+            source,
+        }
+    } else {
+        BuildError::SourceRead { source }
     }
 }
 
@@ -921,7 +1038,7 @@ mod tests {
         async fn write_file_member(
             &mut self,
             _path: &str,
-            payload: &mut EntryPayload<'_>,
+            payload: &mut FilePayload<'_>,
             _metadata: EntryMetadata,
         ) -> Result<(), BuildFailure<Self::Error>> {
             if mem::take(&mut self.fail_next_file) {
@@ -964,9 +1081,13 @@ mod tests {
         path.push_str("file");
         let mut builder = NoopArchiveBuilder::default().builder();
         builder
-            .add_entry(&path, b"", EntryMetadata::default())
+            .add_file(
+                &path,
+                FilePayload::new(0, b"".as_slice()),
+                EntryMetadata::default(),
+            )
             .await
-            .expect("deep manual entry should be added");
+            .expect("deep manual file should be added");
 
         assert_eq!(builder.state.entries.node_count(), DEPTH + 2);
         assert_eq!(
@@ -980,7 +1101,11 @@ mod tests {
         let mut builder = NoopArchiveBuilder::default().builder();
         for path in ["a//b", "a/b", "/absolute", "absolute", ".", ".."] {
             builder
-                .add_entry(path, b"", EntryMetadata::default())
+                .add_file(
+                    path,
+                    FilePayload::new(0, b"".as_slice()),
+                    EntryMetadata::default(),
+                )
                 .await
                 .expect("distinct textual path should be added");
         }
@@ -988,7 +1113,11 @@ mod tests {
         for (path, collision) in [("a//b", "a//b"), ("a/", "a/"), ("", ""), ("./child", ".")] {
             assert!(matches!(
                 builder
-                    .add_entry(path, b"", EntryMetadata::default())
+                    .add_file(
+                        path,
+                        FilePayload::new(0, b"".as_slice()),
+                        EntryMetadata::default(),
+                    )
                     .await,
                 Err(BuildError::PathCollision { path }) if path == collision
             ));
@@ -1004,21 +1133,26 @@ mod tests {
         .builder();
         assert!(matches!(
             builder
-                .add_entry("parent/file", b"", EntryMetadata::default())
+                .add_file(
+                    "parent/file",
+                    FilePayload::new(0, b"".as_slice()),
+                    EntryMetadata::default(),
+                )
                 .await,
             Err(BuildError::Encoder(TestError))
         ));
         builder
-            .add_entry("parent/file", b"", EntryMetadata::default())
+            .add_file(
+                "parent/file",
+                FilePayload::new(0, b"".as_slice()),
+                EntryMetadata::default(),
+            )
             .await
             .expect("a recoverable failure should not reserve the path");
     }
 
     #[tokio::test]
-    async fn recoverable_recursive_write_failure_does_not_commit_reservation() {
-        let temp = tempdir().expect("temporary directory should be created");
-        let source = temp.path().join("directory");
-        fs::create_dir(&source).expect("source directory should be created");
+    async fn recoverable_directory_write_failure_does_not_commit_reservation() {
         let mut builder = NoopArchiveBuilder {
             fail_next_directory: true,
             ..Default::default()
@@ -1026,13 +1160,13 @@ mod tests {
         .builder();
 
         assert!(matches!(
-            builder.add_directory(&source).await,
+            builder.add_directory("directory").await,
             Err(BuildError::Encoder(TestError))
         ));
         assert_eq!(builder.state.entries.node_count(), 1);
 
         builder
-            .add_directory(&source)
+            .add_directory("directory")
             .await
             .expect("a recoverable failure should not reserve the directory");
         assert_eq!(builder.state.entries.node_count(), 2);
@@ -1048,7 +1182,7 @@ mod tests {
             let source = temp.path().join(format!("directory-{index}"));
             fs::create_dir(&source).expect("source directory should be created");
             builder
-                .add_directory(&source)
+                .add_directory_all(&source)
                 .await
                 .expect("empty source directory should be added");
         }

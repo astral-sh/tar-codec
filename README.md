@@ -24,14 +24,20 @@ Anti-goals:
 Encoding/archive serialization:
 
 ```rust
-use tar_codec::{ArchiveBuilder as _, EntryMetadata, TarEncoder};
+use tar_codec::{ArchiveBuilder as _, EntryMetadata, FilePayload, TarEncoder};
 
+let payload = FilePayload::from_path("README.md").await?;
 let mut encoder = TarEncoder::new(&mut writer).builder();
 encoder
-    .add_entry("README.md", b"hello\n", EntryMetadata::default())
+    .add_file("README.md", payload, EntryMetadata::default())
     .await?;
 encoder.finish().await?;
 ```
+
+`FilePayload::new` accepts a declared size and any asynchronous reader, while
+`FilePayload::from_path` and `FilePayload::from_file` determine file sizes.
+`Builder::add_directory` writes one directory member without filesystem access;
+`Builder::add_directory_all` recursively imports a filesystem directory.
 
 See `ArchiveBuilder::builder_with_policy` for policy knobs that
 can be changed during building.
@@ -70,4 +76,3 @@ tar libraries for Rust, including [tar] and [astral-tokio-tar].
 See [BENCHMARKS] for current benchmarks.
 
 [BENCHMARKS]: ./BENCHMARKS.md
-

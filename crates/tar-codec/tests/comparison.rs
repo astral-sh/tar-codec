@@ -1,7 +1,7 @@
 use std::{fs, path::Path};
 
 use tar_codec::{
-    Archive as _, ArchiveBuilder as _, EntryMetadata, TarArchive, TarEncoder,
+    Archive as _, ArchiveBuilder as _, EntryMetadata, FilePayload, TarArchive, TarEncoder,
     extract::ExtractPolicy,
 };
 use tempfile::tempdir;
@@ -30,7 +30,14 @@ async fn pax_archive() -> Vec<u8> {
     let mut encoder = TarEncoder::new(&mut bytes).builder();
     for (path, data) in ENTRIES {
         encoder
-            .add_entry(path, data, EntryMetadata::default())
+            .add_file(
+                path,
+                FilePayload::new(
+                    u64::try_from(data.len()).expect("test payload size should fit in u64"),
+                    *data,
+                ),
+                EntryMetadata::default(),
+            )
             .await
             .expect("tar-codec should encode pax test entry");
     }

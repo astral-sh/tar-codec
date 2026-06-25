@@ -4,11 +4,12 @@ use std::{cell::RefCell, io, path::PathBuf, rc::Rc};
 use archive_trait::builder::SymlinkPolicy;
 use archive_trait::{
     ArchiveBuilder, BuildError, EntryMetadata, TraversalError,
-    builder::{BuildFailure, BuilderPolicy, EntryPayload},
+    builder::{BuildFailure, BuilderPolicy, FilePayload},
     default_name_validator,
 };
 use tempfile::tempdir;
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
 
 const LARGE_FILE_BYTES: usize = 2 * 1024 * 1024 + 17;
 const BATCHED_FILE_BYTES: usize = 512 * 1024 + 17;
@@ -87,7 +88,7 @@ impl ArchiveBuilder for MockFormat {
     async fn write_file_member(
         &mut self,
         path: &str,
-        payload: &mut EntryPayload<'_>,
+        payload: &mut FilePayload<'_>,
         metadata: EntryMetadata,
     ) -> Result<(), BuildFailure<Self::Error>> {
         if self.recoverable_failure.as_deref() == Some(path) {
@@ -148,38 +149,52 @@ impl ArchiveBuilder for MockFormat {
 }
 
 #[tokio::test]
-async fn manual_entries_preserve_order_metadata_and_collision_state() {
+async fn manual_files_and_directories_preserve_order_metadata_and_collision_state() {
     let format = MockFormat::new();
     let entries = format.entries();
     let mut builder = format.builder();
     builder
-        .add_entry(
+        .add_file(
             "bin/tool",
-            b"run",
+            FilePayload::new(3, b"run".as_slice()),
             EntryMetadata::default().executable(true),
         )
         .await
         .expect("first entry should be added");
+    let mut readme_source = b"hello trailing".as_slice();
+    let readme_reader: &mut (dyn AsyncRead + Unpin) = &mut readme_source;
     builder
-        .add_entry("README", b"hello", EntryMetadata::default())
+        .add_file(
+            "README",
+            FilePayload::new(5, readme_reader),
+            EntryMetadata::default(),
+        )
         .await
         .expect("second entry should be added");
+    assert_eq!(readme_source, b" trailing");
 
     for path in ["bin/tool", "bin/tool/child"] {
         assert!(matches!(
-            builder.add_entry(path, b"", EntryMetadata::default()).await,
+            builder
+                .add_file(
+                    path,
+                    FilePayload::new(0, b"".as_slice()),
+                    EntryMetadata::default(),
+                )
+                .await,
             Err(BuildError::PathCollision { .. })
         ));
     }
-    let temp = tempdir().expect("temporary directory should be created");
-    let directory = temp.path().join("bin");
-    std::fs::create_dir(&directory).expect("directory should be created");
     builder
-        .add_directory(&directory)
+        .add_directory("bin")
         .await
         .expect("an implicit ancestor should accept its explicit directory member");
     builder
-        .add_entry("bin/other", b"other", EntryMetadata::default())
+        .add_file(
+            "bin/other",
+            FilePayload::new(5, b"other".as_slice()),
+            EntryMetadata::default(),
+        )
         .await
         .expect("preflight failures should leave the builder usable");
 
@@ -192,6 +207,100 @@ async fn manual_entries_preserve_order_metadata_and_collision_state() {
             RecordedEntry::file("bin/other", b"other", false),
         ]
     );
+}
+
+#[tokio::test]
+async fn manual_entries_stream_async_sources_in_bounded_chunks() {
+    let size = u64::try_from(LARGE_FILE_BYTES).expect("test payload size should fit in u64");
+    let format = MockFormat::new();
+    let entries = format.entries();
+    let mut builder = format.builder();
+    builder
+        .add_file(
+            "streamed",
+            FilePayload::new(size, tokio::io::repeat(b'x').take(size)),
+            EntryMetadata::default(),
+        )
+        .await
+        .expect("asynchronous source should be streamed");
+
+    assert!(matches!(
+        entries.borrow().as_slice(),
+        [RecordedEntry::File {
+            path,
+            data,
+            executable: false,
+            chunks: 2,
+        }] if path == "streamed"
+            && data.len() == LARGE_FILE_BYTES
+            && data.iter().all(|byte| *byte == b'x')
+    ));
+}
+
+#[tokio::test]
+async fn file_payload_constructors_stream_contents() {
+    let temp = tempdir().expect("temporary directory should be created");
+    let path = temp.path().join("source");
+    std::fs::write(&path, b"skipcontents").expect("source file should be written");
+    let complete_payload = FilePayload::from_path(&path)
+        .await
+        .expect("path payload should be created");
+    assert_eq!(complete_payload.size(), 12);
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .expect("source file should be opened");
+    file.seek(io::SeekFrom::Start(4))
+        .await
+        .expect("source file should be positioned");
+    let payload = FilePayload::from_file(file)
+        .await
+        .expect("file payload should be created");
+    assert_eq!(payload.size(), 8);
+
+    let format = MockFormat::new();
+    let entries = format.entries();
+    let mut builder = format.builder();
+    builder
+        .add_file("complete", complete_payload, EntryMetadata::default())
+        .await
+        .expect("path payload should be streamed");
+    builder
+        .add_file("remaining", payload, EntryMetadata::default())
+        .await
+        .expect("file payload should be streamed");
+    assert_eq!(
+        entries.borrow().as_slice(),
+        [
+            RecordedEntry::file("complete", b"skipcontents", false),
+            RecordedEntry::file("remaining", b"contents", false),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn short_manual_file_sources_poison_the_builder() {
+    let mut builder = MockFormat::new().builder();
+    assert!(matches!(
+        builder
+            .add_file(
+                "short",
+                FilePayload::new(6, b"short".as_slice()),
+                EntryMetadata::default(),
+            )
+            .await,
+        Err(BuildError::SourceRead { source })
+            if source.kind() == io::ErrorKind::UnexpectedEof
+    ));
+    assert!(matches!(
+        builder
+            .add_file(
+                "other",
+                FilePayload::new(0, b"".as_slice()),
+                EntryMetadata::default(),
+            )
+            .await,
+        Err(BuildError::Poisoned)
+    ));
 }
 
 #[tokio::test]
@@ -221,11 +330,21 @@ async fn name_validation_supports_default_custom_and_disabled_policies() {
 
     for (policy, path, accepted, context) in policies {
         let mut builder = MockFormat::new().builder_with_policy(policy);
-        let result = builder.add_entry(path, b"", EntryMetadata::default()).await;
+        let result = builder
+            .add_file(
+                path,
+                FilePayload::new(0, b"".as_slice()),
+                EntryMetadata::default(),
+            )
+            .await;
         assert_eq!(result.is_ok(), accepted, "{context}: {result:?}");
         if !accepted {
             builder
-                .add_entry("accepted", b"ok", EntryMetadata::default())
+                .add_file(
+                    "accepted",
+                    FilePayload::new(2, b"ok".as_slice()),
+                    EntryMetadata::default(),
+                )
                 .await
                 .expect("name rejection should leave the builder usable");
         }
@@ -262,7 +381,7 @@ async fn recursive_build_sorts_entries_batches_small_files_and_streams_large_fil
     let entries = format.entries();
     let mut builder = format.builder();
     builder
-        .add_directory(&source)
+        .add_directory_all(&source)
         .await
         .expect("directory should be added");
 
@@ -347,7 +466,7 @@ async fn recursive_build_applies_symlink_policy() {
         assert!(matches!(
             MockFormat::new()
                 .builder()
-                .add_directory(rejected_source)
+                .add_directory_all(rejected_source)
                 .await,
             Err(BuildError::Traversal(
                 TraversalError::SymbolicLinkRejected { .. }
@@ -360,7 +479,7 @@ async fn recursive_build_applies_symlink_policy() {
     let entries = format.entries();
     let mut builder = format.builder_with_policy(preserve);
     builder
-        .add_directory(&source)
+        .add_directory_all(&source)
         .await
         .expect("directory should be added");
 
@@ -380,7 +499,7 @@ async fn recursive_build_applies_symlink_policy() {
     assert!(matches!(
         MockFormat::new()
             .builder_with_policy(policy)
-            .add_directory(&source)
+            .add_directory_all(&source)
             .await,
         Err(BuildError::Traversal(TraversalError::NameRejected {
             context: "symbolic-link target",
@@ -392,7 +511,7 @@ async fn recursive_build_applies_symlink_policy() {
     symlink(" leading", source.join("disabled")).expect("disabled-policy link should be created");
     MockFormat::new()
         .builder_with_policy(preserve.name_validator(None))
-        .add_directory(&source)
+        .add_directory_all(&source)
         .await
         .expect("disabled validation should accept the link target");
 }
@@ -409,7 +528,7 @@ async fn recursive_build_reports_non_utf8_and_unsupported_sources() {
     let source = temp.path().join("file");
     std::fs::write(&source, b"contents").expect("source file should be written");
     assert!(matches!(
-        MockFormat::new().builder().add_directory(&source).await,
+        MockFormat::new().builder().add_directory_all(&source).await,
         Err(BuildError::Traversal(
             TraversalError::SourceNotDirectory { .. }
         ))
@@ -418,7 +537,7 @@ async fn recursive_build_reports_non_utf8_and_unsupported_sources() {
     let source = temp.path().join(" rejected");
     std::fs::create_dir(&source).expect("rejected source directory should be created");
     assert!(matches!(
-        MockFormat::new().builder().add_directory(&source).await,
+        MockFormat::new().builder().add_directory_all(&source).await,
         Err(BuildError::Traversal(TraversalError::NameRejected {
             context: "member path",
             ..
@@ -430,7 +549,7 @@ async fn recursive_build_reports_non_utf8_and_unsupported_sources() {
     let invalid_name = OsString::from_vec(vec![0xff]);
     if std::fs::write(source.join(&invalid_name), b"contents").is_ok() {
         assert!(matches!(
-            MockFormat::new().builder().add_directory(&source).await,
+            MockFormat::new().builder().add_directory_all(&source).await,
             Err(BuildError::Traversal(
                 TraversalError::NonUtf8SourcePath { .. }
             ))
@@ -447,7 +566,7 @@ async fn recursive_build_reports_non_utf8_and_unsupported_sources() {
     assert!(matches!(
         MockFormat::new()
             .builder_with_policy(BuilderPolicy::default().symlink_policy(SymlinkPolicy::Preserve),)
-            .add_directory(&source)
+            .add_directory_all(&source)
             .await,
         Err(BuildError::Traversal(
             TraversalError::NonUtf8LinkTarget { .. }
@@ -459,7 +578,7 @@ async fn recursive_build_reports_non_utf8_and_unsupported_sources() {
     let _listener =
         UnixListener::bind(source.join("listener")).expect("Unix-domain socket should be created");
     assert!(matches!(
-        MockFormat::new().builder().add_directory(&source).await,
+        MockFormat::new().builder().add_directory_all(&source).await,
         Err(BuildError::Traversal(
             TraversalError::UnsupportedFilesystemType { .. }
         ))
@@ -485,7 +604,7 @@ async fn late_traversal_failures_poison_after_a_completed_batch() {
     let entries = format.entries();
     let mut builder = format.builder();
     assert!(matches!(
-        builder.add_directory(&source).await,
+        builder.add_directory_all(&source).await,
         Err(BuildError::Traversal(
             TraversalError::UnsupportedFilesystemType { .. }
         ))
@@ -493,7 +612,11 @@ async fn late_traversal_failures_poison_after_a_completed_batch() {
     assert!(!entries.borrow().is_empty());
     assert!(matches!(
         builder
-            .add_entry("other", b"", EntryMetadata::default())
+            .add_file(
+                "other",
+                FilePayload::new(0, b"".as_slice()),
+                EntryMetadata::default(),
+            )
             .await,
         Err(BuildError::Poisoned)
     ));
@@ -511,13 +634,17 @@ async fn source_truncation_poison_after_member_framing() {
     format.truncate_source = Some(file);
     let mut builder = format.builder();
     assert!(matches!(
-        builder.add_directory(&source).await,
+        builder.add_directory_all(&source).await,
         Err(BuildError::Filesystem { source, .. })
             if source.kind() == io::ErrorKind::UnexpectedEof
     ));
     assert!(matches!(
         builder
-            .add_entry("other", b"", EntryMetadata::default())
+            .add_file(
+                "other",
+                FilePayload::new(0, b"".as_slice()),
+                EntryMetadata::default(),
+            )
             .await,
         Err(BuildError::Poisoned)
     ));
@@ -528,11 +655,15 @@ async fn early_failures_leave_builders_usable_but_late_failures_poison_them() {
     let temp = tempdir().expect("temporary directory should be created");
     let mut builder = MockFormat::new().builder();
     assert!(matches!(
-        builder.add_directory(temp.path().join("missing")).await,
+        builder.add_directory_all(temp.path().join("missing")).await,
         Err(BuildError::Traversal(TraversalError::Filesystem { .. }))
     ));
     builder
-        .add_entry("kept", b"ok", EntryMetadata::default())
+        .add_file(
+            "kept",
+            FilePayload::new(2, b"ok".as_slice()),
+            EntryMetadata::default(),
+        )
         .await
         .expect("early traversal failure should leave the builder usable");
 
@@ -541,16 +672,24 @@ async fn early_failures_leave_builders_usable_but_late_failures_poison_them() {
     std::fs::write(source.join("file"), b"new").expect("source file should be written");
     let mut builder = MockFormat::new().builder();
     builder
-        .add_entry("tree/file", b"existing", EntryMetadata::default())
+        .add_file(
+            "tree/file",
+            FilePayload::new(8, b"existing".as_slice()),
+            EntryMetadata::default(),
+        )
         .await
-        .expect("manual entry should be added");
+        .expect("manual file should be added");
     assert!(matches!(
-        builder.add_directory(&source).await,
+        builder.add_directory_all(&source).await,
         Err(BuildError::PathCollision { .. })
     ));
     assert!(matches!(
         builder
-            .add_entry("other", b"", EntryMetadata::default())
+            .add_file(
+                "other",
+                FilePayload::new(0, b"".as_slice()),
+                EntryMetadata::default(),
+            )
             .await,
         Err(BuildError::Poisoned)
     ));
@@ -560,12 +699,20 @@ async fn early_failures_leave_builders_usable_but_late_failures_poison_them() {
     let mut builder = format.builder();
     assert!(matches!(
         builder
-            .add_entry("failed", b"payload", EntryMetadata::default())
+            .add_file(
+                "failed",
+                FilePayload::new(7, b"payload".as_slice()),
+                EntryMetadata::default(),
+            )
             .await,
         Err(BuildError::Encoder(MockError))
     ));
     builder
-        .add_entry("other", b"", EntryMetadata::default())
+        .add_file(
+            "other",
+            FilePayload::new(0, b"".as_slice()),
+            EntryMetadata::default(),
+        )
         .await
         .expect("recoverable format failure should leave the builder usable");
 
@@ -574,13 +721,21 @@ async fn early_failures_leave_builders_usable_but_late_failures_poison_them() {
     let mut builder = format.builder();
     assert!(matches!(
         builder
-            .add_entry("failed", b"payload", EntryMetadata::default())
+            .add_file(
+                "failed",
+                FilePayload::new(7, b"payload".as_slice()),
+                EntryMetadata::default(),
+            )
             .await,
         Err(BuildError::Encoder(MockError))
     ));
     assert!(matches!(
         builder
-            .add_entry("other", b"", EntryMetadata::default())
+            .add_file(
+                "other",
+                FilePayload::new(0, b"".as_slice()),
+                EntryMetadata::default(),
+            )
             .await,
         Err(BuildError::Poisoned)
     ));

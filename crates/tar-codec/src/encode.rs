@@ -9,7 +9,7 @@ use std::io;
 
 use archive_trait::{
     ArchiveBuilder, BuildError, EntryMetadata,
-    builder::{BuildFailure, EntryPayload},
+    builder::{BuildFailure, FilePayload},
 };
 use tar_framing::{
     UstarKind,
@@ -81,7 +81,7 @@ impl<W: AsyncWrite + Unpin> ArchiveBuilder for TarEncoder<W> {
     async fn write_file_member(
         &mut self,
         path: &str,
-        payload: &mut EntryPayload<'_>,
+        payload: &mut FilePayload<'_>,
         metadata: EntryMetadata,
     ) -> Result<(), BuildFailure<Self::Error>> {
         self.write_member(PaxMember {

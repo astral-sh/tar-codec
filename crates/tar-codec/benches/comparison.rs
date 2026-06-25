@@ -16,7 +16,7 @@ use support::{
     runtime, ustar_archive_entries,
 };
 use tar_codec::{
-    Archive as _, ArchiveBuilder as _, EntryMetadata, TarArchive, TarEncoder,
+    Archive as _, ArchiveBuilder as _, EntryMetadata, FilePayload, TarArchive, TarEncoder,
     extract::ExtractPolicy,
 };
 use tempfile::{TempDir, tempdir};
@@ -157,7 +157,15 @@ async fn encode_entries_tar_codec(fixture: &Fixture) -> u64 {
     let mut encoder = TarEncoder::new(&mut sink).builder();
     for entry in &fixture.entries {
         encoder
-            .add_entry(&entry.archive_path, &entry.data, EntryMetadata::default())
+            .add_file(
+                &entry.archive_path,
+                FilePayload::new(
+                    u64::try_from(entry.data.len())
+                        .expect("fixture payload size should be representable"),
+                    entry.data.as_slice(),
+                ),
+                EntryMetadata::default(),
+            )
             .await
             .expect("tar-codec should encode fixture entry");
     }
@@ -204,7 +212,7 @@ async fn encode_directory_tar_codec(fixture: &Fixture) -> u64 {
     let mut sink = FramingSink::default();
     let mut encoder = TarEncoder::new(&mut sink).builder();
     encoder
-        .add_directory(&fixture.source)
+        .add_directory_all(&fixture.source)
         .await
         .expect("tar-codec should encode fixture directory");
     encoder
@@ -255,7 +263,15 @@ async fn pax_archive_entries(entries: &[Entry]) -> Vec<u8> {
     let mut encoder = TarEncoder::new(&mut bytes).builder();
     for entry in entries {
         encoder
-            .add_entry(&entry.archive_path, &entry.data, EntryMetadata::default())
+            .add_file(
+                &entry.archive_path,
+                FilePayload::new(
+                    u64::try_from(entry.data.len())
+                        .expect("fixture payload size should be representable"),
+                    entry.data.as_slice(),
+                ),
+                EntryMetadata::default(),
+            )
             .await
             .expect("tar-codec should encode pax fixture entry");
     }

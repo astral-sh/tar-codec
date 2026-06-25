@@ -229,7 +229,11 @@ impl TraversalProducer {
             };
             let entry = entry.map_err(|error| {
                 let path = error.path().unwrap_or(&self.source).to_path_buf();
-                filesystem_error("traverse source directory", &path, error.into())
+                TraversalError::Filesystem {
+                    operation: "traverse source directory",
+                    path,
+                    source: error.into(),
+                }
             })?;
             entries.push(traversal_entry(
                 &self.source,
@@ -271,8 +275,11 @@ fn traversal_entry(
                 path: path.to_path_buf(),
             });
         }
-        let target = std::fs::read_link(path)
-            .map_err(|error| filesystem_error("read symbolic link", path, error))?;
+        let target = std::fs::read_link(path).map_err(|source| TraversalError::Filesystem {
+            operation: "read symbolic link",
+            path: path.to_path_buf(),
+            source,
+        })?;
         let Some(target) = target.to_str().map(str::to_owned) else {
             return Err(TraversalError::NonUtf8LinkTarget {
                 path: path.to_path_buf(),
@@ -340,14 +347,6 @@ fn validate_name(
             context,
             value: name.to_owned(),
         })
-    }
-}
-
-fn filesystem_error(operation: &'static str, path: &Path, source: io::Error) -> TraversalError {
-    TraversalError::Filesystem {
-        operation,
-        path: path.to_path_buf(),
-        source,
     }
 }
 
