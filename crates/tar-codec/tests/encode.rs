@@ -113,6 +113,25 @@ async fn encoded_paths(bytes: &[u8]) -> Vec<String> {
 }
 
 #[tokio::test]
+async fn finishing_into_inner_returns_a_terminated_owned_archive() {
+    let mut encoder = TarEncoder::new(Vec::new()).builder();
+    encoder
+        .add_file("README", b"hello".as_slice(), EntryMetadata::default())
+        .await
+        .expect("archive entry should be added");
+
+    let bytes = encoder
+        .finish_into_inner()
+        .await
+        .expect("archive should finish")
+        .into_inner();
+
+    assert_eq!(bytes.len() % 512, 0);
+    assert!(bytes.ends_with(&[0; 1024]));
+    assert_eq!(encoded_paths(&bytes).await, ["README"]);
+}
+
+#[tokio::test]
 async fn manual_entries_are_pax_framed_padded_terminated_and_extractable() {
     let mut bytes = Vec::new();
     let mut encoder = TarEncoder::new(&mut bytes).builder();
@@ -264,7 +283,10 @@ async fn output_failures_poison_the_encoder() {
             .await,
         Err(BuildError::Poisoned)
     ));
-    assert!(matches!(encoder.finish().await, Err(BuildError::Poisoned)));
+    assert!(matches!(
+        encoder.finish_into_inner().await,
+        Err(BuildError::Poisoned)
+    ));
 }
 
 #[tokio::test]

@@ -550,13 +550,20 @@ impl<B: ArchiveBuilder> Builder<B> {
     }
 
     /// Finalizes and consumes this archive builder.
+    pub async fn finish(self) -> Result<(), BuildError<B::Error>> {
+        self.finish_into_inner().await?;
+        Ok(())
+    }
+
+    /// Finalizes this archive builder and returns its format writer.
     ///
-    /// Callers that need to retain access to an output sink should lend it to
-    /// the format writer before wrapping it rather than transferring ownership.
-    pub async fn finish(mut self) -> Result<(), BuildError<B::Error>> {
+    /// This allows callers to recover and finalize an owned output sink after
+    /// the archive terminator has been written.
+    pub async fn finish_into_inner(mut self) -> Result<B, BuildError<B::Error>> {
         self.state.ensure_active()?;
         let result = self.backend.finish_archive().await;
-        self.resolve_hook(result)
+        self.resolve_hook(result)?;
+        Ok(self.backend)
     }
 
     fn resolve_hook<T>(
