@@ -36,6 +36,14 @@ impl<W> TarEncoder<W> {
             framing_buffer: Vec::new(),
         }
     }
+
+    /// Returns the underlying writer without finalizing the archive.
+    ///
+    /// Use [`archive_trait::Builder::finish_into_inner`] first to recover the
+    /// writer from a completed archive.
+    pub fn into_inner(self) -> W {
+        self.writer
+    }
 }
 
 impl<W: AsyncWrite + Unpin> TarEncoder<W> {

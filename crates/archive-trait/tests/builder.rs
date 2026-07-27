@@ -54,6 +54,7 @@ struct MockError;
 
 struct MockFormat {
     entries: Rc<RefCell<Vec<RecordedEntry>>>,
+    finished: bool,
     recoverable_failure: Option<String>,
     poisoned_failure: Option<String>,
     truncate_source: Option<PathBuf>,
@@ -83,6 +84,7 @@ impl MockFormat {
     fn new() -> Self {
         Self {
             entries: Rc::new(RefCell::new(Vec::new())),
+            finished: false,
             recoverable_failure: None,
             poisoned_failure: None,
             truncate_source: None,
@@ -110,6 +112,7 @@ impl ArchiveBuilder for MockFormat {
     type Error = MockError;
 
     async fn finish_archive(&mut self) -> Result<(), BuildFailure<Self::Error>> {
+        self.finished = true;
         Ok(())
     }
 
@@ -174,6 +177,26 @@ impl ArchiveBuilder for MockFormat {
         });
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn finishing_into_inner_returns_the_finalized_format_writer() {
+    let mut builder = MockFormat::new().builder();
+    builder
+        .add_file("README", b"hello".as_slice(), EntryMetadata::default())
+        .await
+        .expect("archive entry should be added");
+
+    let format = builder
+        .finish_into_inner()
+        .await
+        .expect("archive should finish");
+
+    assert!(format.finished);
+    assert_eq!(
+        format.entries.borrow().as_slice(),
+        [RecordedEntry::file("README", b"hello", false)]
+    );
 }
 
 #[tokio::test]
