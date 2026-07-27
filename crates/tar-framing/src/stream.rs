@@ -1957,7 +1957,7 @@ mod tests {
     #[test]
     fn rejects_deleted_size_when_member_payload_cannot_be_framed() {
         let records = record("size", "");
-        for typeflag in [b'x', b'g'] {
+        for typeflag in *b"xg" {
             let mut bytes = Vec::new();
             append_pax(&mut bytes, typeflag, &records);
             append_block(&mut bytes, &header(b'0', 0));
@@ -2372,7 +2372,7 @@ mod tests {
             }
         ));
 
-        for typeflag in [b'x', b'g'] {
+        for typeflag in *b"xg" {
             assert!(
                 matches!(
                     last_error_inner(&collect(gnu_header(typeflag, 0).to_vec(), BLOCK_SIZE)),
