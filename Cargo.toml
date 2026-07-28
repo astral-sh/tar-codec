@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/archive-trait",
     "crates/tar-codec",
+    "crates/tar-codec-python",
     "crates/tar-framing",
     "crates/tarpit",
 ]
@@ -29,6 +30,7 @@ criterion = { version = "0.8.2", features = [
     "async_tokio",
 ], default-features = false }
 junction = "2.0.0"
+pyo3 = "0.29.0"
 tar = "0.4.46"
 tempfile = "3"
 thiserror = "2"
@@ -39,3 +41,7 @@ windows-sys = { version = "0.60.2", features = ["Win32_Storage_FileSystem"] }
 [workspace.lints.rust]
 unsafe_code = "warn"
 unreachable_pub = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

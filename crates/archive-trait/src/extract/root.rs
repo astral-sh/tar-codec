@@ -24,7 +24,6 @@ use cap_std::{
     ambient_authority,
     fs::{Dir, Metadata, OpenOptions},
 };
-use tokio::{fs::File, io::AsyncWriteExt};
 #[cfg(windows)]
 use {
     cap_std::fs::MetadataExt as _, std::os::windows::fs::MetadataExt as _,
@@ -34,6 +33,7 @@ use {
 use self::buffered::{BufferedFile, BufferedFileReplacement, write_buffered_files};
 use super::{
     LinkPolicy,
+    filesystem::FilesystemIo,
     path::{ExtractMember, NormalizedPath, resolve_link_target, validate_symlink_target},
 };
 use crate::{
@@ -76,9 +76,8 @@ const BUFFERED_PAYLOAD_MAX_BYTES: usize = 1024 * 1024;
 // Bound read-ahead while amortizing blocking-pool handoffs across small files.
 const BUFFERED_FILE_BATCH_MAX_ENTRIES: usize = 64;
 const BUFFERED_FILE_BATCH_MAX_BYTES: usize = 4 * 1024 * 1024;
-
-// Balance reusable-buffer initialization against blocking write cadence.
-const STREAMING_PAYLOAD_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+// Reuse recently visited parents without exhausting process file descriptors.
+const MAX_CACHED_DIRECTORY_HANDLES: usize = 16;
 
 /// The latest archive-visible state and provenance of an extracted path.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -199,12 +198,11 @@ impl FileOpenMode {
 }
 
 /// Tracks destination capabilities and archive-owned state for one extraction.
-pub(super) struct ExtractionRoot<E> {
+pub(super) struct ExtractionRoot<E, Io: FilesystemIo> {
     /// The capability anchoring all extraction filesystem operations.
     directory: Arc<Dir>,
-    /// The most recently opened directory capability, used to keep nearby leaf
-    /// operations cheap without retaining one descriptor per directory.
-    directory_handle: Option<(EntryId, Arc<Dir>)>,
+    /// Recently opened parent directories.
+    directory_handles: Vec<(EntryId, Arc<Dir>)>,
     /// Whether overwrites are allowed during extraction.
     allow_overwrites: bool,
     /// The latest state recorded for every path encountered by the extraction.
@@ -219,11 +217,11 @@ pub(super) struct ExtractionRoot<E> {
     buffered_file_buffers: Vec<Vec<u8>>,
     /// Signals an in-flight blocking batch when the extraction future is dropped.
     buffered_file_cancellation: Arc<AtomicBool>,
-    /// Associates filesystem failures with the archive error type without owning it.
-    error: PhantomData<fn() -> E>,
+    /// The archive error and filesystem backend types.
+    marker: PhantomData<fn() -> (E, Io)>,
 }
 
-impl<E> Drop for ExtractionRoot<E> {
+impl<E, Io: FilesystemIo> Drop for ExtractionRoot<E, Io> {
     fn drop(&mut self) {
         self.buffered_file_cancellation
             .store(true, Ordering::Release);
@@ -254,33 +252,8 @@ enum ResolvedTarget {
     Unowned(NormalizedPath),
 }
 
-/// Streams a large payload into an already-created file.
-async fn write_payload<P: MemberPayload>(
-    mut payload: P,
-    chunk_buffer: &mut Vec<u8>,
-    path: &NormalizedPath,
-    mut file: File,
-) -> Result<(), ExtractError<P::Error>> {
-    loop {
-        if !payload
-            .next_chunk(chunk_buffer, STREAMING_PAYLOAD_CHUNK_BYTES)
-            .await
-            .map_err(ExtractError::Archive)?
-        {
-            break;
-        }
-        file.write_all(chunk_buffer)
-            .await
-            .map_err(|source| ExtractError::filesystem("write file", path.to_path_buf(), source))?;
-    }
-    file.flush()
-        .await
-        .map_err(|source| ExtractError::filesystem("flush file", path.to_path_buf(), source))?;
-    Ok(())
-}
-
 // Member operations invoked by the extraction loop.
-impl<E> ExtractionRoot<E> {
+impl<E, Io: FilesystemIo> ExtractionRoot<E, Io> {
     /// Opens or creates a real directory and anchors extraction to its capability.
     pub(super) async fn open(
         destination: &Path,
@@ -288,35 +261,35 @@ impl<E> ExtractionRoot<E> {
     ) -> Result<Self, ExtractError<E>> {
         let destination = destination.to_owned();
         let error_path = destination.clone();
-        let directory = tokio::task::spawn_blocking(move || {
-            match std_fs::symlink_metadata(&destination) {
-                Ok(_) => {}
+        let open = move || {
+            let metadata = match std_fs::symlink_metadata(&destination) {
+                Ok(metadata) => metadata,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     std_fs::create_dir_all(&destination)?;
+                    std_fs::symlink_metadata(&destination)?
                 }
                 Err(error) => return Err(error),
-            }
-            let metadata = std_fs::symlink_metadata(&destination)?;
+            };
             if ambient_metadata_is_link(&metadata) || !metadata.is_dir() {
                 return Err(io::Error::other("destination is not a real directory"));
             }
-            let path = std_fs::canonicalize(destination)?;
-            let directory = Dir::open_ambient_dir(path, ambient_authority())?;
+            let directory = Dir::open_ambient_dir(&destination, ambient_authority())?;
             let metadata = directory.dir_metadata()?;
             if metadata_is_link(&metadata) || !metadata.is_dir() {
                 return Err(io::Error::other("destination is not a real directory"));
             }
             Ok(Arc::new(directory))
-        })
-        .await
-        .map_err(ExtractError::<E>::BlockingTask)?
-        .map_err(|source| {
-            ExtractError::<E>::filesystem("open destination directory", error_path, source)
-        })?;
+        };
+        let directory = Io::run(open)
+            .await
+            .map_err(ExtractError::<E>::BlockingTask)?
+            .map_err(|source| {
+                ExtractError::<E>::filesystem("open destination directory", error_path, source)
+            })?;
 
         Ok(Self {
             directory,
-            directory_handle: None,
+            directory_handles: Vec::new(),
             allow_overwrites,
             entries: EntryTree::new(),
             symlinks: Vec::new(),
@@ -324,7 +297,7 @@ impl<E> ExtractionRoot<E> {
             buffered_file_bytes: 0,
             buffered_file_buffers: Vec::new(),
             buffered_file_cancellation: Arc::new(AtomicBool::new(false)),
-            error: PhantomData,
+            marker: PhantomData,
         })
     }
 
@@ -383,7 +356,7 @@ impl<E> ExtractionRoot<E> {
         }
         self.flush_buffered_files().await?;
         let file = self.create_file(path, executable).await?;
-        write_payload(payload, chunk_buffer, path, file).await
+        Io::write_payload(payload, chunk_buffer, path.as_path(), file).await
     }
 
     /// Creates or reuses the real directory at `path`.
@@ -489,7 +462,7 @@ impl<E> ExtractionRoot<E> {
                     FileOpenMode::Truncate,
                 )
                 .await?;
-            write_payload(payload, chunk_buffer, &member.path, file).await
+            Io::write_payload(payload, chunk_buffer, member.path.as_path(), file).await
         }
     }
 
@@ -588,7 +561,7 @@ impl<E> ExtractionRoot<E> {
 }
 
 // Destination state transitions and replacement policy.
-impl<E> ExtractionRoot<E> {
+impl<E, Io: FilesystemIo> ExtractionRoot<E, Io> {
     /// Queues a fully validated payload for ordered creation in a bounded batch.
     async fn queue_buffered_file(
         &mut self,
@@ -599,6 +572,8 @@ impl<E> ExtractionRoot<E> {
         let parent = if let Some(parent) = self.known_parent(path) {
             parent
         } else {
+            // Parent creation must not run ahead of an earlier buffered file:
+            // collisions can alias through filesystem case folding or normalization.
             self.flush_buffered_files().await?;
             self.ensure_parents(path).await?
         };
@@ -623,13 +598,8 @@ impl<E> ExtractionRoot<E> {
         } else {
             BufferedFileReplacement::Allowed
         };
-        if self
-            .directory_handle
-            .as_ref()
-            .is_some_and(|(cached_entry, _)| *cached_entry == entry)
-        {
-            self.directory_handle = None;
-        }
+        self.directory_handles
+            .retain(|(cached_entry, _)| *cached_entry != entry);
         let (directory, relative_path) = self.entry_capability(path, parent);
         self.buffered_file_bytes = self.buffered_file_bytes.saturating_add(contents.len());
         self.buffered_files.push(BufferedFile {
@@ -660,10 +630,9 @@ impl<E> ExtractionRoot<E> {
         self.buffered_file_bytes = 0;
         let files = mem::take(&mut self.buffered_files);
         let cancellation = Arc::clone(&self.buffered_file_cancellation);
-        let result =
-            tokio::task::spawn_blocking(move || write_buffered_files(files, &cancellation))
-                .await
-                .map_err(ExtractError::<E>::BlockingTask)?;
+        let result = Io::run(move || write_buffered_files(files, &cancellation))
+            .await
+            .map_err(ExtractError::<E>::BlockingTask)?;
         for mut buffer in result.buffers {
             buffer.clear();
             self.buffered_file_buffers.push(buffer);
@@ -678,11 +647,21 @@ impl<E> ExtractionRoot<E> {
         self.entries.find_parent_directory(path)
     }
 
+    /// Caches recently used parent directories.
+    fn cache_directory(&mut self, entry: EntryId, directory: Dir) {
+        self.directory_handles
+            .retain(|(cached_entry, _)| *cached_entry != entry);
+        if self.directory_handles.len() == MAX_CACHED_DIRECTORY_HANDLES {
+            self.directory_handles.remove(0);
+        }
+        self.directory_handles.push((entry, Arc::new(directory)));
+    }
+
     async fn create_file(
         &mut self,
         path: &NormalizedPath,
         executable: bool,
-    ) -> Result<File, ExtractError<E>> {
+    ) -> Result<std_fs::File, ExtractError<E>> {
         let parent = self.ensure_parents(path).await?;
         let entry = self.entries.ensure_child(parent, leaf_name(path));
         if matches!(
@@ -761,7 +740,7 @@ impl<E> ExtractionRoot<E> {
         // Missing parents are common, so inspect and replace only after a collision.
         let create_error = match self.try_create_directory(path, parent).await? {
             Ok(directory) => {
-                self.directory_handle = Some((entry, Arc::new(directory)));
+                self.cache_directory(entry, directory);
                 self.entries
                     .set_state(entry, ExtractedEntry::CreatedDirectory);
                 return Ok(());
@@ -778,7 +757,7 @@ impl<E> ExtractionRoot<E> {
                     directory.open_dir(path)
                 })
                 .await?;
-            self.directory_handle = Some((entry, Arc::new(directory)));
+            self.cache_directory(entry, directory);
             self.entries
                 .set_state(entry, ExtractedEntry::AmbientDirectory);
             return Ok(());
@@ -797,7 +776,7 @@ impl<E> ExtractionRoot<E> {
         }
         self.replace_leaf(path, entry, parent).await?;
         let directory = self.create_directory(path, parent).await?;
-        self.directory_handle = Some((entry, Arc::new(directory)));
+        self.cache_directory(entry, directory);
         self.entries
             .set_state(entry, ExtractedEntry::CreatedDirectory);
         Ok(())
@@ -840,7 +819,7 @@ impl<E> ExtractionRoot<E> {
 }
 
 // Symbolic-link graph resolution.
-impl<E> ExtractionRoot<E> {
+impl<E, Io: FilesystemIo> ExtractionRoot<E, Io> {
     fn resolve_terminal(
         &self,
         path: &NormalizedPath,
@@ -932,7 +911,7 @@ impl<E> ExtractionRoot<E> {
 }
 
 // Capability-relative filesystem access.
-impl<E> ExtractionRoot<E> {
+impl<E, Io: FilesystemIo> ExtractionRoot<E, Io> {
     async fn metadata(
         &self,
         path: &NormalizedPath,
@@ -965,13 +944,8 @@ impl<E> ExtractionRoot<E> {
                 });
             }
             // Windows directory handles do not share delete access.
-            if self
-                .directory_handle
-                .as_ref()
-                .is_some_and(|(cached_entry, _)| *cached_entry == entry)
-            {
-                self.directory_handle = None;
-            }
+            self.directory_handles
+                .retain(|(cached_entry, _)| *cached_entry != entry);
             self.with_entry_parent("remove directory", path, parent, |directory, path| {
                 directory.remove_dir(path)
             })
@@ -991,19 +965,14 @@ impl<E> ExtractionRoot<E> {
         path: &NormalizedPath,
         parent: EntryId,
         mode: FileOpenMode,
-    ) -> Result<File, ExtractError<E>> {
-        let file = self
-            .with_entry_parent(operation, path, parent, move |directory, path| {
-                let options = mode.options();
-                directory
-                    .open_with(path, &options)
-                    .map(|file| file.into_std())
-            })
-            .await?;
-        let mut file = File::from_std(file);
-        // Keep each extraction chunk to one Tokio blocking write.
-        file.set_max_buf_size(STREAMING_PAYLOAD_CHUNK_BYTES);
-        Ok(file)
+    ) -> Result<std_fs::File, ExtractError<E>> {
+        self.with_entry_parent(operation, path, parent, move |directory, path| {
+            let options = mode.options();
+            directory
+                .open_with(path, &options)
+                .map(|file| file.into_std())
+        })
+        .await
     }
 
     async fn create_directory(
@@ -1027,7 +996,7 @@ impl<E> ExtractionRoot<E> {
         contents: String,
     ) -> Result<io::Result<()>, ExtractError<E>> {
         let (directory, relative_path) = self.entry_capability(path, parent);
-        run_blocking_io(directory, relative_path, move |directory, path| {
+        self.run_filesystem(directory, relative_path, move |directory, path| {
             create_symlink(directory, &contents, path)
         })
         .await
@@ -1043,7 +1012,7 @@ impl<E> ExtractionRoot<E> {
         parent: EntryId,
     ) -> Result<io::Result<Dir>, ExtractError<E>> {
         let (directory, relative_path) = self.entry_capability(path, parent);
-        run_blocking_io(directory, relative_path, |directory, path| {
+        self.run_filesystem(directory, relative_path, |directory, path| {
             directory.create_dir(path)?;
             directory.open_dir(path)
         })
@@ -1061,14 +1030,9 @@ impl<E> ExtractionRoot<E> {
         T: Send + 'static,
         F: FnOnce(&Dir, &Path) -> io::Result<T> + Send + 'static,
     {
-        run_blocking(
-            Arc::clone(&self.directory),
-            operation,
-            path,
-            path.to_path_buf(),
-            action,
-        )
-        .await
+        self.run_filesystem(Arc::clone(&self.directory), path.to_path_buf(), action)
+            .await?
+            .map_err(|source| ExtractError::filesystem(operation, path.to_path_buf(), source))
     }
 
     /// Runs an operation against the nearest cached parent capability.
@@ -1087,7 +1051,25 @@ impl<E> ExtractionRoot<E> {
         F: FnOnce(&Dir, &Path) -> io::Result<T> + Send + 'static,
     {
         let (directory, relative_path) = self.entry_capability(path, parent);
-        run_blocking(directory, operation, path, relative_path, action).await
+        self.run_filesystem(directory, relative_path, action)
+            .await?
+            .map_err(|source| ExtractError::filesystem(operation, path.to_path_buf(), source))
+    }
+
+    /// Runs a capability-relative filesystem operation.
+    async fn run_filesystem<T, F>(
+        &self,
+        directory: Arc<Dir>,
+        relative_path: PathBuf,
+        action: F,
+    ) -> Result<io::Result<T>, ExtractError<E>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Dir, &Path) -> io::Result<T> + Send + 'static,
+    {
+        Io::run(move || action(&directory, &relative_path))
+            .await
+            .map_err(ExtractError::<E>::BlockingTask)
     }
 
     fn entry_capability(&self, path: &NormalizedPath, parent: EntryId) -> (Arc<Dir>, PathBuf) {
@@ -1095,8 +1077,11 @@ impl<E> ExtractionRoot<E> {
             if parent == ROOT_ENTRY {
                 return (Arc::clone(&self.directory), file_name.into());
             }
-            if let Some((cached_entry, directory)) = &self.directory_handle
-                && *cached_entry == parent
+            if let Some((_, directory)) = self
+                .directory_handles
+                .iter()
+                .rev()
+                .find(|(entry, _)| *entry == parent)
             {
                 return (Arc::clone(directory), file_name.into());
             }
@@ -1160,41 +1145,6 @@ fn remove_file_or_symlink(directory: &Dir, path: &Path, is_link: bool) -> io::Re
             .or_else(|_| directory.remove_dir(path));
     }
     directory.remove_file(path)
-}
-
-/// Runs one capability-relative filesystem operation on Tokio's blocking pool.
-///
-/// `relative_path` is passed to `action`; `error_path` is retained only for
-/// [`ExtractError::Filesystem`] diagnostics.
-async fn run_blocking<E, T, F>(
-    directory: Arc<Dir>,
-    operation: &'static str,
-    error_path: &NormalizedPath,
-    relative_path: PathBuf,
-    action: F,
-) -> Result<T, ExtractError<E>>
-where
-    T: Send + 'static,
-    F: FnOnce(&Dir, &Path) -> io::Result<T> + Send + 'static,
-{
-    run_blocking_io(directory, relative_path, action)
-        .await?
-        .map_err(|source| ExtractError::filesystem(operation, error_path.to_path_buf(), source))
-}
-
-/// Runs one capability-relative filesystem operation without attaching a path to I/O errors.
-async fn run_blocking_io<E, T, F>(
-    directory: Arc<Dir>,
-    relative_path: PathBuf,
-    action: F,
-) -> Result<io::Result<T>, ExtractError<E>>
-where
-    T: Send + 'static,
-    F: FnOnce(&Dir, &Path) -> io::Result<T> + Send + 'static,
-{
-    tokio::task::spawn_blocking(move || action(&directory, &relative_path))
-        .await
-        .map_err(ExtractError::<E>::BlockingTask)
 }
 
 #[cfg(not(windows))]

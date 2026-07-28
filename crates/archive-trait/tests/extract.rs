@@ -6,7 +6,7 @@ use std::{env, os::unix::fs::PermissionsExt as _, process::Command};
 
 use archive_trait::{
     Archive, ExtractError, ExtractPolicyViolation, Member, SpecialKind,
-    extract::{ExtractPolicy, LinkPolicy, SymlinkPolicy},
+    extract::{ExtractPolicy, LinkPolicy, SymlinkPolicy, extract_blocking},
 };
 use cap_std::{ambient_authority, fs::Dir};
 use support::{TestArchive, TestEntry, TestError, TestPayload, entry};
@@ -57,53 +57,75 @@ async fn extracts_common_members_and_streams_payload_sizes() {
     const SMALL_BYTES: usize = 128 * 1024 + 7;
     const BUFFERED_BOUNDARY_BYTES: usize = 1024 * 1024;
     const LARGE_BYTES: usize = 1024 * 1024 + 7;
+    const STREAMING_BOUNDARY_BYTES: usize = 4 * 1024 * 1024;
+    const MULTI_CHUNK_BYTES: usize = STREAMING_BOUNDARY_BYTES + 7;
 
     let small = patterned_payload(SMALL_BYTES);
     let buffered_boundary = patterned_payload(BUFFERED_BOUNDARY_BYTES);
     let large = patterned_payload(LARGE_BYTES);
-    let archive = TestArchive::new([
-        entry::directory("bin"),
-        entry::executable("bin/tool", b"run"),
-        entry::file("same", b"old"),
-        entry::file("same", b"new"),
-        entry::file("empty", b""),
-        entry::file("unicodé/文件", b"utf8"),
-        entry::file("small", small.clone()),
-        entry::file("buffered-boundary", buffered_boundary.clone()),
-        entry::file("large", large.clone()),
-    ]);
+    let streaming_boundary = patterned_payload(STREAMING_BOUNDARY_BYTES);
+    let multi_chunk = patterned_payload(MULTI_CHUNK_BYTES);
     let temp = tempdir().expect("temporary directory should be created");
-    let destination = temp.path().join("out");
 
-    archive
-        .extract_in(&destination, ExtractPolicy::default())
-        .await
-        .expect("archive should extract");
+    for (name, blocking_thread) in [("blocking-pool", false), ("blocking-thread", true)] {
+        let archive = TestArchive::new([
+            entry::directory("bin"),
+            entry::executable("bin/tool", b"run"),
+            entry::file("same", b"old"),
+            entry::file("same", b"new"),
+            entry::file("empty", b""),
+            entry::file("unicodé/文件", b"utf8"),
+            entry::file("first-parent/first", b"first"),
+            entry::file("second-parent/second", b"second"),
+            entry::file("small", small.clone()),
+            entry::direct_file("direct-small", small.clone()),
+            entry::file("buffered-boundary", buffered_boundary.clone()),
+            entry::file("large", large.clone()),
+            entry::direct_file("direct-large", large.clone()),
+            entry::file("streaming-boundary", streaming_boundary.clone()),
+            entry::file("multi-chunk", multi_chunk.clone()),
+        ]);
+        let destination = temp.path().join(name);
+        let result = if blocking_thread {
+            extract_blocking(archive, &destination, ExtractPolicy::default()).await
+        } else {
+            archive
+                .extract_in(&destination, ExtractPolicy::default())
+                .await
+        };
+        result.expect("archive should extract");
 
-    for (path, expected) in [
-        ("bin/tool", &b"run"[..]),
-        ("same", &b"new"[..]),
-        ("empty", &b""[..]),
-        ("unicodé/文件", &b"utf8"[..]),
-        ("small", small.as_slice()),
-        ("buffered-boundary", buffered_boundary.as_slice()),
-        ("large", large.as_slice()),
-    ] {
-        assert_eq!(
-            std::fs::read(destination.join(path)).expect("file should be readable"),
-            expected
-        );
-    }
-    #[cfg(unix)]
-    {
-        assert_ne!(
-            std::fs::metadata(destination.join("bin/tool"))
-                .expect("tool metadata should be readable")
-                .permissions()
-                .mode()
-                & 0o111,
-            0
-        );
+        for (path, expected) in [
+            ("bin/tool", &b"run"[..]),
+            ("same", &b"new"[..]),
+            ("empty", &b""[..]),
+            ("unicodé/文件", &b"utf8"[..]),
+            ("first-parent/first", &b"first"[..]),
+            ("second-parent/second", &b"second"[..]),
+            ("small", small.as_slice()),
+            ("direct-small", small.as_slice()),
+            ("buffered-boundary", buffered_boundary.as_slice()),
+            ("large", large.as_slice()),
+            ("direct-large", large.as_slice()),
+            ("streaming-boundary", streaming_boundary.as_slice()),
+            ("multi-chunk", multi_chunk.as_slice()),
+        ] {
+            assert_eq!(
+                std::fs::read(destination.join(path)).expect("file should be readable"),
+                expected
+            );
+        }
+        #[cfg(unix)]
+        {
+            assert_ne!(
+                std::fs::metadata(destination.join("bin/tool"))
+                    .expect("tool metadata should be readable")
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0
+            );
+        }
     }
 }
 
@@ -112,18 +134,24 @@ async fn streaming_payload_reuses_initialized_chunk_buffer() {
     const PAYLOAD_BYTES: usize = 1024 * 1024 + 7;
 
     let expected = patterned_payload(PAYLOAD_BYTES);
-    let archive = TestArchive::new([entry::reuse_checked_file("file", expected.clone())]);
     let temp = tempdir().expect("temporary directory should be created");
-    let destination = temp.path().join("out");
 
-    archive
-        .extract_in(&destination, ExtractPolicy::default())
-        .await
-        .expect("streaming extraction should reuse its chunk buffer");
-    assert_eq!(
-        std::fs::read(destination.join("file")).expect("file should be readable"),
-        expected
-    );
+    for (name, blocking_thread) in [("blocking-pool", false), ("blocking-thread", true)] {
+        let archive = TestArchive::new([entry::reuse_checked_file("file", expected.clone())]);
+        let destination = temp.path().join(name);
+        let result = if blocking_thread {
+            extract_blocking(archive, &destination, ExtractPolicy::default()).await
+        } else {
+            archive
+                .extract_in(&destination, ExtractPolicy::default())
+                .await
+        };
+        result.expect("streaming extraction should reuse its chunk buffer");
+        assert_eq!(
+            std::fs::read(destination.join("file")).expect("file should be readable"),
+            expected
+        );
+    }
 }
 
 #[tokio::test]
@@ -289,21 +317,30 @@ async fn name_validation_covers_member_and_link_values() {
 #[tokio::test]
 async fn payload_errors_flush_prior_files_before_returning() {
     let temp = tempdir().expect("temporary directory should be created");
-    let destination = temp.path().join("out");
 
-    let result = TestArchive::new([
-        entry::file("created", b"kept"),
-        entry::invalid_file("invalid", b""),
-    ])
-    .extract_in(&destination, ExtractPolicy::default())
-    .await;
+    for (name, blocking_thread) in [("blocking-pool", false), ("blocking-thread", true)] {
+        let destination = temp.path().join(name);
+        let invalid = if blocking_thread {
+            entry::invalid_direct_file("invalid", b"invalid")
+        } else {
+            entry::invalid_file("invalid", b"")
+        };
+        let archive = TestArchive::new([entry::file("created", b"kept"), invalid]);
+        let result = if blocking_thread {
+            extract_blocking(archive, &destination, ExtractPolicy::default()).await
+        } else {
+            archive
+                .extract_in(&destination, ExtractPolicy::default())
+                .await
+        };
 
-    assert!(matches!(result, Err(ExtractError::Archive(_))));
-    assert_eq!(
-        std::fs::read(destination.join("created")).expect("prior file should remain"),
-        b"kept"
-    );
-    assert!(!destination.join("invalid").exists());
+        assert!(matches!(result, Err(ExtractError::Archive(_))));
+        assert_eq!(
+            std::fs::read(destination.join("created")).expect("prior file should remain"),
+            b"kept"
+        );
+        assert!(!destination.join("invalid").exists());
+    }
 }
 
 #[tokio::test]
@@ -361,6 +398,63 @@ async fn rejects_invalid_destinations_unsafe_special_and_colliding_members() {
             .await,
         Err(ExtractError::PathCollision { path }) if path == Path::new("file")
     ));
+
+    let destination = temp.path().join("buffered-parent-collision");
+    assert!(matches!(
+        TestArchive::new([
+            entry::file("parent", b"keep"),
+            entry::file("parent/child", b"reject"),
+        ])
+        .extract_in(&destination, ExtractPolicy::default())
+        .await,
+        Err(ExtractError::PathCollision { path }) if path == Path::new("parent")
+    ));
+    assert_eq!(
+        std::fs::read(destination.join("parent")).expect("prior file should remain"),
+        b"keep"
+    );
+
+    let destination = temp.path().join("ordered-collision");
+    std::fs::create_dir(&destination).expect("destination should be created");
+    std::fs::write(destination.join("occupied"), b"ambient")
+        .expect("ambient file should be written");
+    assert!(matches!(
+        TestArchive::new([
+            entry::file("occupied", b"replacement"),
+            entry::file("later/child", b"later"),
+        ])
+        .extract_in(&destination, ExtractPolicy::default().allow_overwrites(false))
+        .await,
+        Err(ExtractError::PathCollision { path }) if path == Path::new("occupied")
+    ));
+    assert_eq!(
+        std::fs::read(destination.join("occupied")).expect("ambient file should remain"),
+        b"ambient"
+    );
+    assert!(!destination.join("later").exists());
+
+    let destination = temp.path().join("case-folded-parent-collision");
+    std::fs::create_dir(&destination).expect("destination should be created");
+    let probe = destination.join("CaseProbe");
+    std::fs::write(&probe, b"probe").expect("case-folding probe should be written");
+    let case_folding = destination.join("caseprobe").exists();
+    std::fs::remove_file(probe).expect("case-folding probe should be removed");
+    if case_folding {
+        assert!(matches!(
+            TestArchive::new([
+                entry::file("file", b"first"),
+                entry::file("file", b"latest"),
+                entry::file("FILE/child/grandchild", b"reject"),
+            ])
+            .extract_in(&destination, ExtractPolicy::default())
+            .await,
+            Err(ExtractError::PathCollision { path }) if path == Path::new("FILE")
+        ));
+        assert_eq!(
+            std::fs::read(destination.join("file")).expect("latest prior file should remain"),
+            b"latest"
+        );
+    }
 }
 
 #[tokio::test]

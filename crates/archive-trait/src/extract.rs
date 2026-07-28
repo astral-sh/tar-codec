@@ -3,12 +3,17 @@
 //! [`ExtractPolicy`] configures common path, overwrite, and link behavior.
 //! Filesystem mutation is capability-relative and confined to the destination.
 
+mod filesystem;
 mod path;
 mod root;
 
 use std::path::Path;
 
-use self::{path::decode_member, root::ExtractionRoot};
+use self::{
+    filesystem::{BlockingPool, FilesystemIo, Inline},
+    path::decode_member,
+    root::ExtractionRoot,
+};
 use super::*;
 
 /// Controls behavior shared by [`Archive::extract_in`] implementations.
@@ -153,13 +158,35 @@ impl LinkPolicy {
     }
 }
 
+/// Extracts an archive on the calling thread.
+///
+/// Use only from a dedicated blocking thread. Asynchronous callers should use
+/// [`Archive::extract_in`].
+pub async fn extract_blocking<A: Archive, P: AsRef<Path>>(
+    archive: A,
+    destination: P,
+    policy: ExtractPolicy,
+) -> Result<(), ExtractError<A::Error>> {
+    extract_with_filesystem::<A, Inline>(archive.members(), destination.as_ref(), policy).await
+}
+
 /// Extracts a member stream into `destination` under the shared extraction policy.
 pub(crate) async fn extract<A: Archive>(
+    members: Members<A>,
+    destination: &Path,
+    policy: ExtractPolicy,
+) -> Result<(), ExtractError<A::Error>> {
+    extract_with_filesystem::<A, BlockingPool>(members, destination, policy).await
+}
+
+/// Extracts members through the selected filesystem backend.
+async fn extract_with_filesystem<A: Archive, Io: FilesystemIo>(
     mut members: Members<A>,
     destination: &Path,
     policy: ExtractPolicy,
 ) -> Result<(), ExtractError<A::Error>> {
-    let mut root = ExtractionRoot::<A::Error>::open(destination, policy.allow_overwrites).await?;
+    let mut root =
+        ExtractionRoot::<A::Error, Io>::open(destination, policy.allow_overwrites).await?;
     // Scratch space reused for each payload read and streamed directly for large files.
     let mut chunk_buffer = Vec::new();
     // Complete small-file contents, buffered so payload validation precedes file creation.
