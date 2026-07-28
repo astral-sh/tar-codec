@@ -298,6 +298,15 @@ impl<R> TarReader<R> {
         }
     }
 
+    /// Returns the current member's payload, even after its frame is dropped.
+    ///
+    /// Returns an exhausted cursor when no payload is active.
+    pub fn payload(&mut self) -> MemberPayload<'_, R> {
+        MemberPayload {
+            reader: &mut self.payload,
+        }
+    }
+
     /// Configures the framing policy used by this reader.
     ///
     /// Call before reading any members.
@@ -476,6 +485,21 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
 }
 
 impl<R: AsyncRead + Unpin> PayloadReader<R> {
+    async fn read_aligned(&mut self, output: &mut [u8]) -> Result<usize, FrameError> {
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let len = self.stream.read_member_aligned(output).await?;
+        self.remaining = self.remaining.checked_sub(len as u64).ok_or_else(|| {
+            FrameError::unexpected_order(
+                self.stream.position,
+                "bounded member payload",
+                "oversized member payload output",
+            )
+        })?;
+        Ok(len)
+    }
+
     async fn next_payload_block(&mut self) -> Result<Option<PayloadBlock>, FrameError> {
         if self.remaining == 0 {
             return Ok(None);
@@ -538,8 +562,18 @@ impl<R: AsyncRead + Unpin> PayloadReader<R> {
 
 impl<R: AsyncRead + Unpin> MemberPayload<'_, R> {
     /// Returns the next meaningful payload block, excluding final padding in `len`.
+    /// This operation is cancellation-safe.
     pub async fn next_block(&mut self) -> Result<Option<PayloadBlock>, FrameError> {
         self.reader.next_payload_block().await
+    }
+
+    /// Reads complete tar blocks directly into `output`.
+    ///
+    /// Returns zero when a complete block cannot be read directly; use
+    /// [`Self::next_chunk`] for remaining bytes. Cancellation may discard bytes
+    /// written to `output`.
+    pub async fn read_aligned(&mut self, output: &mut [u8]) -> Result<usize, FrameError> {
+        self.reader.read_aligned(output).await
     }
 
     /// Reads validated payload bytes into a reusable chunk buffer.
@@ -553,6 +587,8 @@ impl<R: AsyncRead + Unpin> MemberPayload<'_, R> {
     /// returns. This preserves [`Self::next_block`] as the lossless interface
     /// while allowing higher-level consumers to amortize per-block bookkeeping
     /// and copies.
+    ///
+    /// This operation is cancellation-safe.
     pub async fn next_chunk(
         &mut self,
         buffer: &mut Vec<u8>,

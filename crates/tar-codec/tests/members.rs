@@ -205,6 +205,31 @@ async fn advancing_drains_payload_and_applies_tar_policy() -> TestResult {
     };
     assert_eq!(read_payload(payload).await?, b"next");
 
+    let mut archive = TarArchive::new(bytes.as_slice());
+    let mut output = [0; 512];
+    assert_eq!(archive.payload().read_aligned(&mut output).await?, 0);
+    assert!(matches!(
+        archive.next_member().await?,
+        Some(Member::File { metadata, .. }) if metadata.path == "first"
+    ));
+    assert_eq!(
+        archive.payload().read_aligned(&mut output).await?,
+        output.len()
+    );
+    assert_eq!(output, [b'a'; 512]);
+    let mut chunk = Vec::new();
+    assert!(archive.payload().next_chunk(&mut chunk, 512).await?);
+    assert_eq!(chunk, vec![b'a'; 512]);
+    archive.payload().skip().await?;
+    assert!(matches!(
+        archive.next_member().await?,
+        Some(Member::File { metadata, .. }) if metadata.path == "second"
+    ));
+    assert_eq!(archive.payload().read_aligned(&mut output).await?, 0);
+    assert!(archive.payload().next_chunk(&mut chunk, 32).await?);
+    assert_eq!(chunk, b"next");
+    assert!(!archive.payload().next_chunk(&mut chunk, 32).await?);
+
     let mut archive = ArchiveBuilder::new();
     archive.ustar("truncated", b'0', &[b'x'; 1024], "", 0o644);
     let mut bytes = archive.finish();
@@ -285,7 +310,7 @@ async fn payload_errors_fuse_member_iteration() -> TestResult {
         Skip,
     }
 
-    let bytes = header(ArchiveFormat::Pax, "truncated", b'0', 5, "", 0o644);
+    let bytes = header(ArchiveFormat::Pax, "truncated", b'0', 512, "", 0o644);
 
     for operation in [Operation::Read, Operation::Skip] {
         let mut members = TarArchive::new(bytes.as_slice()).members();
@@ -311,7 +336,48 @@ async fn payload_errors_fuse_member_iteration() -> TestResult {
                 "{operation:?}, iteration {attempt}"
             );
         }
+
+        let mut archive = TarArchive::new(bytes.as_slice());
+        assert!(matches!(
+            archive.next_member().await?,
+            Some(Member::File { .. })
+        ));
+
+        let result = match operation {
+            Operation::Read => {
+                let mut chunk = Vec::new();
+                archive
+                    .payload()
+                    .next_chunk(&mut chunk, 1)
+                    .await
+                    .map(|_| ())
+            }
+            Operation::Skip => archive.payload().skip().await,
+        };
+        assert!(
+            matches!(result, Err(DecodeError::Framing(_))),
+            "direct {operation:?}"
+        );
+
+        for attempt in 1..=2 {
+            assert!(
+                matches!(archive.next_member().await, Ok(None)),
+                "direct {operation:?}, iteration {attempt}"
+            );
+        }
     }
+
+    let mut archive = TarArchive::new(bytes.as_slice());
+    assert!(matches!(
+        archive.next_member().await?,
+        Some(Member::File { .. })
+    ));
+    let mut output = [0; 512];
+    assert!(matches!(
+        archive.payload().read_aligned(&mut output).await,
+        Err(DecodeError::Framing(_))
+    ));
+    assert!(archive.next_member().await?.is_none());
 
     Ok(())
 }

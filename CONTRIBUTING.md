@@ -34,19 +34,33 @@ headers, extensions, data, etc.) should occur in the physical layer, while a
 change to source traversal, path containment, or filesystem behavior belongs in
 `archive-trait`.
 
+## Python development
+
+Use `uv` for package management and `maturin` to build the Python bindings.
+
 ## Formatting and linting
 
 Linting and formatting:
 
 ```shell
+# Rust
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
+
+# Python
+uv run --dev ruff check
+uv run --dev ruff format --check
+uv run --dev ty check
 ```
 
 Run tests:
 
 ```shell
+# Rust tests
 cargo test
+
+# Python tests
+uv run python -m unittest discover crates/tar-codec-python/tests
 ```
 
 In general, integration tests are preferred over unit tests. Unit tests
@@ -70,3 +84,19 @@ cargo bench -p tar-codec --bench extraction_filesystem
 ```
 
 Run both targets when refreshing the benchmark snapshot in [BENCHMARKS](./BENCHMARKS.md)
+
+Compare the Python bindings against the standard library's `tarfile` with:
+
+```shell
+uv run --python 3.14.6 --frozen \
+  crates/tar-codec-python/benches/comparison.py
+```
+
+Run the Python benchmarks on Linux with
+[`Dockerfile.benchmark`](./Dockerfile.benchmark):
+
+```shell
+docker build -f Dockerfile.benchmark -t tar-codec-benchmark .
+docker run --rm tar-codec-benchmark \
+  uv run --locked crates/tar-codec-python/benches/comparison.py
+```
