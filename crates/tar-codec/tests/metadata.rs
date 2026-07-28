@@ -276,9 +276,10 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
 
 #[tokio::test]
 async fn vendor_pax_allowlist_requires_exact_keywords_in_both_scopes() {
+    let keyword = ["Acme", "attribute"].join(".");
     let decode_policy = DecodePolicy::default().pax_policy(
         PaxDecodePolicy::default()
-            .vendor_extension_policy(PaxVendorExtensionPolicy::ignore(["Acme.attribute"])),
+            .vendor_extension_policy(PaxVendorExtensionPolicy::ignore([keyword])),
     );
 
     for (scope, vendor, name, allowed) in [

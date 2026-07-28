@@ -22,6 +22,11 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - run: uv run --dev ruff check
+      - run: uv run --dev ruff format --check
+      - run: uv run --dev ty check
 
   test:
     name: Test (${{ matrix.os }})
@@ -40,4 +45,9 @@ jobs:
           persist-credentials: false
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo test --workspace
-
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - name: Build the Python wheel and source distribution
+        run: uv build
+      - name: Test the Python project
+        run: uv run --locked python -m unittest discover crates/tar-codec-python/tests

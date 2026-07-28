@@ -1,0 +1,44 @@
+[build-system]
+requires = ["maturin>=1.10.0,<2"]
+build-backend = "maturin"
+
+[project]
+name = "tar-codec"
+description = "Streaming, strict tar archive encoding, decoding, and extraction"
+readme = "crates/tar-codec-python/README.md"
+requires-python = ">=3.10"
+license = "MIT OR Apache-2.0"
+dynamic = ["version"]
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Rust",
+]
+
+[project.urls]
+Homepage = "https://github.com/astral-sh/tar-codec"
+Repository = "https://github.com/astral-sh/tar-codec"
+
+[dependency-groups]
+dev = ["maturin>=1.10.0,<2", "ruff>=0.15.22", "ty>=0.0.61"]
+
+[tool.uv]
+exclude-newer = "P7D"
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
+    { file = "crates/*/Cargo.toml" },
+    { file = "crates/*/src/**/*.rs" },
+]
+
+[tool.maturin]
+bindings = "pyo3"
+editable-profile = "release"
+manifest-path = "crates/tar-codec-python/Cargo.toml"
+module-name = "tar_codec._tar_codec"
+python-source = "crates/tar-codec-python/python"
+
+[tool.ty.environment]
+extra-paths = ["crates/tar-codec-python/python"]

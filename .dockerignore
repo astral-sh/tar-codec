@@ -1,0 +1,10 @@
+.git
+.ruff_cache
+.venv
+dist
+target
+**/.venv
+**/__pycache__
+**/*.py[cod]
+**/_tar_codec.*.pyd
+**/_tar_codec.*.so

@@ -15,15 +15,23 @@ pub mod entry {
     use super::*;
 
     pub fn file(path: &str, data: impl Into<Vec<u8>>) -> TestEntry {
-        file_with_options(path, data, false, false)
+        file_with_options(path, data, false, false, false)
     }
 
     pub fn invalid_file(path: &str, data: impl Into<Vec<u8>>) -> TestEntry {
-        file_with_options(path, data, false, true)
+        file_with_options(path, data, false, true, false)
+    }
+
+    pub fn direct_file(path: &str, data: impl Into<Vec<u8>>) -> TestEntry {
+        file_with_options(path, data, false, false, true)
+    }
+
+    pub fn invalid_direct_file(path: &str, data: impl Into<Vec<u8>>) -> TestEntry {
+        file_with_options(path, data, false, true, true)
     }
 
     pub fn executable(path: &str, data: impl Into<Vec<u8>>) -> TestEntry {
-        file_with_options(path, data, true, false)
+        file_with_options(path, data, true, false, false)
     }
 
     pub fn reuse_checked_file(path: &str, data: impl Into<Vec<u8>>) -> TestEntry {
@@ -41,13 +49,15 @@ pub mod entry {
         data: impl Into<Vec<u8>>,
         executable: bool,
         fail_at_end: bool,
+        expose_remaining_bytes: bool,
     ) -> TestEntry {
         let data = data.into();
         Ok(Member::File {
             metadata: metadata(path),
             size: data.len() as u64,
             executable,
-            payload: TestPayload::new(data, fail_at_end),
+            payload: TestPayload::new(data, fail_at_end)
+                .expose_remaining_bytes(expose_remaining_bytes),
         })
     }
 
@@ -110,6 +120,7 @@ pub struct TestPayload {
     offset: usize,
     fail_at_end: bool,
     require_buffer_reuse: bool,
+    expose_remaining_bytes: bool,
 }
 
 impl TestPayload {
@@ -119,7 +130,13 @@ impl TestPayload {
             offset: 0,
             fail_at_end,
             require_buffer_reuse: false,
+            expose_remaining_bytes: false,
         }
+    }
+
+    fn expose_remaining_bytes(mut self, expose: bool) -> Self {
+        self.expose_remaining_bytes = expose;
+        self
     }
 
     fn require_buffer_reuse(mut self) -> Self {
@@ -130,6 +147,11 @@ impl TestPayload {
 
 impl MemberPayload for TestPayload {
     type Error = TestError;
+
+    fn remaining_bytes(&self) -> Option<&[u8]> {
+        self.expose_remaining_bytes
+            .then_some(&self.data[self.offset..])
+    }
 
     async fn next_chunk(
         &mut self,

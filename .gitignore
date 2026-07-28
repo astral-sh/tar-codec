@@ -1,3 +1,10 @@
+/dist
 /target
+/.venv
+
+__pycache__/
+*.py[cod]
+/crates/tar-codec-python/python/tar_codec/_tar_codec.*.so
+/crates/tar-codec-python/python/tar_codec/_tar_codec.*.pyd
 
 /reproducers

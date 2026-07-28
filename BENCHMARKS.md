@@ -30,3 +30,27 @@ faster and values above 1.00x are slower.
 | ustar large | 1.00x | 1.89x | 3.73x |
 | pax many-small | 1.00x | 1.55x | 4.25x |
 | ustar many-small | 1.00x | 1.53x | 4.42x |
+
+## Python bindings
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) to run the Python benchmarks.
+
+Values are `tarfile` time divided by `tar-codec` time; above 1.00x means `tar-codec` is faster.
+
+| Workload | Operation | macOS |
+| --- | --- | ---: |
+| large: 1 x 16 MiB | encode | 4.96x |
+| large: 1 x 16 MiB | decode | 32.83x |
+| large: 1 x 16 MiB | decode-bytesio | 28.51x |
+| large: 1 x 16 MiB | decode-stream | 2.73x |
+| large: 1 x 16 MiB | extract | 1.38x |
+| many-small: 1,024 x 1 KiB | encode | 20.27x |
+| many-small: 1,024 x 1 KiB | decode | 17.32x |
+| many-small: 1,024 x 1 KiB | decode-bytesio | 14.27x |
+| many-small: 1,024 x 1 KiB | decode-stream | 14.18x |
+| many-small: 1,024 x 1 KiB | extract | 1.79x |
+| mixed: 7 x 1 KiB–4 MiB | encode | 1.50x |
+| mixed: 7 x 1 KiB–4 MiB | decode | 5.53x |
+| mixed: 7 x 1 KiB–4 MiB | decode-bytesio | 5.17x |
+| mixed: 7 x 1 KiB–4 MiB | decode-stream | 2.33x |
+| mixed: 7 x 1 KiB–4 MiB | extract | 1.64x |

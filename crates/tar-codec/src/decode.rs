@@ -1,6 +1,6 @@
 //! Member-oriented decoding of pax or GNU tar streams.
 
-use std::collections::HashSet;
+use std::{borrow::Cow, collections::HashSet};
 
 use archive_trait::{
     Archive as ArchiveTrait, Member, MemberMetadata, MemberPayload as MemberPayloadTrait,
@@ -51,6 +51,15 @@ impl<R> TarArchive<R> {
         self.policy = policy;
         self
     }
+
+    /// Returns the current member's payload, even after the member is dropped.
+    ///
+    /// Returns an exhausted cursor when no payload is active.
+    pub fn payload(&mut self) -> TarMemberPayload<'_, R> {
+        TarMemberPayload {
+            payload: self.reader.payload(),
+        }
+    }
 }
 
 /// Controls tar compatibility and the feature subset member decoding may accept.
@@ -98,9 +107,12 @@ impl PaxVendorExtensionPolicy {
     /// Ignores vendor records whose complete keywords appear in `keywords`.
     ///
     /// Keywords include the vendor namespace, such as `Acme.attribute`.
-    pub fn ignore(keywords: impl IntoIterator<Item = &'static str>) -> Self {
+    pub fn ignore<S>(keywords: impl IntoIterator<Item = S>) -> Self
+    where
+        S: Into<Cow<'static, str>>,
+    {
         Self::Ignore(PaxVendorExtensionAllowlist {
-            keywords: keywords.into_iter().collect(),
+            keywords: keywords.into_iter().map(Into::into).collect(),
         })
     }
 }
@@ -110,7 +122,7 @@ impl PaxVendorExtensionPolicy {
 /// Construct an allowlist with [`PaxVendorExtensionPolicy::ignore`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaxVendorExtensionAllowlist {
-    keywords: HashSet<&'static str>,
+    keywords: HashSet<Cow<'static, str>>,
 }
 
 impl Default for PaxDecodePolicy {
@@ -407,10 +419,15 @@ impl PaxDecodePolicy {
         }
 
         if !self.allow_duplicate_pax_records {
-            let mut keywords = HashSet::new();
-            for record in records {
+            let mut keywords = (records.len() > 8).then(|| HashSet::with_capacity(records.len()));
+            for (index, record) in records.iter().enumerate() {
                 let keyword = record.keyword();
-                if !keywords.insert(keyword.clone()) {
+                if match &mut keywords {
+                    Some(keywords) => !keywords.insert(keyword.clone()),
+                    None => records[..index]
+                        .iter()
+                        .any(|previous| previous.keyword() == keyword),
+                } {
                     return Err(DecodeError::policy_violation(
                         position,
                         DecodePolicyViolation::DuplicatePaxRecord {
@@ -500,6 +517,17 @@ impl DecodeError {
 /// A tar member payload adapted to [`MemberPayloadTrait`].
 pub struct TarMemberPayload<'a, R> {
     payload: FramingMemberPayload<'a, R>,
+}
+
+impl<R: AsyncRead + Unpin> TarMemberPayload<'_, R> {
+    /// Reads complete tar blocks directly into `output`.
+    ///
+    /// Returns zero when a complete block cannot be read directly; use
+    /// [`MemberPayloadTrait::next_chunk`] for remaining bytes. Cancellation may
+    /// discard bytes already written to `output`.
+    pub async fn read_aligned(&mut self, output: &mut [u8]) -> Result<usize, DecodeError> {
+        self.payload.read_aligned(output).await.map_err(Into::into)
+    }
 }
 
 impl<R: AsyncRead + Unpin> MemberPayloadTrait for TarMemberPayload<'_, R> {
