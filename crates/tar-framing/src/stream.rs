@@ -516,13 +516,19 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
     /// this reader, so every subsequent call also returns [`None`]. Cancelling
     /// this operation retains any partial block for the next call.
     pub async fn next_frame(&mut self) -> Result<Option<Frame>, FrameError> {
-        poll_fn(|context| self.poll_next_frame(context)).await
+        let result = poll_fn(|context| self.poll_next_frame(context)).await;
+        self.fail_on_error(result)
     }
 
     /// Reads one ordinary-member payload block without constructing a [`Frame`].
     ///
     /// Returns the block's position, lossless bytes, and meaningful length.
     pub(crate) async fn read_member_block(&mut self) -> Result<(u64, Block, usize), FrameError> {
+        let result = self.read_member_block_inner().await;
+        self.fail_on_error(result)
+    }
+
+    async fn read_member_block_inner(&mut self) -> Result<(u64, Block, usize), FrameError> {
         if self.member_chunk.state.is_some() {
             self.complete_member_chunk().await?;
             return self.take_member_block_from_chunk();
@@ -530,7 +536,6 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         let remaining = match &self.state {
             State::ReadingMember { remaining } => *remaining,
             _ => {
-                self.state = State::Failed;
                 return Err(FrameError::unexpected_order(
                     self.position,
                     "ordinary member payload",
@@ -540,15 +545,8 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         };
         let (position, block) = match poll_fn(|context| self.poll_read_block(context)).await {
             Ok(Some(block)) => block,
-            Ok(None) => {
-                let error = self.handle_eof();
-                self.state = State::Failed;
-                return Err(error);
-            }
-            Err(error) => {
-                self.state = State::Failed;
-                return Err(error);
-            }
+            Ok(None) => return Err(self.handle_eof()),
+            Err(error) => return Err(error),
         };
         let meaningful_len = remaining.min(BLOCK_SIZE as u64) as usize;
         self.state = member_payload_state(remaining - meaningful_len as u64);
@@ -560,6 +558,15 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
     /// This internal path preserves exact physical-block completion checks
     /// while avoiding lossless [`Frame`] construction for chunk consumers.
     pub(crate) async fn read_member_chunk(
+        &mut self,
+        buffer: &mut Vec<u8>,
+        target_len: usize,
+    ) -> Result<usize, FrameError> {
+        let result = self.read_member_chunk_inner(buffer, target_len).await;
+        self.fail_on_error(result)
+    }
+
+    async fn read_member_chunk_inner(
         &mut self,
         buffer: &mut Vec<u8>,
         target_len: usize,
@@ -579,6 +586,13 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         self.take_member_chunk(buffer)
     }
 
+    fn fail_on_error<T>(&mut self, result: Result<T, FrameError>) -> Result<T, FrameError> {
+        if result.is_err() {
+            self.state = State::Failed;
+        }
+        result
+    }
+
     fn start_member_chunk(
         &mut self,
         buffer: &mut Vec<u8>,
@@ -587,7 +601,6 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         let member_remaining = match &self.state {
             State::ReadingMember { remaining } => *remaining,
             _ => {
-                self.state = State::Failed;
                 return Err(FrameError::unexpected_order(
                     self.position,
                     "ordinary member payload",
@@ -596,7 +609,6 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             }
         };
         if self.block_len != 0 {
-            self.state = State::Failed;
             return Err(FrameError::unexpected_order(
                 self.position,
                 "aligned ordinary member payload",
@@ -651,7 +663,6 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 }) => (member_remaining, filled),
                 Some(MemberChunkState::Ready { .. }) => return Ok(()),
                 None => {
-                    self.state = State::Failed;
                     return Err(FrameError::unexpected_order(
                         self.position,
                         "pending member payload chunk",
@@ -665,13 +676,11 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             if filled == physical_len {
                 self.position =
                     checked_position(start_position, physical_len).inspect_err(|_| {
-                        self.state = State::Failed;
                         self.member_chunk.state = None;
                     })?;
                 let remaining = member_remaining
                     .checked_sub(meaningful_len as u64)
                     .ok_or_else(|| {
-                        self.state = State::Failed;
                         self.member_chunk.state = None;
                         FrameError::arithmetic_overflow(
                             start_position,
@@ -696,7 +705,6 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             {
                 Ok(read) => read,
                 Err(source) => {
-                    self.state = State::Failed;
                     self.member_chunk.state = None;
                     let error_position = checked_position(start_position, filled)?;
                     self.position = checked_position(start_position, filled - filled % BLOCK_SIZE)?;
@@ -707,7 +715,6 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 }
             };
             if read == 0 {
-                self.state = State::Failed;
                 self.member_chunk.state = None;
                 let partial_len = filled % BLOCK_SIZE;
                 let completed_len = filled - partial_len;
@@ -738,7 +745,6 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
 
     fn take_member_chunk(&mut self, buffer: &mut Vec<u8>) -> Result<usize, FrameError> {
         let Some(MemberChunkState::Ready { delivered }) = self.member_chunk.state.take() else {
-            self.state = State::Failed;
             return Err(FrameError::unexpected_order(
                 self.position,
                 "completed member payload chunk",
@@ -747,7 +753,6 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         };
         let meaningful_len = self.member_chunk.meaningful_len;
         let remaining_len = meaningful_len.checked_sub(delivered).ok_or_else(|| {
-            self.state = State::Failed;
             FrameError::arithmetic_overflow(self.position, "undelivered member payload length")
         })?;
         if delivered != 0 {
@@ -762,7 +767,6 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
 
     fn take_member_block_from_chunk(&mut self) -> Result<(u64, Block, usize), FrameError> {
         let Some(MemberChunkState::Ready { delivered }) = self.member_chunk.state else {
-            self.state = State::Failed;
             return Err(FrameError::unexpected_order(
                 self.position,
                 "completed member payload chunk",
@@ -773,7 +777,6 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         let physical_len = self.member_chunk.physical_len;
         let total_meaningful_len = self.member_chunk.meaningful_len;
         let position = checked_position(start_position, delivered).inspect_err(|_| {
-            self.state = State::Failed;
             self.member_chunk.state = None;
         })?;
         let mut block = [0; BLOCK_SIZE];
@@ -781,7 +784,6 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         let meaningful_len = total_meaningful_len
             .checked_sub(delivered)
             .ok_or_else(|| {
-                self.state = State::Failed;
                 self.member_chunk.state = None;
                 FrameError::arithmetic_overflow(self.position, "undelivered member payload length")
             })?
@@ -1232,24 +1234,14 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             let (position, block) = match self.poll_read_block(context) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(Some(block))) => block,
-                Poll::Ready(Ok(None)) => {
-                    let error = self.handle_eof();
-                    self.state = State::Failed;
-                    return Poll::Ready(Err(error));
-                }
-                Poll::Ready(Err(error)) => {
-                    self.state = State::Failed;
-                    return Poll::Ready(Err(error));
-                }
+                Poll::Ready(Ok(None)) => return Poll::Ready(Err(self.handle_eof())),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             };
 
             match self.process_block(position, block) {
                 Ok(Some(frame)) => return Poll::Ready(Ok(Some(frame))),
                 Ok(None) => continue,
-                Err(error) => {
-                    self.state = State::Failed;
-                    return Poll::Ready(Err(error));
-                }
+                Err(error) => return Poll::Ready(Err(error)),
             }
         }
     }

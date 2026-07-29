@@ -8,7 +8,7 @@ use tar_codec::{
     PaxDecodePolicy, SpecialKind, TarArchive,
 };
 use tar_framing::{
-    PaxKeyword,
+    FrameError, FrameErrorInner, GnuKind, PaxKeyword,
     header::{GID_RANGE, MODE_RANGE, MTIME_RANGE, UID_RANGE},
 };
 
@@ -244,6 +244,39 @@ async fn advancing_drains_payload_and_applies_tar_policy() -> TestResult {
 }
 
 #[tokio::test]
+async fn payload_chunk_preflight_errors_fuse_member_iteration() -> TestResult {
+    let mut archive = ArchiveBuilder::new();
+    archive
+        .pax(b'x', &pax_record(PaxKeyword::Size, &u64::MAX.to_string()))
+        .ustar("oversized", b'0', b"", "", 0o644);
+    let bytes = archive.into_unterminated();
+    let mut members = TarArchive::new(bytes.as_slice()).members();
+    let Some(Member::File { mut payload, .. }) = members.next().await? else {
+        return Err(io::Error::other("expected oversized file member").into());
+    };
+
+    let mut chunk = Vec::new();
+    assert!(matches!(
+        payload.next_chunk(&mut chunk, usize::MAX).await,
+        Err(DecodeError::Framing(FrameError {
+            inner: FrameErrorInner::ArithmeticOverflow {
+                context: "member payload chunk physical length",
+            },
+            ..
+        }))
+    ));
+
+    for attempt in 1..=2 {
+        assert!(
+            matches!(members.next().await, Ok(None)),
+            "iteration {attempt}"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn payload_errors_fuse_member_iteration() -> TestResult {
     #[derive(Clone, Copy, Debug)]
     enum Operation {
@@ -278,6 +311,31 @@ async fn payload_errors_fuse_member_iteration() -> TestResult {
             );
         }
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn projection_errors_fuse_member_iteration() -> TestResult {
+    let mut archive = ArchiveBuilder::new();
+    archive
+        .gnu("longname", b'L', b"no-nul", "", 0o644)
+        .gnu("first", b'0', b"", "", 0o644)
+        .gnu("second", b'0', b"", "", 0o644);
+    let bytes = archive.finish();
+    let mut members = TarArchive::new(bytes.as_slice()).members();
+
+    assert!(matches!(
+        members.next().await,
+        Err(DecodeError::Framing(FrameError {
+            inner: FrameErrorInner::InvalidGnuMetadata {
+                kind: GnuKind::LongName,
+                ..
+            },
+            ..
+        }))
+    ));
+    assert!(members.next().await?.is_none());
 
     Ok(())
 }
