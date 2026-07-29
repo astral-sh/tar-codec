@@ -8,7 +8,7 @@ use tar_codec::{
     PaxDecodePolicy, SpecialKind, TarArchive,
 };
 use tar_framing::{
-    FrameError, FrameErrorInner, PaxKeyword,
+    FrameError, FrameErrorInner, GnuKind, PaxKeyword,
     header::{GID_RANGE, MODE_RANGE, MTIME_RANGE, UID_RANGE},
 };
 
@@ -311,6 +311,31 @@ async fn payload_errors_fuse_member_iteration() -> TestResult {
             );
         }
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn projection_errors_fuse_member_iteration() -> TestResult {
+    let mut archive = ArchiveBuilder::new();
+    archive
+        .gnu("longname", b'L', b"no-nul", "", 0o644)
+        .gnu("first", b'0', b"", "", 0o644)
+        .gnu("second", b'0', b"", "", 0o644);
+    let bytes = archive.finish();
+    let mut members = TarArchive::new(bytes.as_slice()).members();
+
+    assert!(matches!(
+        members.next().await,
+        Err(DecodeError::Framing(FrameError {
+            inner: FrameErrorInner::InvalidGnuMetadata {
+                kind: GnuKind::LongName,
+                ..
+            },
+            ..
+        }))
+    ));
+    assert!(members.next().await?.is_none());
 
     Ok(())
 }
