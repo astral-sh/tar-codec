@@ -484,6 +484,18 @@ impl<R: AsyncRead + Unpin> ArchiveTrait for TarArchive<R> {
     async fn next_member<'a>(
         &'a mut self,
     ) -> Result<Option<Member<Self::Payload<'a>>>, Self::Error> {
+        #[inline]
+        async fn decode_next_member<R: AsyncRead + Unpin>(
+            reader: &mut TarReader<R>,
+            policy: DecodePolicy,
+        ) -> Result<Option<Member<TarMemberPayload<'_, R>>>, DecodeError> {
+            let Some(frame) = reader.next_frame().await? else {
+                return Ok(None);
+            };
+            policy.check_member(&frame)?;
+            project_member(frame).map(Some)
+        }
+
         if self.fused {
             return Ok(None);
         }
@@ -492,17 +504,6 @@ impl<R: AsyncRead + Unpin> ArchiveTrait for TarArchive<R> {
         self.fused = !matches!(&result, Ok(Some(_)));
         result
     }
-}
-
-async fn decode_next_member<R: AsyncRead + Unpin>(
-    reader: &mut TarReader<R>,
-    policy: DecodePolicy,
-) -> Result<Option<Member<TarMemberPayload<'_, R>>>, DecodeError> {
-    let Some(frame) = reader.next_frame().await? else {
-        return Ok(None);
-    };
-    policy.check_member(&frame)?;
-    project_member(frame).map(Some)
 }
 
 fn project_member<'a, R>(
