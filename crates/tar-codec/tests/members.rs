@@ -244,6 +244,45 @@ async fn advancing_drains_payload_and_applies_tar_policy() -> TestResult {
 }
 
 #[tokio::test]
+async fn payload_errors_fuse_member_iteration() -> TestResult {
+    #[derive(Clone, Copy, Debug)]
+    enum Operation {
+        Read,
+        Skip,
+    }
+
+    let bytes = header(ArchiveFormat::Pax, "truncated", b'0', 5, "", 0o644);
+
+    for operation in [Operation::Read, Operation::Skip] {
+        let mut members = TarArchive::new(bytes.as_slice()).members();
+        let Some(Member::File { mut payload, .. }) = members.next().await? else {
+            return Err(io::Error::other("expected truncated file member").into());
+        };
+
+        let result = match operation {
+            Operation::Read => {
+                let mut chunk = Vec::new();
+                payload.next_chunk(&mut chunk, 1).await.map(|_| ())
+            }
+            Operation::Skip => payload.skip().await,
+        };
+        assert!(
+            matches!(result, Err(DecodeError::Framing(_))),
+            "{operation:?}"
+        );
+
+        for attempt in 1..=2 {
+            assert!(
+                matches!(members.next().await, Ok(None)),
+                "{operation:?}, iteration {attempt}"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn policy_errors_fuse_member_iteration() -> TestResult {
     let mut archive = ArchiveBuilder::new();
     archive

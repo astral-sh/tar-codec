@@ -13,7 +13,7 @@ use crate::{
     PaxString, PaxValue, UstarKind,
     header::{GNAME_RANGE, LINK_NAME_RANGE, UNAME_RANGE},
     pax::GlobalPaxRecords,
-    stream::{DataFrame, DataOwner, Frame, HeaderFrame, TarStream},
+    stream::{DataFrame, DataOwner, Frame, HeaderFrame, State, TarStream},
 };
 
 pub use crate::{PaxExtension, PaxState};
@@ -355,6 +355,11 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
     /// view borrowing this reader; it must be dropped before requesting another
     /// member.
     pub async fn next_frame(&mut self) -> Result<Option<MemberFrame<'_, R>>, FrameError> {
+        if matches!(self.payload.stream.state, State::Failed) {
+            self.clear_extension_state();
+            return Ok(None);
+        }
+
         if let Err(error) = self.payload.drain_payload().await {
             self.clear_extension_state();
             return Err(error);
@@ -1792,44 +1797,60 @@ mod tests {
     fn reports_truncated_payload_when_read_or_skipped() {
         #[derive(Clone, Copy, Debug)]
         enum Operation {
-            Read,
+            ReadBlock,
+            ReadChunk,
             ExplicitSkip,
             AutomaticSkip,
         }
 
         for operation in [
-            Operation::Read,
+            Operation::ReadBlock,
+            Operation::ReadChunk,
             Operation::ExplicitSkip,
             Operation::AutomaticSkip,
         ] {
-            let result: Result<(), FrameError> = ready(async {
+            ready_ok(async {
                 let mut reader =
                     TarReader::new(ChunkedReader::new(header(b'0', 1).to_vec(), BLOCK_SIZE));
-                let Ok(Some(mut member)) = reader.next_frame().await else {
-                    panic!("expected member");
-                };
-                match operation {
-                    Operation::Read => member.payload.next_block().await.map(|_| ()),
-                    Operation::ExplicitSkip => member.payload.skip().await,
-                    Operation::AutomaticSkip => {
-                        drop(member);
-                        reader.next_frame().await.map(|_| ())
+                let result = {
+                    let mut member = next_member(&mut reader).await?;
+                    match operation {
+                        Operation::ReadBlock => member.payload.next_block().await.map(|_| ()),
+                        Operation::ReadChunk => {
+                            let mut chunk = Vec::new();
+                            member.payload.next_chunk(&mut chunk, 1).await.map(|_| ())
+                        }
+                        Operation::ExplicitSkip => member.payload.skip().await,
+                        Operation::AutomaticSkip => {
+                            drop(member);
+                            reader.next_frame().await.map(|_| ())
+                        }
                     }
-                }
-            });
-            assert!(
-                matches!(
-                    result,
-                    Err(FrameError {
-                        inner: FrameErrorInner::TruncatedPayload {
-                            owner: DataOwner::Member,
+                };
+
+                assert!(
+                    matches!(
+                        result,
+                        Err(FrameError {
+                            inner: FrameErrorInner::TruncatedPayload {
+                                owner: DataOwner::Member,
+                                ..
+                            },
                             ..
-                        },
-                        ..
-                    })
-                ),
-                "{operation:?}"
-            );
+                        })
+                    ),
+                    "{operation:?}"
+                );
+
+                for attempt in 1..=2 {
+                    assert!(
+                        reader.next_frame().await?.is_none(),
+                        "{operation:?}, iteration {attempt}"
+                    );
+                }
+
+                Ok(())
+            });
         }
     }
 }
