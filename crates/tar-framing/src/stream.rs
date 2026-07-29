@@ -572,8 +572,11 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             buffer.extend_from_slice(&block[..meaningful_len]);
             return Ok(meaningful_len);
         }
-        if self.member_chunk.state.is_none() {
-            self.start_member_chunk(buffer, target_len)?;
+        if self.member_chunk.state.is_none()
+            && let Err(error) = self.start_member_chunk(buffer, target_len)
+        {
+            self.state = State::Failed;
+            return Err(error);
         }
         self.complete_member_chunk().await?;
         self.take_member_chunk(buffer)
