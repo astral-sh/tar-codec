@@ -283,12 +283,30 @@ fn copy_string_field_into(block: &Block, range: Range<usize>, destination: &mut 
 }
 
 impl<R> TarReader<R> {
-    /// Creates a new logical reader from an uncompressed tar reader.
-    pub fn new(reader: R) -> Self {
+    /// Creates a logical reader with the default physical-layer read-ahead buffer.
+    ///
+    /// Use [`Self::unbuffered`] to supply an already-buffered source or avoid
+    /// reading beyond logically consumed archive bytes.
+    pub fn new(reader: R) -> Self
+    where
+        R: AsyncRead,
+    {
+        Self::from_stream(TarStream::new(reader))
+    }
+
+    /// Creates a logical reader without physical-layer source read-ahead.
+    pub fn unbuffered(reader: R) -> Self
+    where
+        R: AsyncRead,
+    {
+        Self::from_stream(TarStream::unbuffered(reader))
+    }
+
+    fn from_stream(stream: TarStream<R>) -> Self {
         Self {
             global_pax_records: None,
             payload: PayloadReader {
-                stream: TarStream::new(reader),
+                stream,
                 remaining: 0,
                 drain_buffer: Vec::new(),
             },

@@ -29,10 +29,49 @@ pub struct TarArchive<R> {
 }
 
 impl<R> TarArchive<R> {
-    /// Creates an archive decoder from an uncompressed tar reader.
-    pub fn new(reader: R) -> Self {
+    /// Creates an archive decoder with buffered source reads.
+    ///
+    /// The physical framing layer reads ahead by default, making plain
+    /// filesystem-backed readers efficient without requiring an external
+    /// buffering wrapper. Use [`Self::unbuffered`] to supply an already
+    /// buffered source or control the underlying reader's physical position.
+    pub fn new(reader: R) -> Self
+    where
+        R: AsyncRead,
+    {
+        Self::new_with_policy(reader, DecodePolicy::default())
+    }
+
+    /// Creates an archive decoder without physical-layer source read-ahead.
+    ///
+    /// This is useful when `reader` already supplies an appropriate buffering
+    /// layer or when source read-ahead is undesirable.
+    pub fn unbuffered(reader: R) -> Self
+    where
+        R: AsyncRead,
+    {
+        Self::unbuffered_with_policy(reader, DecodePolicy::default())
+    }
+
+    /// Creates a buffered archive decoder using `policy`.
+    pub fn new_with_policy(reader: R, policy: DecodePolicy) -> Self
+    where
+        R: AsyncRead,
+    {
+        Self::from_reader(TarReader::new(reader)).with_policy(policy)
+    }
+
+    /// Creates an unbuffered archive decoder using `policy`.
+    pub fn unbuffered_with_policy(reader: R, policy: DecodePolicy) -> Self
+    where
+        R: AsyncRead,
+    {
+        Self::from_reader(TarReader::unbuffered(reader)).with_policy(policy)
+    }
+
+    fn from_reader(reader: TarReader<R>) -> Self {
         Self {
-            reader: TarReader::new(reader),
+            reader,
             policy: DecodePolicy::default(),
             fused: false,
         }

@@ -79,7 +79,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, BufReader, ReadBuf};
 
 use crate::{
     ArchiveFormat, BLOCK_SIZE, Block, DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE,
@@ -94,6 +94,8 @@ use crate::{
 };
 
 type PositionedBlock = (u64, Block);
+
+const DEFAULT_READ_BUFFER_CAPACITY: usize = 256 * 1024;
 
 /// Represents a single non-terminator physical block in a tar stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -493,7 +495,7 @@ pub struct TarStream<R> {
     /// Our current stream position.
     pub(super) position: u64,
     /// Our interior source.
-    pub(super) inner: R,
+    pub(super) inner: BufReader<R>,
     pub(super) block: Block,
     pub(super) block_len: usize,
     pub(super) format: Option<ArchiveFormat>,
@@ -506,11 +508,41 @@ pub struct TarStream<R> {
 }
 
 impl<R> TarStream<R> {
-    /// Creates a new [`TarStream`] from the given reader.
-    pub fn new(reader: R) -> Self {
+    /// Creates a new [`TarStream`] with a 256 KiB source read-ahead buffer.
+    ///
+    /// Buffering avoids dispatching individual 512-byte tar header reads to
+    /// filesystem-backed asynchronous readers. The underlying source may be
+    /// read past the last logically consumed block or the archive terminator.
+    /// Use [`Self::unbuffered`] to control source buffering or reader position.
+    pub fn new(reader: R) -> Self
+    where
+        R: AsyncRead,
+    {
+        Self::with_buffer_capacity(reader, DEFAULT_READ_BUFFER_CAPACITY)
+    }
+
+    /// Creates a [`TarStream`] without source read-ahead.
+    ///
+    /// Use this when `reader` already has an appropriate buffering layer or
+    /// when its physical read position must closely track consumed tar blocks.
+    pub fn unbuffered(reader: R) -> Self
+    where
+        R: AsyncRead,
+    {
+        Self::with_buffer_capacity(reader, 0)
+    }
+
+    /// Creates a [`TarStream`] with a source read-ahead buffer of `capacity` bytes.
+    ///
+    /// A zero capacity disables source read-ahead. Large member payload reads
+    /// can bypass this buffer when their requested size meets its capacity.
+    pub fn with_buffer_capacity(reader: R, capacity: usize) -> Self
+    where
+        R: AsyncRead,
+    {
         Self {
             position: 0,
-            inner: reader,
+            inner: BufReader::with_capacity(capacity, reader),
             block: [0; BLOCK_SIZE],
             block_len: 0,
             format: None,
@@ -1494,6 +1526,7 @@ mod tests {
         bytes: Vec<u8>,
         position: usize,
         consumed: Rc<Cell<usize>>,
+        reads: Rc<Cell<usize>>,
     }
 
     impl AsyncRead for CountingReader {
@@ -1509,6 +1542,7 @@ mod tests {
             buffer.put_slice(&self.bytes[self.position..end]);
             self.position = end;
             self.consumed.set(self.consumed.get() + len);
+            self.reads.set(self.reads.get() + 1);
             Poll::Ready(Ok(()))
         }
     }
@@ -1733,30 +1767,79 @@ mod tests {
     }
 
     #[test]
-    fn oversized_pax_extension_does_not_read_its_payload_block() {
-        let mut bytes = header(b'x', 1).to_vec();
-        bytes.resize(BLOCK_SIZE * 2, 0);
-        let consumed = Rc::new(Cell::new(0));
-        let reader = CountingReader {
-            bytes,
-            position: 0,
-            consumed: Rc::clone(&consumed),
-        };
-        let mut stream =
-            TarStream::new(reader).with_policy(StreamPolicy::default().max_pax_extension_size(0));
-
-        assert!(matches!(
-            ready(stream.next_frame()),
-            Err(FrameError {
+    fn oversized_pax_extension_rejects_before_logical_payload_consumption() {
+        for (buffered, expected_physical_bytes) in [(true, BLOCK_SIZE * 2), (false, BLOCK_SIZE)] {
+            let mut bytes = header(b'x', 1).to_vec();
+            bytes.resize(BLOCK_SIZE * 2, 0);
+            let consumed = Rc::new(Cell::new(0));
+            let reader = CountingReader {
+                bytes,
                 position: 0,
-                inner: FrameErrorInner::ExtensionTooLarge {
-                    format: ArchiveFormat::Pax,
-                    size: 1,
-                    limit: 0,
-                },
-            })
-        ));
-        assert_eq!(consumed.get(), BLOCK_SIZE);
+                consumed: Rc::clone(&consumed),
+                reads: Rc::new(Cell::new(0)),
+            };
+            let stream = if buffered {
+                TarStream::new(reader)
+            } else {
+                TarStream::unbuffered(reader)
+            };
+            let mut stream = stream.with_policy(StreamPolicy::default().max_pax_extension_size(0));
+
+            assert!(matches!(
+                ready(stream.next_frame()),
+                Err(FrameError {
+                    position: 0,
+                    inner: FrameErrorInner::ExtensionTooLarge {
+                        format: ArchiveFormat::Pax,
+                        size: 1,
+                        limit: 0,
+                    },
+                })
+            ));
+            assert_eq!(stream.position, BLOCK_SIZE as u64);
+            assert_eq!(consumed.get(), expected_physical_bytes);
+        }
+    }
+
+    #[test]
+    fn buffers_source_reads_by_default_and_supports_explicit_opt_out() {
+        let mut bytes = Vec::new();
+        append_block(&mut bytes, &header(b'0', 0));
+        append_block(&mut bytes, &header(b'0', 0));
+        append_terminator(&mut bytes);
+        let archive_len = bytes.len();
+
+        for (capacity, expected_first_read, expected_reads) in [
+            (None, archive_len, 1),
+            (Some(BLOCK_SIZE * 2), BLOCK_SIZE * 2, 2),
+            (Some(0), BLOCK_SIZE, 4),
+        ] {
+            let consumed = Rc::new(Cell::new(0));
+            let reads = Rc::new(Cell::new(0));
+            let reader = CountingReader {
+                bytes: bytes.clone(),
+                position: 0,
+                consumed: Rc::clone(&consumed),
+                reads: Rc::clone(&reads),
+            };
+            let mut stream = match capacity {
+                None => TarStream::new(reader),
+                Some(0) => TarStream::unbuffered(reader),
+                Some(capacity) => TarStream::with_buffer_capacity(reader, capacity),
+            };
+
+            assert!(matches!(
+                ready(stream.next_frame()),
+                Ok(Some(Frame::Header(_)))
+            ));
+            assert_eq!(consumed.get(), expected_first_read);
+            assert!(matches!(
+                ready(stream.next_frame()),
+                Ok(Some(Frame::Header(_)))
+            ));
+            assert!(matches!(ready(stream.next_frame()), Ok(None)));
+            assert_eq!(reads.get(), expected_reads);
+        }
     }
 
     #[test]

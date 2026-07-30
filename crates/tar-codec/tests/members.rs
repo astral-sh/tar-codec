@@ -1,6 +1,13 @@
 pub mod support;
 
-use std::{error::Error, io};
+use std::{
+    cell::Cell,
+    error::Error,
+    io,
+    pin::Pin,
+    rc::Rc,
+    task::{Context, Poll},
+};
 
 use support::{ArchiveBuilder, ArchiveFormat, header, pax_record, set_checksum};
 use tar_codec::{
@@ -11,8 +18,32 @@ use tar_framing::{
     FrameError, FrameErrorInner, GnuKind, PaxKeyword,
     header::{GID_RANGE, MODE_RANGE, MTIME_RANGE, UID_RANGE},
 };
+use tokio::io::{AsyncRead, ReadBuf};
 
 type TestResult = Result<(), Box<dyn Error>>;
+
+struct CountingReader<'a> {
+    bytes: &'a [u8],
+    position: usize,
+    reads: Rc<Cell<usize>>,
+}
+
+impl AsyncRead for CountingReader<'_> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let len = buffer
+            .remaining()
+            .min(self.bytes.len().saturating_sub(self.position));
+        let end = self.position + len;
+        buffer.put_slice(&self.bytes[self.position..end]);
+        self.position = end;
+        self.reads.set(self.reads.get() + 1);
+        Poll::Ready(Ok(()))
+    }
+}
 
 async fn read_payload<P: MemberPayload<Error = DecodeError>>(
     mut payload: P,
@@ -23,6 +54,57 @@ async fn read_payload<P: MemberPayload<Error = DecodeError>>(
         data.extend_from_slice(&chunk);
     }
     Ok(data)
+}
+
+#[tokio::test]
+async fn buffers_member_reads_by_default_and_allows_unbuffered_sources() -> TestResult {
+    let mut archive = ArchiveBuilder::new();
+    archive
+        .ustar("first", b'0', b"first payload", "", 0o644)
+        .ustar("second", b'0', b"second payload", "", 0o644);
+    let bytes = archive.finish();
+
+    for buffered in [true, false] {
+        let reads = Rc::new(Cell::new(0));
+        let reader = CountingReader {
+            bytes: bytes.as_slice(),
+            position: 0,
+            reads: Rc::clone(&reads),
+        };
+        let archive = if buffered {
+            TarArchive::new(reader)
+        } else {
+            TarArchive::unbuffered(reader)
+        };
+        let mut members = archive.members();
+
+        for expected in [b"first payload".as_slice(), b"second payload".as_slice()] {
+            let Some(Member::File { payload, .. }) = members.next().await? else {
+                return Err(io::Error::other("expected regular file member").into());
+            };
+            assert_eq!(read_payload(payload).await?, expected);
+        }
+        assert!(members.next().await?.is_none());
+        if buffered {
+            assert_eq!(reads.get(), 1);
+        } else {
+            assert!(reads.get() > 1);
+        }
+    }
+
+    let mut archive = ArchiveBuilder::new();
+    archive.gnu("file", b'0', b"", "", 0o644);
+    let bytes = archive.finish();
+    let mut members = TarArchive::unbuffered_with_policy(
+        bytes.as_slice(),
+        DecodePolicy::default().allow_gnu(false),
+    )
+    .members();
+    assert!(matches!(
+        members.next().await,
+        Err(DecodeError::PolicyViolation { .. })
+    ));
+    Ok(())
 }
 
 #[tokio::test]
