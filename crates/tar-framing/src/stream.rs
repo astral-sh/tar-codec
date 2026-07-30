@@ -508,12 +508,9 @@ pub struct TarStream<R> {
 }
 
 impl<R> TarStream<R> {
-    /// Creates a new [`TarStream`] with a 256 KiB source read-ahead buffer.
+    /// Creates a buffered [`TarStream`] from `reader`.
     ///
-    /// Buffering avoids dispatching individual 512-byte tar header reads to
-    /// filesystem-backed asynchronous readers. The underlying source may be
-    /// read past the last logically consumed block or the archive terminator.
-    /// Use [`Self::unbuffered`] to control source buffering or reader position.
+    /// Buffering may read beyond logically consumed archive data.
     pub fn new(reader: R) -> Self
     where
         R: AsyncRead,
@@ -521,10 +518,7 @@ impl<R> TarStream<R> {
         Self::with_buffer_capacity(reader, DEFAULT_READ_BUFFER_CAPACITY)
     }
 
-    /// Creates a [`TarStream`] without source read-ahead.
-    ///
-    /// Use this when `reader` already has an appropriate buffering layer or
-    /// when its physical read position must closely track consumed tar blocks.
+    /// Creates an unbuffered [`TarStream`] from `reader`.
     pub fn unbuffered(reader: R) -> Self
     where
         R: AsyncRead,
@@ -532,10 +526,7 @@ impl<R> TarStream<R> {
         Self::with_buffer_capacity(reader, 0)
     }
 
-    /// Creates a [`TarStream`] with a source read-ahead buffer of `capacity` bytes.
-    ///
-    /// A zero capacity disables source read-ahead. Large member payload reads
-    /// can bypass this buffer when their requested size meets its capacity.
+    /// Creates a [`TarStream`] with the specified buffer capacity.
     pub fn with_buffer_capacity(reader: R, capacity: usize) -> Self
     where
         R: AsyncRead,

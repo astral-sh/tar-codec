@@ -59,10 +59,8 @@ TarArchive::new(reader)
     .await?;
 ```
 
-Archive readers buffer their input by default, so passing a `tokio::fs::File`
-directly avoids per-header filesystem reads. Buffering can read ahead past the
-archive terminator. Use `TarArchive::unbuffered(reader)` when the source is
-already buffered or when its physical read position must be controlled.
+Archive readers buffer input by default and may read beyond the archive
+terminator. Use `TarArchive::unbuffered(reader)` to disable buffering.
 
 Unlike encoding, decoding/extraction has two policy layers:
 

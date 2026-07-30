@@ -29,12 +29,9 @@ pub struct TarArchive<R> {
 }
 
 impl<R> TarArchive<R> {
-    /// Creates an archive decoder with buffered source reads.
+    /// Creates a buffered archive decoder.
     ///
-    /// The physical framing layer reads ahead by default, making plain
-    /// filesystem-backed readers efficient without requiring an external
-    /// buffering wrapper. Use [`Self::unbuffered`] to supply an already
-    /// buffered source or control the underlying reader's physical position.
+    /// Buffering may read beyond logically consumed archive data.
     pub fn new(reader: R) -> Self
     where
         R: AsyncRead,
@@ -42,10 +39,7 @@ impl<R> TarArchive<R> {
         Self::from_reader(TarReader::new(reader))
     }
 
-    /// Creates an archive decoder without physical-layer source read-ahead.
-    ///
-    /// This is useful when `reader` already supplies an appropriate buffering
-    /// layer or when source read-ahead is undesirable.
+    /// Creates an unbuffered archive decoder.
     pub fn unbuffered(reader: R) -> Self
     where
         R: AsyncRead,
@@ -61,9 +55,7 @@ impl<R> TarArchive<R> {
         }
     }
 
-    /// Configures the decoding policy used by this archive.
-    ///
-    /// Call before reading any members.
+    /// Sets the archive's decoding policy.
     pub fn with_policy(mut self, policy: DecodePolicy) -> Self {
         let stream_policy = StreamPolicy::default()
             .max_pax_extension_size(policy.pax_policy.max_extension_size)
