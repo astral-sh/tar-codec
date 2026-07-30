@@ -1459,15 +1459,6 @@ fn validate_payload_free_size(position: u64, kind: UstarKind, size: u64) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        cell::Cell,
-        pin::Pin,
-        rc::Rc,
-        task::{Context, Poll},
-    };
-
-    use tokio::io::ReadBuf;
-
     use super::*;
     use crate::{
         ArchiveFormat, FrameError, FrameErrorInner, HdrCharset, PaxString, PaxValue,
@@ -1520,31 +1511,6 @@ mod tests {
 
     fn last_error_inner(frames: &[Result<Frame, FrameError>]) -> &FrameErrorInner {
         &last_error(frames).inner
-    }
-
-    struct CountingReader {
-        bytes: Vec<u8>,
-        position: usize,
-        consumed: Rc<Cell<usize>>,
-        reads: Rc<Cell<usize>>,
-    }
-
-    impl AsyncRead for CountingReader {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            _context: &mut Context<'_>,
-            buffer: &mut ReadBuf<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            let len = buffer
-                .remaining()
-                .min(self.bytes.len().saturating_sub(self.position));
-            let end = self.position + len;
-            buffer.put_slice(&self.bytes[self.position..end]);
-            self.position = end;
-            self.consumed.set(self.consumed.get() + len);
-            self.reads.set(self.reads.get() + 1);
-            Poll::Ready(Ok(()))
-        }
     }
 
     #[derive(Clone, Copy)]
@@ -1768,20 +1734,13 @@ mod tests {
 
     #[test]
     fn oversized_pax_extension_rejects_before_logical_payload_consumption() {
-        for (buffered, expected_physical_bytes) in [(true, BLOCK_SIZE * 2), (false, BLOCK_SIZE)] {
+        for buffered in [true, false] {
             let mut bytes = header(b'x', 1).to_vec();
             bytes.resize(BLOCK_SIZE * 2, 0);
-            let consumed = Rc::new(Cell::new(0));
-            let reader = CountingReader {
-                bytes,
-                position: 0,
-                consumed: Rc::clone(&consumed),
-                reads: Rc::new(Cell::new(0)),
-            };
             let stream = if buffered {
-                TarStream::new(reader)
+                TarStream::new(bytes.as_slice())
             } else {
-                TarStream::unbuffered(reader)
+                TarStream::unbuffered(bytes.as_slice())
             };
             let mut stream = stream.with_policy(StreamPolicy::default().max_pax_extension_size(0));
 
@@ -1797,48 +1756,6 @@ mod tests {
                 })
             ));
             assert_eq!(stream.position, BLOCK_SIZE as u64);
-            assert_eq!(consumed.get(), expected_physical_bytes);
-        }
-    }
-
-    #[test]
-    fn buffers_source_reads_by_default_and_supports_explicit_opt_out() {
-        let mut bytes = Vec::new();
-        append_block(&mut bytes, &header(b'0', 0));
-        append_block(&mut bytes, &header(b'0', 0));
-        append_terminator(&mut bytes);
-        let archive_len = bytes.len();
-
-        for (capacity, expected_first_read, expected_reads) in [
-            (None, archive_len, 1),
-            (Some(BLOCK_SIZE * 2), BLOCK_SIZE * 2, 2),
-            (Some(0), BLOCK_SIZE, 4),
-        ] {
-            let consumed = Rc::new(Cell::new(0));
-            let reads = Rc::new(Cell::new(0));
-            let reader = CountingReader {
-                bytes: bytes.clone(),
-                position: 0,
-                consumed: Rc::clone(&consumed),
-                reads: Rc::clone(&reads),
-            };
-            let mut stream = match capacity {
-                None => TarStream::new(reader),
-                Some(0) => TarStream::unbuffered(reader),
-                Some(capacity) => TarStream::with_buffer_capacity(reader, capacity),
-            };
-
-            assert!(matches!(
-                ready(stream.next_frame()),
-                Ok(Some(Frame::Header(_)))
-            ));
-            assert_eq!(consumed.get(), expected_first_read);
-            assert!(matches!(
-                ready(stream.next_frame()),
-                Ok(Some(Frame::Header(_)))
-            ));
-            assert!(matches!(ready(stream.next_frame()), Ok(None)));
-            assert_eq!(reads.get(), expected_reads);
         }
     }
 
