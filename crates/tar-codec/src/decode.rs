@@ -39,7 +39,7 @@ impl<R> TarArchive<R> {
     where
         R: AsyncRead,
     {
-        Self::new_with_policy(reader, DecodePolicy::default())
+        Self::from_reader(TarReader::new(reader))
     }
 
     /// Creates an archive decoder without physical-layer source read-ahead.
@@ -50,23 +50,7 @@ impl<R> TarArchive<R> {
     where
         R: AsyncRead,
     {
-        Self::unbuffered_with_policy(reader, DecodePolicy::default())
-    }
-
-    /// Creates a buffered archive decoder using `policy`.
-    pub fn new_with_policy(reader: R, policy: DecodePolicy) -> Self
-    where
-        R: AsyncRead,
-    {
-        Self::from_reader(TarReader::new(reader)).with_policy(policy)
-    }
-
-    /// Creates an unbuffered archive decoder using `policy`.
-    pub fn unbuffered_with_policy(reader: R, policy: DecodePolicy) -> Self
-    where
-        R: AsyncRead,
-    {
-        Self::from_reader(TarReader::unbuffered(reader)).with_policy(policy)
+        Self::from_reader(TarReader::unbuffered(reader))
     }
 
     fn from_reader(reader: TarReader<R>) -> Self {

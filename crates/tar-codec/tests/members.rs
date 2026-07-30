@@ -95,11 +95,9 @@ async fn buffers_member_reads_by_default_and_allows_unbuffered_sources() -> Test
     let mut archive = ArchiveBuilder::new();
     archive.gnu("file", b'0', b"", "", 0o644);
     let bytes = archive.finish();
-    let mut members = TarArchive::unbuffered_with_policy(
-        bytes.as_slice(),
-        DecodePolicy::default().allow_gnu(false),
-    )
-    .members();
+    let mut members = TarArchive::unbuffered(bytes.as_slice())
+        .with_policy(DecodePolicy::default().allow_gnu(false))
+        .members();
     assert!(matches!(
         members.next().await,
         Err(DecodeError::PolicyViolation { .. })
