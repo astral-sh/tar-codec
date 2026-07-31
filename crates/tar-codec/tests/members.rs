@@ -139,8 +139,9 @@ async fn all_nul_numeric_fields_are_policy_controlled() -> TestResult {
                 assert!(members.next().await?.is_none());
             }
 
-            let mut members =
-                TarArchive::new_with_policy(bytes.as_slice(), strict_policy).members();
+            let mut members = TarArchive::new(bytes.as_slice())
+                .with_policy(strict_policy.clone())
+                .members();
             assert!(
                 matches!(members.next().await, Err(DecodeError::Framing(_))),
                 "strict policy should reject an all-NUL {format:?} {field} field"
@@ -221,9 +222,9 @@ async fn advancing_drains_payload_and_applies_tar_policy() -> TestResult {
     let mut archive = ArchiveBuilder::new();
     archive.gnu("file", b'0', b"", "", 0o644);
     let bytes = archive.finish();
-    let mut members =
-        TarArchive::new_with_policy(bytes.as_slice(), DecodePolicy::default().allow_gnu(false))
-            .members();
+    let mut members = TarArchive::new(bytes.as_slice())
+        .with_policy(DecodePolicy::default().allow_gnu(false))
+        .members();
     assert!(matches!(
         members.next().await,
         Err(DecodeError::PolicyViolation { .. })
@@ -234,11 +235,11 @@ async fn advancing_drains_payload_and_applies_tar_policy() -> TestResult {
         .pax(b'x', &pax_record(PaxKeyword::Comment, "metadata"))
         .ustar("file", b'0', b"", "", 0o644);
     let bytes = archive.finish();
-    let mut members = TarArchive::new_with_policy(
-        bytes.as_slice(),
-        DecodePolicy::default().pax_policy(PaxDecodePolicy::default().max_extension_size(1)),
-    )
-    .members();
+    let mut members = TarArchive::new(bytes.as_slice())
+        .with_policy(
+            DecodePolicy::default().pax_policy(PaxDecodePolicy::default().max_extension_size(1)),
+        )
+        .members();
     assert!(matches!(members.next().await, Err(DecodeError::Framing(_))));
     Ok(())
 }

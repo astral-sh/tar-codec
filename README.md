@@ -39,7 +39,7 @@ Apart from `Builder::add_file`, you can use:
 - `Builder::add_directory` to add a single directory (just the directory, not any contents)
 - `Builder::add_directory_all` to recursively add an on-filesystem directory
 
-See `ArchiveBuilder::builder_with_policy` for policy knobs that
+See `Builder::with_policy` for policy knobs that
 can be changed during building.
 
 Note that `tar-codec` does **not** perform compression for you.
@@ -61,7 +61,7 @@ TarArchive::new(reader)
 
 Unlike encoding, decoding/extraction has two policy layers:
 
-- Use `TarArchive::new_with_policy` to control various aspects of GNU or pax handling.
+- Use `TarArchive::with_policy` to control various aspects of GNU or pax handling.
 - Use `extract::ExtractPolicy` to control various aspects of how archives become
   real paths on the host filesystem.
 

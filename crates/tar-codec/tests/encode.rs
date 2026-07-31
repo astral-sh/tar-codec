@@ -449,7 +449,7 @@ async fn recursive_encoding_frames_preserved_symlinks() {
 
     let policy = BuilderPolicy::default().symlink_policy(SymlinkPolicy::Preserve);
     let mut bytes = Vec::new();
-    let mut encoder = TarEncoder::new(&mut bytes).builder_with_policy(policy);
+    let mut encoder = TarEncoder::new(&mut bytes).builder().with_policy(policy);
     encoder
         .add_directory_all(&source)
         .await
