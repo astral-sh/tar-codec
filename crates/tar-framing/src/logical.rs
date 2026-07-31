@@ -299,6 +299,8 @@ impl<R> TarReader<R> {
     }
 
     /// Configures the framing policy used by this reader.
+    ///
+    /// Call before reading any members.
     pub fn with_policy(mut self, policy: StreamPolicy) -> Self {
         self.payload.stream = self.payload.stream.with_policy(policy);
         self

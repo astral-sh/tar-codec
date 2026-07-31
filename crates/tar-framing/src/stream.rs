@@ -523,6 +523,8 @@ impl<R> TarStream<R> {
     }
 
     /// Configures the framing policy used by this stream.
+    ///
+    /// Call before reading any frames.
     pub fn with_policy(mut self, policy: StreamPolicy) -> Self {
         self.policy = policy;
         self

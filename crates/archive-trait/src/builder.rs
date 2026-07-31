@@ -397,6 +397,8 @@ pub struct Builder<B> {
 
 impl<B: ArchiveBuilder> Builder<B> {
     /// Configures the policy used by this builder.
+    ///
+    /// Call before adding any entries.
     pub fn with_policy(mut self, policy: BuilderPolicy) -> Self {
         self.state.policy = policy;
         self

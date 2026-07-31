@@ -39,6 +39,8 @@ impl<R> TarArchive<R> {
     }
 
     /// Configures the decoding policy used by this archive.
+    ///
+    /// Call before reading any members.
     pub fn with_policy(mut self, policy: DecodePolicy) -> Self {
         let stream_policy = StreamPolicy::default()
             .max_pax_extension_size(policy.pax_policy.max_extension_size)
