@@ -2,34 +2,35 @@
 
 Python bindings for `tar-codec`.
 
+See [CONTRIBUTING.md](../../CONTRIBUTING.md) for development instructions.
+
+## Usage
+
+Basic examples:
+
 ```python
 import io
 
 from tar_codec import Builder, TarArchive
 
+# Build a tar stream in memory
 output = io.BytesIO()
 with Builder(output) as builder:
     builder.add_file("hello.txt", b"hello from Python\n")
     builder.add_directory("empty-directory")
 archive_bytes = output.getvalue()
 
+# Parse a tar and iterate over its members
 with TarArchive(io.BytesIO(archive_bytes)) as archive:
     for member in archive:
         print(member.path, member.kind, (payload := member.payload) and payload.read())
+
+# Extract directly to some target directory
 with TarArchive(archive_bytes) as archive:
     archive.extract_in("destination")
 ```
 
-Archives accept bytes, filesystem paths, and binary streams. `DecodePolicy` and
-`ExtractPolicy` customize their behavior.
-
-Payload reads return read-only `memoryview` objects without copying `bytes` or
-`io.BytesIO` sources. Use `read(size)` for bounded reads or `.tobytes()` to
-obtain `bytes`.
-
-See [CONTRIBUTING.md](../../CONTRIBUTING.md) for development instructions.
-
-## Compressed archives
+### Compressed archives
 
 Use Python's standard-library compression wrappers. Write a `.tar.gz` archive
 with `gzip.open`:
@@ -45,7 +46,8 @@ with gzip.open("archive.tar.gz", "wb") as compressed:
         archive.add_directory_all("project")
 ```
 
-Read the archive through a decompressed stream:
+Read the archive through a decompressed stream (substitute `gzip` for `bz`, etc.
+as necessary):
 
 ```python
 import gzip
@@ -59,4 +61,3 @@ with gzip.open("archive.tar.gz", "rb") as decompressed:
                 print(member.path, payload.read().tobytes())
 ```
 
-Use `bz2.open` or `lzma.open` for `.tar.bz2` or `.tar.xz` archives.
