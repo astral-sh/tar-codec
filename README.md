@@ -59,6 +59,9 @@ TarArchive::new(reader)
     .await?;
 ```
 
+Archive readers buffer input by default and may read beyond the archive
+terminator. Use `TarArchive::unbuffered(reader)` to disable buffering.
+
 Unlike encoding, decoding/extraction has two policy layers:
 
 - Use `TarArchive::with_policy` to control various aspects of GNU or pax handling.

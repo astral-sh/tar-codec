@@ -29,18 +29,33 @@ pub struct TarArchive<R> {
 }
 
 impl<R> TarArchive<R> {
-    /// Creates an archive decoder from an uncompressed tar reader.
-    pub fn new(reader: R) -> Self {
+    /// Creates a buffered archive decoder.
+    ///
+    /// Buffering may read beyond logically consumed archive data.
+    pub fn new(reader: R) -> Self
+    where
+        R: AsyncRead,
+    {
+        Self::from_reader(TarReader::new(reader))
+    }
+
+    /// Creates an unbuffered archive decoder.
+    pub fn unbuffered(reader: R) -> Self
+    where
+        R: AsyncRead,
+    {
+        Self::from_reader(TarReader::unbuffered(reader))
+    }
+
+    fn from_reader(reader: TarReader<R>) -> Self {
         Self {
-            reader: TarReader::new(reader),
+            reader,
             policy: DecodePolicy::default(),
             fused: false,
         }
     }
 
-    /// Configures the decoding policy used by this archive.
-    ///
-    /// Call before reading any members.
+    /// Sets the archive's decoding policy.
     pub fn with_policy(mut self, policy: DecodePolicy) -> Self {
         let stream_policy = StreamPolicy::default()
             .max_pax_extension_size(policy.pax_policy.max_extension_size)

@@ -79,7 +79,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, BufReader, ReadBuf};
 
 use crate::{
     ArchiveFormat, BLOCK_SIZE, Block, DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE,
@@ -94,6 +94,8 @@ use crate::{
 };
 
 type PositionedBlock = (u64, Block);
+
+const DEFAULT_READ_BUFFER_CAPACITY: usize = 256 * 1024;
 
 /// Represents a single non-terminator physical block in a tar stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -493,7 +495,7 @@ pub struct TarStream<R> {
     /// Our current stream position.
     pub(super) position: u64,
     /// Our interior source.
-    pub(super) inner: R,
+    pub(super) inner: BufReader<R>,
     pub(super) block: Block,
     pub(super) block_len: usize,
     pub(super) format: Option<ArchiveFormat>,
@@ -506,11 +508,32 @@ pub struct TarStream<R> {
 }
 
 impl<R> TarStream<R> {
-    /// Creates a new [`TarStream`] from the given reader.
-    pub fn new(reader: R) -> Self {
+    /// Creates a buffered [`TarStream`] from `reader`.
+    ///
+    /// Buffering may read beyond logically consumed archive data.
+    pub fn new(reader: R) -> Self
+    where
+        R: AsyncRead,
+    {
+        Self::with_buffer_capacity(reader, DEFAULT_READ_BUFFER_CAPACITY)
+    }
+
+    /// Creates an unbuffered [`TarStream`] from `reader`.
+    pub fn unbuffered(reader: R) -> Self
+    where
+        R: AsyncRead,
+    {
+        Self::with_buffer_capacity(reader, 0)
+    }
+
+    /// Creates a [`TarStream`] with the specified buffer capacity.
+    pub fn with_buffer_capacity(reader: R, capacity: usize) -> Self
+    where
+        R: AsyncRead,
+    {
         Self {
             position: 0,
-            inner: reader,
+            inner: BufReader::with_capacity(capacity, reader),
             block: [0; BLOCK_SIZE],
             block_len: 0,
             format: None,
@@ -1427,15 +1450,6 @@ fn validate_payload_free_size(position: u64, kind: UstarKind, size: u64) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        cell::Cell,
-        pin::Pin,
-        rc::Rc,
-        task::{Context, Poll},
-    };
-
-    use tokio::io::ReadBuf;
-
     use super::*;
     use crate::{
         ArchiveFormat, FrameError, FrameErrorInner, HdrCharset, PaxString, PaxValue,
@@ -1488,29 +1502,6 @@ mod tests {
 
     fn last_error_inner(frames: &[Result<Frame, FrameError>]) -> &FrameErrorInner {
         &last_error(frames).inner
-    }
-
-    struct CountingReader {
-        bytes: Vec<u8>,
-        position: usize,
-        consumed: Rc<Cell<usize>>,
-    }
-
-    impl AsyncRead for CountingReader {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            _context: &mut Context<'_>,
-            buffer: &mut ReadBuf<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            let len = buffer
-                .remaining()
-                .min(self.bytes.len().saturating_sub(self.position));
-            let end = self.position + len;
-            buffer.put_slice(&self.bytes[self.position..end]);
-            self.position = end;
-            self.consumed.set(self.consumed.get() + len);
-            Poll::Ready(Ok(()))
-        }
     }
 
     #[derive(Clone, Copy)]
@@ -1733,30 +1724,30 @@ mod tests {
     }
 
     #[test]
-    fn oversized_pax_extension_does_not_read_its_payload_block() {
-        let mut bytes = header(b'x', 1).to_vec();
-        bytes.resize(BLOCK_SIZE * 2, 0);
-        let consumed = Rc::new(Cell::new(0));
-        let reader = CountingReader {
-            bytes,
-            position: 0,
-            consumed: Rc::clone(&consumed),
-        };
-        let mut stream =
-            TarStream::new(reader).with_policy(StreamPolicy::default().max_pax_extension_size(0));
+    fn oversized_pax_extension_rejects_before_logical_payload_consumption() {
+        for buffered in [true, false] {
+            let mut bytes = header(b'x', 1).to_vec();
+            bytes.resize(BLOCK_SIZE * 2, 0);
+            let stream = if buffered {
+                TarStream::new(bytes.as_slice())
+            } else {
+                TarStream::unbuffered(bytes.as_slice())
+            };
+            let mut stream = stream.with_policy(StreamPolicy::default().max_pax_extension_size(0));
 
-        assert!(matches!(
-            ready(stream.next_frame()),
-            Err(FrameError {
-                position: 0,
-                inner: FrameErrorInner::ExtensionTooLarge {
-                    format: ArchiveFormat::Pax,
-                    size: 1,
-                    limit: 0,
-                },
-            })
-        ));
-        assert_eq!(consumed.get(), BLOCK_SIZE);
+            assert!(matches!(
+                ready(stream.next_frame()),
+                Err(FrameError {
+                    position: 0,
+                    inner: FrameErrorInner::ExtensionTooLarge {
+                        format: ArchiveFormat::Pax,
+                        size: 1,
+                        limit: 0,
+                    },
+                })
+            ));
+            assert_eq!(stream.position, BLOCK_SIZE as u64);
+        }
     }
 
     #[test]
