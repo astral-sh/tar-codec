@@ -421,6 +421,73 @@ enum MemberChunkState {
     },
 }
 
+/// Controls limits and compatibility accepted by a tar frame stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StreamPolicy {
+    max_pax_extension_size: u64,
+    max_global_pax_extensions_size: u64,
+    allow_all_nul_numeric_fields: bool,
+    max_gnu_extension_size: u64,
+}
+
+impl Default for StreamPolicy {
+    fn default() -> Self {
+        Self {
+            max_pax_extension_size: DEFAULT_MAX_PAX_EXTENSION_SIZE,
+            max_global_pax_extensions_size: DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE,
+            allow_all_nul_numeric_fields: true,
+            max_gnu_extension_size: DEFAULT_MAX_GNU_EXTENSION_SIZE,
+        }
+    }
+}
+
+impl StreamPolicy {
+    /// Configures the maximum size accepted for each pax extension.
+    ///
+    /// A local or global header that declares a larger payload is rejected
+    /// before its payload is consumed. Setting the maximum to zero rejects
+    /// every nonempty extension. Setting it to [`u64::MAX`] removes the
+    /// per-extension bound; global extensions remain subject to their
+    /// cumulative limit.
+    pub fn max_pax_extension_size(mut self, max_pax_extension_size: u64) -> Self {
+        self.max_pax_extension_size = max_pax_extension_size;
+        self
+    }
+
+    /// Configures the maximum cumulative size of global pax extensions.
+    ///
+    /// The total resets after each ordinary member. A global header that would
+    /// increase the pending total beyond this limit is rejected before its
+    /// payload is consumed. Setting the maximum to zero rejects every nonempty
+    /// global extension. Setting it to [`u64::MAX`] removes the cumulative
+    /// bound; each extension remains subject to its individual limit.
+    pub fn max_global_pax_extensions_size(mut self, max_global_pax_extensions_size: u64) -> Self {
+        self.max_global_pax_extensions_size = max_global_pax_extensions_size;
+        self
+    }
+
+    /// Configures whether wholly NUL numeric metadata fields may be accepted.
+    ///
+    /// This compatibility option applies to `mode`, `uid`, `gid`, and `mtime`
+    /// in both pax/ustar and GNU ordinary member headers. It is enabled by
+    /// default. Disabling it requires each field to use a valid numeric encoding
+    /// for its archive family.
+    pub fn allow_all_nul_numeric_fields(mut self, allow: bool) -> Self {
+        self.allow_all_nul_numeric_fields = allow;
+        self
+    }
+
+    /// Configures the maximum size accepted for each GNU extension.
+    ///
+    /// A GNU extension member that declares a larger payload is rejected before
+    /// its payload is consumed. Setting the maximum to zero rejects every nonempty
+    /// GNU extension member. Setting it to [`u64::MAX`] removes the per-extension bound.
+    pub fn max_gnu_extension_size(mut self, max_gnu_extension_size: u64) -> Self {
+        self.max_gnu_extension_size = max_gnu_extension_size;
+        self
+    }
+}
+
 /// A strict stream of POSIX-pax or GNU frames sourced from an underlying reader.
 pub struct TarStream<R> {
     /// Our current stream position.
@@ -432,11 +499,8 @@ pub struct TarStream<R> {
     pub(super) format: Option<ArchiveFormat>,
     /// The currently effective global pax records, if any.
     pub(super) global_pax_records: Option<GlobalPaxRecords>,
-    max_pax_extension_size: u64,
-    max_global_pax_extensions_size: u64,
+    policy: StreamPolicy,
     global_pax_extensions_size: u64,
-    allow_all_nul_numeric_fields: bool,
-    max_gnu_extension_size: u64,
     member_chunk: MemberChunk,
     pub(super) state: State,
 }
@@ -451,56 +515,17 @@ impl<R> TarStream<R> {
             block_len: 0,
             format: None,
             global_pax_records: None,
-            max_pax_extension_size: DEFAULT_MAX_PAX_EXTENSION_SIZE,
-            max_global_pax_extensions_size: DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE,
+            policy: StreamPolicy::default(),
             global_pax_extensions_size: 0,
-            allow_all_nul_numeric_fields: true,
-            max_gnu_extension_size: DEFAULT_MAX_GNU_EXTENSION_SIZE,
             member_chunk: MemberChunk::default(),
             state: State::AwaitingHeader,
         }
     }
 
-    /// Sets the maximum size accepted for each subsequent pax extension.
-    ///
-    /// A local or global header that declares a larger payload is rejected
-    /// before its payload is consumed. Setting the maximum to zero rejects
-    /// every nonempty extension. Setting it to [`u64::MAX`] removes the
-    /// per-extension bound; global extensions remain subject to their
-    /// cumulative limit.
-    pub fn set_max_pax_extension_size(&mut self, max_pax_extension_size: u64) {
-        self.max_pax_extension_size = max_pax_extension_size;
-    }
-
-    /// Sets the maximum cumulative size accepted for global pax extensions
-    /// before one ordinary member.
-    ///
-    /// The total resets after each ordinary member. A global header that would
-    /// increase the pending total beyond this limit is rejected before its
-    /// payload is consumed. Setting the maximum to zero rejects every nonempty
-    /// global extension. Setting it to [`u64::MAX`] removes the cumulative
-    /// bound; each extension remains subject to its individual limit.
-    pub fn set_max_global_pax_extensions_size(&mut self, max_global_pax_extensions_size: u64) {
-        self.max_global_pax_extensions_size = max_global_pax_extensions_size;
-    }
-
-    /// Sets whether wholly NUL numeric metadata fields may be accepted.
-    ///
-    /// This compatibility option applies to `mode`, `uid`, `gid`, and `mtime`
-    /// in both pax/ustar and GNU ordinary member headers. It is enabled by
-    /// default. Disabling it requires each field to use a valid numeric encoding
-    /// for its archive family.
-    pub fn set_allow_all_nul_numeric_fields(&mut self, allow: bool) {
-        self.allow_all_nul_numeric_fields = allow;
-    }
-
-    /// Sets the maximum size accepted for each GNU extension.
-    ///
-    /// A GNU extension member that declares a larger payload is rejected before
-    /// its payload is consumed. Setting the maximum to zero rejects every nonempty
-    /// GNU extension member. Setting it to [`u64::MAX`] removes the per-extension bound.
-    pub fn set_max_gnu_extension_size(&mut self, max_gnu_extension_size: u64) {
-        self.max_gnu_extension_size = max_gnu_extension_size;
+    /// Configures the framing policy used by this stream.
+    pub fn with_policy(mut self, policy: StreamPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
     /// Returns the selected archive family after the first header is read.
@@ -1082,13 +1107,13 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         payload_size: u64,
         kind: PaxKind,
     ) -> Result<Frame, FrameError> {
-        if payload_size > self.max_pax_extension_size {
+        if payload_size > self.policy.max_pax_extension_size {
             return Err(FrameError::at(
                 position,
                 FrameErrorInner::ExtensionTooLarge {
                     format: ArchiveFormat::Pax,
                     size: payload_size,
-                    limit: self.max_pax_extension_size,
+                    limit: self.policy.max_pax_extension_size,
                 },
             ));
         }
@@ -1099,12 +1124,12 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                 .ok_or_else(|| {
                     FrameError::arithmetic_overflow(position, "global pax extension payload total")
                 })?;
-            if size > self.max_global_pax_extensions_size {
+            if size > self.policy.max_global_pax_extensions_size {
                 return Err(FrameError::at(
                     position,
                     FrameErrorInner::GlobalPaxExtensionsTooLarge {
                         size,
-                        limit: self.max_global_pax_extensions_size,
+                        limit: self.policy.max_global_pax_extensions_size,
                     },
                 ));
             }
@@ -1151,7 +1176,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             parsed.size,
             local_pax_records.as_deref(),
             self.global_pax_records.as_ref(),
-            self.allow_all_nul_numeric_fields,
+            self.policy.allow_all_nul_numeric_fields,
         )?;
         self.global_pax_extensions_size = 0;
         self.state = member_payload_state(frame.effective_size);
@@ -1182,13 +1207,13 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                     "duplicate GNU metadata extension",
                 ));
             }
-            if parsed.size > self.max_gnu_extension_size {
+            if parsed.size > self.policy.max_gnu_extension_size {
                 return Err(FrameError::at(
                     position,
                     FrameErrorInner::ExtensionTooLarge {
                         format: ArchiveFormat::Gnu,
                         size: parsed.size,
-                        limit: self.max_gnu_extension_size,
+                        limit: self.policy.max_gnu_extension_size,
                     },
                 ));
             }
@@ -1216,7 +1241,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             parsed.typeflag,
             parsed.size,
             pending.long_link,
-            self.allow_all_nul_numeric_fields,
+            self.policy.allow_all_nul_numeric_fields,
         )?;
         self.state = member_payload_state(frame.effective_size);
         Ok(Frame::Header(frame))
@@ -1430,9 +1455,11 @@ mod tests {
         max_chunk: usize,
         max_pax_extension_size: u64,
     ) -> Vec<Result<Frame, FrameError>> {
-        let mut stream = TarStream::new(ChunkedReader::new(bytes, max_chunk));
-        stream.set_max_pax_extension_size(max_pax_extension_size);
-        ready(collect_frames(stream))
+        ready(collect_frames(
+            TarStream::new(ChunkedReader::new(bytes, max_chunk)).with_policy(
+                StreamPolicy::default().max_pax_extension_size(max_pax_extension_size),
+            ),
+        ))
     }
 
     fn header_frame(frames: &[Result<Frame, FrameError>], index: usize) -> &HeaderFrame {
@@ -1713,8 +1740,8 @@ mod tests {
             position: 0,
             consumed: Rc::clone(&consumed),
         };
-        let mut stream = TarStream::new(reader);
-        stream.set_max_pax_extension_size(0);
+        let mut stream =
+            TarStream::new(reader).with_policy(StreamPolicy::default().max_pax_extension_size(0));
 
         assert!(matches!(
             ready(stream.next_frame()),

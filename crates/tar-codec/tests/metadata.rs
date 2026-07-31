@@ -41,7 +41,8 @@ async fn pax_precedence_and_validation_use_effective_names() {
     let bytes = archive.finish();
     let decode_policy = DecodePolicy::default()
         .pax_policy(PaxDecodePolicy::default().allow_global_pax_member_metadata(true));
-    TarArchive::new_with_policy(bytes.as_slice(), decode_policy)
+    TarArchive::new(bytes.as_slice())
+        .with_policy(decode_policy)
         .extract_in(&destination, ExtractPolicy::default())
         .await
         .unwrap();
@@ -169,7 +170,8 @@ async fn gnu_archives_can_be_forbidden_without_rejecting_empty_archives() {
         .gnu("raw", b'0', b"contents", "", 0o644);
     let bytes = archive.finish();
     assert!(matches!(
-        TarArchive::new_with_policy(bytes.as_slice(), DecodePolicy::default().allow_gnu(false),)
+        TarArchive::new(bytes.as_slice())
+            .with_policy(DecodePolicy::default().allow_gnu(false))
             .extract_in(&destination, ExtractPolicy::default())
             .await,
         Err(ExtractError::Archive(DecodeError::PolicyViolation {
@@ -180,7 +182,8 @@ async fn gnu_archives_can_be_forbidden_without_rejecting_empty_archives() {
     assert!(!destination.join("renamed").exists());
 
     let bytes = ArchiveBuilder::new().finish();
-    TarArchive::new_with_policy(bytes.as_slice(), DecodePolicy::default().allow_gnu(false))
+    TarArchive::new(bytes.as_slice())
+        .with_policy(DecodePolicy::default().allow_gnu(false))
         .extract_in(temp.path().join("empty"), ExtractPolicy::default())
         .await
         .unwrap();
@@ -219,12 +222,10 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
             .vendor_extension_policy(vendor_extension_policy)
             .allow_non_utf8_pax_vendor_values(false);
         assert!(matches!(
-            TarArchive::new_with_policy(
-                bytes.as_slice(),
-                DecodePolicy::default().pax_policy(strict_pax_policy),
-            )
-            .extract_in(temp.path().join(directory), ExtractPolicy::default())
-            .await,
+            TarArchive::new(bytes.as_slice())
+                .with_policy(DecodePolicy::default().pax_policy(strict_pax_policy))
+                .extract_in(temp.path().join(directory), ExtractPolicy::default())
+                .await,
             Err(ExtractError::Archive(DecodeError::PolicyViolation {
                 position: 0,
                 violation: DecodePolicyViolation::NonUtf8PaxVendorValue { .. },
@@ -262,7 +263,8 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
     let decode_policy = DecodePolicy::default().pax_policy(
         PaxDecodePolicy::default().vendor_extension_policy(PaxVendorExtensionPolicy::AllowUnknown),
     );
-    TarArchive::new_with_policy(bytes.as_slice(), decode_policy)
+    TarArchive::new(bytes.as_slice())
+        .with_policy(decode_policy)
         .extract_in(&destination, ExtractPolicy::default())
         .await
         .unwrap();
@@ -299,8 +301,9 @@ async fn vendor_pax_allowlist_requires_exact_keywords_in_both_scopes() {
             )
             .ustar("file", b'0', b"contents", "", 0o644);
         let bytes = archive.finish();
-        let mut members =
-            TarArchive::new_with_policy(bytes.as_slice(), decode_policy.clone()).members();
+        let mut members = TarArchive::new(bytes.as_slice())
+            .with_policy(decode_policy.clone())
+            .members();
         assert_eq!(
             matches!(members.next().await, Ok(Some(_))),
             allowed,
@@ -333,7 +336,8 @@ async fn duplicate_pax_records_are_rejected_by_default_and_can_use_last_value() 
     let destination = temp.path().join("permitted");
     let decode_policy = DecodePolicy::default()
         .pax_policy(PaxDecodePolicy::default().allow_duplicate_pax_records(true));
-    TarArchive::new_with_policy(bytes.as_slice(), decode_policy)
+    TarArchive::new(bytes.as_slice())
+        .with_policy(decode_policy)
         .extract_in(&destination, ExtractPolicy::default())
         .await
         .unwrap();
@@ -360,7 +364,8 @@ async fn pax_extension_size_limit_is_configurable_for_extraction() {
     let decode_policy = DecodePolicy::default()
         .pax_policy(PaxDecodePolicy::default().max_extension_size(payload_size - 1));
     assert!(matches!(
-        TarArchive::new_with_policy(bytes.as_slice(), decode_policy)
+        TarArchive::new(bytes.as_slice())
+            .with_policy(decode_policy)
             .extract_in(&destination, ExtractPolicy::default())
             .await,
         Err(ExtractError::Archive(DecodeError::Framing(FrameError {
@@ -383,7 +388,8 @@ async fn pax_extension_size_limit_is_configurable_for_extraction() {
     let destination = temp.path().join("accepted");
     let decode_policy = DecodePolicy::default()
         .pax_policy(PaxDecodePolicy::default().max_extension_size(payload_size));
-    TarArchive::new_with_policy(bytes.as_slice(), decode_policy)
+    TarArchive::new(bytes.as_slice())
+        .with_policy(decode_policy)
         .extract_in(&destination, ExtractPolicy::default())
         .await
         .expect("extension at configured limit should extract");
@@ -413,7 +419,8 @@ async fn global_pax_extensions_size_limit_is_configurable_for_extraction() {
     let decode_policy = DecodePolicy::default()
         .pax_policy(PaxDecodePolicy::default().max_global_extensions_size(limit));
     assert!(matches!(
-        TarArchive::new_with_policy(bytes.as_slice(), decode_policy)
+        TarArchive::new(bytes.as_slice())
+            .with_policy(decode_policy)
             .extract_in(&destination, ExtractPolicy::default())
             .await,
         Err(ExtractError::Archive(DecodeError::Framing(FrameError {
@@ -435,7 +442,8 @@ async fn global_pax_extensions_size_limit_is_configurable_for_extraction() {
     let destination = temp.path().join("accepted");
     let decode_policy = DecodePolicy::default()
         .pax_policy(PaxDecodePolicy::default().max_global_extensions_size(payload_size * 3));
-    TarArchive::new_with_policy(bytes.as_slice(), decode_policy)
+    TarArchive::new(bytes.as_slice())
+        .with_policy(decode_policy)
         .extract_in(&destination, ExtractPolicy::default())
         .await
         .expect("global extensions at the configured limit should extract");
@@ -460,7 +468,8 @@ async fn gnu_extension_size_limit_is_configurable_for_extraction() {
     let destination = temp.path().join("rejected");
     let decode_policy = DecodePolicy::default().max_gnu_extension_size(payload_size - 1);
     assert!(matches!(
-        TarArchive::new_with_policy(bytes.as_slice(), decode_policy)
+        TarArchive::new(bytes.as_slice())
+            .with_policy(decode_policy)
             .extract_in(&destination, ExtractPolicy::default())
             .await,
         Err(ExtractError::Archive(DecodeError::Framing(FrameError {
@@ -482,7 +491,8 @@ async fn gnu_extension_size_limit_is_configurable_for_extraction() {
 
     let destination = temp.path().join("accepted");
     let decode_policy = DecodePolicy::default().max_gnu_extension_size(payload_size);
-    TarArchive::new_with_policy(bytes.as_slice(), decode_policy)
+    TarArchive::new(bytes.as_slice())
+        .with_policy(decode_policy)
         .extract_in(&destination, ExtractPolicy::default())
         .await
         .expect("extension at configured limit should extract");
@@ -504,7 +514,8 @@ async fn global_pax_headers_support_opt_out_and_ignore_trailing_updates() {
     let reject_globals = DecodePolicy::default()
         .pax_policy(PaxDecodePolicy::default().allow_global_pax_extensions(false));
     assert!(matches!(
-        TarArchive::new_with_policy(bytes.as_slice(), reject_globals.clone())
+        TarArchive::new(bytes.as_slice())
+            .with_policy(reject_globals.clone())
             .extract_in(temp.path().join("rejected"), ExtractPolicy::default())
             .await,
         Err(ExtractError::Archive(DecodeError::PolicyViolation {
@@ -531,7 +542,8 @@ async fn global_pax_headers_support_opt_out_and_ignore_trailing_updates() {
     let mut archive = ArchiveBuilder::new();
     archive.pax(b'g', &pax_record(PaxKeyword::Comment, "metadata"));
     let trailing = archive.finish();
-    TarArchive::new_with_policy(trailing.as_slice(), reject_globals.clone())
+    TarArchive::new(trailing.as_slice())
+        .with_policy(reject_globals.clone())
         .extract_in(temp.path().join("trailing"), ExtractPolicy::default())
         .await
         .unwrap();
@@ -540,7 +552,8 @@ async fn global_pax_headers_support_opt_out_and_ignore_trailing_updates() {
     archive.pax(b'g', b"invalid");
     let malformed = archive.finish();
     assert!(matches!(
-        TarArchive::new_with_policy(malformed.as_slice(), reject_globals)
+        TarArchive::new(malformed.as_slice())
+            .with_policy(reject_globals)
             .extract_in(temp.path().join("malformed"), ExtractPolicy::default())
             .await,
         Err(ExtractError::Archive(DecodeError::Framing(FrameError {
@@ -585,7 +598,8 @@ async fn global_member_metadata_requires_opt_in_and_uses_pax_precedence() {
     let bytes = archive.finish();
     let decode_policy = DecodePolicy::default()
         .pax_policy(PaxDecodePolicy::default().allow_global_pax_member_metadata(true));
-    TarArchive::new_with_policy(bytes.as_slice(), decode_policy)
+    TarArchive::new(bytes.as_slice())
+        .with_policy(decode_policy)
         .extract_in(&destination, ExtractPolicy::default())
         .await
         .unwrap();

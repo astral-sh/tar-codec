@@ -10,7 +10,7 @@ use tokio::io::AsyncRead;
 
 use crate::{
     ArchiveFormat, Block, FrameError, FrameErrorInner, GnuKind, PaxKeyword, PaxKind, PaxRecord,
-    PaxString, PaxValue, UstarKind,
+    PaxString, PaxValue, StreamPolicy, UstarKind,
     header::{GNAME_RANGE, LINK_NAME_RANGE, UNAME_RANGE},
     pax::GlobalPaxRecords,
     stream::{DataFrame, DataOwner, Frame, HeaderFrame, State, TarStream},
@@ -298,50 +298,10 @@ impl<R> TarReader<R> {
         }
     }
 
-    /// Sets the maximum size accepted for each subsequent pax extension.
-    ///
-    /// A local or global pax header that declares a larger payload is rejected
-    /// before any of its payload blocks are consumed. Setting the maximum to
-    /// [`u64::MAX`] removes the per-extension bound; global extensions remain
-    /// subject to their cumulative limit.
-    ///
-    /// See [`TarStream::set_max_pax_extension_size`].
-    pub fn set_max_pax_extension_size(&mut self, max_pax_extension_size: u64) {
-        self.payload
-            .stream
-            .set_max_pax_extension_size(max_pax_extension_size);
-    }
-
-    /// Sets the maximum cumulative size of global pax extensions before one member.
-    ///
-    /// A global header that would increase the pending total beyond this limit
-    /// is rejected before its payload is consumed. Setting the maximum to
-    /// [`u64::MAX`] removes the cumulative bound; each extension remains
-    /// subject to its individual limit.
-    ///
-    /// See [`TarStream::set_max_global_pax_extensions_size`].
-    pub fn set_max_global_pax_extensions_size(&mut self, max_global_pax_extensions_size: u64) {
-        self.payload
-            .stream
-            .set_max_global_pax_extensions_size(max_global_pax_extensions_size);
-    }
-
-    /// Sets whether wholly NUL numeric metadata fields may be accepted.
-    ///
-    /// See [`TarStream::set_allow_all_nul_numeric_fields`].
-    pub fn set_allow_all_nul_numeric_fields(&mut self, allow: bool) {
-        self.payload.stream.set_allow_all_nul_numeric_fields(allow);
-    }
-
-    /// Sets the maximum size accepted for each subsequent GNU metadata extension.
-    ///
-    /// A long-name or long-link header that declares a larger payload is
-    /// rejected before any of its payload blocks are consumed. Setting the
-    /// maximum to [`u64::MAX`] permits unbounded metadata buffering.
-    pub fn set_max_gnu_extension_size(&mut self, max_gnu_extension_size: u64) {
-        self.payload
-            .stream
-            .set_max_gnu_extension_size(max_gnu_extension_size);
+    /// Configures the framing policy used by this reader.
+    pub fn with_policy(mut self, policy: StreamPolicy) -> Self {
+        self.payload.stream = self.payload.stream.with_policy(policy);
+        self
     }
 }
 
@@ -1233,8 +1193,8 @@ mod tests {
             u64::try_from(rejected.len()).expect("test position should fit u64");
         append_block(&mut rejected, &header(b'g', payload_size));
         let error: Result<(), FrameError> = ready(async {
-            let mut reader = TarReader::new(ChunkedReader::new(rejected, BLOCK_SIZE));
-            reader.set_max_global_pax_extensions_size(limit);
+            let mut reader = TarReader::new(ChunkedReader::new(rejected, BLOCK_SIZE))
+                .with_policy(StreamPolicy::default().max_global_pax_extensions_size(limit));
             reader.next_frame().await.map(|_| ())
         });
         assert!(matches!(
@@ -1259,8 +1219,9 @@ mod tests {
         }
         append_terminator(&mut accepted);
         ready_ok(async {
-            let mut reader = TarReader::new(ChunkedReader::new(accepted, BLOCK_SIZE));
-            reader.set_max_global_pax_extensions_size(payload_size * 3);
+            let mut reader = TarReader::new(ChunkedReader::new(accepted, BLOCK_SIZE)).with_policy(
+                StreamPolicy::default().max_global_pax_extensions_size(payload_size * 3),
+            );
             for _ in 0..2 {
                 let member = next_member(&mut reader).await?;
                 assert_eq!(
@@ -1602,8 +1563,8 @@ mod tests {
             let mut reader = TarReader::new(ChunkedReader::new(
                 gnu_header(typeflag, declared_size).to_vec(),
                 BLOCK_SIZE,
-            ));
-            reader.set_max_gnu_extension_size(declared_size - 1);
+            ))
+            .with_policy(StreamPolicy::default().max_gnu_extension_size(declared_size - 1));
             assert!(
                 matches!(
                     ready(reader.next_frame()),
@@ -1647,8 +1608,8 @@ mod tests {
         append_terminator(&mut bytes);
 
         ready_ok(async {
-            let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE));
-            reader.set_max_gnu_extension_size(payload_size - 1);
+            let mut reader = TarReader::new(ChunkedReader::new(bytes, BLOCK_SIZE))
+                .with_policy(StreamPolicy::default().max_gnu_extension_size(payload_size - 1));
             assert!(matches!(
                 reader.next_frame().await,
                 Err(FrameError {

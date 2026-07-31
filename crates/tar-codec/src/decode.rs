@@ -7,7 +7,7 @@ use archive_trait::{
     SpecialKind,
 };
 use tar_framing::{
-    ArchiveFormat, FrameError, PaxKeyword, PaxKind, PaxRecord, PaxValue, UstarKind,
+    ArchiveFormat, FrameError, PaxKeyword, PaxKind, PaxRecord, PaxValue, StreamPolicy, UstarKind,
     logical::{MemberExtensions, MemberFrame, MemberPayload as FramingMemberPayload, TarReader},
 };
 use thiserror::Error;
@@ -31,21 +31,23 @@ pub struct TarArchive<R> {
 impl<R> TarArchive<R> {
     /// Creates an archive decoder from an uncompressed tar reader.
     pub fn new(reader: R) -> Self {
-        Self::new_with_policy(reader, DecodePolicy::default())
-    }
-
-    /// Creates an archive decoder using `policy`.
-    pub fn new_with_policy(reader: R, policy: DecodePolicy) -> Self {
-        let mut reader = TarReader::new(reader);
-        reader.set_max_pax_extension_size(policy.pax_policy.max_extension_size);
-        reader.set_max_global_pax_extensions_size(policy.pax_policy.max_global_extensions_size);
-        reader.set_allow_all_nul_numeric_fields(policy.allow_all_nul_numeric_fields);
-        reader.set_max_gnu_extension_size(policy.max_gnu_extension_size);
         Self {
-            reader,
-            policy,
+            reader: TarReader::new(reader),
+            policy: DecodePolicy::default(),
             fused: false,
         }
+    }
+
+    /// Configures the decoding policy used by this archive.
+    pub fn with_policy(mut self, policy: DecodePolicy) -> Self {
+        let stream_policy = StreamPolicy::default()
+            .max_pax_extension_size(policy.pax_policy.max_extension_size)
+            .max_global_pax_extensions_size(policy.pax_policy.max_global_extensions_size)
+            .allow_all_nul_numeric_fields(policy.allow_all_nul_numeric_fields)
+            .max_gnu_extension_size(policy.max_gnu_extension_size);
+        self.reader = self.reader.with_policy(stream_policy);
+        self.policy = policy;
+        self
     }
 }
 

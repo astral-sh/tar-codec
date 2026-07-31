@@ -89,7 +89,7 @@
 //! tar-framing accepts wholly NUL `mode`, `uid`, `gid`, and `mtime` fields by default for
 //! compatibility with real-world writers in both families. These fields are represented as
 //! missing rather than assigned a value. This can be disabled with
-//! [`stream::TarStream::set_allow_all_nul_numeric_fields`].
+//! [`StreamPolicy::allow_all_nul_numeric_fields`].
 //!
 //! Separately, higher-level crates (like tar-codec) may choose to apply additional
 //! restrictions when processing logical archive members. For example, a consumer
@@ -116,6 +116,7 @@ pub use error::{FrameError, FrameErrorInner};
 pub use pax::{
     HdrCharset, PaxError, PaxExtension, PaxKeyword, PaxRecord, PaxState, PaxString, PaxValue,
 };
+pub use stream::StreamPolicy;
 
 /// The size of a logical tar record.
 pub const BLOCK_SIZE: usize = 512;

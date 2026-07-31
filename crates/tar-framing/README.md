@@ -18,6 +18,10 @@ This crate provides two views over an asynchronous I/O source:
   according to PAX/GNU precedence, and streams member payload blocks through
   a borrowing cursor.
 
+Both readers accept a `StreamPolicy` through `with_policy` to configure
+extension size limits and numeric-header compatibility. Their `new`
+constructors use the default policy.
+
 For PAX members, one `PaxState` provides standards-consistent effective values
 while preserving each positioned global or local extension newly encountered
 for that member. Trailing global extensions without a following member are

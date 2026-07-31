@@ -403,7 +403,7 @@ async fn name_validation_supports_default_custom_and_disabled_policies() {
     ];
 
     for (policy, path, accepted, context) in policies {
-        let mut builder = MockFormat::new().builder_with_policy(policy);
+        let mut builder = MockFormat::new().builder().with_policy(policy);
         let result = builder
             .add_file(path, b"".as_slice(), EntryMetadata::default())
             .await;
@@ -543,7 +543,7 @@ async fn recursive_build_applies_symlink_policy() {
     let preserve = BuilderPolicy::default().symlink_policy(SymlinkPolicy::Preserve);
     let format = MockFormat::new();
     let entries = format.entries();
-    let mut builder = format.builder_with_policy(preserve);
+    let mut builder = format.builder().with_policy(preserve);
     builder
         .add_directory_all(&source)
         .await
@@ -564,7 +564,8 @@ async fn recursive_build_applies_symlink_policy() {
     }));
     assert!(matches!(
         MockFormat::new()
-            .builder_with_policy(policy)
+            .builder()
+            .with_policy(policy)
             .add_directory_all(&source)
             .await,
         Err(BuildError::Traversal(TraversalError::NameRejected {
@@ -576,7 +577,8 @@ async fn recursive_build_applies_symlink_policy() {
     std::fs::remove_file(source.join("custom")).expect("custom link should be removed");
     symlink(" leading", source.join("disabled")).expect("disabled-policy link should be created");
     MockFormat::new()
-        .builder_with_policy(preserve.name_validator(None))
+        .builder()
+        .with_policy(preserve.name_validator(None))
         .add_directory_all(&source)
         .await
         .expect("disabled validation should accept the link target");
@@ -631,7 +633,8 @@ async fn recursive_build_reports_non_utf8_and_unsupported_sources() {
     .expect("non-UTF-8 symbolic link should be created");
     assert!(matches!(
         MockFormat::new()
-            .builder_with_policy(BuilderPolicy::default().symlink_policy(SymlinkPolicy::Preserve),)
+            .builder()
+            .with_policy(BuilderPolicy::default().symlink_policy(SymlinkPolicy::Preserve))
             .add_directory_all(&source)
             .await,
         Err(BuildError::Traversal(

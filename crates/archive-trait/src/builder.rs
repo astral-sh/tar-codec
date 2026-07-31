@@ -338,8 +338,7 @@ impl<E> BuildFailure<E> {
 /// The asynchronous methods on this trait are implementation hooks for
 /// [`Builder`]. Archive construction callers must not invoke them directly;
 /// doing so bypasses builder policy, collision tracking, and cancellation
-/// poisoning. Use [`Self::builder`] or [`Self::builder_with_policy`] and then
-/// the [`Builder`] APIs instead.
+/// poisoning. Use [`Self::builder`] and then the [`Builder`] APIs instead.
 ///
 /// Hook implementations must return [`BuildFailure::recoverable`] only when the
 /// failed invocation wrote no output. Any failure after output may have begun
@@ -359,16 +358,6 @@ pub trait ArchiveBuilder: Sized {
         Builder {
             backend: self,
             state: BuilderState::new(BuilderPolicy::default()),
-        }
-    }
-
-    /// Wraps this format writer in a builder using `policy`.
-    ///
-    /// Implementors should not override this default implementation.
-    fn builder_with_policy(self, policy: BuilderPolicy) -> Builder<Self> {
-        Builder {
-            backend: self,
-            state: BuilderState::new(policy),
         }
     }
 
@@ -400,14 +389,19 @@ pub trait ArchiveBuilder: Sized {
 
 /// A stateful format-neutral archive construction engine.
 ///
-/// Create this wrapper with [`ArchiveBuilder::builder`] or
-/// [`ArchiveBuilder::builder_with_policy`].
+/// Create this wrapper with [`ArchiveBuilder::builder`].
 pub struct Builder<B> {
     backend: B,
     state: BuilderState,
 }
 
 impl<B: ArchiveBuilder> Builder<B> {
+    /// Configures the policy used by this builder.
+    pub fn with_policy(mut self, policy: BuilderPolicy) -> Self {
+        self.state.policy = policy;
+        self
+    }
+
     /// Adds one regular file from a [`FilePayload`].
     ///
     /// If the payload ends before its declared size or returns an error, the
