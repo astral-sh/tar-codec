@@ -8,7 +8,7 @@ use support::{
 };
 use tar_codec::{
     Archive as _, DecodeError, DecodePolicy, DecodePolicyViolation, ExtractError, PaxDecodePolicy,
-    TarArchive, extract::ExtractPolicy,
+    PaxVendorExtensionPolicy, TarArchive, extract::ExtractPolicy,
 };
 #[cfg(unix)]
 use tar_codec::{ExtractPolicyViolation, default_name_validator};
@@ -208,24 +208,29 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
         })) if vendor == "Acme" && name == "attribute"
     ));
 
-    let strict_pax_policy = PaxDecodePolicy::default()
-        .allow_unknown_pax_vendor_records(true)
-        .allow_non_utf8_pax_vendor_values(false);
-    assert!(matches!(
-        TarArchive::new_with_policy(
-            bytes.as_slice(),
-            DecodePolicy::default().pax_policy(strict_pax_policy),
-        )
-        .extract_in(temp.path().join("strict"), ExtractPolicy::default())
-        .await,
-        Err(ExtractError::Archive(DecodeError::PolicyViolation {
-            position: 0,
-            violation: DecodePolicyViolation::NonUtf8PaxVendorValue {
-                vendor,
-                name,
-            },
-        })) if vendor == "Acme" && name == "attribute"
-    ));
+    for (directory, vendor_extension_policy) in [
+        ("strict-allow-all", PaxVendorExtensionPolicy::AllowUnknown),
+        (
+            "strict-allowlisted",
+            PaxVendorExtensionPolicy::ignore(["Acme.attribute"]),
+        ),
+    ] {
+        let strict_pax_policy = PaxDecodePolicy::default()
+            .vendor_extension_policy(vendor_extension_policy)
+            .allow_non_utf8_pax_vendor_values(false);
+        assert!(matches!(
+            TarArchive::new_with_policy(
+                bytes.as_slice(),
+                DecodePolicy::default().pax_policy(strict_pax_policy),
+            )
+            .extract_in(temp.path().join(directory), ExtractPolicy::default())
+            .await,
+            Err(ExtractError::Archive(DecodeError::PolicyViolation {
+                position: 0,
+                violation: DecodePolicyViolation::NonUtf8PaxVendorValue { .. },
+            }))
+        ));
+    }
 
     let destination = temp.path().join("partial");
     let mut archive = ArchiveBuilder::new();
@@ -254,8 +259,9 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
         .pax(b'x', &binary_vendor)
         .ustar("file", b'0', b"ok", "", 0o644);
     let bytes = archive.finish();
-    let decode_policy = DecodePolicy::default()
-        .pax_policy(PaxDecodePolicy::default().allow_unknown_pax_vendor_records(true));
+    let decode_policy = DecodePolicy::default().pax_policy(
+        PaxDecodePolicy::default().vendor_extension_policy(PaxVendorExtensionPolicy::AllowUnknown),
+    );
     TarArchive::new_with_policy(bytes.as_slice(), decode_policy)
         .extract_in(&destination, ExtractPolicy::default())
         .await
@@ -264,6 +270,43 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
         std::fs::read_to_string(destination.join("file")).unwrap(),
         "ok"
     );
+}
+
+#[tokio::test]
+async fn vendor_pax_allowlist_requires_exact_keywords_in_both_scopes() {
+    let decode_policy = DecodePolicy::default().pax_policy(
+        PaxDecodePolicy::default()
+            .vendor_extension_policy(PaxVendorExtensionPolicy::ignore(["Acme.attribute"])),
+    );
+
+    for (scope, vendor, name, allowed) in [
+        (b'x', "Acme", "attribute", true),
+        (b'g', "Acme", "attribute", true),
+        (b'x', "Acme", "attribute.extra", false),
+        (b'g', "Other", "attribute", false),
+    ] {
+        let mut archive = ArchiveBuilder::new();
+        archive
+            .pax(
+                scope,
+                &raw_pax_record(
+                    PaxKeyword::Vendor {
+                        vendor: Arc::from(vendor),
+                        name: Arc::from(name),
+                    },
+                    &[0xd6, 0xfb, 0x00],
+                ),
+            )
+            .ustar("file", b'0', b"contents", "", 0o644);
+        let bytes = archive.finish();
+        let mut members =
+            TarArchive::new_with_policy(bytes.as_slice(), decode_policy.clone()).members();
+        assert_eq!(
+            matches!(members.next().await, Ok(Some(_))),
+            allowed,
+            "{vendor}.{name}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -461,7 +504,7 @@ async fn global_pax_headers_support_opt_out_and_ignore_trailing_updates() {
     let reject_globals = DecodePolicy::default()
         .pax_policy(PaxDecodePolicy::default().allow_global_pax_extensions(false));
     assert!(matches!(
-        TarArchive::new_with_policy(bytes.as_slice(), reject_globals)
+        TarArchive::new_with_policy(bytes.as_slice(), reject_globals.clone())
             .extract_in(temp.path().join("rejected"), ExtractPolicy::default())
             .await,
         Err(ExtractError::Archive(DecodeError::PolicyViolation {
@@ -488,7 +531,7 @@ async fn global_pax_headers_support_opt_out_and_ignore_trailing_updates() {
     let mut archive = ArchiveBuilder::new();
     archive.pax(b'g', &pax_record(PaxKeyword::Comment, "metadata"));
     let trailing = archive.finish();
-    TarArchive::new_with_policy(trailing.as_slice(), reject_globals)
+    TarArchive::new_with_policy(trailing.as_slice(), reject_globals.clone())
         .extract_in(temp.path().join("trailing"), ExtractPolicy::default())
         .await
         .unwrap();

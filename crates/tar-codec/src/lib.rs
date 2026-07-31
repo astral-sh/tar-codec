@@ -25,6 +25,7 @@ pub use archive_trait::{
 };
 pub use archive_trait::{builder, extract};
 pub use decode::{
-    DecodeError, DecodePolicy, DecodePolicyViolation, PaxDecodePolicy, TarArchive, TarMemberPayload,
+    DecodeError, DecodePolicy, DecodePolicyViolation, PaxDecodePolicy, PaxVendorExtensionAllowlist,
+    PaxVendorExtensionPolicy, TarArchive, TarMemberPayload,
 };
 pub use encode::{EncodeError, TarEncoder};

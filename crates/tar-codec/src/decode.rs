@@ -52,7 +52,7 @@ impl<R> TarArchive<R> {
 /// Controls tar compatibility and the feature subset member decoding may accept.
 ///
 /// See each configuration API for its default.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct DecodePolicy {
     allow_gnu: bool,
     allow_all_nul_numeric_fields: bool,
@@ -63,15 +63,50 @@ pub struct DecodePolicy {
 /// Controls pax compatibility and the feature subset member decoding may accept.
 ///
 /// See each allow API for its default.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaxDecodePolicy {
     max_extension_size: u64,
     max_global_extensions_size: u64,
     allow_non_utf8_pax_vendor_values: bool,
     allow_global_pax_extensions: bool,
-    allow_unknown_pax_vendor_records: bool,
+    vendor_extension_policy: PaxVendorExtensionPolicy,
     allow_duplicate_pax_records: bool,
     allow_global_pax_member_metadata: bool,
+}
+
+/// Controls which vendor-namespaced pax records may be ignored during decoding.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum PaxVendorExtensionPolicy {
+    /// Reject every unknown vendor-namespaced pax record.
+    #[default]
+    RejectUnknown,
+    /// Ignore only records whose complete keywords appear in this allowlist.
+    ///
+    /// Keywords include the vendor namespace, such as `Acme.attribute`.
+    Ignore(PaxVendorExtensionAllowlist),
+    /// Ignore every unknown vendor-namespaced pax record.
+    ///
+    /// Unknown vendor semantics can affect the archive's intended contents.
+    AllowUnknown,
+}
+
+impl PaxVendorExtensionPolicy {
+    /// Ignores vendor records whose complete keywords appear in `keywords`.
+    ///
+    /// Keywords include the vendor namespace, such as `Acme.attribute`.
+    pub fn ignore(keywords: impl IntoIterator<Item = &'static str>) -> Self {
+        Self::Ignore(PaxVendorExtensionAllowlist {
+            keywords: keywords.into_iter().collect(),
+        })
+    }
+}
+
+/// An opaque allowlist of vendor-namespaced pax record keywords.
+///
+/// Construct an allowlist with [`PaxVendorExtensionPolicy::ignore`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaxVendorExtensionAllowlist {
+    keywords: HashSet<&'static str>,
 }
 
 impl Default for PaxDecodePolicy {
@@ -81,7 +116,7 @@ impl Default for PaxDecodePolicy {
             max_global_extensions_size: DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE,
             allow_non_utf8_pax_vendor_values: true,
             allow_global_pax_extensions: true,
-            allow_unknown_pax_vendor_records: false,
+            vendor_extension_policy: PaxVendorExtensionPolicy::default(),
             allow_duplicate_pax_records: false,
             allow_global_pax_member_metadata: false,
         }
@@ -232,8 +267,8 @@ impl PaxDecodePolicy {
     /// record value to be valid UTF-8. Vendor values remain exposed as opaque
     /// bytes in either mode.
     ///
-    /// [`Self::allow_unknown_pax_vendor_records`] separately controls whether
-    /// decoding may ignore vendor records after they have been parsed.
+    /// [`Self::vendor_extension_policy`] separately controls whether decoding
+    /// may ignore vendor records after they have been parsed.
     pub fn allow_non_utf8_pax_vendor_values(mut self, allow: bool) -> Self {
         self.allow_non_utf8_pax_vendor_values = allow;
         self
@@ -252,22 +287,23 @@ impl PaxDecodePolicy {
         self
     }
 
-    /// Configures whether unknown vendor-namespaced pax records may be accepted.
+    /// Configures which unknown vendor-namespaced pax records may be ignored.
     ///
-    /// When enabled, well-formed vendor-namespaced pax records do not cause a
-    /// decoding error. Their values are parsed structurally, but their semantics
-    /// are not interpreted.
+    /// [`PaxVendorExtensionPolicy::Ignore`] accepts only explicitly listed
+    /// complete keywords, while [`PaxVendorExtensionPolicy::AllowUnknown`]
+    /// accepts every vendor-namespaced record. Accepted values are parsed
+    /// structurally, but their semantics are not interpreted.
     ///
     /// This can produce output that differs from the archive's intended
     /// contents. For example, `GNU.sparse.*` records can change a member's
     /// effective name, logical size, and mapping from stored payload bytes to
     /// file contents; these semantics are ignored when this option is enabled.
     ///
-    /// **IMPORTANT**: Only enable this when silently ignoring unknown vendor
-    /// semantics is acceptable. Unknown vendor-namespaced pax records are
-    /// **forbidden by default**.
-    pub fn allow_unknown_pax_vendor_records(mut self, allow: bool) -> Self {
-        self.allow_unknown_pax_vendor_records = allow;
+    /// **IMPORTANT**: Only permit records whose ignored semantics are
+    /// acceptable. Unknown vendor-namespaced pax records are **forbidden by
+    /// default**.
+    pub fn vendor_extension_policy(mut self, policy: PaxVendorExtensionPolicy) -> Self {
+        self.vendor_extension_policy = policy;
         self
     }
 
@@ -317,7 +353,14 @@ impl PaxDecodePolicy {
                 value,
             } = record
             {
-                if !self.allow_unknown_pax_vendor_records {
+                let allowed = match &self.vendor_extension_policy {
+                    PaxVendorExtensionPolicy::RejectUnknown => false,
+                    PaxVendorExtensionPolicy::Ignore(allowed) => allowed
+                        .keywords
+                        .contains(format!("{vendor}.{name}").as_str()),
+                    PaxVendorExtensionPolicy::AllowUnknown => true,
+                };
+                if !allowed {
                     return Err(DecodeError::policy_violation(
                         position,
                         DecodePolicyViolation::PaxVendorExtension {
@@ -485,10 +528,10 @@ impl<R: AsyncRead + Unpin> ArchiveTrait for TarArchive<R> {
         &'a mut self,
     ) -> Result<Option<Member<Self::Payload<'a>>>, Self::Error> {
         #[inline]
-        async fn decode_next_member<R: AsyncRead + Unpin>(
-            reader: &mut TarReader<R>,
-            policy: DecodePolicy,
-        ) -> Result<Option<Member<TarMemberPayload<'_, R>>>, DecodeError> {
+        async fn decode_next_member<'a, R: AsyncRead + Unpin>(
+            reader: &'a mut TarReader<R>,
+            policy: &DecodePolicy,
+        ) -> Result<Option<Member<TarMemberPayload<'a, R>>>, DecodeError> {
             let Some(frame) = reader.next_frame().await? else {
                 return Ok(None);
             };
@@ -500,7 +543,7 @@ impl<R: AsyncRead + Unpin> ArchiveTrait for TarArchive<R> {
             return Ok(None);
         }
 
-        let result = decode_next_member(&mut self.reader, self.policy).await;
+        let result = decode_next_member(&mut self.reader, &self.policy).await;
         self.fused = !matches!(&result, Ok(Some(_)));
         result
     }

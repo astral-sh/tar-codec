@@ -140,7 +140,7 @@ async fn all_nul_numeric_fields_are_policy_controlled() -> TestResult {
             }
 
             let mut members =
-                TarArchive::new_with_policy(bytes.as_slice(), strict_policy).members();
+                TarArchive::new_with_policy(bytes.as_slice(), strict_policy.clone()).members();
             assert!(
                 matches!(members.next().await, Err(DecodeError::Framing(_))),
                 "strict policy should reject an all-NUL {format:?} {field} field"
