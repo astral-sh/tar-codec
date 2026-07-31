@@ -70,3 +70,32 @@ cargo bench -p tar-codec --bench extraction_filesystem
 ```
 
 Run both targets when refreshing the benchmark snapshot in [BENCHMARKS](./BENCHMARKS.md)
+
+## Torture testing
+
+Run `tar-codec` against the newest non-yanked `.tar.gz` source distribution
+for each of the top 10,000 PyPI projects:
+
+```shell
+python3 scripts/torture_pypi_sdists.py
+```
+
+The harness builds the debug `tarpit` binary, caches verified archives, writes
+reports beneath `target/tarpit-pypi`, shows live progress on the terminal, and
+uses `sandbox-exec` on macOS to restrict extraction writes to a fresh temporary
+directory. It reports stale task directories left by interrupted runs without
+deleting them. On other platforms, or when running inside an existing sandbox
+that cannot nest `sandbox-exec`, pass `--no-sandbox` to explicitly rely on the
+temporary directory and `tar-codec` capability checks alone. Use `--limit` for
+a smaller smoke test, or `--project logging` to reproduce one PyPI project
+without fetching the ranking dump.
+
+To recheck only failures from an earlier run, pass its JSONL report:
+
+```shell
+python3 scripts/torture_pypi_sdists.py \
+  --rerun-failures target/tarpit-pypi/runs/<timestamp>/results.jsonl
+```
+
+This skips the ranking download, reruns every `failed_*` outcome, and saves a
+snapshot of the input report in the new run directory.
