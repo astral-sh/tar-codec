@@ -61,3 +61,16 @@ with gzip.open("archive.tar.gz", "rb") as decompressed:
                 print(member.path, payload.read().tobytes())
 ```
 
+## PyPI torture test
+
+Stream and parse source distributions from the most-downloaded PyPI packages:
+
+```shell
+uv run python crates/tar-codec-python/tests/pypi_torture.py --limit 100
+```
+
+The script compares every archive member's name and size against Python's
+`tarfile` parser and reads each payload without extracting any files. Use
+`--offset` to continue further down the rankings. Projects without a supported
+tar source distribution are skipped, and parsing failures are reported without
+stopping the remaining packages.
