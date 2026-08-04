@@ -1029,6 +1029,10 @@ impl NativeArchiveTrait for ExtractionArchive {
 }
 
 /// A one-pass tar archive reader.
+///
+/// In-memory sources are snapshotted when the archive is constructed.
+/// Later mutations do not affect the archive contents. Other binary streams,
+/// including `io.BytesIO` subclasses, are read lazily.
 #[pyclass(module = "tar_codec", frozen)]
 pub(crate) struct TarArchive {
     cursor: Arc<ArchiveCursor>,
