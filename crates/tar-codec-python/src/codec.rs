@@ -21,7 +21,7 @@ use pyo3::{
     IntoPyObjectExt,
     exceptions::{PyOverflowError, PyRuntimeError, PyTypeError, PyValueError},
     prelude::*,
-    pybacked::PyBackedBytes,
+    pybacked::{PyBackedBytes, PyBackedStr},
     pyclass::{PyTraverseError, PyVisit},
     types::{PyBytes, PyMemoryView, PySlice},
 };
@@ -173,9 +173,11 @@ impl PaxVendorExtensionPolicy {
 
     /// Ignores only the supplied complete vendor-namespaced keywords.
     #[staticmethod]
-    fn ignore(keywords: Vec<String>) -> Self {
+    fn ignore(keywords: Vec<PyBackedStr>) -> Self {
         Self {
-            policy: NativePaxVendorExtensionPolicy::ignore(keywords),
+            policy: NativePaxVendorExtensionPolicy::ignore(
+                keywords.iter().map(PyBackedStr::as_str),
+            ),
         }
     }
 

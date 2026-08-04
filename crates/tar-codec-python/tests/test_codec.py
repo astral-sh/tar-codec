@@ -173,6 +173,7 @@ class ArchiveCodecTests(unittest.TestCase):
             (None, False),
             (tar_codec.PaxVendorExtensionPolicy.REJECT_UNKNOWN, False),
             (tar_codec.PaxVendorExtensionPolicy.ALLOW_UNKNOWN, True),
+            (tar_codec.PaxVendorExtensionPolicy.ignore([]), False),
             (tar_codec.PaxVendorExtensionPolicy.ignore([keyword]), True),
             (tar_codec.PaxVendorExtensionPolicy.ignore([keyword + ".extra"]), False),
         )

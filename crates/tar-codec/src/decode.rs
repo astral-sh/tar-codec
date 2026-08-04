@@ -1,6 +1,6 @@
 //! Member-oriented decoding of pax or GNU tar streams.
 
-use std::{borrow::Cow, collections::HashSet};
+use std::collections::HashSet;
 
 use archive_trait::{
     Archive as ArchiveTrait, Member, MemberMetadata, MemberPayload as MemberPayloadTrait,
@@ -115,12 +115,9 @@ impl PaxVendorExtensionPolicy {
     /// Ignores vendor records whose complete keywords appear in `keywords`.
     ///
     /// Keywords include the vendor namespace, such as `Acme.attribute`.
-    pub fn ignore<S>(keywords: impl IntoIterator<Item = S>) -> Self
-    where
-        S: Into<Cow<'static, str>>,
-    {
+    pub fn ignore<'a>(keywords: impl IntoIterator<Item = &'a str>) -> Self {
         Self::Ignore(PaxVendorExtensionAllowlist {
-            keywords: keywords.into_iter().map(Into::into).collect(),
+            keywords: keywords.into_iter().map(str::to_owned).collect(),
         })
     }
 }
@@ -130,7 +127,7 @@ impl PaxVendorExtensionPolicy {
 /// Construct an allowlist with [`PaxVendorExtensionPolicy::ignore`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaxVendorExtensionAllowlist {
-    keywords: HashSet<Cow<'static, str>>,
+    keywords: HashSet<String>,
 }
 
 impl Default for PaxDecodePolicy {
