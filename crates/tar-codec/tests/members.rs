@@ -25,6 +25,13 @@ async fn read_payload<P: MemberPayload<Error = DecodeError>>(
     Ok(data)
 }
 
+async fn assert_fused_payload_is_absent(archive: &mut TarArchive<&[u8]>) -> TestResult {
+    assert!(archive.payload().is_none());
+    assert!(archive.next_member().await?.is_none());
+    assert!(archive.payload().is_none());
+    Ok(())
+}
+
 #[tokio::test]
 async fn projects_every_member_kind_and_streams_payloads() -> TestResult {
     let mut archive = ArchiveBuilder::new();
@@ -190,7 +197,12 @@ async fn advancing_drains_payload_and_applies_tar_policy() -> TestResult {
     let mut archive = ArchiveBuilder::new();
     archive
         .ustar("first", b'0', &[b'a'; 1024], "", 0o644)
-        .ustar("second", b'0', b"next", "", 0o644);
+        .ustar("second", b'0', b"next", "", 0o644)
+        .ustar("directory", b'5', b"", "", 0o755)
+        .ustar("symbolic", b'2', b"", "first", 0o777)
+        .ustar("fifo", b'6', b"", "", 0o644)
+        .ustar("hard", b'1', b"linked", "first", 0o644)
+        .ustar("empty-hard", b'1', b"", "first", 0o644);
     let bytes = archive.finish();
     let mut members = TarArchive::new(bytes.as_slice()).members();
     {
@@ -207,28 +219,72 @@ async fn advancing_drains_payload_and_applies_tar_policy() -> TestResult {
 
     let mut archive = TarArchive::new(bytes.as_slice());
     let mut output = [0; 512];
-    assert_eq!(archive.payload().read_aligned(&mut output).await?, 0);
+    assert!(archive.payload().is_none());
     assert!(matches!(
         archive.next_member().await?,
         Some(Member::File { metadata, .. }) if metadata.path == "first"
     ));
-    assert_eq!(
-        archive.payload().read_aligned(&mut output).await?,
-        output.len()
-    );
+    let Some(mut payload) = archive.payload() else {
+        return Err(io::Error::other("expected first file payload").into());
+    };
+    assert_eq!(payload.read_aligned(&mut output).await?, output.len());
     assert_eq!(output, [b'a'; 512]);
     let mut chunk = Vec::new();
-    assert!(archive.payload().next_chunk(&mut chunk, 512).await?);
+    assert!(payload.next_chunk(&mut chunk, 512).await?);
     assert_eq!(chunk, vec![b'a'; 512]);
-    archive.payload().skip().await?;
+    payload.skip().await?;
     assert!(matches!(
         archive.next_member().await?,
         Some(Member::File { metadata, .. }) if metadata.path == "second"
     ));
-    assert_eq!(archive.payload().read_aligned(&mut output).await?, 0);
-    assert!(archive.payload().next_chunk(&mut chunk, 32).await?);
+    let Some(mut payload) = archive.payload() else {
+        return Err(io::Error::other("expected second file payload").into());
+    };
+    assert_eq!(payload.read_aligned(&mut output).await?, 0);
+    assert!(payload.next_chunk(&mut chunk, 32).await?);
     assert_eq!(chunk, b"next");
-    assert!(!archive.payload().next_chunk(&mut chunk, 32).await?);
+    assert!(!payload.next_chunk(&mut chunk, 32).await?);
+
+    assert!(matches!(
+        archive.next_member().await?,
+        Some(Member::Directory { metadata }) if metadata.path == "directory"
+    ));
+    assert!(archive.payload().is_none());
+
+    assert!(matches!(
+        archive.next_member().await?,
+        Some(Member::SymbolicLink { metadata, .. }) if metadata.path == "symbolic"
+    ));
+    assert!(archive.payload().is_none());
+
+    assert!(matches!(
+        archive.next_member().await?,
+        Some(Member::Special {
+            metadata,
+            kind: SpecialKind::Fifo,
+        }) if metadata.path == "fifo"
+    ));
+    assert!(archive.payload().is_none());
+
+    assert!(matches!(
+        archive.next_member().await?,
+        Some(Member::HardLink { metadata, .. }) if metadata.path == "hard"
+    ));
+    let Some(payload) = archive.payload() else {
+        return Err(io::Error::other("expected hard-link payload").into());
+    };
+    assert_eq!(read_payload(payload).await?, b"linked");
+
+    assert!(matches!(
+        archive.next_member().await?,
+        Some(Member::HardLink { metadata, .. }) if metadata.path == "empty-hard"
+    ));
+    let Some(payload) = archive.payload() else {
+        return Err(io::Error::other("expected empty hard-link payload").into());
+    };
+    assert!(read_payload(payload).await?.is_empty());
+    assert!(archive.next_member().await?.is_none());
+    assert!(archive.payload().is_none());
 
     let mut archive = ArchiveBuilder::new();
     archive.ustar("truncated", b'0', &[b'x'; 1024], "", 0o644);
@@ -343,16 +399,15 @@ async fn payload_errors_fuse_member_iteration() -> TestResult {
             Some(Member::File { .. })
         ));
 
+        let Some(mut payload) = archive.payload() else {
+            return Err(io::Error::other("expected truncated file payload").into());
+        };
         let result = match operation {
             Operation::Read => {
                 let mut chunk = Vec::new();
-                archive
-                    .payload()
-                    .next_chunk(&mut chunk, 1)
-                    .await
-                    .map(|_| ())
+                payload.next_chunk(&mut chunk, 1).await.map(|_| ())
             }
-            Operation::Skip => archive.payload().skip().await,
+            Operation::Skip => payload.skip().await,
         };
         assert!(
             matches!(result, Err(DecodeError::Framing(_))),
@@ -364,6 +419,7 @@ async fn payload_errors_fuse_member_iteration() -> TestResult {
                 matches!(archive.next_member().await, Ok(None)),
                 "direct {operation:?}, iteration {attempt}"
             );
+            assert!(archive.payload().is_none());
         }
     }
 
@@ -372,12 +428,16 @@ async fn payload_errors_fuse_member_iteration() -> TestResult {
         archive.next_member().await?,
         Some(Member::File { .. })
     ));
+    let Some(mut payload) = archive.payload() else {
+        return Err(io::Error::other("expected truncated file payload").into());
+    };
     let mut output = [0; 512];
     assert!(matches!(
-        archive.payload().read_aligned(&mut output).await,
+        payload.read_aligned(&mut output).await,
         Err(DecodeError::Framing(_))
     ));
     assert!(archive.next_member().await?.is_none());
+    assert!(archive.payload().is_none());
 
     Ok(())
 }
@@ -387,7 +447,7 @@ async fn projection_errors_fuse_member_iteration() -> TestResult {
     let mut archive = ArchiveBuilder::new();
     archive
         .gnu("longname", b'L', b"no-nul", "", 0o644)
-        .gnu("first", b'0', b"", "", 0o644)
+        .gnu("first", b'0', b"rejected payload", "", 0o644)
         .gnu("second", b'0', b"", "", 0o644);
     let bytes = archive.finish();
     let mut members = TarArchive::new(bytes.as_slice()).members();
@@ -403,6 +463,10 @@ async fn projection_errors_fuse_member_iteration() -> TestResult {
         }))
     ));
     assert!(members.next().await?.is_none());
+
+    let mut archive = TarArchive::new(bytes.as_slice());
+    assert!(archive.next_member().await.is_err());
+    assert_fused_payload_is_absent(&mut archive).await?;
 
     Ok(())
 }
@@ -434,7 +498,7 @@ async fn policy_errors_fuse_member_iteration() -> TestResult {
     let mut archive = ArchiveBuilder::new();
     archive
         .pax(b'g', &pax_record(PaxKeyword::Path, "forbidden"))
-        .ustar("first", b'0', b"", "", 0o644)
+        .ustar("first", b'0', b"rejected payload", "", 0o644)
         .ustar("second", b'0', b"payload", "", 0o644);
     let bytes = archive.finish();
     let mut members = TarArchive::new(bytes.as_slice()).members();
@@ -447,5 +511,10 @@ async fn policy_errors_fuse_member_iteration() -> TestResult {
         })
     ));
     assert!(members.next().await?.is_none());
+
+    let mut archive = TarArchive::new(bytes.as_slice());
+    assert!(archive.next_member().await.is_err());
+    assert_fused_payload_is_absent(&mut archive).await?;
+
     Ok(())
 }

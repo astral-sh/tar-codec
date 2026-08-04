@@ -25,7 +25,14 @@ pub use tar_framing::{
 pub struct TarArchive<R> {
     reader: TarReader<R>,
     policy: DecodePolicy,
-    fused: bool,
+    state: ArchiveState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArchiveState {
+    Ready,
+    PayloadActive,
+    Finished,
 }
 
 impl<R> TarArchive<R> {
@@ -34,7 +41,7 @@ impl<R> TarArchive<R> {
         Self {
             reader: TarReader::new(reader),
             policy: DecodePolicy::default(),
-            fused: false,
+            state: ArchiveState::Ready,
         }
     }
 
@@ -54,11 +61,12 @@ impl<R> TarArchive<R> {
 
     /// Returns the current member's payload, even after the member is dropped.
     ///
-    /// Returns an exhausted cursor when no payload is active.
-    pub fn payload(&mut self) -> TarMemberPayload<'_, R> {
-        TarMemberPayload {
+    /// Returns [`None`] before a file or hard-link member is accepted, after a
+    /// member without a payload, and after iteration ends or fails.
+    pub fn payload(&mut self) -> Option<TarMemberPayload<'_, R>> {
+        (self.state == ArchiveState::PayloadActive).then(|| TarMemberPayload {
             payload: self.reader.payload(),
-        }
+        })
     }
 }
 
@@ -560,31 +568,38 @@ impl<R: AsyncRead + Unpin> ArchiveTrait for TarArchive<R> {
     async fn next_member<'a>(
         &'a mut self,
     ) -> Result<Option<Member<Self::Payload<'a>>>, Self::Error> {
-        if self.fused {
+        if self.state == ArchiveState::Finished {
             return Ok(None);
         }
 
         let frame = match self.reader.next_frame().await {
             Ok(Some(frame)) => frame,
             Ok(None) => {
-                self.fused = true;
+                self.state = ArchiveState::Finished;
                 return Ok(None);
             }
             Err(error) => {
-                self.fused = true;
+                self.state = ArchiveState::Finished;
                 return Err(error.into());
             }
         };
 
         if let Err(error) = self.policy.check_member(&frame) {
-            self.fused = true;
+            self.state = ArchiveState::Finished;
             return Err(error);
         }
 
         match project_member(frame) {
-            Ok(member) => Ok(Some(member)),
+            Ok(member) => {
+                self.state = if matches!(&member, Member::File { .. } | Member::HardLink { .. }) {
+                    ArchiveState::PayloadActive
+                } else {
+                    ArchiveState::Ready
+                };
+                Ok(Some(member))
+            }
             Err(error) => {
-                self.fused = true;
+                self.state = ArchiveState::Finished;
                 Err(error)
             }
         }
