@@ -818,8 +818,9 @@ impl ArchiveState {
                 self.buffer.clear();
                 self.offset = 0;
                 if matches!(&snapshot.payload, Some(Payload::Direct(_))) {
+                    let payload = archive.payload().ok_or_else(invalidated_payload)?;
                     source.discarding.store(true, Ordering::Release);
-                    let result = runtime.block_on(archive.payload().skip());
+                    let result = runtime.block_on(payload.skip());
                     source.discarding.store(false, Ordering::Release);
                     if let Err(error) = result {
                         batch.push_back(Err(map_decode_error(error)));
@@ -853,7 +854,11 @@ impl ArchiveState {
         if source.generation.load(Ordering::Acquire) != generation {
             return Err(invalidated_payload());
         }
-        let archive = self.archive.as_mut().ok_or_else(invalidated_payload)?;
+        let mut payload = self
+            .archive
+            .as_mut()
+            .and_then(NativeTarArchive::payload)
+            .ok_or_else(invalidated_payload)?;
         let buffer = &mut self.buffer;
         let offset = &mut self.offset;
         let written = runtime
@@ -863,10 +868,7 @@ impl ArchiveState {
                     if *offset == buffer.len() {
                         buffer.clear();
                         *offset = 0;
-                        let read = archive
-                            .payload()
-                            .read_aligned(&mut output[written..])
-                            .await?;
+                        let read = payload.read_aligned(&mut output[written..]).await?;
                         if read != 0 {
                             written += read;
                             continue;
@@ -876,7 +878,7 @@ impl ArchiveState {
                             .div_ceil(4)
                             .clamp(DEFAULT_READ_CHUNK_SIZE, io::MAX_PYTHON_STREAM_READ_BYTES)
                             .min(output.len().saturating_sub(written));
-                        if !archive.payload().next_chunk(buffer, target).await? {
+                        if !payload.next_chunk(buffer, target).await? {
                             break;
                         }
                     }

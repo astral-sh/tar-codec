@@ -25,7 +25,14 @@ pub use tar_framing::{
 pub struct TarArchive<R> {
     reader: TarReader<R>,
     policy: DecodePolicy,
-    fused: bool,
+    state: ArchiveState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArchiveState {
+    Ready,
+    PayloadActive,
+    Finished,
 }
 
 impl<R> TarArchive<R> {
@@ -34,7 +41,7 @@ impl<R> TarArchive<R> {
         Self {
             reader: TarReader::new(reader),
             policy: DecodePolicy::default(),
-            fused: false,
+            state: ArchiveState::Ready,
         }
     }
 
@@ -54,11 +61,12 @@ impl<R> TarArchive<R> {
 
     /// Returns the current member's payload, even after the member is dropped.
     ///
-    /// Returns an exhausted cursor when no payload is active.
-    pub fn payload(&mut self) -> TarMemberPayload<'_, R> {
-        TarMemberPayload {
+    /// Returns [`None`] before a file or hard-link member is accepted, after a
+    /// member without a payload, and after iteration ends or fails.
+    pub fn payload(&mut self) -> Option<TarMemberPayload<'_, R>> {
+        (self.state == ArchiveState::PayloadActive).then(|| TarMemberPayload {
             payload: self.reader.payload(),
-        }
+        })
     }
 }
 
@@ -571,12 +579,16 @@ impl<R: AsyncRead + Unpin> ArchiveTrait for TarArchive<R> {
             project_member(frame).map(Some)
         }
 
-        if self.fused {
+        if self.state == ArchiveState::Finished {
             return Ok(None);
         }
 
         let result = decode_next_member(&mut self.reader, &self.policy).await;
-        self.fused = !matches!(&result, Ok(Some(_)));
+        self.state = match &result {
+            Ok(Some(Member::File { .. } | Member::HardLink { .. })) => ArchiveState::PayloadActive,
+            Ok(Some(_)) => ArchiveState::Ready,
+            Ok(None) | Err(_) => ArchiveState::Finished,
+        };
         result
     }
 }
