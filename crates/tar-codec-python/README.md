@@ -60,4 +60,3 @@ with gzip.open("archive.tar.gz", "rb") as decompressed:
             if (payload := member.payload) is not None:
                 print(member.path, payload.read().tobytes())
 ```
-
