@@ -1,3 +1,9 @@
+//! Asynchronous gzip encoding with independently decompressible chapters.
+//!
+//! The gzip framing and chapter boundary construction are adapted from David
+//! Tolnay's `chapter-tgz` (MIT OR Apache-2.0):
+//! <https://github.com/dtolnay/chapter-tgz>.
+
 use std::{
     future::poll_fn,
     io::{self, Write},

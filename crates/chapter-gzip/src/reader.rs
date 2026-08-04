@@ -1,3 +1,9 @@
+//! Asynchronous chapter indexing and decoding.
+//!
+//! The backward-linked chapter discovery algorithm is adapted from David
+//! Tolnay's `chapter-tgz` (MIT OR Apache-2.0):
+//! <https://github.com/dtolnay/chapter-tgz>.
+
 use std::{
     io::{self, Cursor, SeekFrom},
     ops::Range,

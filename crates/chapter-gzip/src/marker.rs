@@ -1,4 +1,7 @@
 //! Empty DEFLATE blocks that carry backwards compressed-offset pointers.
+//!
+//! Adapted from `src/encode.rs` and `src/decode.rs` in David Tolnay's
+//! `chapter-tgz` (MIT OR Apache-2.0): <https://github.com/dtolnay/chapter-tgz>.
 
 use std::io;
 

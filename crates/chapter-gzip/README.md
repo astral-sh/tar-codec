@@ -10,6 +10,19 @@ index without decompressing chapter contents.
 This crate operates on arbitrary bytes. It does not parse tar archives, create
 tar members, or insert tar terminators.
 
+## Attribution
+
+This crate is derived from [chapter-tgz] by David Tolnay. Its chapter marker
+format, Huffman marker encoding and decoding, backward-linked chapter index, and
+gzip boundary handling are adapted from that project's implementation for
+asynchronous, tar-independent use.
+
+The upstream project is available under either the MIT license or the Apache
+License, Version 2.0. See [NOTICE](NOTICE) for the upstream attribution and MIT
+permission notice.
+
+[chapter-tgz]: https://github.com/dtolnay/chapter-tgz
+
 ## Writing
 
 ```rust,ignore
