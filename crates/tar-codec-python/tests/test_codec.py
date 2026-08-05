@@ -326,6 +326,8 @@ class ArchiveCodecTests(unittest.TestCase):
                     payload.read()
 
                 archive.close()
+                with self.assertRaisesRegex(RuntimeError, "the archive is closed"):
+                    payload.read()
                 self.assertEqual(first, contents[:17])
                 self.assertEqual(remaining, contents[17:])
                 if isinstance(source, io.BytesIO):
