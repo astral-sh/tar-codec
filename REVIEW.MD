@@ -79,7 +79,7 @@ cover any public API contract affected by the chosen fix.
 
 ## P1: Malformed in-memory archives control Python allocation size
 
-- [ ] Resolve.
+- [x] Resolved by bounding fallback allocations to the available in-memory archive bytes.
 - Location: `crates/tar-codec-python/src/codec.rs:1302`.
 
 When a supposedly direct in-memory payload does not fit in the backing archive,
