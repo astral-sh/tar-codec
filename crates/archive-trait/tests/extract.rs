@@ -5,7 +5,8 @@ use std::{collections::VecDeque, io::Read as _, path::Path, sync::mpsc, thread};
 use std::{env, os::unix::fs::PermissionsExt as _, process::Command};
 
 use archive_trait::{
-    Archive, ExtractError, ExtractPolicyViolation, Member, SpecialKind,
+    Archive, ExtractError, ExtractPolicyViolation, Member, MemberMetadata, MemberPayload,
+    SpecialKind,
     extract::{ExtractPolicy, LinkPolicy, SymlinkPolicy, extract_blocking},
 };
 use cap_std::{ambient_authority, fs::Dir};
@@ -49,6 +50,71 @@ impl Archive for GatedArchive {
             Some(entry) => entry.map(Some),
             None => Ok(None),
         }
+    }
+}
+
+struct GatedStreamingArchive {
+    contents: Vec<u8>,
+    ready: Option<oneshot::Sender<()>>,
+    resume: Option<oneshot::Receiver<()>>,
+    queued: Option<oneshot::Sender<()>>,
+}
+
+impl Archive for GatedStreamingArchive {
+    type Error = TestError;
+    type Payload<'a> = &'a mut Self;
+
+    async fn next_member<'a>(
+        &'a mut self,
+    ) -> Result<Option<Member<Self::Payload<'a>>>, Self::Error> {
+        if self.ready.is_none() {
+            return Ok(None);
+        }
+
+        Ok(Some(Member::File {
+            metadata: MemberMetadata {
+                path: "streamed".to_owned(),
+                position: 0,
+            },
+            size: self.contents.len() as u64,
+            executable: false,
+            payload: self,
+        }))
+    }
+}
+
+impl MemberPayload for &mut GatedStreamingArchive {
+    type Error = TestError;
+
+    async fn next_chunk(
+        &mut self,
+        buffer: &mut Vec<u8>,
+        _target_len: usize,
+    ) -> Result<bool, Self::Error> {
+        if let Some(ready) = self.ready.take() {
+            if ready.send(()).is_err() {
+                return Err(TestError);
+            }
+            if let Some(resume) = self.resume.take()
+                && resume.await.is_err()
+            {
+                return Err(TestError);
+            }
+            buffer.clear();
+            buffer.extend_from_slice(&self.contents);
+            return Ok(true);
+        }
+
+        if let Some(queued) = self.queued.take()
+            && queued.send(()).is_err()
+        {
+            return Err(TestError);
+        }
+        Ok(false)
+    }
+
+    async fn skip(self) -> Result<(), Self::Error> {
+        Ok(())
     }
 }
 
@@ -538,6 +604,69 @@ fn cancelling_extraction_stops_pending_buffered_files() {
             .count(),
         0
     );
+}
+
+#[test]
+fn cancelling_extraction_stops_pending_streamed_file_writes() {
+    let temp = tempdir().expect("temporary directory should be created");
+    let destination = temp.path().join("out");
+    let file_path = destination.join("streamed");
+    let (payload_ready_sender, payload_ready_receiver) = oneshot::channel();
+    let (resume_sender, resume_receiver) = oneshot::channel();
+    let (write_queued_sender, write_queued_receiver) = oneshot::channel();
+    let archive = GatedStreamingArchive {
+        contents: vec![b'x'; 4 * 1024 * 1024],
+        ready: Some(payload_ready_sender),
+        resume: Some(resume_receiver),
+        queued: Some(write_queued_sender),
+    };
+    let extraction_destination = destination.clone();
+    let runtime = Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .build()
+        .expect("test runtime should be created");
+
+    runtime.block_on(async {
+        let extraction = tokio::spawn(async move {
+            archive
+                .extract_in(extraction_destination, ExtractPolicy::default())
+                .await
+        });
+        payload_ready_receiver
+            .await
+            .expect("the streamed destination should be open");
+
+        let (release_worker_sender, release_worker_receiver) = mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || release_worker_receiver.recv().is_ok());
+        assert!(resume_sender.send(()).is_ok());
+        write_queued_receiver
+            .await
+            .expect("the streamed file write should be queued");
+
+        extraction.abort();
+        assert!(matches!(
+            extraction.await,
+            Err(error) if error.is_cancelled()
+        ));
+        assert_eq!(
+            std::fs::metadata(&file_path)
+                .expect("the streamed file should exist")
+                .len(),
+            0
+        );
+
+        assert!(release_worker_sender.send(()).is_ok());
+        assert!(matches!(worker.await, Ok(true)));
+        tokio::task::spawn_blocking(|| ())
+            .await
+            .expect("the blocking pool should drain");
+        assert_eq!(
+            std::fs::metadata(&file_path)
+                .expect("the streamed file should remain empty")
+                .len(),
+            0
+        );
+    });
 }
 
 #[cfg(windows)]
