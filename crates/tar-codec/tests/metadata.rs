@@ -277,10 +277,10 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
 #[tokio::test]
 async fn vendor_pax_allowlist_accepts_entire_vendor_namespaces_in_both_scopes() {
     let vendor = ["Ac", "me"].join("");
-    let decode_policy = DecodePolicy::default().pax_policy(
-        PaxDecodePolicy::default()
-            .vendor_extension_policy(PaxVendorExtensionPolicy::ignore([vendor.as_str(), "SCHILY"])),
-    );
+    let decode_policy =
+        DecodePolicy::default().pax_policy(PaxDecodePolicy::default().vendor_extension_policy(
+            PaxVendorExtensionPolicy::ignore([vendor.as_str(), "SCHILY"]),
+        ));
     let empty_policy = DecodePolicy::default().pax_policy(
         PaxDecodePolicy::default().vendor_extension_policy(PaxVendorExtensionPolicy::ignore([])),
     );

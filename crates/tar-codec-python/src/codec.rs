@@ -175,9 +175,7 @@ impl PaxVendorExtensionPolicy {
     #[staticmethod]
     fn ignore(vendors: Vec<PyBackedStr>) -> Self {
         Self {
-            policy: NativePaxVendorExtensionPolicy::ignore(
-                vendors.iter().map(PyBackedStr::as_str),
-            ),
+            policy: NativePaxVendorExtensionPolicy::ignore(vendors.iter().map(PyBackedStr::as_str)),
         }
     }
 

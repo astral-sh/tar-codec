@@ -192,7 +192,9 @@ class ArchiveCodecTests(unittest.TestCase):
 
         policy = tar_codec.DecodePolicy(
             pax_policy=tar_codec.PaxDecodePolicy(
-                vendor_extension_policy=tar_codec.PaxVendorExtensionPolicy.ignore([vendor])
+                vendor_extension_policy=tar_codec.PaxVendorExtensionPolicy.ignore(
+                    [vendor]
+                )
             )
         )
         self.assertEqual(next(tar_codec.TarArchive(archive, policy)).path, "file")
