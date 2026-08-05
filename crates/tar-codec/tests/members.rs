@@ -413,6 +413,7 @@ async fn payload_errors_fuse_member_iteration() -> TestResult {
             matches!(result, Err(DecodeError::Framing(_))),
             "direct {operation:?}"
         );
+        assert!(archive.payload().is_none(), "direct {operation:?}");
 
         for attempt in 1..=2 {
             assert!(
@@ -436,6 +437,7 @@ async fn payload_errors_fuse_member_iteration() -> TestResult {
         payload.read_aligned(&mut output).await,
         Err(DecodeError::Framing(_))
     ));
+    assert!(archive.payload().is_none());
     assert!(archive.next_member().await?.is_none());
     assert!(archive.payload().is_none());
 
