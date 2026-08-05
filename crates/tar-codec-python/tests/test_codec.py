@@ -177,51 +177,26 @@ class ArchiveCodecTests(unittest.TestCase):
             with self.assertRaises(tar_codec.DecodeError):
                 next(tar_codec.TarArchive(source, policy))
 
-    def test_vendor_pax_policy_requires_exact_keywords_in_both_scopes(self) -> None:
-        keyword, contents = "Acme.attribute", b"contents"
+    def test_forwards_vendor_pax_policies(self) -> None:
+        keyword = ".".join(("Acme", "attribute"))
+        archive = make_archive(
+            (ArchiveEntry("file", pax_headers=((keyword, "value"),)),)
+        )
         self.assertEqual(
             tar_codec.PaxDecodePolicy().vendor_extension_policy,
             tar_codec.PaxVendorExtensionPolicy.REJECT_UNKNOWN,
         )
-        policies: tuple[tuple[tar_codec.PaxVendorExtensionPolicy | None, bool], ...] = (
-            (None, False),
-            (tar_codec.PaxVendorExtensionPolicy.REJECT_UNKNOWN, False),
-            (tar_codec.PaxVendorExtensionPolicy.ALLOW_UNKNOWN, True),
-            (tar_codec.PaxVendorExtensionPolicy.ignore([]), False),
-            (tar_codec.PaxVendorExtensionPolicy.ignore([keyword]), True),
-            (tar_codec.PaxVendorExtensionPolicy.ignore([keyword + ".extra"]), False),
+        with self.assertRaises(tar_codec.DecodeError):
+            next(tar_codec.TarArchive(archive))
+
+        policy = tar_codec.DecodePolicy(
+            pax_policy=tar_codec.PaxDecodePolicy(
+                vendor_extension_policy=tar_codec.PaxVendorExtensionPolicy.ignore(
+                    [keyword]
+                )
+            )
         )
-
-        for scope in ("local", "global"):
-            output = io.BytesIO()
-            global_headers = {keyword: "value"} if scope == "global" else None
-            with tarfile.open(
-                fileobj=output,
-                mode="w",
-                format=tarfile.PAX_FORMAT,
-                pax_headers=global_headers,
-            ) as archive:
-                metadata = tarfile.TarInfo("file")
-                metadata.size = len(contents)
-                if scope == "local":
-                    metadata.pax_headers = {keyword: "value"}
-                archive.addfile(metadata, io.BytesIO(contents))
-
-            for vendor_policy, accepted in policies:
-                with self.subTest(scope=scope, policy=vendor_policy):
-                    policy = tar_codec.DecodePolicy(
-                        pax_policy=tar_codec.PaxDecodePolicy(
-                            vendor_extension_policy=vendor_policy
-                        )
-                    )
-                    if accepted:
-                        self.assertEqual(
-                            next(tar_codec.TarArchive(output.getvalue(), policy)).path,
-                            "file",
-                        )
-                    else:
-                        with self.assertRaises(tar_codec.DecodeError):
-                            next(tar_codec.TarArchive(output.getvalue(), policy))
+        self.assertEqual(next(tar_codec.TarArchive(archive, policy)).path, "file")
 
     def test_streams_payloads_across_partial_reads(self) -> None:
         entries = (
@@ -332,22 +307,6 @@ class ArchiveCodecTests(unittest.TestCase):
                 self.assertEqual(remaining, contents[17:])
                 if isinstance(source, io.BytesIO):
                     self.assertFalse(source.closed)
-
-    def test_invalidates_payloads_after_advance_and_close(self) -> None:
-        entries = (ArchiveEntry("first", b"x"), ArchiveEntry("next", b"y"))
-        for operation in ("advance", "close"):
-            with self.subTest(operation=operation):
-                archive = tar_codec.TarArchive(make_archive(entries))
-                stale = member_payload(next(archive))
-                if operation == "close":
-                    archive.close()
-                    with self.assertRaises(RuntimeError):
-                        stale.read()
-                else:
-                    following = next(archive)
-                    with self.assertRaises(tar_codec.InvalidatedPayloadError):
-                        stale.read()
-                    self.assertEqual(member_payload(following).read(), b"y")
 
     def test_collects_stream_cycles_through_all_archive_objects(self) -> None:
         for stream_type in (io.BytesIO, CyclicStream):

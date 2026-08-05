@@ -241,7 +241,7 @@ public API assertion that checks the actual position.
 
 ## P3: Python repeats the Rust PAX vendor-policy matrix
 
-- [ ] Simplify.
+- [x] Simplified to binding-specific rejection and allowlist forwarding coverage.
 - Python location: `crates/tar-codec-python/tests/test_codec.py:166`.
 - Existing Rust coverage: `crates/tar-codec/tests/metadata.rs:278`.
 
@@ -257,7 +257,7 @@ needed.
 
 ## P3: A standalone payload-invalidation test duplicates nearby coverage
 
-- [ ] Simplify.
+- [x] Simplified by removing the redundant standalone lifecycle test.
 - Location: `crates/tar-codec-python/tests/test_codec.py:313`.
 - Existing advance coverage: `crates/tar-codec-python/tests/test_codec.py:274`.
 - Existing close coverage: `crates/tar-codec-python/tests/test_codec.py:476`.
