@@ -1,6 +1,14 @@
 pub mod support;
 
-use std::{collections::VecDeque, io::Read as _, path::Path, sync::mpsc, thread};
+use std::{
+    collections::VecDeque,
+    future::Future as _,
+    io::Read as _,
+    path::Path,
+    sync::mpsc,
+    task::{Context, Poll, Waker},
+    thread,
+};
 #[cfg(unix)]
 use std::{env, os::unix::fs::PermissionsExt as _, process::Command};
 
@@ -536,6 +544,47 @@ async fn archive_errors_flush_prior_buffered_files() {
         std::fs::read(destination.join("created")).expect("created file should remain"),
         b"kept"
     );
+}
+
+#[test]
+fn cancelling_extraction_stops_pending_destination_creation() {
+    let temp = tempdir().expect("temporary directory should be created");
+    let destination = temp.path().join("out");
+    let runtime = Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .build()
+        .expect("test runtime should be created");
+
+    runtime.block_on(async {
+        let (worker_started_sender, worker_started_receiver) = oneshot::channel();
+        let (release_worker_sender, release_worker_receiver) = mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            if worker_started_sender.send(()).is_err() {
+                return false;
+            }
+            release_worker_receiver.recv().is_ok()
+        });
+        worker_started_receiver
+            .await
+            .expect("the blocking worker should be occupied");
+
+        let mut extraction =
+            Box::pin(TestArchive::new([]).extract_in(&destination, ExtractPolicy::default()));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            extraction.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        drop(extraction);
+        assert!(!destination.exists());
+
+        assert!(release_worker_sender.send(()).is_ok());
+        assert!(matches!(worker.await, Ok(true)));
+        tokio::task::spawn_blocking(|| ())
+            .await
+            .expect("the blocking pool should drain");
+        assert!(!destination.exists());
+    });
 }
 
 #[test]

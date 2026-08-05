@@ -13,6 +13,7 @@ pub mod builder;
 mod component_tree;
 pub mod extract;
 mod name;
+mod task;
 
 use std::{
     io,
