@@ -11,6 +11,7 @@
 - AVOID shortening variable names, e.g., use `version` instead of `ver`
 - AVOID single-line functions that just call another function
 - AVOID single-use bindings, and prefer point-free style
+- PREFER making breaking public API changes if they make a fix or refactor simpler
 
 ## Rust
 

@@ -570,8 +570,9 @@ impl<R: AsyncRead + Unpin> MemberPayload<'_, R> {
     /// Reads complete tar blocks directly into `output`.
     ///
     /// Returns zero when a complete block cannot be read directly; use
-    /// [`Self::next_chunk`] for remaining bytes. Cancellation may discard bytes
-    /// written to `output`.
+    /// [`Self::next_chunk`] for remaining bytes.
+    ///
+    /// This operation is cancellation-safe.
     pub async fn read_aligned(&mut self, output: &mut [u8]) -> Result<usize, FrameError> {
         self.reader.read_aligned(output).await
     }
@@ -1476,6 +1477,53 @@ mod tests {
             assert_eq!(member.header.position, next_member_position);
             Ok(())
         });
+    }
+
+    #[test]
+    fn resumes_aligned_member_payload_reads_across_cancellation_and_partial_blocks() {
+        let payload = (0..BLOCK_SIZE * 2 + 17)
+            .map(|index| u8::try_from(index % 251).expect("test byte should fit"))
+            .collect::<Vec<_>>();
+        let (bytes, next_member_position) = member_followed_by_empty_member(&payload);
+
+        for (bytes_before_pending, expected_completed) in
+            [(0, BLOCK_SIZE * 2), (73, 0), (BLOCK_SIZE + 73, BLOCK_SIZE)]
+        {
+            ready_ok(async {
+                let mut reader = TarReader::new(ChunkedReader::pending_once(
+                    bytes.clone(),
+                    BLOCK_SIZE + bytes_before_pending,
+                ));
+                {
+                    let mut member = next_member(&mut reader).await?;
+                    let mut output = vec![0; payload.len()];
+                    if bytes_before_pending == 0 {
+                        cancel_pending(member.payload.read_aligned(&mut output));
+                    }
+                    assert_eq!(
+                        member.payload.read_aligned(&mut output).await?,
+                        expected_completed
+                    );
+
+                    let mut chunk = Vec::new();
+                    if bytes_before_pending != 0 {
+                        cancel_pending(member.payload.next_chunk(&mut chunk, payload.len()));
+                    }
+                    let mut observed = output[..expected_completed].to_vec();
+                    while member.payload.next_chunk(&mut chunk, payload.len()).await? {
+                        observed.extend_from_slice(&chunk);
+                    }
+                    assert_eq!(
+                        observed, payload,
+                        "pending after {bytes_before_pending} bytes"
+                    );
+                }
+
+                let member = next_member(&mut reader).await?;
+                assert_eq!(member.header.position, next_member_position);
+                Ok(())
+            });
+        }
     }
 
     #[test]

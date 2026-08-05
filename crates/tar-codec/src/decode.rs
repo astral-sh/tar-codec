@@ -529,8 +529,9 @@ impl<R: AsyncRead + Unpin> TarMemberPayload<'_, R> {
     /// Reads complete tar blocks directly into `output`.
     ///
     /// Returns zero when a complete block cannot be read directly; use
-    /// [`MemberPayloadTrait::next_chunk`] for remaining bytes. Cancellation may
-    /// discard bytes already written to `output`.
+    /// [`MemberPayloadTrait::next_chunk`] for remaining bytes.
+    ///
+    /// This operation is cancellation-safe.
     pub async fn read_aligned(&mut self, output: &mut [u8]) -> Result<usize, DecodeError> {
         self.payload.read_aligned(output).await.map_err(Into::into)
     }
