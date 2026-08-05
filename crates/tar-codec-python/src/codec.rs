@@ -1359,20 +1359,7 @@ fn invalidated_payload() -> PyErr {
 }
 
 fn map_decode_error(error: NativeDecodeError) -> PyErr {
-    if let Some(original) = original_python_error(&error) {
-        return original;
-    }
-
-    let position = match &error {
-        NativeDecodeError::Framing(error) => error.position,
-        NativeDecodeError::InvalidUtf8 { position, .. }
-        | NativeDecodeError::PolicyViolation { position, .. } => *position,
-    };
-    let exception = crate::DecodeError::new_err(error.to_string());
-    Python::attach(|py| {
-        let _ = exception.value(py).setattr("position", position);
-    });
-    exception
+    original_python_error(&error).unwrap_or_else(|| crate::DecodeError::new_err(error.to_string()))
 }
 
 fn map_extract_error(error: NativeExtractError<NativeDecodeError>) -> PyErr {

@@ -215,7 +215,7 @@ both direct and streaming sources in a single existing payload-lifecycle test.
 
 ## P2: The public typing stub omits `DecodeError.position`
 
-- [ ] Resolve.
+- [x] Resolved by removing the unnecessary Python-only `position` attribute.
 - Location: `crates/tar-codec-python/python/tar_codec/_tar_codec.pyi:26`.
 - Runtime implementation: `crates/tar-codec-python/src/codec.rs:1350`.
 
