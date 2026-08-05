@@ -64,9 +64,13 @@ impl<R> TarArchive<R> {
     /// Returns [`None`] before a file or hard-link member is accepted, after a
     /// member without a payload, and after iteration ends or fails.
     pub fn payload(&mut self) -> Option<TarMemberPayload<'_, R>> {
-        (self.state == ArchiveState::PayloadActive).then(|| TarMemberPayload {
-            payload: self.reader.payload(),
-        })
+        if self.state != ArchiveState::PayloadActive {
+            return None;
+        }
+
+        self.reader
+            .payload()
+            .map(|payload| TarMemberPayload { payload })
     }
 }
 

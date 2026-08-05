@@ -120,7 +120,7 @@ using a truncated header with an obviously impossible declared size.
 
 ## P2: Fused archives still expose stale payload handles
 
-- [ ] Resolve.
+- [x] Resolved by making fused framing readers return no payload handle.
 - Location: `crates/tar-codec/src/decode.rs:62`.
 - Existing incomplete coverage: `crates/tar-codec/tests/members.rs:402`.
 

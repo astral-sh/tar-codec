@@ -300,11 +300,12 @@ impl<R> TarReader<R> {
 
     /// Returns the current member's payload, even after its frame is dropped.
     ///
-    /// Returns an exhausted cursor when no payload is active.
-    pub fn payload(&mut self) -> MemberPayload<'_, R> {
-        MemberPayload {
+    /// Returns [`None`] after the reader fails, and an exhausted cursor when no
+    /// payload is active.
+    pub fn payload(&mut self) -> Option<MemberPayload<'_, R>> {
+        (!matches!(self.payload.stream.state, State::Failed)).then_some(MemberPayload {
             reader: &mut self.payload,
-        }
+        })
     }
 
     /// Configures the framing policy used by this reader.
