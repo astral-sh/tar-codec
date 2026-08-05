@@ -1302,7 +1302,12 @@ impl MemberPayload {
         let bytes = self.cursor.state.with(py, |runtime, state| {
             let payload_remaining = usize::try_from(state.payload_remaining)
                 .map_err(|_| PyOverflowError::new_err("the payload exceeds the supported size"))?;
-            let len = limit.unwrap_or(payload_remaining).min(payload_remaining);
+            let len = limit
+                .unwrap_or(payload_remaining)
+                .min(payload_remaining)
+                .min(state.bytes.as_ref().map_or(usize::MAX, |bytes| {
+                    bytes.len().saturating_sub(self.cursor.source.offset)
+                }));
             Python::attach(|py| {
                 PyBytes::new_with(py, len, |output| {
                     py.detach(|| state.read_into(runtime, &self.cursor.source, generation, output))

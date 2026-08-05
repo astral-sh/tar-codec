@@ -145,7 +145,14 @@ class ArchiveCodecTests(unittest.TestCase):
         self.assertEqual((first.read(), second.read()), (b"", b""))
         truncated = archive[: tarfile.BLOCKSIZE + len(contents) - 1]
         missing_padding = HELLO_ARCHIVE[: tarfile.BLOCKSIZE + 5]
-        for source in (truncated, io.BytesIO(truncated), missing_padding):
+        oversized = tarfile.TarInfo("oversized")
+        oversized.size = sys.maxsize
+        for source in (
+            truncated,
+            io.BytesIO(truncated),
+            missing_padding,
+            oversized.tobuf(format=GNU_FORMAT),
+        ):
             with self.assertRaises(tar_codec.DecodeError):
                 member_payload(next(tar_codec.TarArchive(source))).read()
 
