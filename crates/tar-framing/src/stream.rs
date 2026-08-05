@@ -595,8 +595,8 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
 
     /// Reads complete payload blocks directly into `output`.
     ///
-    /// Returns zero when a complete block cannot be read directly. Cancellation
-    /// may discard bytes already written to `output`.
+    /// Returns zero when a complete block cannot be read directly.
+    /// This operation is cancellation-safe.
     pub(crate) async fn read_member_aligned(
         &mut self,
         output: &mut [u8],
@@ -623,45 +623,36 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             return Ok(0);
         }
 
-        let start_position = self.position;
-        let mut filled = 0;
-        while filled < physical_len {
-            let read = poll_fn(|context| {
-                let mut buffer = ReadBuf::new(&mut output[filled..physical_len]);
-                match Pin::new(&mut self.inner).poll_read(context, &mut buffer) {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(Ok(())) => Poll::Ready(Ok(buffer.filled().len())),
-                    Poll::Ready(Err(source)) => Poll::Ready(Err(source)),
-                }
-            })
-            .await
-            .map_err(|source| {
-                let position = start_position.saturating_add(filled as u64);
-                FrameError::at(position, FrameErrorInner::Io { source })
-            })?;
-
-            if read == 0 {
-                let partial_len = filled % BLOCK_SIZE;
-                let completed_len = filled - partial_len;
-                self.position = checked_position(start_position, completed_len)?;
-                if partial_len != 0 {
-                    return Err(FrameError::at(
-                        self.position,
-                        FrameErrorInner::IncompleteBlock { read: partial_len },
-                    ));
-                }
-                return Err(FrameError::truncated_payload(
-                    self.position,
-                    DataOwner::Member,
-                    member_remaining.saturating_sub(completed_len as u64),
-                ));
+        let read = poll_fn(|context| {
+            let mut buffer = ReadBuf::new(&mut output[..physical_len]);
+            match Pin::new(&mut self.inner).poll_read(context, &mut buffer) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(buffer.filled().len())),
+                Poll::Ready(Err(source)) => Poll::Ready(Err(source)),
             }
-            filled += read;
+        })
+        .await
+        .map_err(|source| FrameError::at(self.position, FrameErrorInner::Io { source }))?;
+
+        if read == 0 {
+            return Err(FrameError::truncated_payload(
+                self.position,
+                DataOwner::Member,
+                member_remaining,
+            ));
         }
 
-        self.position = checked_position(start_position, physical_len)?;
-        self.state = member_payload_state(member_remaining - physical_len as u64);
-        Ok(physical_len)
+        // Commit one source read before suspending again, retaining any partial
+        // trailing block in the existing cancellation-safe block buffer.
+        let partial_len = read % BLOCK_SIZE;
+        let completed_len = read - partial_len;
+        if partial_len != 0 {
+            self.block[..partial_len].copy_from_slice(&output[completed_len..read]);
+            self.block_len = partial_len;
+        }
+        self.position = checked_position(self.position, completed_len)?;
+        self.state = member_payload_state(member_remaining - completed_len as u64);
+        Ok(completed_len)
     }
 
     async fn read_member_chunk_inner(
