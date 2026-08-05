@@ -155,6 +155,22 @@ pub(crate) fn parse_bytes(source: &Bound<'_, PyAny>) -> PyResult<Option<PyBacked
     }
 
     if source.is_instance_of::<PyMemoryView>() {
+        // Reuse immutable bytes without copying only when the view spans the
+        // entire contiguous backing: read-only views can alias mutable storage,
+        // and slices or strides can change the represented archive.
+        let backing = source.getattr(intern!(source.py(), "obj"))?;
+        if let Ok(bytes) = backing.cast::<PyBytes>()
+            && source
+                .getattr(intern!(source.py(), "c_contiguous"))?
+                .extract::<bool>()?
+            && source
+                .getattr(intern!(source.py(), "nbytes"))?
+                .extract::<usize>()?
+                == bytes.as_bytes().len()
+        {
+            return Ok(Some(bytes.clone().into()));
+        }
+
         let bytes = source
             .call_method0(intern!(source.py(), "tobytes"))?
             .cast_into::<PyBytes>()?;

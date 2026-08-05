@@ -171,7 +171,7 @@ lifetime test with a failed-decoding case.
 
 ## P2: Immutable memoryviews are unnecessarily copied
 
-- [ ] Resolve.
+- [x] Resolved by reusing contiguous full-span views backed by immutable bytes.
 - Location: `crates/tar-codec-python/src/io.rs:157`.
 
 `parse_bytes` calls `memoryview.tobytes()` unconditionally. This copies even a

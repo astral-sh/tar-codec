@@ -119,9 +119,16 @@ class ArchiveCodecTests(unittest.TestCase):
                 self.assertEqual(decode_member(source), HELLO_MEMBER)
             with self.assertRaises(FileNotFoundError):
                 tar_codec.TarArchive(path.with_name("missing.tar"))
-        for source_type in (bytearray, memoryview):
+        for source_type, readonly in (
+            (bytearray, False),
+            (memoryview, False),
+            (memoryview, True),
+        ):
             mutable = bytearray(HELLO_ARCHIVE)
-            archive = tar_codec.TarArchive(source_type(mutable))
+            source = source_type(mutable)
+            if readonly and isinstance(source, memoryview):
+                source = source.toreadonly()
+            archive = tar_codec.TarArchive(source)
             mutable[0] ^= 1
             self.assertEqual(member_payload(next(archive)).read(), b"hello")
 
@@ -287,6 +294,11 @@ class ArchiveCodecTests(unittest.TestCase):
         prefixed.seek(len(b"prefix"))
         sources: tuple[tuple[str, ArchiveSource], ...] = (
             ("bytes", archive_bytes),
+            ("immutable-memoryview", memoryview(archive_bytes)),
+            (
+                "sliced-memoryview",
+                memoryview(b"prefix" + archive_bytes + b"suffix")[6:-6],
+            ),
             ("bytes-io", io.BytesIO(archive_bytes)),
             ("positioned-bytes-io", prefixed),
             ("short-reader", ShortReader(archive_bytes, maximum_read=257)),
@@ -304,6 +316,8 @@ class ArchiveCodecTests(unittest.TestCase):
                 self.assertIsInstance(remaining, memoryview)
                 self.assertTrue(first.readonly)
                 self.assertTrue(remaining.readonly)
+                if name == "immutable-memoryview":
+                    self.assertTrue(first.obj is archive_bytes)
                 self.assertEqual(first, contents[:17])
                 self.assertEqual(remaining, contents[17:])
                 self.assertEqual(member_payload(next(archive)).read(), b"tail")
