@@ -9,6 +9,9 @@ use std::{
 use tokio::task::{JoinError, JoinHandle};
 
 /// Aborts a spawned task when its owning operation is dropped.
+///
+/// This is very similar to `tokio_util::task::AbortOnDropHandle`,
+/// but without introducing a dependency on `tokio_util`.
 pub(crate) struct PendingTask<T>(pub(crate) JoinHandle<T>);
 
 impl<T> Future for PendingTask<T> {
