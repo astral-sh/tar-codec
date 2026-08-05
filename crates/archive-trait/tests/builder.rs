@@ -561,15 +561,17 @@ fn cancelling_recursive_build_stops_pending_traversal() {
         ));
         assert_eq!(VALIDATOR_CALLS.load(Ordering::Acquire), 1);
         tokio::task::yield_now().await;
+        let (drained_sender, drained_receiver) = mpsc::channel();
+        let drained = tokio::task::spawn_blocking(move || drained_sender.send(()).is_ok());
         drop(addition);
-        tokio::task::yield_now().await;
 
         assert!(release_worker_sender.send(()).is_ok());
-        assert!(matches!(worker.await, Ok(true)));
-        tokio::task::spawn_blocking(|| ())
-            .await
-            .expect("the blocking pool should drain");
+        // Drain older blocking work before the async scheduler can process
+        // the outer traversal task's cancellation.
+        assert!(drained_receiver.recv().is_ok());
         assert_eq!(VALIDATOR_CALLS.load(Ordering::Acquire), 1);
+        assert!(matches!(worker.await, Ok(true)));
+        assert!(matches!(drained.await, Ok(true)));
     });
 }
 
