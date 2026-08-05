@@ -195,7 +195,7 @@ zero-copy property for an immutable contiguous view.
 
 ## P2: Closed payload exceptions depend on archive source type
 
-- [ ] Resolve.
+- [x] Resolved by checking archive closure before streaming payload invalidation.
 - Location: `crates/tar-codec-python/src/codec.rs:849`.
 - Direct-payload comparison: `crates/tar-codec-python/src/codec.rs:615`.
 

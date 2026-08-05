@@ -853,6 +853,9 @@ impl ArchiveState {
         generation: u64,
         output: &mut [u8],
     ) -> PyResult<()> {
+        if source.closed.load(Ordering::Acquire) {
+            return Err(PyRuntimeError::new_err("the archive is closed"));
+        }
         if source.generation.load(Ordering::Acquire) != generation {
             return Err(invalidated_payload());
         }
