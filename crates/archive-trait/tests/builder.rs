@@ -5,7 +5,11 @@ use std::{
     path::PathBuf,
     pin::Pin,
     rc::Rc,
-    task::{Context, Poll},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
+    task::{Context, Poll, Waker},
 };
 
 #[cfg(unix)]
@@ -17,7 +21,11 @@ use archive_trait::{
 };
 use tempfile::tempdir;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, ReadBuf};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, ReadBuf},
+    runtime::Builder,
+    sync::oneshot,
+};
 
 const LARGE_FILE_BYTES: usize = 2 * 1024 * 1024 + 17;
 const BATCHED_FILE_BYTES: usize = 512 * 1024 + 17;
@@ -509,6 +517,60 @@ async fn recursive_build_sorts_entries_batches_small_files_and_streams_large_fil
         entry,
         RecordedEntry::File { path, executable: true, .. } if path == "tree/a"
     )));
+}
+
+#[test]
+fn cancelling_recursive_build_stops_pending_traversal() {
+    static VALIDATOR_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    let temp = tempdir().expect("temporary directory should be created");
+    let source = temp.path().join("tree");
+    std::fs::create_dir(&source).expect("source directory should be created");
+    std::fs::write(source.join("file"), b"contents").expect("source file should be created");
+    VALIDATOR_CALLS.store(0, Ordering::Release);
+    let mut builder =
+        MockFormat::new()
+            .builder()
+            .with_policy(BuilderPolicy::default().name_validator(Some(|name| {
+                VALIDATOR_CALLS.fetch_add(1, Ordering::Relaxed);
+                default_name_validator(name)
+            })));
+    let runtime = Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .build()
+        .expect("test runtime should be created");
+
+    runtime.block_on(async {
+        let (worker_started_sender, worker_started_receiver) = oneshot::channel();
+        let (release_worker_sender, release_worker_receiver) = mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            if worker_started_sender.send(()).is_err() {
+                return false;
+            }
+            release_worker_receiver.recv().is_ok()
+        });
+        worker_started_receiver
+            .await
+            .expect("the blocking worker should be occupied");
+
+        let mut addition = Box::pin(builder.add_directory_all(&source));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            addition.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        assert_eq!(VALIDATOR_CALLS.load(Ordering::Acquire), 1);
+        tokio::task::yield_now().await;
+        drop(addition);
+        tokio::task::yield_now().await;
+
+        assert!(release_worker_sender.send(()).is_ok());
+        assert!(matches!(worker.await, Ok(true)));
+        tokio::task::spawn_blocking(|| ())
+            .await
+            .expect("the blocking pool should drain");
+        assert_eq!(VALIDATOR_CALLS.load(Ordering::Acquire), 1);
+    });
 }
 
 #[cfg(unix)]

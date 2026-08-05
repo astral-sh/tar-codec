@@ -21,11 +21,11 @@ use std::{
 };
 
 use thiserror::Error;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::sync::mpsc;
 use walkdir::{DirEntry, IntoIter, WalkDir};
 
 use super::SymlinkPolicy;
-use crate::name::NameValidation;
+use crate::{name::NameValidation, task::PendingTask};
 
 /// Number of filesystem entries grouped into one producer batch.
 ///
@@ -65,7 +65,7 @@ pub(crate) enum TraversalKind {
 /// small typed stream abstraction.
 pub(crate) struct TraversalStream {
     entries: mpsc::Receiver<Vec<TraversalEntry>>,
-    task: JoinHandle<Result<(), TraversalError>>,
+    task: PendingTask<Result<(), TraversalError>>,
 }
 
 impl TraversalStream {
@@ -171,11 +171,11 @@ pub(crate) fn stream_directory_entries(
     let (sender, receiver) = mpsc::channel(DIRECTORY_TRAVERSAL_BUFFER_BATCHES);
     // Await channel backpressure outside the blocking pool so source
     // preparation and asynchronous file I/O can always acquire a worker.
-    let task = tokio::spawn(async move {
+    let task = PendingTask(tokio::spawn(async move {
         let mut producer = TraversalProducer::new(source, archive_path, validation, symlink_policy);
         loop {
             let (next_producer, entries) =
-                tokio::task::spawn_blocking(move || producer.next_batch()).await??;
+                PendingTask(tokio::task::spawn_blocking(move || producer.next_batch())).await??;
             producer = next_producer;
             let Some(entries) = entries else {
                 return Ok(());
@@ -184,7 +184,7 @@ pub(crate) fn stream_directory_entries(
                 return Ok(());
             }
         }
-    });
+    }));
     Ok(TraversalStream {
         entries: receiver,
         task,

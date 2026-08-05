@@ -8,9 +8,9 @@ use std::{
     sync::Arc,
 };
 
-use tokio::task::{JoinError, JoinHandle};
+use tokio::task::JoinError;
 
-use crate::{ExtractError, MemberPayload};
+use crate::{ExtractError, MemberPayload, task::PendingTask};
 
 // Balance reusable-buffer initialization against blocking write cadence.
 const STREAMING_PAYLOAD_CHUNK_BYTES: usize = 4 * 1024 * 1024;
@@ -37,22 +37,13 @@ pub(super) trait FilesystemIo {
 /// Runs filesystem operations on a blocking pool.
 pub(super) struct BlockingPool;
 
-/// Cancels a queued blocking write if extraction is dropped.
-struct PendingWrite(JoinHandle<io::Result<Vec<u8>>>);
-
-impl Drop for PendingWrite {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
 impl FilesystemIo for BlockingPool {
     async fn run<T, F>(operation: F) -> Result<T, JoinError>
     where
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        tokio::task::spawn_blocking(operation).await
+        PendingTask(tokio::task::spawn_blocking(operation)).await
     }
 
     async fn write_payload<P: MemberPayload>(
@@ -62,15 +53,15 @@ impl FilesystemIo for BlockingPool {
         file: File,
     ) -> Result<(), ExtractError<P::Error>> {
         let file = Arc::new(file);
-        let mut pending = None::<PendingWrite>;
+        let mut pending = None::<PendingTask<io::Result<Vec<u8>>>>;
         let mut reusable = Vec::new();
 
         loop {
             let next = payload
                 .next_chunk(buffer, STREAMING_PAYLOAD_CHUNK_BYTES)
                 .await;
-            if let Some(mut task) = pending.take() {
-                reusable = (&mut task.0)
+            if let Some(task) = pending.take() {
+                reusable = task
                     .await
                     .map_err(ExtractError::BlockingTask)?
                     .map_err(|source| {
@@ -84,7 +75,7 @@ impl FilesystemIo for BlockingPool {
             let replacement_len = buffer.len();
             let chunk = mem::take(buffer);
             let file = Arc::clone(&file);
-            pending = Some(PendingWrite(tokio::task::spawn_blocking(move || {
+            pending = Some(PendingTask(tokio::task::spawn_blocking(move || {
                 (&*file).write_all(&chunk)?;
                 Ok(chunk)
             })));

@@ -271,7 +271,7 @@ adding both source types when fixing the closed-payload exception behavior.
 
 ## Inherited issue: extraction writes can continue after cancellation
 
-- [x] Resolved by aborting queued streamed writes when extraction is dropped.
+- [x] Resolved by aborting queued filesystem tasks when extraction is dropped.
 - Branch location: `crates/archive-trait/src/extract/filesystem.rs:78`.
 - Existing incomplete test:
   `crates/archive-trait/tests/extract.rs:476`.
