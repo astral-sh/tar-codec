@@ -147,7 +147,7 @@ payload availability reflect the framing parser's actual fused state.
 
 ## P2: Terminal decoding errors retain caller-owned streams
 
-- [ ] Resolve.
+- [x] Resolved by releasing archive resources when terminal decoding errors are delivered.
 - Location: `crates/tar-codec-python/src/codec.rs:739`.
 - Related iterator path: `crates/tar-codec-python/src/codec.rs:1133`.
 

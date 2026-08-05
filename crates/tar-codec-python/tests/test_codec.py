@@ -358,9 +358,13 @@ class ArchiveCodecTests(unittest.TestCase):
                     self.assertIsNone(reference())
 
     def test_releases_caller_owned_streams_after_completion(self) -> None:
+        corrupt = bytearray(HELLO_ARCHIVE)
+        corrupt[2 * tarfile.BLOCKSIZE] ^= 1
         for kind in (
             "closed archive",
             "exhausted archive",
+            "failed in-memory decoding",
+            "failed streaming decoding",
             "extracted archive",
             "failed extraction",
             "failed initialization",
@@ -374,9 +378,13 @@ class ArchiveCodecTests(unittest.TestCase):
                         stream_type: type[io.BytesIO] = FailingFlush
                     case "failed initialization":
                         stream_type = FailingLookup
+                    case "failed streaming decoding":
+                        stream_type = ShortReadIntoReader
                     case _:
                         stream_type = io.BytesIO
-                stream = stream_type(HELLO_ARCHIVE)
+                stream = stream_type(
+                    bytes(corrupt) if kind.endswith("decoding") else HELLO_ARCHIVE
+                )
                 reference = weakref.ref(stream)
 
                 match kind:
@@ -389,6 +397,11 @@ class ArchiveCodecTests(unittest.TestCase):
                     case "exhausted archive":
                         archive = tar_codec.TarArchive(stream)
                         self.assertEqual(len(list(archive)), 1)
+                    case "failed in-memory decoding" | "failed streaming decoding":
+                        archive = tar_codec.TarArchive(stream)
+                        self.assertEqual(member_payload(next(archive)).read(), b"hello")
+                        with self.assertRaises(tar_codec.DecodeError):
+                            next(archive)
                     case "extracted archive":
                         archive = tar_codec.TarArchive(stream)
                         with tempfile.TemporaryDirectory() as directory:
