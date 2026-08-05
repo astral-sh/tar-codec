@@ -1,8 +1,9 @@
 ## General
 
 - Read CONTRIBUTING.md for guidelines on how to run tools
-- ALWAYS attempt to add a test case for changed behavior, except benchmarks and the `tarpit` CLI
-- AVOID writing duplicate or tautological testcases
+- ALWAYS attempt to add a test case for changed behavior that affects public APIs
+- AVOID writing duplicate or tautological testcases, and always test at the closest layer of abstraction
+- NEVER write testcases that test developer processes or repo-only tooling, like `tarpit`
 - NEVER perform builds with the release profile, unless asked or reproducing performance issues
 - PREFER running specific tests over running the entire test suite
 - ALWAYS read and copy the style of similar tests when adding new cases
@@ -29,3 +30,4 @@
 - AVOID using `type: ignore` and other typing loopholes
 - PREFER `match` statements over `if` chains, if applicable
 - AVOID making copies across the Python/Rust boundary; public APIs should be as zero-copy as possible
+- ALWAYS preserve cancellation safety and other security boundaries introduced by the Rust APIs
