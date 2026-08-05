@@ -1,0 +1,35 @@
+FROM ubuntu:24.04
+
+COPY --from=astral/uv:0.12.0 /uv /usr/local/bin/uv
+
+ENV CARGO_HOME=/opt/tar-codec/cargo \
+    CARGO_TARGET_DIR=/opt/tar-codec/target \
+    PATH=/opt/tar-codec/cargo/bin:$PATH \
+    RUSTUP_HOME=/opt/tar-codec/rustup \
+    UV_CACHE_DIR=/opt/tar-codec/uv-cache \
+    UV_PROJECT_ENVIRONMENT=/opt/tar-codec/venv \
+    UV_PYTHON=3.14.6 \
+    UV_PYTHON_INSTALL_DIR=/opt/tar-codec/python \
+    UV_PYTHON_PREFERENCE=only-managed
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+        https://sh.rustup.rs --output /tmp/tar-codec-rustup-init.sh \
+    && sh /tmp/tar-codec-rustup-init.sh \
+        --default-toolchain 1.97.1 --profile minimal -y \
+    && rm /tmp/tar-codec-rustup-init.sh \
+    && uv python install 3.14.6
+
+WORKDIR /work
+
+COPY . .
+
+RUN uv sync --locked

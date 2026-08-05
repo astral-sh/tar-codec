@@ -276,9 +276,13 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
 
 #[tokio::test]
 async fn vendor_pax_allowlist_requires_exact_keywords_in_both_scopes() {
+    let keyword = ["Acme", "attribute"].join(".");
     let decode_policy = DecodePolicy::default().pax_policy(
         PaxDecodePolicy::default()
-            .vendor_extension_policy(PaxVendorExtensionPolicy::ignore(["Acme.attribute"])),
+            .vendor_extension_policy(PaxVendorExtensionPolicy::ignore([keyword.as_str()])),
+    );
+    let empty_policy = DecodePolicy::default().pax_policy(
+        PaxDecodePolicy::default().vendor_extension_policy(PaxVendorExtensionPolicy::ignore([])),
     );
 
     for (scope, vendor, name, allowed) in [
@@ -301,14 +305,16 @@ async fn vendor_pax_allowlist_requires_exact_keywords_in_both_scopes() {
             )
             .ustar("file", b'0', b"contents", "", 0o644);
         let bytes = archive.finish();
-        let mut members = TarArchive::new(bytes.as_slice())
-            .with_policy(decode_policy.clone())
-            .members();
-        assert_eq!(
-            matches!(members.next().await, Ok(Some(_))),
-            allowed,
-            "{vendor}.{name}"
-        );
+        for (policy, accepted) in [(&decode_policy, allowed), (&empty_policy, false)] {
+            let mut members = TarArchive::new(bytes.as_slice())
+                .with_policy(policy.clone())
+                .members();
+            assert_eq!(
+                matches!(members.next().await, Ok(Some(_))),
+                accepted,
+                "{vendor}.{name}"
+            );
+        }
     }
 }
 

@@ -23,6 +23,7 @@ use crate::{
     NameValidator,
     component_tree::{ComponentTree, ROOT_NODE},
     name::NameValidation,
+    task::PendingTask,
 };
 
 const BUFFERED_SOURCE_FILE_BYTES: usize = 1024 * 1024;
@@ -715,7 +716,7 @@ async fn prepare_directory_entries(
     mut entries: VecDeque<TraversalEntry>,
     mut buffer: Vec<u8>,
 ) -> Result<(PreparedDirectoryBatch, VecDeque<TraversalEntry>), SourceError> {
-    tokio::task::spawn_blocking(move || {
+    PendingTask(tokio::task::spawn_blocking(move || {
         buffer.clear();
         let mut prepared = Vec::with_capacity(entries.len());
         while let Some(entry) = entries.pop_front() {
@@ -743,7 +744,7 @@ async fn prepare_directory_entries(
             },
             entries,
         ))
-    })
+    }))
     .await
     .map_err(SourceError::BlockingTask)?
 }

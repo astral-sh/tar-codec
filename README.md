@@ -21,6 +21,9 @@ Anti-goals:
 
 ## Usage
 
+For the Python bindings, see
+[crates/tar-codec-python](./crates/tar-codec-python/README.md).
+
 Encoding/archive serialization:
 
 ```rust

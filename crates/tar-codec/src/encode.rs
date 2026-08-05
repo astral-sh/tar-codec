@@ -12,7 +12,7 @@ use archive_trait::{
     builder::{BuildFailure, FilePayload},
 };
 use tar_framing::{
-    UstarKind,
+    BLOCK_SIZE, UstarKind,
     write::{
         FramingWriteError, PaxMember, end_marker_bytes, frame_pax_member_into, payload_padding,
     },
@@ -33,7 +33,8 @@ impl<W> TarEncoder<W> {
         Self {
             writer,
             sequence: 0,
-            framing_buffer: Vec::new(),
+            // One PAX header, one padded PAX-record block, and one member header.
+            framing_buffer: Vec::with_capacity(3 * BLOCK_SIZE),
         }
     }
 

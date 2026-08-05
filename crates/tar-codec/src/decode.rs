@@ -25,7 +25,14 @@ pub use tar_framing::{
 pub struct TarArchive<R> {
     reader: TarReader<R>,
     policy: DecodePolicy,
-    fused: bool,
+    state: ArchiveState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArchiveState {
+    Ready,
+    PayloadActive,
+    Finished,
 }
 
 impl<R> TarArchive<R> {
@@ -34,7 +41,7 @@ impl<R> TarArchive<R> {
         Self {
             reader: TarReader::new(reader),
             policy: DecodePolicy::default(),
-            fused: false,
+            state: ArchiveState::Ready,
         }
     }
 
@@ -50,6 +57,20 @@ impl<R> TarArchive<R> {
         self.reader = self.reader.with_policy(stream_policy);
         self.policy = policy;
         self
+    }
+
+    /// Returns the current member's payload, even after the member is dropped.
+    ///
+    /// Returns [`None`] before a file or hard-link member is accepted, after a
+    /// member without a payload, and after iteration ends or fails.
+    pub fn payload(&mut self) -> Option<TarMemberPayload<'_, R>> {
+        if self.state != ArchiveState::PayloadActive {
+            return None;
+        }
+
+        self.reader
+            .payload()
+            .map(|payload| TarMemberPayload { payload })
     }
 }
 
@@ -98,9 +119,9 @@ impl PaxVendorExtensionPolicy {
     /// Ignores vendor records whose complete keywords appear in `keywords`.
     ///
     /// Keywords include the vendor namespace, such as `Acme.attribute`.
-    pub fn ignore(keywords: impl IntoIterator<Item = &'static str>) -> Self {
+    pub fn ignore<'a>(keywords: impl IntoIterator<Item = &'a str>) -> Self {
         Self::Ignore(PaxVendorExtensionAllowlist {
-            keywords: keywords.into_iter().collect(),
+            keywords: keywords.into_iter().map(str::to_owned).collect(),
         })
     }
 }
@@ -110,7 +131,7 @@ impl PaxVendorExtensionPolicy {
 /// Construct an allowlist with [`PaxVendorExtensionPolicy::ignore`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaxVendorExtensionAllowlist {
-    keywords: HashSet<&'static str>,
+    keywords: HashSet<String>,
 }
 
 impl Default for PaxDecodePolicy {
@@ -407,10 +428,15 @@ impl PaxDecodePolicy {
         }
 
         if !self.allow_duplicate_pax_records {
-            let mut keywords = HashSet::new();
-            for record in records {
+            let mut keywords = (records.len() > 8).then(|| HashSet::with_capacity(records.len()));
+            for (index, record) in records.iter().enumerate() {
                 let keyword = record.keyword();
-                if !keywords.insert(keyword.clone()) {
+                if match &mut keywords {
+                    Some(keywords) => !keywords.insert(keyword.clone()),
+                    None => records[..index]
+                        .iter()
+                        .any(|previous| previous.keyword() == keyword),
+                } {
                     return Err(DecodeError::policy_violation(
                         position,
                         DecodePolicyViolation::DuplicatePaxRecord {
@@ -502,6 +528,18 @@ pub struct TarMemberPayload<'a, R> {
     payload: FramingMemberPayload<'a, R>,
 }
 
+impl<R: AsyncRead + Unpin> TarMemberPayload<'_, R> {
+    /// Reads complete tar blocks directly into `output`.
+    ///
+    /// Returns zero when a complete block cannot be read directly; use
+    /// [`MemberPayloadTrait::next_chunk`] for remaining bytes.
+    ///
+    /// This operation is cancellation-safe.
+    pub async fn read_aligned(&mut self, output: &mut [u8]) -> Result<usize, DecodeError> {
+        self.payload.read_aligned(output).await.map_err(Into::into)
+    }
+}
+
 impl<R: AsyncRead + Unpin> MemberPayloadTrait for TarMemberPayload<'_, R> {
     type Error = DecodeError;
 
@@ -543,12 +581,16 @@ impl<R: AsyncRead + Unpin> ArchiveTrait for TarArchive<R> {
             project_member(frame).map(Some)
         }
 
-        if self.fused {
+        if self.state == ArchiveState::Finished {
             return Ok(None);
         }
 
         let result = decode_next_member(&mut self.reader, &self.policy).await;
-        self.fused = !matches!(&result, Ok(Some(_)));
+        self.state = match &result {
+            Ok(Some(Member::File { .. } | Member::HardLink { .. })) => ArchiveState::PayloadActive,
+            Ok(Some(_)) => ArchiveState::Ready,
+            Ok(None) | Err(_) => ArchiveState::Finished,
+        };
         result
     }
 }
