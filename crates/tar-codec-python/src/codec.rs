@@ -1130,9 +1130,17 @@ impl TarArchive {
                 .state
                 .with(py, |runtime, state| state.next(runtime, &cursor.source))?;
         }
-        let snapshot = pending.pop_front().transpose()?;
+        let snapshot = pending.pop_front();
         drop(pending);
-        let Some(snapshot) = snapshot else {
+        if snapshot.as_ref().is_some_and(Result::is_err) {
+            cursor.state.with(py, |_, state| {
+                state.archive = None;
+                state.bytes = None;
+                Ok(())
+            })?;
+            release_stream(&this.stream);
+        }
+        let Some(snapshot) = snapshot.transpose()? else {
             release_stream(&this.stream);
             return Ok(None);
         };
