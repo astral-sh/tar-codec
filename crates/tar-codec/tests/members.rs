@@ -2,7 +2,7 @@ pub mod support;
 
 use std::{error::Error, io};
 
-use support::{ArchiveBuilder, ArchiveFormat, header, pax_record, set_checksum};
+use support::{ArchiveBuilder, ArchiveFormat, header, pax_record, raw_pax_record, set_checksum};
 use tar_codec::{
     Archive as _, DecodeError, DecodePolicy, DecodePolicyViolation, Member, MemberPayload,
     PaxDecodePolicy, SpecialKind, TarArchive,
@@ -335,6 +335,28 @@ async fn projection_errors_fuse_member_iteration() -> TestResult {
             },
             ..
         }))
+    ));
+    assert!(members.next().await?.is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_utf8_projection_errors_fuse_member_iteration() -> TestResult {
+    let mut binary_path = pax_record(PaxKeyword::HdrCharset, "BINARY");
+    binary_path.extend_from_slice(&raw_pax_record(PaxKeyword::Path, &[0xff]));
+
+    let mut archive = ArchiveBuilder::new();
+    archive
+        .pax(b'x', &binary_path)
+        .ustar("first", b'0', b"", "", 0o644)
+        .ustar("second", b'0', b"", "", 0o644);
+    let bytes = archive.finish();
+    let mut members = TarArchive::new(bytes.as_slice()).members();
+
+    assert!(matches!(
+        members.next().await,
+        Err(DecodeError::InvalidUtf8 { field: "path", .. })
     ));
     assert!(members.next().await?.is_none());
 
