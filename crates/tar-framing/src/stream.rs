@@ -589,15 +589,6 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         buffer: &mut Vec<u8>,
         target_len: usize,
     ) -> Result<usize, FrameError> {
-        let result = self.read_member_chunk_inner(buffer, target_len).await;
-        self.fail_on_error(result)
-    }
-
-    async fn read_member_chunk_inner(
-        &mut self,
-        buffer: &mut Vec<u8>,
-        target_len: usize,
-    ) -> Result<usize, FrameError> {
         // A cancelled block read retains its partial physical block here. Finish
         // and deliver it before starting a direct chunk so no bytes are lost.
         if self.member_chunk.state.is_none() && self.block_len != 0 {
@@ -607,10 +598,13 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             return Ok(meaningful_len);
         }
         if self.member_chunk.state.is_none() {
-            self.start_member_chunk(buffer, target_len)?;
+            let result = self.start_member_chunk(buffer, target_len);
+            self.fail_on_error(result)?;
         }
-        self.complete_member_chunk().await?;
-        self.take_member_chunk(buffer)
+        let result = self.complete_member_chunk().await;
+        self.fail_on_error(result)?;
+        let result = self.take_member_chunk(buffer);
+        self.fail_on_error(result)
     }
 
     fn fail_on_error<T>(&mut self, result: Result<T, FrameError>) -> Result<T, FrameError> {
