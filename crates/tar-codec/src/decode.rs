@@ -84,10 +84,10 @@ pub enum PaxVendorExtensionPolicy {
     /// Reject every unknown vendor-namespaced pax record.
     #[default]
     RejectUnknown,
-    /// Ignore only records whose complete keywords appear in this allowlist.
+    /// Ignore only records whose vendor namespaces appear in this allowlist.
     ///
-    /// Keywords include the vendor namespace, such as `Acme.attribute`.
-    Ignore(PaxVendorExtensionAllowlist),
+    /// A vendor namespace such as `SCHILY` permits every `SCHILY.*` record.
+    Ignore(PaxVendorAllowlist),
     /// Ignore every unknown vendor-namespaced pax record.
     ///
     /// Unknown vendor semantics can affect the archive's intended contents.
@@ -95,22 +95,22 @@ pub enum PaxVendorExtensionPolicy {
 }
 
 impl PaxVendorExtensionPolicy {
-    /// Ignores vendor records whose complete keywords appear in `keywords`.
+    /// Ignores vendor records whose vendor namespaces appear in `vendors`.
     ///
-    /// Keywords include the vendor namespace, such as `Acme.attribute`.
-    pub fn ignore(keywords: impl IntoIterator<Item = &'static str>) -> Self {
-        Self::Ignore(PaxVendorExtensionAllowlist {
-            keywords: keywords.into_iter().collect(),
+    /// A vendor namespace such as `SCHILY` permits every `SCHILY.*` record.
+    pub fn ignore(vendors: impl IntoIterator<Item = &'static str>) -> Self {
+        Self::Ignore(PaxVendorAllowlist {
+            vendors: vendors.into_iter().collect(),
         })
     }
 }
 
-/// An opaque allowlist of vendor-namespaced pax record keywords.
+/// An opaque allowlist of pax vendor namespaces.
 ///
 /// Construct an allowlist with [`PaxVendorExtensionPolicy::ignore`].
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PaxVendorExtensionAllowlist {
-    keywords: HashSet<&'static str>,
+pub struct PaxVendorAllowlist {
+    vendors: HashSet<&'static str>,
 }
 
 impl Default for PaxDecodePolicy {
@@ -293,10 +293,11 @@ impl PaxDecodePolicy {
 
     /// Configures which unknown vendor-namespaced pax records may be ignored.
     ///
-    /// [`PaxVendorExtensionPolicy::Ignore`] accepts only explicitly listed
-    /// complete keywords, while [`PaxVendorExtensionPolicy::AllowUnknown`]
-    /// accepts every vendor-namespaced record. Accepted values are parsed
-    /// structurally, but their semantics are not interpreted.
+    /// [`PaxVendorExtensionPolicy::Ignore`] accepts every record under its
+    /// explicitly listed vendor namespaces, while
+    /// [`PaxVendorExtensionPolicy::AllowUnknown`] accepts every
+    /// vendor-namespaced record. Accepted values are parsed structurally, but
+    /// their semantics are not interpreted.
     ///
     /// This can produce output that differs from the archive's intended
     /// contents. For example, `GNU.sparse.*` records can change a member's
@@ -359,9 +360,9 @@ impl PaxDecodePolicy {
             {
                 let allowed = match &self.vendor_extension_policy {
                     PaxVendorExtensionPolicy::RejectUnknown => false,
-                    PaxVendorExtensionPolicy::Ignore(allowed) => allowed
-                        .keywords
-                        .contains(format!("{vendor}.{name}").as_str()),
+                    PaxVendorExtensionPolicy::Ignore(allowed) => {
+                        allowed.vendors.contains(vendor.as_ref())
+                    }
                     PaxVendorExtensionPolicy::AllowUnknown => true,
                 };
                 if !allowed {
