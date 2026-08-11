@@ -215,7 +215,7 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
         ("strict-allow-all", PaxVendorExtensionPolicy::AllowUnknown),
         (
             "strict-allowlisted",
-            PaxVendorExtensionPolicy::ignore(["Acme.attribute"]),
+            PaxVendorExtensionPolicy::ignore(["Acme"]),
         ),
     ] {
         let strict_pax_policy = PaxDecodePolicy::default()
@@ -275,16 +275,20 @@ async fn vendor_pax_policy_covers_both_scopes_positions_and_opt_in() {
 }
 
 #[tokio::test]
-async fn vendor_pax_allowlist_requires_exact_keywords_in_both_scopes() {
+async fn vendor_pax_allowlist_accepts_entire_vendor_namespaces_in_both_scopes() {
     let decode_policy = DecodePolicy::default().pax_policy(
         PaxDecodePolicy::default()
-            .vendor_extension_policy(PaxVendorExtensionPolicy::ignore(["Acme.attribute"])),
+            .vendor_extension_policy(PaxVendorExtensionPolicy::ignore(["Acme", "SCHILY"])),
     );
 
     for (scope, vendor, name, allowed) in [
         (b'x', "Acme", "attribute", true),
         (b'g', "Acme", "attribute", true),
-        (b'x', "Acme", "attribute.extra", false),
+        (b'x', "Acme", "attribute.extra", true),
+        (b'x', "SCHILY", "xattr.user.data", true),
+        (b'g', "SCHILY", "xattr.user.deleted", true),
+        (b'x', "SCHILY_OTHER", "xattr.user.data", false),
+        (b'g', "schily", "xattr.user.data", false),
         (b'g', "Other", "attribute", false),
     ] {
         let mut archive = ArchiveBuilder::new();
