@@ -154,6 +154,14 @@ pub enum FrameErrorInner {
         /// The configured maximum cumulative payload size.
         limit: u64,
     },
+    /// The encoded size of the active global pax records is more than the configured limit.
+    #[error("active global pax record size {size} exceeds configured limit {limit}")]
+    ActiveGlobalPaxRecordsTooLarge {
+        /// The encoded size after the rejected update.
+        size: u64,
+        /// The configured limit for the encoded size.
+        limit: u64,
+    },
     /// A GNU long-name or long-link metadata payload is not a valid value.
     #[error("malformed GNU {kind:?} metadata payload: {reason}")]
     InvalidGnuMetadata {

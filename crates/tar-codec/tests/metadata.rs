@@ -22,6 +22,10 @@ fn vendor_attribute_keyword() -> PaxKeyword {
     }
 }
 
+fn security_attribute_keyword(name: &str) -> PaxKeyword {
+    PaxKeyword::Security(Arc::from(name))
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn pax_precedence_and_validation_use_effective_names() {
@@ -456,6 +460,76 @@ async fn global_pax_extensions_size_limit_is_configurable_for_extraction() {
             .expect("extracted file should be readable"),
         "contents"
     );
+}
+
+#[tokio::test]
+async fn global_pax_extensions_size_limit_bounds_active_records_across_members() {
+    let temp = tempdir().expect("temporary directory should be created");
+    let payloads =
+        ["one", "two", "tri"].map(|name| pax_record(security_attribute_keyword(name), "metadata"));
+    let payload_size = u64::try_from(payloads[0].len()).expect("payload size should fit u64");
+    assert!(payloads.iter().all(|payload| {
+        u64::try_from(payload.len()).expect("payload size should fit u64") == payload_size
+    }));
+
+    let mut archive = ArchiveBuilder::new();
+    for (index, payload) in payloads.iter().enumerate() {
+        archive
+            .pax(b'g', payload)
+            .ustar(&format!("file-{index}"), b'0', b"", "", 0o644);
+    }
+    let bytes = archive.finish();
+    let limit = payload_size
+        .checked_mul(2)
+        .expect("active record limit should fit u64");
+    let decode_policy = DecodePolicy::default()
+        .pax_policy(PaxDecodePolicy::default().max_global_extensions_size(limit));
+    let destination = temp.path().join("active-records-rejected");
+
+    assert!(matches!(
+        TarArchive::new(bytes.as_slice())
+            .with_policy(decode_policy)
+            .extract_in(&destination, ExtractPolicy::default())
+            .await,
+        Err(ExtractError::Archive(DecodeError::Framing(FrameError {
+            inner: FrameErrorInner::ActiveGlobalPaxRecordsTooLarge {
+                size,
+                limit: found_limit,
+            },
+            ..
+        }))) if size == payload_size * 3 && found_limit == limit
+    ));
+}
+
+#[tokio::test]
+async fn global_pax_extensions_size_limit_allows_replacements_across_members() {
+    let temp = tempdir().expect("temporary directory should be created");
+    let payloads =
+        ["one", "two", "tri"].map(|value| pax_record(security_attribute_keyword("label"), value));
+    let limit = u64::try_from(payloads[0].len()).expect("payload size should fit u64");
+    assert!(payloads.iter().all(|payload| {
+        u64::try_from(payload.len()).expect("payload size should fit u64") == limit
+    }));
+
+    let mut archive = ArchiveBuilder::new();
+    for (index, payload) in payloads.iter().enumerate() {
+        archive
+            .pax(b'g', payload)
+            .ustar(&format!("file-{index}"), b'0', b"", "", 0o644);
+    }
+    let bytes = archive.finish();
+    let decode_policy = DecodePolicy::default()
+        .pax_policy(PaxDecodePolicy::default().max_global_extensions_size(limit));
+    let destination = temp.path().join("active-record-replacements");
+
+    TarArchive::new(bytes.as_slice())
+        .with_policy(decode_policy)
+        .extract_in(&destination, ExtractPolicy::default())
+        .await
+        .expect("replacing one active global record should remain within the limit");
+    for index in 0..payloads.len() {
+        assert!(destination.join(format!("file-{index}")).is_file());
+    }
 }
 
 #[tokio::test]

@@ -420,7 +420,12 @@ impl<R: AsyncRead + Unpin> TarReader<R> {
                 if let Some(records) = frame.into_completed_pax_records() {
                     match kind {
                         PaxKind::Global => {
-                            records.apply_global(&mut self.global_pax_records);
+                            if records.apply_global(&mut self.global_pax_records).is_none() {
+                                return Err(FrameError::arithmetic_overflow(
+                                    position,
+                                    "active global pax record size",
+                                ));
+                            }
                             self.pending_extensions
                                 .global_pax
                                 .push(PaxExtension::new(position, kind, records));

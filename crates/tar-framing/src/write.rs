@@ -231,8 +231,8 @@ pub fn payload_padding(size: u64) -> &'static [u8] {
 
 fn validate_member(member: PaxMember<'_>) -> Result<(), FramingWriteError> {
     validate_text("path", member.path)?;
-    // Defensive: our own decoder rejects non-directories with suffixes that
-    // require directory resolution, so we should never encode one.
+    // Extraction rejects a non-directory with a suffix that requires directory
+    // resolution. Do not encode such a member.
     // TODO: Single-source this check, maybe in name validation?
     if !matches!(member.kind, UstarKind::Directory)
         && (member.path.ends_with('/')
