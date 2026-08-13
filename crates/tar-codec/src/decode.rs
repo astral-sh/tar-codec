@@ -252,24 +252,21 @@ impl PaxDecodePolicy {
     ///
     /// The default is [`DEFAULT_MAX_PAX_EXTENSION_SIZE`]. Setting the limit to
     /// zero rejects every nonempty pax extension. Setting it to [`u64::MAX`]
-    /// removes the limit for each extension. The limits for pending data and
-    /// active records still apply to global extensions.
+    /// removes the limit for each extension. Each global extension still counts
+    /// toward the limit for the full archive.
     pub fn max_extension_size(mut self, max_extension_size: u64) -> Self {
         self.max_extension_size = max_extension_size;
         self
     }
 
-    /// Sets the maximum size for pending and active global pax data.
+    /// Sets the maximum total payload size of all global pax extensions.
     ///
-    /// The policy uses this value for two limits. One limit applies to the total
-    /// payload size of consecutive global extensions before an ordinary member.
-    /// The other limit applies to the encoded size of the active global record
-    /// set. The pending total resets after each ordinary member. The active total
-    /// does not reset.
+    /// This limit applies to the full archive. It does not reset after an
+    /// ordinary member.
     ///
     /// The default is [`DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE`]. A value of zero
     /// rejects each nonempty global extension. A value of [`u64::MAX`] removes
-    /// both limits. The separate limit for each extension still applies.
+    /// this limit. The separate limit for each extension still applies.
     pub fn max_global_extensions_size(mut self, max_global_extensions_size: u64) -> Self {
         self.max_global_extensions_size = max_global_extensions_size;
         self

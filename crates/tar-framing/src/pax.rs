@@ -62,19 +62,8 @@ pub enum PaxError {
 
 pub(crate) type SharedPaxRecords = Arc<PaxRecords>;
 
-#[derive(Clone, Debug, Default)]
-pub(crate) struct PaxRecords {
-    records: Vec<PaxRecord>,
-    encoded_lengths: Vec<u64>,
-}
-
-impl PartialEq for PaxRecords {
-    fn eq(&self, other: &Self) -> bool {
-        self.records == other.records
-    }
-}
-
-impl Eq for PaxRecords {}
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PaxRecords(Vec<PaxRecord>);
 
 /// An owned, hashable pax extended-header keyword.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -156,58 +145,24 @@ impl fmt::Display for PaxKeyword {
 /// Like [`PaxRecords`], but with an additional index of `keyword -> effective record index`
 /// to keep lookups cheap, even across pathological pax archives (e.g. multiple
 /// global extensions being merged together).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Eq, PartialEq)]
 pub(crate) struct GlobalPaxRecords {
     records: PaxRecords,
     indices: HashMap<PaxKeyword, usize>,
-    encoded_size: u64,
 }
-
-impl PartialEq for GlobalPaxRecords {
-    fn eq(&self, other: &Self) -> bool {
-        self.records == other.records && self.indices == other.indices
-    }
-}
-
-impl Eq for GlobalPaxRecords {}
 
 impl GlobalPaxRecords {
-    fn projected_encoded_size(&self, updates: &PaxRecords) -> Option<u64> {
-        let mut effective_updates = HashMap::new();
-        for (update, encoded_length) in updates.iter_with_encoded_lengths() {
-            effective_updates.insert(update.keyword(), encoded_length);
-        }
-
-        let mut replaced_size = 0_u64;
-        let mut replacement_size = 0_u64;
-        for (keyword, encoded_length) in effective_updates {
-            if let Some(index) = self.indices.get(&keyword) {
-                replaced_size =
-                    replaced_size.checked_add(*self.records.encoded_lengths.get(*index)?)?;
-            }
-            replacement_size = replacement_size.checked_add(encoded_length)?;
-        }
-        self.encoded_size
-            .checked_sub(replaced_size)?
-            .checked_add(replacement_size)
-    }
-
-    fn apply(&mut self, updates: &PaxRecords, encoded_size: u64) {
-        for (update, encoded_length) in updates.iter_with_encoded_lengths() {
+    fn apply(&mut self, updates: &PaxRecords) {
+        for update in updates.as_slice() {
             match self.indices.entry(update.keyword()) {
-                Entry::Occupied(entry) => {
-                    self.records.records[*entry.get()] = update.clone();
-                    self.records.encoded_lengths[*entry.get()] = encoded_length;
-                }
+                Entry::Occupied(entry) => self.records.0[*entry.get()] = update.clone(),
                 Entry::Vacant(entry) => {
-                    let index = self.records.records.len();
-                    self.records.records.push(update.clone());
-                    self.records.encoded_lengths.push(encoded_length);
+                    let index = self.records.0.len();
+                    self.records.0.push(update.clone());
                     entry.insert(index);
                 }
             }
         }
-        self.encoded_size = encoded_size;
     }
 
     fn get(&self, keyword: &PaxKeyword) -> Option<&PaxRecord> {
@@ -525,13 +480,7 @@ impl PaxRecord {
 
 impl PaxRecords {
     pub(crate) fn as_slice(&self) -> &[PaxRecord] {
-        &self.records
-    }
-
-    fn iter_with_encoded_lengths(&self) -> impl Iterator<Item = (&PaxRecord, u64)> {
-        self.records
-            .iter()
-            .zip(self.encoded_lengths.iter().copied())
+        &self.0
     }
 
     pub(super) fn parse(
@@ -565,7 +514,6 @@ impl PaxRecords {
                 .ok_or(PaxError::InvalidRecords {
                     reason: "record length is not a valid decimal integer",
                 })?;
-            let encoded_length = record_len;
             let record_len =
                 usize::try_from(record_len).map_err(|_| PaxError::ArithmeticOverflow {
                     context: "pax record length",
@@ -602,11 +550,7 @@ impl PaxRecords {
             }
             let keyword = std::str::from_utf8(&record[content_start..equals])
                 .map_err(|_| PaxError::InvalidUtf8)?;
-            records.push((
-                keyword,
-                &record[equals + 1..record.len() - 1],
-                encoded_length,
-            ));
+            records.push((keyword, &record[equals + 1..record.len() - 1]));
             cursor = record_end;
         }
 
@@ -617,26 +561,21 @@ impl PaxRecords {
         //
         // See: pax spec, "pax Extended Header"
         let hdrcharset = Self::resolve_hdrcharset(&records, inherited_hdrcharset)?;
-        let mut parsed_records = Vec::with_capacity(records.len());
-        let mut encoded_lengths = Vec::with_capacity(records.len());
-        for (keyword, value, encoded_length) in records {
-            parsed_records.push(PaxRecord::parse(keyword, value, hdrcharset)?);
-            encoded_lengths.push(encoded_length);
-        }
-        Ok(Self {
-            records: parsed_records,
-            encoded_lengths,
-        })
+        records
+            .into_iter()
+            .map(|(keyword, value)| PaxRecord::parse(keyword, value, hdrcharset))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Self)
     }
 
     fn resolve_hdrcharset(
-        records: &[(&str, &[u8], u64)],
+        records: &[(&str, &[u8])],
         inherited: HdrCharset,
     ) -> Result<HdrCharset, PaxError> {
         let mut hdrcharset = inherited;
         // TODO: Consider finding the last `hdrcharset` with a reverse search to avoid parsing
         // shadowed values here. All records would still be validated during typed parsing.
-        for (keyword, value, _) in records {
+        for (keyword, value) in records {
             if *keyword == "hdrcharset" {
                 hdrcharset = match PaxValue::parse_hdrcharset(value)? {
                     PaxValue::Value(value) => value,
@@ -648,34 +587,14 @@ impl PaxRecords {
     }
 
     fn get(&self, keyword: &PaxKeyword) -> Option<&PaxRecord> {
-        self.records
+        self.0
             .iter()
             .rev()
             .find(|record| record.keyword() == *keyword)
     }
 
-    pub(super) fn projected_global_encoded_size(
-        &self,
-        active: Option<&GlobalPaxRecords>,
-    ) -> Option<u64> {
-        active.map_or_else(
-            || GlobalPaxRecords::default().projected_encoded_size(self),
-            |active| active.projected_encoded_size(self),
-        )
-    }
-
-    pub(super) fn apply_global_with_encoded_size(
-        &self,
-        active: &mut Option<GlobalPaxRecords>,
-        encoded_size: u64,
-    ) {
-        active.get_or_insert_default().apply(self, encoded_size);
-    }
-
-    pub(super) fn apply_global(&self, active: &mut Option<GlobalPaxRecords>) -> Option<u64> {
-        let encoded_size = self.projected_global_encoded_size(active.as_ref())?;
-        self.apply_global_with_encoded_size(active, encoded_size);
-        Some(encoded_size)
+    pub(super) fn apply_global(&self, active: &mut Option<GlobalPaxRecords>) {
+        active.get_or_insert_default().apply(self);
     }
 }
 
@@ -811,27 +730,14 @@ mod tests {
         }
     }
 
-    impl PaxRecords {
-        fn from_records(records: Vec<PaxRecord>) -> Self {
-            Self {
-                encoded_lengths: vec![0; records.len()],
-                records,
-            }
-        }
-    }
-
     fn global_state(records: Vec<PaxRecord>) -> Option<GlobalPaxRecords> {
         let mut active = None;
-        assert!(
-            PaxRecords::from_records(records)
-                .apply_global(&mut active)
-                .is_some()
-        );
+        PaxRecords(records).apply_global(&mut active);
         active
     }
 
     fn extension(position: u64, kind: PaxKind, records: Vec<PaxRecord>) -> PaxExtension {
-        PaxExtension::new(position, kind, Arc::new(PaxRecords::from_records(records)))
+        PaxExtension::new(position, kind, Arc::new(PaxRecords(records)))
     }
 
     #[test]
@@ -917,16 +823,12 @@ mod tests {
 
     #[test]
     fn updates_effective_global_state_in_place() {
-        let physical_records = Arc::new(PaxRecords::from_records(vec![comment("initial")]));
+        let physical_records = Arc::new(PaxRecords(vec![comment("initial")]));
         let mut active = None;
-        assert!(physical_records.apply_global(&mut active).is_some());
+        physical_records.apply_global(&mut active);
         let initial_state = ptr::from_ref(active.as_ref().expect("global state should exist"));
 
-        assert!(
-            PaxRecords::from_records(vec![vendor("attribute", "value")])
-                .apply_global(&mut active)
-                .is_some()
-        );
+        PaxRecords(vec![vendor("attribute", "value")]).apply_global(&mut active);
 
         assert_eq!(
             ptr::from_ref(active.as_ref().expect("global state should exist")),
@@ -937,16 +839,14 @@ mod tests {
 
     #[test]
     fn global_deletions_remain_effective_tombstones() {
-        let initial = Arc::new(PaxRecords::from_records(vec![
+        let initial = Arc::new(PaxRecords(vec![
             PaxRecord::Path(PaxValue::Value(utf8("global"))),
             vendor("kept", "value"),
         ]));
-        let deletion = Arc::new(PaxRecords::from_records(vec![PaxRecord::Path(
-            PaxValue::Deleted,
-        )]));
+        let deletion = Arc::new(PaxRecords(vec![PaxRecord::Path(PaxValue::Deleted)]));
         let mut active = None;
-        assert!(initial.apply_global(&mut active).is_some());
-        assert!(deletion.apply_global(&mut active).is_some());
+        initial.apply_global(&mut active);
+        deletion.apply_global(&mut active);
 
         let active_records = active.as_ref().expect("global state should exist");
         assert_eq!(active_records.records.as_slice().len(), 2);
@@ -954,50 +854,6 @@ mod tests {
         assert_eq!(
             state.effective_record(&PaxKeyword::Path),
             Some(&PaxRecord::Path(PaxValue::Deleted))
-        );
-    }
-
-    #[test]
-    fn accounts_for_effective_global_record_bytes() {
-        let shadowed = raw_record(b"security.label", b"shadowed");
-        let label = raw_record(b"security.label", b"initial");
-        let kept = raw_record(b"security.kept", b"value");
-        let initial_payload = [shadowed.as_slice(), label.as_slice(), kept.as_slice()].concat();
-        let initial =
-            PaxRecords::parse(&initial_payload, HdrCharset::Utf8).expect("records should parse");
-        let initial_size =
-            u64::try_from(label.len() + kept.len()).expect("effective record size should fit u64");
-        let mut active = None;
-        assert_eq!(initial.apply_global(&mut active), Some(initial_size));
-
-        let shadowed_replacement = raw_record(b"security.label", b"long replacement");
-        let deletion = raw_record(b"security.label", b"");
-        let kept_replacement = raw_record(b"security.kept", b"x");
-        let update_payload = [
-            shadowed_replacement.as_slice(),
-            deletion.as_slice(),
-            kept_replacement.as_slice(),
-        ]
-        .concat();
-        let update =
-            PaxRecords::parse(&update_payload, HdrCharset::Utf8).expect("records should parse");
-        let updated_size = u64::try_from(deletion.len() + kept_replacement.len())
-            .expect("effective record size should fit u64");
-        assert_eq!(
-            update.projected_global_encoded_size(active.as_ref()),
-            Some(updated_size)
-        );
-        assert_eq!(update.apply_global(&mut active), Some(updated_size));
-
-        let active = active.as_ref().expect("global state should exist");
-        assert_eq!(active.encoded_size, updated_size);
-        assert_eq!(active.records.as_slice().len(), 2);
-        assert_eq!(
-            active.get(&PaxKeyword::Security(text("label"))),
-            Some(&PaxRecord::Security {
-                name: text("label"),
-                value: PaxValue::Deleted,
-            })
         );
     }
 
@@ -1146,7 +1002,7 @@ mod tests {
         let invalid_utf8 = [0xd6, 0xfb, 0x00];
         let mut vendor_records = raw_record(b"SCHILY.xattr.user.data", &invalid_utf8);
         vendor_records.extend_from_slice(&raw_record(b"SCHILY.xattr.user.deleted", b""));
-        let expected = PaxRecords::from_records(vec![
+        let expected = PaxRecords(vec![
             PaxRecord::Vendor {
                 vendor: text("SCHILY"),
                 name: text("xattr.user.data"),
@@ -1183,11 +1039,8 @@ mod tests {
             vendor("second", "kept"),
             security("old"),
         ]);
-        let update = Arc::new(PaxRecords::from_records(vec![
-            vendor("first", "new"),
-            security("new"),
-        ]));
-        assert!(update.apply_global(&mut active).is_some());
+        let update = Arc::new(PaxRecords(vec![vendor("first", "new"), security("new")]));
+        update.apply_global(&mut active);
         let active = active.as_ref().expect("global state should exist");
         assert_eq!(active.records.as_slice().len(), 3);
         assert_eq!(

@@ -442,29 +442,26 @@ impl Default for StreamPolicy {
 }
 
 impl StreamPolicy {
-    /// Configures the maximum size accepted for each pax extension.
+    /// Sets the maximum size for each pax extension.
     ///
     /// A local or global header that declares a larger payload is rejected
     /// before its payload is consumed. Setting the maximum to zero rejects
     /// every nonempty extension. Setting it to [`u64::MAX`] removes the
-    /// limit for each extension. The limits for pending data and active records
-    /// still apply to global extensions.
+    /// limit for each extension. The archive-wide limit still applies to global
+    /// extensions.
     pub fn max_pax_extension_size(mut self, max_pax_extension_size: u64) -> Self {
         self.max_pax_extension_size = max_pax_extension_size;
         self
     }
 
-    /// Sets the maximum size for pending and active global pax data.
+    /// Sets the maximum total payload size for all global pax extensions.
     ///
-    /// The policy uses this value for two limits. One limit applies to the total
-    /// payload size of consecutive global extensions before an ordinary member.
-    /// The other limit applies to the encoded size of the active global record
-    /// set. The pending total resets after each ordinary member. The active total
-    /// changes only when a global record is added or replaced.
+    /// The total includes each global extension in the archive. It does not reset
+    /// after an ordinary member. A global header is rejected before its payload
+    /// is read if the new total is more than this limit.
     ///
     /// A value of zero rejects each nonempty global extension. A value of
-    /// [`u64::MAX`] removes both limits. The separate limit for each extension
-    /// still applies.
+    /// [`u64::MAX`] removes this limit. The limit for each extension still applies.
     pub fn max_global_pax_extensions_size(mut self, max_global_pax_extensions_size: u64) -> Self {
         self.max_global_pax_extensions_size = max_global_pax_extensions_size;
         self
@@ -504,7 +501,7 @@ pub struct TarStream<R> {
     /// The currently effective global pax records, if any.
     pub(super) global_pax_records: Option<GlobalPaxRecords>,
     policy: StreamPolicy,
-    pending_global_pax_extensions_size: u64,
+    global_pax_extensions_size: u64,
     member_chunk: MemberChunk,
     pub(super) state: State,
 }
@@ -520,7 +517,7 @@ impl<R> TarStream<R> {
             format: None,
             global_pax_records: None,
             policy: StreamPolicy::default(),
-            pending_global_pax_extensions_size: 0,
+            global_pax_extensions_size: 0,
             member_chunk: MemberChunk::default(),
             state: State::AwaitingHeader,
         }
@@ -935,27 +932,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                             };
                         }
                         PaxKind::Global => {
-                            let encoded_size = records
-                                .projected_global_encoded_size(self.global_pax_records.as_ref())
-                                .ok_or_else(|| {
-                                    FrameError::arithmetic_overflow(
-                                        header_position,
-                                        "active global pax record size",
-                                    )
-                                })?;
-                            if encoded_size > self.policy.max_global_pax_extensions_size {
-                                return Err(FrameError::at(
-                                    header_position,
-                                    FrameErrorInner::ActiveGlobalPaxRecordsTooLarge {
-                                        size: encoded_size,
-                                        limit: self.policy.max_global_pax_extensions_size,
-                                    },
-                                ));
-                            }
-                            records.apply_global_with_encoded_size(
-                                &mut self.global_pax_records,
-                                encoded_size,
-                            );
+                            records.apply_global(&mut self.global_pax_records);
                             self.state = State::AwaitingHeader;
                         }
                     }
@@ -1139,7 +1116,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
         }
         if kind == PaxKind::Global {
             let size = self
-                .pending_global_pax_extensions_size
+                .global_pax_extensions_size
                 .checked_add(payload_size)
                 .ok_or_else(|| {
                     FrameError::arithmetic_overflow(position, "global pax extension payload total")
@@ -1153,7 +1130,7 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
                     },
                 ));
             }
-            self.pending_global_pax_extensions_size = size;
+            self.global_pax_extensions_size = size;
         }
         if payload_size == 0 {
             return Err(FrameError::invalid_pax_record(
@@ -1198,7 +1175,6 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             self.global_pax_records.as_ref(),
             self.policy.allow_all_nul_numeric_fields,
         )?;
-        self.pending_global_pax_extensions_size = 0;
         self.state = member_payload_state(frame.effective_size);
         Ok(Frame::Header(frame))
     }

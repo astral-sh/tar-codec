@@ -125,10 +125,10 @@ pub const BLOCK_SIZE: usize = 512;
 /// This is 256 KiB.
 pub const DEFAULT_MAX_PAX_EXTENSION_SIZE: u64 = 256 * 1024;
 
-/// The default maximum size for pending and active global pax data.
+/// The default maximum total payload size of all global pax extensions.
 ///
-/// This limit applies separately to consecutive global extension payloads and
-/// to the active global record set.
+/// This limit applies to the full archive. It does not reset after an ordinary
+/// member.
 ///
 /// This is 1 MiB.
 pub const DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE: u64 = 4 * DEFAULT_MAX_PAX_EXTENSION_SIZE;
