@@ -146,12 +146,12 @@ pub enum FrameErrorInner {
         /// The configured maximum extension payload size.
         limit: u64,
     },
-    /// Consecutive global pax extensions contain more metadata than the configured limit.
+    /// Global pax extensions contain more data than the configured archive limit.
     #[error("global pax extension payload total {size} exceeds configured limit {limit}")]
     GlobalPaxExtensionsTooLarge {
-        /// The cumulative declared size including the rejected extension.
+        /// The total declared size, including the rejected extension.
         size: u64,
-        /// The configured maximum cumulative payload size.
+        /// The configured maximum payload size for the archive.
         limit: u64,
     },
     /// A GNU long-name or long-link metadata payload is not a valid value.

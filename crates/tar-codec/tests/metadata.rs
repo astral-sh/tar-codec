@@ -459,6 +459,41 @@ async fn global_pax_extensions_size_limit_is_configurable_for_extraction() {
 }
 
 #[tokio::test]
+async fn global_pax_extensions_size_limit_accumulates_across_members() {
+    let temp = tempdir().expect("temporary directory should be created");
+    let payload = pax_record(PaxKeyword::Comment, "metadata");
+    let payload_size = u64::try_from(payload.len()).expect("payload size should fit u64");
+
+    let mut archive = ArchiveBuilder::new();
+    for index in 0..3 {
+        archive
+            .pax(b'g', &payload)
+            .ustar(&format!("file-{index}"), b'0', b"", "", 0o644);
+    }
+    let bytes = archive.finish();
+    let limit = payload_size
+        .checked_mul(2)
+        .expect("global extension limit should fit u64");
+    let decode_policy = DecodePolicy::default()
+        .pax_policy(PaxDecodePolicy::default().max_global_extensions_size(limit));
+    let destination = temp.path().join("global-extensions-rejected");
+
+    assert!(matches!(
+        TarArchive::new(bytes.as_slice())
+            .with_policy(decode_policy)
+            .extract_in(&destination, ExtractPolicy::default())
+            .await,
+        Err(ExtractError::Archive(DecodeError::Framing(FrameError {
+            inner: FrameErrorInner::GlobalPaxExtensionsTooLarge {
+                size,
+                limit: found_limit,
+            },
+            ..
+        }))) if size == payload_size * 3 && found_limit == limit
+    ));
+}
+
+#[tokio::test]
 async fn gnu_extension_size_limit_is_configurable_for_extraction() {
     let temp = tempdir().expect("temporary directory should be created");
     let payload = b"renamed\0";

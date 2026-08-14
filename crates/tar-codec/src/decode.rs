@@ -1,4 +1,9 @@
 //! Member-oriented decoding of pax or GNU tar streams.
+//!
+//! The decoder applies format extensions to member paths and link targets.
+//! It does not normalize these values for extraction. Do not use them directly
+//! as file-system paths. [`ArchiveTrait::extract_in`] validates and normalizes
+//! them as specified by [`crate::extract::ExtractPolicy`].
 
 use std::collections::HashSet;
 
@@ -18,7 +23,11 @@ pub use tar_framing::{
     DEFAULT_MAX_PAX_EXTENSION_SIZE,
 };
 
-/// A one-pass reader for a validated pax or GNU tar archive.
+/// This type reads one structurally valid pax or GNU tar archive in one pass.
+///
+/// Member paths and link targets are not normalized for extraction. A direct
+/// consumer must validate them before it uses them as file-system paths.
+/// [`ArchiveTrait::extract_in`] does this validation.
 ///
 /// Member iteration is fused. After reaching the end of the archive or
 /// returning a decoding error, every subsequent attempt returns end-of-archive.
@@ -243,22 +252,21 @@ impl PaxDecodePolicy {
     ///
     /// The default is [`DEFAULT_MAX_PAX_EXTENSION_SIZE`]. Setting the limit to
     /// zero rejects every nonempty pax extension. Setting it to [`u64::MAX`]
-    /// removes the per-extension bound; global extensions remain subject to
-    /// their cumulative limit.
+    /// removes the limit for each extension. Each global extension still counts
+    /// toward the limit for the full archive.
     pub fn max_extension_size(mut self, max_extension_size: u64) -> Self {
         self.max_extension_size = max_extension_size;
         self
     }
 
-    /// Configures the maximum cumulative payload size of global pax extensions.
+    /// Sets the maximum total payload size of all global pax extensions.
     ///
-    /// The total is reset after each ordinary member. A global extension that
-    /// would increase the pending total beyond this limit is rejected before
-    /// its payload is consumed. The default is
-    /// [`DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE`]. Setting the limit to zero
-    /// rejects every nonempty global extension. Setting it to [`u64::MAX`]
-    /// removes the cumulative bound; each extension remains subject to its
-    /// individual limit.
+    /// This limit applies to the full archive. It does not reset after an
+    /// ordinary member.
+    ///
+    /// The default is [`DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE`]. A value of zero
+    /// rejects each nonempty global extension. A value of [`u64::MAX`] removes
+    /// this limit. The separate limit for each extension still applies.
     pub fn max_global_extensions_size(mut self, max_global_extensions_size: u64) -> Self {
         self.max_global_extensions_size = max_global_extensions_size;
         self

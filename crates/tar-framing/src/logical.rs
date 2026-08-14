@@ -1181,7 +1181,7 @@ mod tests {
     }
 
     #[test]
-    fn bounds_cumulative_global_pax_extension_payloads() {
+    fn bounds_total_global_pax_extension_payloads() {
         let payload = record("comment", "metadata");
         let payload_size = u64::try_from(payload.len()).expect("payload size should fit u64");
         let limit = payload_size
@@ -1222,7 +1222,7 @@ mod tests {
         append_terminator(&mut accepted);
         ready_ok(async {
             let mut reader = TarReader::new(ChunkedReader::new(accepted, BLOCK_SIZE)).with_policy(
-                StreamPolicy::default().max_global_pax_extensions_size(payload_size * 3),
+                StreamPolicy::default().max_global_pax_extensions_size(payload_size * 6),
             );
             for _ in 0..2 {
                 let member = next_member(&mut reader).await?;

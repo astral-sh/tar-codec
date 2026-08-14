@@ -38,12 +38,11 @@
 //!   as a filesystem allocation hint rather than a physical size, but real-world parsers vary
 //!   widely in how they handle it (some ignore it, others skip over that number of bytes, etc.).
 //!
-//! - tar-framing rejects regular file entries (typeflag `'0'` or `'\0'`) that include a trailing
-//!   slash (e.g. `foo.txt/`). pax is ambiguous about to handle these cases: it notes that
-//!   pre-ustar tar had no directory entry typeflag and thus a trailing slash was used
-//!   to indicate a directory by convention, but does not prescribe that pax implementors
-//!   honor this legacy behavior. We choose to reject it since it presents the same directory
-//!   size problem mentioned above.
+//! - tar-framing does not change a member type because of a path suffix. For example, it preserves
+//!   a trailing slash in an effective member path. Before ustar, tar used a trailing slash to
+//!   identify a directory. pax does not require an implementation to use this behavior. Therefore,
+//!   a path suffix can conflict with the header type. The extraction layer in tar-codec rejects
+//!   this conflict.
 //!
 //! - tar-framing rejects negative timestamps as well as timestamps that would exceed the
 //!   precision of a `u64`. pax allows both of these, although it notes that portable timestamps
@@ -126,7 +125,10 @@ pub const BLOCK_SIZE: usize = 512;
 /// This is 256 KiB.
 pub const DEFAULT_MAX_PAX_EXTENSION_SIZE: u64 = 256 * 1024;
 
-/// The default maximum cumulative size of global pax extensions before one member.
+/// The default maximum total payload size of all global pax extensions.
+///
+/// This limit applies to the full archive. It does not reset after an ordinary
+/// member.
 ///
 /// This is 1 MiB.
 pub const DEFAULT_MAX_GLOBAL_PAX_EXTENSIONS_SIZE: u64 = 4 * DEFAULT_MAX_PAX_EXTENSION_SIZE;

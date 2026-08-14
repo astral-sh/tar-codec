@@ -442,25 +442,26 @@ impl Default for StreamPolicy {
 }
 
 impl StreamPolicy {
-    /// Configures the maximum size accepted for each pax extension.
+    /// Sets the maximum size for each pax extension.
     ///
     /// A local or global header that declares a larger payload is rejected
     /// before its payload is consumed. Setting the maximum to zero rejects
     /// every nonempty extension. Setting it to [`u64::MAX`] removes the
-    /// per-extension bound; global extensions remain subject to their
-    /// cumulative limit.
+    /// limit for each extension. The archive-wide limit still applies to global
+    /// extensions.
     pub fn max_pax_extension_size(mut self, max_pax_extension_size: u64) -> Self {
         self.max_pax_extension_size = max_pax_extension_size;
         self
     }
 
-    /// Configures the maximum cumulative size of global pax extensions.
+    /// Sets the maximum total payload size for all global pax extensions.
     ///
-    /// The total resets after each ordinary member. A global header that would
-    /// increase the pending total beyond this limit is rejected before its
-    /// payload is consumed. Setting the maximum to zero rejects every nonempty
-    /// global extension. Setting it to [`u64::MAX`] removes the cumulative
-    /// bound; each extension remains subject to its individual limit.
+    /// The total includes each global extension in the archive. It does not reset
+    /// after an ordinary member. A global header is rejected before its payload
+    /// is read if the new total is more than this limit.
+    ///
+    /// A value of zero rejects each nonempty global extension. A value of
+    /// [`u64::MAX`] removes this limit. The limit for each extension still applies.
     pub fn max_global_pax_extensions_size(mut self, max_global_pax_extensions_size: u64) -> Self {
         self.max_global_pax_extensions_size = max_global_pax_extensions_size;
         self
@@ -1174,7 +1175,6 @@ impl<R: AsyncRead + Unpin> TarStream<R> {
             self.global_pax_records.as_ref(),
             self.policy.allow_all_nul_numeric_fields,
         )?;
-        self.global_pax_extensions_size = 0;
         self.state = member_payload_state(frame.effective_size);
         Ok(Frame::Header(frame))
     }
