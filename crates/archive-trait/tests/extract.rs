@@ -1,12 +1,21 @@
 pub mod support;
 
-use std::{collections::VecDeque, io::Read as _, path::Path, sync::mpsc, thread};
+use std::{
+    collections::VecDeque,
+    future::Future as _,
+    io::Read as _,
+    path::Path,
+    sync::mpsc,
+    task::{Context, Poll, Waker},
+    thread,
+};
 #[cfg(unix)]
 use std::{env, os::unix::fs::PermissionsExt as _, process::Command};
 
 use archive_trait::{
-    Archive, ExtractError, ExtractPolicyViolation, Member, SpecialKind,
-    extract::{ExtractPolicy, LinkPolicy, SymlinkPolicy},
+    Archive, ExtractError, ExtractPolicyViolation, Member, MemberMetadata, MemberPayload,
+    SpecialKind,
+    extract::{ExtractPolicy, LinkPolicy, SymlinkPolicy, extract_blocking},
 };
 use cap_std::{ambient_authority, fs::Dir};
 use support::{TestArchive, TestEntry, TestError, TestPayload, entry};
@@ -52,58 +61,145 @@ impl Archive for GatedArchive {
     }
 }
 
+struct GatedStreamingArchive {
+    contents: Vec<u8>,
+    ready: Option<oneshot::Sender<()>>,
+    resume: Option<oneshot::Receiver<()>>,
+    queued: Option<oneshot::Sender<()>>,
+}
+
+impl Archive for GatedStreamingArchive {
+    type Error = TestError;
+    type Payload<'a> = &'a mut Self;
+
+    async fn next_member<'a>(
+        &'a mut self,
+    ) -> Result<Option<Member<Self::Payload<'a>>>, Self::Error> {
+        if self.ready.is_none() {
+            return Ok(None);
+        }
+
+        Ok(Some(Member::File {
+            metadata: MemberMetadata {
+                path: "streamed".to_owned(),
+                position: 0,
+            },
+            size: self.contents.len() as u64,
+            executable: false,
+            payload: self,
+        }))
+    }
+}
+
+impl MemberPayload for &mut GatedStreamingArchive {
+    type Error = TestError;
+
+    async fn next_chunk(
+        &mut self,
+        buffer: &mut Vec<u8>,
+        _target_len: usize,
+    ) -> Result<bool, Self::Error> {
+        if let Some(ready) = self.ready.take() {
+            if ready.send(()).is_err() {
+                return Err(TestError);
+            }
+            if let Some(resume) = self.resume.take()
+                && resume.await.is_err()
+            {
+                return Err(TestError);
+            }
+            buffer.clear();
+            buffer.extend_from_slice(&self.contents);
+            return Ok(true);
+        }
+
+        if let Some(queued) = self.queued.take()
+            && queued.send(()).is_err()
+        {
+            return Err(TestError);
+        }
+        Ok(false)
+    }
+
+    async fn skip(self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn extracts_common_members_and_streams_payload_sizes() {
     const SMALL_BYTES: usize = 128 * 1024 + 7;
     const BUFFERED_BOUNDARY_BYTES: usize = 1024 * 1024;
     const LARGE_BYTES: usize = 1024 * 1024 + 7;
+    const STREAMING_BOUNDARY_BYTES: usize = 4 * 1024 * 1024;
+    const MULTI_CHUNK_BYTES: usize = STREAMING_BOUNDARY_BYTES + 7;
 
     let small = patterned_payload(SMALL_BYTES);
     let buffered_boundary = patterned_payload(BUFFERED_BOUNDARY_BYTES);
     let large = patterned_payload(LARGE_BYTES);
-    let archive = TestArchive::new([
-        entry::directory("bin"),
-        entry::executable("bin/tool", b"run"),
-        entry::file("same", b"old"),
-        entry::file("same", b"new"),
-        entry::file("empty", b""),
-        entry::file("unicodé/文件", b"utf8"),
-        entry::file("small", small.clone()),
-        entry::file("buffered-boundary", buffered_boundary.clone()),
-        entry::file("large", large.clone()),
-    ]);
+    let streaming_boundary = patterned_payload(STREAMING_BOUNDARY_BYTES);
+    let multi_chunk = patterned_payload(MULTI_CHUNK_BYTES);
     let temp = tempdir().expect("temporary directory should be created");
-    let destination = temp.path().join("out");
 
-    archive
-        .extract_in(&destination, ExtractPolicy::default())
-        .await
-        .expect("archive should extract");
+    for (name, blocking_thread) in [("blocking-pool", false), ("blocking-thread", true)] {
+        let archive = TestArchive::new([
+            entry::directory("bin"),
+            entry::executable("bin/tool", b"run"),
+            entry::file("same", b"old"),
+            entry::file("same", b"new"),
+            entry::file("empty", b""),
+            entry::file("unicodé/文件", b"utf8"),
+            entry::file("first-parent/first", b"first"),
+            entry::file("second-parent/second", b"second"),
+            entry::file("small", small.clone()),
+            entry::direct_file("direct-small", small.clone()),
+            entry::file("buffered-boundary", buffered_boundary.clone()),
+            entry::file("large", large.clone()),
+            entry::direct_file("direct-large", large.clone()),
+            entry::file("streaming-boundary", streaming_boundary.clone()),
+            entry::file("multi-chunk", multi_chunk.clone()),
+        ]);
+        let destination = temp.path().join(name);
+        let result = if blocking_thread {
+            extract_blocking(archive, &destination, ExtractPolicy::default()).await
+        } else {
+            archive
+                .extract_in(&destination, ExtractPolicy::default())
+                .await
+        };
+        result.expect("archive should extract");
 
-    for (path, expected) in [
-        ("bin/tool", &b"run"[..]),
-        ("same", &b"new"[..]),
-        ("empty", &b""[..]),
-        ("unicodé/文件", &b"utf8"[..]),
-        ("small", small.as_slice()),
-        ("buffered-boundary", buffered_boundary.as_slice()),
-        ("large", large.as_slice()),
-    ] {
-        assert_eq!(
-            std::fs::read(destination.join(path)).expect("file should be readable"),
-            expected
-        );
-    }
-    #[cfg(unix)]
-    {
-        assert_ne!(
-            std::fs::metadata(destination.join("bin/tool"))
-                .expect("tool metadata should be readable")
-                .permissions()
-                .mode()
-                & 0o111,
-            0
-        );
+        for (path, expected) in [
+            ("bin/tool", &b"run"[..]),
+            ("same", &b"new"[..]),
+            ("empty", &b""[..]),
+            ("unicodé/文件", &b"utf8"[..]),
+            ("first-parent/first", &b"first"[..]),
+            ("second-parent/second", &b"second"[..]),
+            ("small", small.as_slice()),
+            ("direct-small", small.as_slice()),
+            ("buffered-boundary", buffered_boundary.as_slice()),
+            ("large", large.as_slice()),
+            ("direct-large", large.as_slice()),
+            ("streaming-boundary", streaming_boundary.as_slice()),
+            ("multi-chunk", multi_chunk.as_slice()),
+        ] {
+            assert_eq!(
+                std::fs::read(destination.join(path)).expect("file should be readable"),
+                expected
+            );
+        }
+        #[cfg(unix)]
+        {
+            assert_ne!(
+                std::fs::metadata(destination.join("bin/tool"))
+                    .expect("tool metadata should be readable")
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0
+            );
+        }
     }
 }
 
@@ -112,18 +208,24 @@ async fn streaming_payload_reuses_initialized_chunk_buffer() {
     const PAYLOAD_BYTES: usize = 1024 * 1024 + 7;
 
     let expected = patterned_payload(PAYLOAD_BYTES);
-    let archive = TestArchive::new([entry::reuse_checked_file("file", expected.clone())]);
     let temp = tempdir().expect("temporary directory should be created");
-    let destination = temp.path().join("out");
 
-    archive
-        .extract_in(&destination, ExtractPolicy::default())
-        .await
-        .expect("streaming extraction should reuse its chunk buffer");
-    assert_eq!(
-        std::fs::read(destination.join("file")).expect("file should be readable"),
-        expected
-    );
+    for (name, blocking_thread) in [("blocking-pool", false), ("blocking-thread", true)] {
+        let archive = TestArchive::new([entry::reuse_checked_file("file", expected.clone())]);
+        let destination = temp.path().join(name);
+        let result = if blocking_thread {
+            extract_blocking(archive, &destination, ExtractPolicy::default()).await
+        } else {
+            archive
+                .extract_in(&destination, ExtractPolicy::default())
+                .await
+        };
+        result.expect("streaming extraction should reuse its chunk buffer");
+        assert_eq!(
+            std::fs::read(destination.join("file")).expect("file should be readable"),
+            expected
+        );
+    }
 }
 
 #[tokio::test]
@@ -289,21 +391,30 @@ async fn name_validation_covers_member_and_link_values() {
 #[tokio::test]
 async fn payload_errors_flush_prior_files_before_returning() {
     let temp = tempdir().expect("temporary directory should be created");
-    let destination = temp.path().join("out");
 
-    let result = TestArchive::new([
-        entry::file("created", b"kept"),
-        entry::invalid_file("invalid", b""),
-    ])
-    .extract_in(&destination, ExtractPolicy::default())
-    .await;
+    for (name, blocking_thread) in [("blocking-pool", false), ("blocking-thread", true)] {
+        let destination = temp.path().join(name);
+        let invalid = if blocking_thread {
+            entry::invalid_direct_file("invalid", b"invalid")
+        } else {
+            entry::invalid_file("invalid", b"")
+        };
+        let archive = TestArchive::new([entry::file("created", b"kept"), invalid]);
+        let result = if blocking_thread {
+            extract_blocking(archive, &destination, ExtractPolicy::default()).await
+        } else {
+            archive
+                .extract_in(&destination, ExtractPolicy::default())
+                .await
+        };
 
-    assert!(matches!(result, Err(ExtractError::Archive(_))));
-    assert_eq!(
-        std::fs::read(destination.join("created")).expect("prior file should remain"),
-        b"kept"
-    );
-    assert!(!destination.join("invalid").exists());
+        assert!(matches!(result, Err(ExtractError::Archive(_))));
+        assert_eq!(
+            std::fs::read(destination.join("created")).expect("prior file should remain"),
+            b"kept"
+        );
+        assert!(!destination.join("invalid").exists());
+    }
 }
 
 #[tokio::test]
@@ -361,6 +472,63 @@ async fn rejects_invalid_destinations_unsafe_special_and_colliding_members() {
             .await,
         Err(ExtractError::PathCollision { path }) if path == Path::new("file")
     ));
+
+    let destination = temp.path().join("buffered-parent-collision");
+    assert!(matches!(
+        TestArchive::new([
+            entry::file("parent", b"keep"),
+            entry::file("parent/child", b"reject"),
+        ])
+        .extract_in(&destination, ExtractPolicy::default())
+        .await,
+        Err(ExtractError::PathCollision { path }) if path == Path::new("parent")
+    ));
+    assert_eq!(
+        std::fs::read(destination.join("parent")).expect("prior file should remain"),
+        b"keep"
+    );
+
+    let destination = temp.path().join("ordered-collision");
+    std::fs::create_dir(&destination).expect("destination should be created");
+    std::fs::write(destination.join("occupied"), b"ambient")
+        .expect("ambient file should be written");
+    assert!(matches!(
+        TestArchive::new([
+            entry::file("occupied", b"replacement"),
+            entry::file("later/child", b"later"),
+        ])
+        .extract_in(&destination, ExtractPolicy::default().allow_overwrites(false))
+        .await,
+        Err(ExtractError::PathCollision { path }) if path == Path::new("occupied")
+    ));
+    assert_eq!(
+        std::fs::read(destination.join("occupied")).expect("ambient file should remain"),
+        b"ambient"
+    );
+    assert!(!destination.join("later").exists());
+
+    let destination = temp.path().join("case-folded-parent-collision");
+    std::fs::create_dir(&destination).expect("destination should be created");
+    let probe = destination.join("CaseProbe");
+    std::fs::write(&probe, b"probe").expect("case-folding probe should be written");
+    let case_folding = destination.join("caseprobe").exists();
+    std::fs::remove_file(probe).expect("case-folding probe should be removed");
+    if case_folding {
+        assert!(matches!(
+            TestArchive::new([
+                entry::file("file", b"first"),
+                entry::file("file", b"latest"),
+                entry::file("FILE/child/grandchild", b"reject"),
+            ])
+            .extract_in(&destination, ExtractPolicy::default())
+            .await,
+            Err(ExtractError::PathCollision { path }) if path == Path::new("FILE")
+        ));
+        assert_eq!(
+            std::fs::read(destination.join("file")).expect("latest prior file should remain"),
+            b"latest"
+        );
+    }
 }
 
 #[tokio::test]
@@ -376,6 +544,47 @@ async fn archive_errors_flush_prior_buffered_files() {
         std::fs::read(destination.join("created")).expect("created file should remain"),
         b"kept"
     );
+}
+
+#[test]
+fn cancelling_extraction_stops_pending_destination_creation() {
+    let temp = tempdir().expect("temporary directory should be created");
+    let destination = temp.path().join("out");
+    let runtime = Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .build()
+        .expect("test runtime should be created");
+
+    runtime.block_on(async {
+        let (worker_started_sender, worker_started_receiver) = oneshot::channel();
+        let (release_worker_sender, release_worker_receiver) = mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            if worker_started_sender.send(()).is_err() {
+                return false;
+            }
+            release_worker_receiver.recv().is_ok()
+        });
+        worker_started_receiver
+            .await
+            .expect("the blocking worker should be occupied");
+
+        let mut extraction =
+            Box::pin(TestArchive::new([]).extract_in(&destination, ExtractPolicy::default()));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            extraction.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        drop(extraction);
+        assert!(!destination.exists());
+
+        assert!(release_worker_sender.send(()).is_ok());
+        assert!(matches!(worker.await, Ok(true)));
+        tokio::task::spawn_blocking(|| ())
+            .await
+            .expect("the blocking pool should drain");
+        assert!(!destination.exists());
+    });
 }
 
 #[test]
@@ -444,6 +653,69 @@ fn cancelling_extraction_stops_pending_buffered_files() {
             .count(),
         0
     );
+}
+
+#[test]
+fn cancelling_extraction_stops_pending_streamed_file_writes() {
+    let temp = tempdir().expect("temporary directory should be created");
+    let destination = temp.path().join("out");
+    let file_path = destination.join("streamed");
+    let (payload_ready_sender, payload_ready_receiver) = oneshot::channel();
+    let (resume_sender, resume_receiver) = oneshot::channel();
+    let (write_queued_sender, write_queued_receiver) = oneshot::channel();
+    let archive = GatedStreamingArchive {
+        contents: vec![b'x'; 4 * 1024 * 1024],
+        ready: Some(payload_ready_sender),
+        resume: Some(resume_receiver),
+        queued: Some(write_queued_sender),
+    };
+    let extraction_destination = destination.clone();
+    let runtime = Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .build()
+        .expect("test runtime should be created");
+
+    runtime.block_on(async {
+        let extraction = tokio::spawn(async move {
+            archive
+                .extract_in(extraction_destination, ExtractPolicy::default())
+                .await
+        });
+        payload_ready_receiver
+            .await
+            .expect("the streamed destination should be open");
+
+        let (release_worker_sender, release_worker_receiver) = mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || release_worker_receiver.recv().is_ok());
+        assert!(resume_sender.send(()).is_ok());
+        write_queued_receiver
+            .await
+            .expect("the streamed file write should be queued");
+
+        extraction.abort();
+        assert!(matches!(
+            extraction.await,
+            Err(error) if error.is_cancelled()
+        ));
+        assert_eq!(
+            std::fs::metadata(&file_path)
+                .expect("the streamed file should exist")
+                .len(),
+            0
+        );
+
+        assert!(release_worker_sender.send(()).is_ok());
+        assert!(matches!(worker.await, Ok(true)));
+        tokio::task::spawn_blocking(|| ())
+            .await
+            .expect("the blocking pool should drain");
+        assert_eq!(
+            std::fs::metadata(&file_path)
+                .expect("the streamed file should remain empty")
+                .len(),
+            0
+        );
+    });
 }
 
 #[cfg(windows)]

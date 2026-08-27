@@ -1,11 +1,10 @@
 //! Format-neutral, asynchronous archive construction and extraction.
 //!
 //! Archive formats implement [`ArchiveBuilder`] and call
-//! [`ArchiveBuilder::builder`] to reuse high-level entry addition, recursive
-//! filesystem traversal, validation, and source streaming.
-//! Archive formats implement [`Archive`] by projecting their entries into
-//! [`Member`] values. The default [`Archive::extract_in`] implementation then
-//! applies common extraction policy and filesystem behavior.
+//! [`ArchiveBuilder::builder`] for an appropriate builder type.
+//!
+//! Archive formats implement [`Archive`] and call [`Archive::extract_in`]
+//! for extraction.
 //!
 //! Extraction assumes unique access to the destination directory. Concurrent
 //! mutation of that directory is outside the threat model.
@@ -14,6 +13,7 @@ pub mod builder;
 mod component_tree;
 pub mod extract;
 mod name;
+mod task;
 
 use std::{
     io,
@@ -152,6 +152,14 @@ pub trait MemberPayload: Sized {
     /// The archive-format error returned while reading the payload.
     type Error;
 
+    /// Returns the unread payload as contiguous bytes, when available.
+    ///
+    /// Does not advance or validate the payload; call [`Self::skip`] afterward.
+    /// Returns [`None`] by default.
+    fn remaining_bytes(&self) -> Option<&[u8]> {
+        None
+    }
+
     /// Reads the next validated, logical payload chunk into a reusable buffer.
     ///
     /// Returns `true` after replacing `buffer` with a nonempty chunk. Returns
@@ -195,6 +203,10 @@ impl<P> LentPayload<'_, P> {
 
 impl<P: MemberPayload> MemberPayload for LentPayload<'_, P> {
     type Error = P::Error;
+
+    fn remaining_bytes(&self) -> Option<&[u8]> {
+        self.payload.remaining_bytes()
+    }
 
     async fn next_chunk(
         &mut self,

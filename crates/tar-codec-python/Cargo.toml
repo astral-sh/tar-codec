@@ -1,0 +1,23 @@
+[package]
+name = "tar-codec-python"
+description = "Synchronous Python bindings for tar-codec"
+readme = "README.md"
+publish = false
+
+version = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+
+[dependencies]
+pyo3 = { workspace = true }
+tar-codec = { workspace = true }
+tar-framing = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
+
+[lib]
+name = "_tar_codec"
+crate-type = ["cdylib", "rlib"]
+doctest = false
