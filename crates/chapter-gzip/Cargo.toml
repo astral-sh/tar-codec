@@ -1,0 +1,22 @@
+[package]
+name = "chapter-gzip"
+description = "Asynchronous gzip compression with independently readable chapters"
+readme = "README.md"
+
+version = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+
+[dependencies]
+async-compression = { workspace = true, features = ["deflate"] }
+flate2 = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lib]
+doctest = false

@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/archive-trait",
+    "crates/chapter-gzip",
     "crates/tar-codec",
     "crates/tar-framing",
     "crates/tarpit",
@@ -28,6 +29,7 @@ clap = "4.6"
 criterion = { version = "0.8.2", features = [
     "async_tokio",
 ], default-features = false }
+flate2 = "1"
 junction = "2.0.0"
 tar = "0.4.46"
 tempfile = "3"
