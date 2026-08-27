@@ -22,6 +22,10 @@ Both readers accept a `StreamPolicy` through `with_policy` to configure
 extension size limits and numeric-header compatibility. Their `new`
 constructors use the default policy.
 
+`TarStream::new` and `TarReader::new` buffer input by default. Use their
+`unbuffered` constructors or `TarStream::with_buffer_capacity` to customize
+buffering.
+
 For PAX members, one `PaxState` provides standards-consistent effective values
 while preserving each positioned global or local extension newly encountered
 for that member. Trailing global extensions without a following member are

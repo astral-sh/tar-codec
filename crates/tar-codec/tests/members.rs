@@ -222,7 +222,7 @@ async fn advancing_drains_payload_and_applies_tar_policy() -> TestResult {
     let mut archive = ArchiveBuilder::new();
     archive.gnu("file", b'0', b"", "", 0o644);
     let bytes = archive.finish();
-    let mut members = TarArchive::new(bytes.as_slice())
+    let mut members = TarArchive::unbuffered(bytes.as_slice())
         .with_policy(DecodePolicy::default().allow_gnu(false))
         .members();
     assert!(matches!(
