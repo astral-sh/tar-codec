@@ -22,7 +22,7 @@ tar-codec = { path = "crates/tar-codec", version = "0.0.14" }
 tar-framing = { path = "crates/tar-framing", version = "0.0.14" }
 
 async-compression = { version = "0.4", features = ["gzip", "tokio"] }
-astral-tokio-tar = "0.6.2"
+astral-tokio-tar = "0.7"
 cap-std = "4.0.2"
 clap = "4.6"
 criterion = { version = "0.8.2", features = [
